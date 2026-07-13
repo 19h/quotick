@@ -1530,6 +1530,14 @@ fn update_crc32c(mut state: u32, bytes: &[u8]) -> u32 {
     state
 }
 
+pub(crate) fn crc32c_parts(parts: &[&[u8]]) -> u32 {
+    let mut state = u32::MAX;
+    for part in parts {
+        state = update_crc32c(state, part);
+    }
+    !state
+}
+
 const fn make_crc32c_table() -> [u32; 256] {
     let mut table = [0_u32; 256];
     let mut index = 0_usize;

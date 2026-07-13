@@ -76,6 +76,20 @@ impl StorageWriter {
         }
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Self::Single { journal, .. } => journal.path(),
+            Self::Segmented(journal) => journal.directory(),
+        }
+    }
+
+    pub(crate) const fn layout(&self) -> JournalLayout {
+        match self {
+            Self::Single { .. } => JournalLayout::SingleFile,
+            Self::Segmented(_) => JournalLayout::Segmented,
+        }
+    }
+
     pub(crate) fn append<T: DurableRecord>(&mut self, record: &T) -> Result<(), StorageError> {
         match self {
             Self::Single { journal, .. } => journal

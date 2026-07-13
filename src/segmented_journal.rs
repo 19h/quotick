@@ -402,6 +402,12 @@ impl SegmentedJournal {
         self.recovery
     }
 
+    /// Returns the canonical directory owned by this manager.
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
     /// Returns physical segments in global sequence order.
     #[must_use]
     pub fn segments(&self) -> &[SegmentDescriptor] {

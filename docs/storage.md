@@ -1,10 +1,11 @@
 # Local storage contract
 
 This document bounds the guarantees of `Journal`, `SegmentedJournal`,
-`DurableOrderBook`, `DurableRiskOrderBook`, and `DurableLedger`. The durable
-runtimes expose both single-file `open` and directory-backed `open_segmented`
-constructors. It distinguishes properties proved by the state machines from
-properties conditional on the operating system, filesystem, and storage device.
+`SnapshotFile`, `DurableOrderBook`, `DurableRiskOrderBook`, and `DurableLedger`.
+The durable runtimes expose both single-file `open` and directory-backed
+`open_segmented` constructors. It distinguishes properties proved by the state
+machines from properties conditional on the operating system, filesystem, and
+storage device.
 
 ## Canonical-path writer ownership
 
@@ -138,11 +139,52 @@ For a segmented directory, the equivalent operations are
 `SegmentedJournal::recover_abandoned_invalid_writer`. They act only on the
 manager lease; individual managed segments do not carry writer leases.
 
+## Semantic snapshot ownership and replacement
+
+`SnapshotFile` canonicalizes its target and uses the raw-journal 34 B `QLCK`
+sidecar protocol at `<target>.writer.lock`. It rejects every mutating operation
+whose target parent carries `format.qseg`; the segmented directory inventory
+therefore remains closed. Read-only snapshot access does not acquire a lease.
+
+The replacement staging path is `<target>.pending` in the same directory. A
+normal write refuses to proceed while that path exists. After validating
+generation and exact semantic lineage against any current snapshot, the writer
+exclusively creates the pending path, writes the complete bounded `QSNP` file,
+synchronizes it, renames it over the target, synchronizes the parent directory,
+and releases the lease.
+
+Rust specifies that `std::fs::rename` replaces an existing target and rejects a
+cross-mount operation ([Rust `rename`](https://doc.rust-lang.org/stable/std/fs/fn.rename.html)).
+For a qualified POSIX-like filesystem, replacement of the same directory entry
+is atomic: an observer sees the prior or new name binding
+([POSIX.1-2024 `rename`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/rename.html)).
+This namespace atomicity is distinct from persistence through power loss.
+
+An incomplete or complete pending file can survive a terminated writer. After
+resolving any abandoned lease under the same external liveness/quiescence
+preconditions as WAL recovery, `recover_pending` validates both files and uses
+semantic generation plus exact history lineage. It promotes a newer successor,
+removes a proven stale prefix or byte-identical duplicate, removes provably
+malformed pending content, and preserves both files on divergence or invalid
+current state. A pending file rejected only because its version/kind is
+unsupported or its size exceeds the caller's configured limit is preserved.
+The complete wire and decision contract is
+[Semantic snapshot format version 1](snapshot-v1.md).
+
+Direct users must dedicate the target and its two sidecars to snapshots.
+`DurableLedger` additionally checks that a checkpoint target, pending path, and
+lease cannot alias its single-file WAL/lease or reside anywhere inside its
+segmented directory. `write_checkpoint` synchronizes the WAL before publishing
+the independently audited ledger image.
+
 ## File and directory durability
 
 Creating a WAL uses exclusive creation, `File::sync_all`, then parent-directory
 `sync_all`. Repairing a torn tail performs `set_len` followed by file
 `sync_all`. Lease creation and removal also synchronize their directory entry.
+Snapshot publication synchronizes the complete pending file before rename and
+synchronizes the parent after rename; pending removal and promotion also
+synchronize the parent.
 
 Append acknowledgement policies are:
 
@@ -182,6 +224,12 @@ loss and remount tests.
 | termination during initial marker write | open reports invalid marker | explicit recovery removes it only when no segment/unknown entry exists |
 | torn append in active segment | poisoned | strict error; repair can truncate only that final tail |
 | any defect in a closed segment | reopen fails | never repaired, skipped, or converted into a new boundary |
+| snapshot failure before pending creation | unchanged target | no pending file; lease cleanup is attempted |
+| partial snapshot pending write or failed pending barrier | current target unchanged | pending requires explicit recovery and is discarded only after validation proves it malformed |
+| complete pending file before rename | current target unchanged | explicit recovery promotes only a valid same-lineage successor |
+| rename completed before parent barrier | namespace contains replacement if operation returned | power-loss persistence is filesystem/device conditional; reopen validates complete content |
+| stale, redundant, or divergent pending generation | current target remains authoritative until recovery | stale/redundant is synchronized away; divergence preserves both and fails closed |
+| checkpoint disagrees with WAL prefix or extends beyond WAL | durable open fails | no suffix is applied and no storage is mutated |
 
 Deterministic injected-fault tests exercise partial frame writes, complete writes
 with failed acknowledgement barriers, partial grouped writes, explicit sync
@@ -190,12 +238,16 @@ Segment tests exercise exact-boundary and whole-batch rotation, configuration
 drift, closed-file corruption, active-tail repair, manager exclusion,
 interrupted empty-file creation, and pre-rotation sequence exhaustion. A
 forced-process-termination test additionally proves recovery after an abandoned
-writer lease and a possible torn tail.
+writer lease and a possible torn tail. Snapshot/checkpoint tests exercise stable
+framing, payload bounds, corrupt and incomplete pending files, current/pending
+generation forks, exact lineage, managed-directory rejection, WAL-path alias
+rejection, and single/segmented WAL-prefix proof.
 
 ## Unimplemented storage properties
 
 - automatic segment retention, archival, and deletion fencing;
-- checksummed semantic state snapshots and WAL cutover;
+- matching/risk semantic state snapshots;
+- ledger checkpoint WAL cutover, compaction, and bounded restart;
 - authenticated records against deliberate forgery;
 - kernel inode locks covering hard-link aliases;
 - remote replication, quorum acknowledgement, and failover;

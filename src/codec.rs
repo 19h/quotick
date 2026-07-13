@@ -14,7 +14,9 @@ use crate::instrument::{
     InstrumentDefinition, InstrumentError, InstrumentKind, InstrumentSpec, InstrumentSymbol,
     PriceRules, QuantityRules, TradingState,
 };
-use crate::ledger::{JournalEntry, LedgerError, Posting};
+use crate::ledger::{
+    JournalEntry, LedgerBalance, LedgerCheckpoint, LedgerCheckpointError, LedgerError, Posting,
+};
 use crate::market_data::{
     MarketDataError, MarketDataKind, MarketDataLevel, MarketDataSnapshot, MarketDataUpdate,
     TradePrint,
@@ -68,6 +70,8 @@ pub enum CodecError {
     InvalidValue(&'static str),
     /// A decoded journal entry violated accounting invariants.
     InvalidJournalEntry(LedgerError),
+    /// A decoded ledger checkpoint failed replay or redundant-state validation.
+    InvalidLedgerCheckpoint(LedgerCheckpointError),
     /// A decoded instrument definition violated instrument-master invariants.
     InvalidInstrument(InstrumentError),
     /// A decoded risk definition violated limit invariants.
@@ -102,6 +106,7 @@ impl fmt::Display for CodecError {
             Self::InvalidDomain(error) => error.fmt(formatter),
             Self::InvalidValue(detail) => formatter.write_str(detail),
             Self::InvalidJournalEntry(error) => error.fmt(formatter),
+            Self::InvalidLedgerCheckpoint(error) => error.fmt(formatter),
             Self::InvalidInstrument(error) => error.fmt(formatter),
             Self::InvalidRisk(error) => error.fmt(formatter),
             Self::InvalidMarketData(error) => error.fmt(formatter),
@@ -114,6 +119,7 @@ impl std::error::Error for CodecError {
         match self {
             Self::InvalidDomain(error) => Some(error),
             Self::InvalidJournalEntry(error) => Some(error),
+            Self::InvalidLedgerCheckpoint(error) => Some(error),
             Self::InvalidInstrument(error) => Some(error),
             Self::InvalidRisk(error) => Some(error),
             Self::InvalidMarketData(error) => Some(error),
@@ -143,6 +149,12 @@ impl From<RiskError> for CodecError {
 impl From<MarketDataError> for CodecError {
     fn from(error: MarketDataError) -> Self {
         Self::InvalidMarketData(error)
+    }
+}
+
+impl From<LedgerCheckpointError> for CodecError {
+    fn from(error: LedgerCheckpointError) -> Self {
+        Self::InvalidLedgerCheckpoint(error)
     }
 }
 
@@ -1220,5 +1232,52 @@ impl BinaryCodec for JournalEntry {
             ));
         }
         Ok(canonical)
+    }
+}
+
+impl BinaryCodec for LedgerCheckpoint {
+    fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let mut encoder = Encoder::default();
+        encoder.u64(self.generation());
+        encoder.length("ledger checkpoint balances", self.balances().len())?;
+        for balance in self.balances() {
+            encoder.u64(balance.account_id().get());
+            encoder.u64(balance.asset_id().get());
+            encoder.i128(balance.amount());
+        }
+        encoder.length("ledger checkpoint entries", self.entries().len())?;
+        for entry in self.entries() {
+            let bytes = entry.encode()?;
+            encoder.length("ledger checkpoint entry payload", bytes.len())?;
+            encoder.bytes(&bytes);
+        }
+        Ok(encoder.finish())
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut decoder = Decoder::new(bytes);
+        let generation = decoder.u64()?;
+        let balance_count = decoder.count("ledger checkpoint balances", 32)?;
+        let mut balances = Vec::with_capacity(balance_count);
+        for _ in 0..balance_count {
+            balances.push(LedgerBalance::from_parts(
+                account(&mut decoder)?,
+                asset(&mut decoder)?,
+                decoder.i128()?,
+            ));
+        }
+        // A valid entry is at least a 4-byte length prefix, a 20-byte fixed
+        // value, and two 32-byte postings. Reject impossible counts before a
+        // potentially large allocation.
+        let entry_count = decoder.count("ledger checkpoint entries", 88)?;
+        let mut entries = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            let length = usize::try_from(decoder.u32()?).map_err(|_| {
+                CodecError::InvalidValue("ledger checkpoint entry length exceeds usize")
+            })?;
+            entries.push(JournalEntry::decode(decoder.bytes(length)?)?);
+        }
+        decoder.finish()?;
+        LedgerCheckpoint::from_parts(generation, balances, entries).map_err(Into::into)
     }
 }

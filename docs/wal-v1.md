@@ -176,6 +176,13 @@ its first frame is rejected. Recovery compares the complete persisted
 definition with the requested definition before replay. A ledger journal
 accepts only ledger-entry records.
 
+A ledger semantic checkpoint is not a WAL frame and introduces no version-1
+record kind. It is a separate `QSNP` file described by
+[Semantic snapshot format version 1](snapshot-v1.md). Checkpoint-assisted open
+still scans every ledger-entry frame and requires the checkpoint's complete
+entry sequence to equal the exact WAL prefix before applying the remaining
+suffix. Version 1 does not truncate or retire that prefix.
+
 A risk-managed matching journal inserts zero or more account-risk-definition
 records between the instrument definition and the first command. The complete
 canonical profile set must equal the requested set. If the file ends during

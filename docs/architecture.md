@@ -104,6 +104,18 @@ order identifiers for FIFO removal without scanning a level.
     balances; stale preparations cannot commit.
 11. Recovery accepts only ledger-entry records and reconstructs every balance
     from the canonical WAL sequence.
+12. A complete invariant audit cross-checks journal order and sequence,
+    transaction index identity, deterministic entry replay, canonical balances,
+    and independently accumulated positive/negative totals per asset.
+13. A checkpoint contains all journal entries plus a redundant, strictly
+    `(asset, account)`-ordered image of non-zero balances. Its generation equals
+    its entry count, and decoding rejects exact duplicate records or transaction
+    collisions while replaying every entry before accepting that balance image.
+14. Durable checkpoint publication follows a successful WAL `sync_all` barrier
+    and a successful live-ledger invariant audit.
+15. Checkpoint-assisted recovery accepts the checkpoint only when its complete
+    entry history equals the exact WAL prefix. It then applies only the suffix
+    and reruns the complete live-ledger audit.
 
 Signed balances are intentional accounting state. Credit limits, collateral,
 and margin are not inferred by the ledger. The implemented order risk layer
@@ -233,9 +245,36 @@ collateral from ledger balances.
     marker only under manager ownership and only when no segment or unknown
     persistent entry exists; a valid marker is immutable.
 
+## Semantic snapshot invariants
+
+1. A `QSNP` file carries a fixed 28 B header with magic, version, typed payload
+   kind, bounded `u64` length, CRC-32C, and semantic generation.
+2. CRC-32C covers the zero-checksum header and complete payload. Physical and
+   declared lengths, typed kind, codec invariants, and header/payload generation
+   must all agree before a value is returned.
+3. Snapshot writers use canonical-path `QLCK` ownership. Targets inside a
+   marker-bound segmented-WAL directory are rejected before mutation.
+4. Replacement exclusively creates and synchronizes `<target>.pending`, renames
+   it over the target, synchronizes the parent directory, and releases the
+   lease. An existing pending file always requires explicit recovery.
+5. A normal write cannot regress generation, replace equal-generation state
+   with different content, or advance to a history that does not extend the
+   current exact lineage.
+6. Pending recovery promotes only an absent-current or newer same-lineage
+   value. It discards a stale value only when the current history extends it,
+   and preserves both sides on equal-generation or cross-lineage divergence.
+7. Truncated or provably corrupt pending content is removable explicitly.
+   Unsupported versions/kinds and values exceeding the caller's configured
+   bound are preserved for a compatible recovery process.
+8. CRC-32C is an accidental-corruption detector, not an authenticity proof.
+9. Ledger checkpoints retain complete history, and durable recovery still scans
+   the complete WAL to prove the prefix. Version 1 performs no WAL cutover,
+   compaction, retention, or bounded-restart protocol.
+
 The authoritative version-1 framing and payload schema is
-[WAL format version 1](wal-v1.md). Filesystem and device assumptions are bounded
-by the [Local storage contract](storage.md).
+[WAL format version 1](wal-v1.md) and
+[Semantic snapshot format version 1](snapshot-v1.md). Filesystem and device
+assumptions are bounded by the [Local storage contract](storage.md).
 
 ## Failure model
 
@@ -248,9 +287,12 @@ newer full-depth snapshot. Forced-process-termination, concurrent-writer,
 abandoned/malformed-lease, injected-write/barrier, exact-boundary/batch rotation,
 closed-segment corruption, active-tail repair, cross-segment replay, torn-report,
 metadata-prefix, replay-divergence, entry-reconstruction, feed-gap, and publisher
-cross-audit tests exercise these paths. There is no claim of
-replicated durability, remote consensus, snapshot recovery, or storage-device
-power-loss behavior.
+cross-audit tests exercise these paths. Ledger snapshot framing, generation and
+lineage divergence, interrupted-pending recovery, independent trial balance,
+checkpoint/WAL prefix proof, and segmented suffix replay are also tested. There
+is no claim of replicated durability, remote consensus, matching/risk state
+snapshot recovery, WAL cutover or retention, bounded restart, or qualified
+storage-device power-loss behavior.
 
 ## Standards and primary-source provenance
 
@@ -263,6 +305,10 @@ power-loss behavior.
   WAL and directory barriers use [`File::sync_all`](https://doc.rust-lang.org/stable/std/fs/struct.File.html#method.sync_all);
   the underlying transfer remains conditional on the implementation as specified
   by [POSIX `fsync`](https://pubs.opengroup.org/onlinepubs/009695399/functions/fsync.html).
+- Snapshot replacement uses Rust
+  [`std::fs::rename`](https://doc.rust-lang.org/stable/std/fs/fn.rename.html) and
+  depends on the atomic same-filesystem namespace replacement specified by
+  [POSIX.1-2024 `rename`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/rename.html).
 - The signed `Price` domain covers real exchange cases in which negative prices
   are supported. [CME Clearing Advisory 20-152](https://www.cmegroup.com/notices/clearing/2020/04/Chadv20-152.pdf)
   is the primary-source basis for retaining negative futures-price support.
@@ -276,8 +322,8 @@ power-loss behavior.
 | Impact | Capability | Evidence required for completion |
 |---|---|---|
 | High | Durable storage completion | segment retention/archival with deletion fencing; kernel inode locking or qualified alias exclusion; forced-power-loss filesystem/device evidence |
-| High | Ledger reconciliation and checkpoints | independent trial balances, external statement reconciliation, checkpoint proofs, corrections, and bounded restart time |
-| High | Snapshots and compaction | checksummed state snapshots, WAL cutover proof, bounded restart time, and retained audit history |
+| High | Ledger lifecycle completion | external statement reconciliation, correction/reversal workflows, operational close controls, and externally anchored cutoff proofs |
+| High | Snapshots and compaction | matching/risk semantic snapshots, fenced WAL cutover, bounded restart time, segment retention, and retained audit-history proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
 | High | Instrument lifecycle expansion | trading calendars, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |

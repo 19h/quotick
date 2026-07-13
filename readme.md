@@ -106,7 +106,7 @@ recovery.
 ### Durability and codecs
 
 - Stable little-endian codecs for definitions, risk profiles, commands,
-  execution reports, market data, and ledger entries.
+  execution reports, market data, ledger entries, and ledger checkpoints.
 - Versioned CRC-32C WAL frames with bounded payloads and contiguous sequences.
 - Size-bounded physical WAL segments with automatic whole-frame and whole-batch
   rotation over one global logical sequence.
@@ -117,6 +117,9 @@ recovery.
 - Grouped append barriers and poisoned-writer behavior after ambiguous I/O.
 - Canonical-path exclusive writer and segment-manager leases with explicit
   abandoned-writer recovery.
+- Versioned, bounded `QSNP` semantic snapshots with CRC-32C, monotonic
+  exact-prefix lineage, synchronized same-filesystem replacement, and explicit
+  abandoned-pending recovery.
 - Definition-bound matching replay, profile-bound risk replay, interrupted
   report completion, and divergence detection.
 
@@ -129,6 +132,10 @@ recovery.
 - Exact-entry idempotency, transaction collision detection, and WAL-free exact
   retries.
 - Full balance reconstruction from the canonical journal sequence.
+- Independent journal/index replay and per-asset trial-balance audits.
+- Canonical non-zero balance checkpoints retaining complete transaction
+  history, plus durable recovery that proves the checkpoint against the exact
+  WAL prefix and replays only its suffix.
 
 The crate forbids `unsafe` code and has no runtime dependencies.
 
@@ -146,6 +153,7 @@ The exact invariants and environmental assumptions are documented in:
 - [Assumption register](docs/assumptions.md)
 - [Local storage contract](docs/storage.md)
 - [WAL format version 1](docs/wal-v1.md)
+- [Semantic snapshot format version 1](docs/snapshot-v1.md)
 - [Market-data payload format version 1](docs/market-data-v1.md)
 
 ## Build and verify
@@ -169,6 +177,10 @@ Segmented-storage tests additionally force record-by-record and whole-batch
 rotation, cross-segment matching/risk/ledger replay, strict closed-segment
 corruption handling, active-tail repair, manager exclusion, and interrupted
 empty-segment recovery.
+Checkpoint tests additionally exercise canonical trial balances, independent
+entry replay, stable snapshot framing, corruption and generation forks,
+pending-file recovery, WAL-prefix divergence, path ownership, and suffix replay
+across physical segment boundaries.
 
 ## Complexity
 
@@ -193,3 +205,10 @@ than the complete WAL. Appending a frame performs `O(F)` checksum and copy work
 for frame length `F`; a `JournalBatch` amortizes one write and one configured
 durability barrier across multiple frames. Rotation adds one closing barrier,
 exclusive file creation, and a parent-directory barrier at a size boundary.
+
+For `E` retained ledger entries, `L` posting legs, and `A` non-zero account
+balances, checkpoint capture/validation is linear in `E + L + A` apart from
+ordered validation-map factors, and retained checkpoint state is
+`O(E + L + A)`. Checkpoint-assisted durable open still scans all `B` WAL bytes
+to prove the exact prefix; it does not yet bound restart time or authorize WAL
+retention.

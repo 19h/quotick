@@ -21,6 +21,7 @@ pub mod market_data;
 pub mod matching;
 pub mod risk;
 mod segmented_journal;
+pub mod snapshot;
 
 pub use domain::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
