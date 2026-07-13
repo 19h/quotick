@@ -1,172 +1,188 @@
-<h1 align="center">Quotick by SIGDEV</h1>
+# Quotick
 
-<h5 align="center">Embedded tick market data (trade, quote, ..) database storage optimized for billions of data points.</h5>
+Quotick is a dependency-free Rust crate for deterministic, auditable financial
+market infrastructure. It connects versioned instrument rules, pre-trade risk,
+price-time-priority matching, level-2 market data, durable recovery, and
+double-entry settlement in one replayable core.
 
-<div align="center">
-  <a href="https://crates.io/crates/quotick">
-    crates.io
-  </a>
-  —
-  <a href="https://github.com/sigset/quotick">
-    Github
-  </a>
-</div>
+Every financial state transition uses integer price quanta and lot quantities.
+Every matching event is sequenced. Every durable runtime can reconstruct its
+state from a verified local write-ahead log (WAL). The result is a foundation
+for systems where the same validated input must produce the same observable
+output during live execution, recovery, and historical analysis.
 
-<br />
+## Project goals
 
-```shell script
-$ cargo add quotick
+- **Deterministic execution:** make order priority, fills, risk reservations,
+  market-data updates, and ledger postings reproducible from an ordered command
+  stream.
+- **Explicit financial semantics:** bind commands and trades to immutable,
+  effective-time instrument definitions with checked fixed-point arithmetic.
+- **Auditable recovery:** detect corruption, incomplete writes, sequence gaps,
+  metadata drift, and replay divergence instead of silently accepting ambiguous
+  state.
+- **Composable infrastructure:** expose matching, risk, publication, journaling,
+  and accounting as separate components with cross-auditable invariants.
+- **Bounded behavior:** define supported inputs, resource complexity, storage
+  assumptions, and system boundaries precisely.
+
+## Architecture at a glance
+
+```text
+instrument definition
+        |
+validated command -> pre-trade risk -> WAL -> matching engine
+        |                                      |
+        |                                      +-> sequenced execution trace
+        |                                                   |
+        +--------------------------------------- reservations and positions
+                                                            |
+                                      L2 updates, trades, and snapshots
+                                                            |
+                                      gap-detecting market-data replica
+                                                            |
+                                                  version-bound settlement
+                                                            |
+                                         balanced multi-asset journal entry
+                                                            |
+                                                   durable account balances
 ```
 
-#### Usage
+An `OrderBook` represents one instrument-version shard and is mutated by one
+execution thread. Parallelism is obtained by running independent shards. The
+durable wrappers record commands or ledger entries before committing the
+corresponding in-memory transition, then verify deterministic results during
+recovery.
 
-```rust
-use serde_derive::{Deserialize, Serialize};
+## Capabilities
 
-use quotick::quotick::Quotick;
+### Instrument model and arithmetic
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-struct Trade {
-    size: u32,
-    price: u32,
-}
+- Validated, fixed-capacity asset codes and instrument symbols.
+- Append-only instrument versions selected by effective time.
+- Tick grids, signed price collars, lot increments, order-size bounds, and
+  trading-state admission.
+- Integer price and quantity types, including valid zero and negative prices.
+- Checked `i128` settlement arithmetic with explicit base and quote conversion
+  multipliers.
 
-impl quotick::tick::Tick for Trade {
-    fn epoch(&self) -> u64 {
-        // one day
-        self.time / 86_400_000_000_000
-    }
-}
+### Matching and order lifecycle
 
-fn main() {
-    let trade1 =
-        (
-            10, // time
-            Trade {
-                size: 1,
-                price: 2,
-            },
-        );
+- Deterministic price-time priority with ordered price levels and intrusive FIFO
+  links.
+- Market and limit orders with GTC, IOC, FOK, and post-only behavior.
+- Cancel and replace with ownership checks and explicit priority-retention
+  rules.
+- Cancel-aggressor, cancel-resting, cancel-both, and decrement-and-cancel
+  self-trade prevention.
+- Atomic FOK preflight, exact-command idempotency, collision detection, and
+  monotonic event and trade sequences.
+- Complete execution traces suitable for replay, downstream publication, and
+  risk reconstruction.
 
-    let trade2 =
-        (
-            11, // time
-            Trade {
-                size: 2,
-                price: 3,
-            },
-        );
+### Pre-trade risk
 
-    let trade3 =
-        (
-            12,
-            Trade {
-                size: 3,
-                price: 4,
-            },
-        );
+- Immutable account profiles with active, reduce-only, and blocked states.
+- Per-order quantity and notional limits.
+- Aggregate resting-order count, quantity, and notional limits.
+- Worst-case long and short position limits across open exposure.
+- Conservative reachable-price notional for positive, zero-crossing, and
+  negative price collars.
+- Trace-driven reservation release across fills, cancellation, replacement,
+  and self-trade prevention.
+- Cross-audits between active orders, reservations, aggregates, and positions.
 
-    let quotick =
-        Quotick::<Trade>::new(
-            "SYMBL",
-            "./db",
-        );
+### Market-data publication and recovery
 
-    qt.insert(&Frame::new(trade1.0, trade1.1));
-    qt.insert(&Frame::new(trade2.0, trade2.1));
-    qt.insert(&Frame::new(trade3.0, trade3.1));
+- One public update for every non-replayed matching event, preserving the
+  source sequence without exposing account, order, or command identifiers.
+- Absolute level-2 quantity and order-count updates plus anonymized trade
+  prints.
+- Full-depth snapshots in canonical price order.
+- Exact-retry suppression and publisher-to-book cross-audits.
+- Consumer-side detection of missing, duplicated, and reordered updates.
+- Snapshot-based replica recovery after an incremental sequence gap.
 
-    qt.persist();
-    
-    // iterate over all epochs
-    quotick
-        .epochs()
-        .for_each(
-            |mut epoch| {
-                // iterate over all frames
-                // in a given epoch
+### Durability and codecs
 
-                epoch
-                    .frames()
-                    .for_each(
-                        |frame| {
-                            frame.time(); // u64 time
-                            frame.tick(); // your tick
-                        },
-                    );
-            }
-        );
+- Stable little-endian codecs for definitions, risk profiles, commands,
+  execution reports, market data, and ledger entries.
+- Versioned CRC-32C WAL frames with bounded payloads and contiguous sequences.
+- Size-bounded physical WAL segments with automatic whole-frame and whole-batch
+  rotation over one global logical sequence.
+- Strict corruption detection and explicit repair of only a physically
+  incomplete final frame; closed segments are always scanned strictly.
+- Configurable buffered, flush, data-sync, and full-sync acknowledgements;
+  `SyncAll` is the default.
+- Grouped append barriers and poisoned-writer behavior after ambiguous I/O.
+- Canonical-path exclusive writer and segment-manager leases with explicit
+  abandoned-writer recovery.
+- Definition-bound matching replay, profile-bound risk replay, interrupted
+  report completion, and divergence detection.
 
-    // obtain the frame with the lowest
-    // time value of the first epoch (10)
-    dbg!(quotick.oldest_frame());
+### Accounting and settlement
 
-    // obtain the frame with the highest
-    // time value of the last epoch (12)
-    dbg!(quotick.newest_frame());
-}
+- Atomic, balanced multi-asset journal entries with canonical leg order.
+- Delivery-versus-payment trade settlement bound to the exact instrument
+  version.
+- Entry-before-balance durability with prepared, generation-checked commits.
+- Exact-entry idempotency, transaction collision detection, and WAL-free exact
+  retries.
+- Full balance reconstruction from the canonical journal sequence.
+
+The crate forbids `unsafe` code and has no runtime dependencies.
+
+## System boundary
+
+Quotick currently implements deterministic local state machines and local WAL
+recovery for a single-instrument execution shard and a multi-asset ledger. It
+does not implement gateways, authentication, distributed sequencing,
+replication or consensus, portfolio collateral and margin, clearing lifecycle,
+network market-data fanout, administrative interfaces, or reporting systems.
+
+The exact invariants and environmental assumptions are documented in:
+
+- [Architecture](docs/architecture.md)
+- [Assumption register](docs/assumptions.md)
+- [Local storage contract](docs/storage.md)
+- [WAL format version 1](docs/wal-v1.md)
+- [Market-data payload format version 1](docs/market-data-v1.md)
+
+## Build and verify
+
+Quotick requires Rust 1.85 or later.
+
+```sh
+cargo fmt --all -- --check
+cargo test --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
-#### Architecture
+The test suites exercise financial-domain boundaries, price/FIFO priority,
+order lifecycle behavior, all self-trade policies, risk rejection and
+reservation release, market-data reconstruction, settlement and arithmetic
+rollback, stable wire layouts, corruption and torn-tail handling, concurrent
+writer exclusion, injected write and barrier failures, forced process
+termination, recovery equivalence, and replay-divergence detection.
 
-Quotick can contain an unlimited amount of symbols. One internal database is used per symbol, and each symbol is stored in a separate directory.
+## Complexity
 
-Ticks are separated by _epochs_. Epochs are used to separate and speed up lookups of ticks contained within a single window of time (i.e. one day).
+For `P` occupied price levels and `M` matched resting orders, price discovery is
+`O(log P)` and execution is `O((M + 1) log P)`. FIFO append is `O(log P)`;
+cancellation is expected `O(1)` lookup plus `O(log P)` level maintenance. Active
+matching state uses `O(O + P + C)` memory for `O` resting orders and `C` retained
+idempotency reports.
 
-The epoch index is a radix-trie and stored inside a file identified by `epochs.qti`.
+Risk authorization and trace application are expected `O(1)` per order event.
+A complete risk cross-audit is `O(O + A)` for `A` registered accounts, and risk
+state uses `O(O + A)` memory.
 
-When lookup up an epoch, a tick or inserting a tick, the radix trie is loaded into memory in full. It stays in memory until quotick goes out of scope and is dropped, or as long as the program is running.
+Market-data trace and replica application are `O(log P)` for level-changing
+events and `O(1)` for no-change events. Publisher bootstrap is `O(O log O + P)`,
+a full-depth snapshot is `O(P)`, and a complete publisher cross-audit is
+`O(O log O + P)`.
 
-When an epoch is located inside the epoch index, and if not, it is added to the index, the epochs' tick-index is loaded from `frameset/[epoch].qti`, and if it does not exist, it is initialized. It is a radix-trie and contains all ticks identified by their nano-second precision timestamp.
-
-Timestamps must be in nano-second precision. Quotick is not designed to store ticks identified by arbitrary identifiers, and relies on the fact that ticks' timestamps must be sortable.
-
-Tick data is stored in a file loaded from `frameset/[epoch].qtf`, called a frameset. Internally, every tick represents a frame.
-
-When a tick is inserted into an epoch, it is appended to the end of the file and the offset of the tick is stored as a (u64 timestamp, u64 offset) tuple inside the tick-index radix-trie of the respective epoch.
-
-When iterating over the tick-index of an epoch, returned ticks are loaded from the frameset file on-demand. The frameset will seek to the desired offset of the backing file, read the respective amount of bytes and attempt to deserialize them into a frame.
-
-If you insert ticks in random order, you must either defragment an epoch to prevent significant read-head jumps on HDDs. It is absolutely recommended to use NVMe storage for Quotick.
-
-#### Notes
-
-Ticks stored inside Quotick must implement `quotick::tick::Tick` which depends on Default, Debug, Deserialize and Serialize.
-
-Note that `Default` is required to be able to determine the size of the structure as serialized by `bincode`. It differs from `std::mem::size_of<T>()` and is therefore mandatory.
-
-`Deserialize` and `Serialize` are required to be able to write and read ticks from file.
-
-#### License
-
-<b>If your organization revenue exceeds $1 million (or currency equivalent) you must obtain a usage license. Please contact [licensing@sig.dev](mainlto:licensing@sig.dev).</b>
-
-The following license applies 
-
-~~ Usage License ~~
-
-Copyright (c) 2021 SIGDEV LLC
-Copyright (c) 2021 Kenan Sulayman
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, and/or sell copies of the
-Software, and to permit persons to whom the Software is furnished to do so,
-subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-This license does not apply if the gross revenue of the organization or
-individual, or group of individuals, if this software is directly or
-indirectly benefiting inidividuals other than the original user, exceeds
-$1 million (or currency equivalent) per year.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+WAL scanning is `O(B)` for `B` persisted bytes. Appending a frame performs
+`O(F)` checksum and copy work for frame length `F`; a `JournalBatch` amortizes
+one write and one configured durability barrier across multiple frames.

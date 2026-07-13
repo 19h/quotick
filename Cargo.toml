@@ -1,32 +1,32 @@
 [package]
 name = "quotick"
-version = "0.2.4-alpha.0"
-authors = ["19h <kenan@sig.dev>", "SIGDEV LLC <hello@sig.dev>"]
-edition = "2018"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
 readme = "readme.md"
-description = "Embedded tick market data (trade, quote, ..) database storage optimized for billions of data points."
+description = "Deterministic, auditable financial market infrastructure."
 license-file = "license.txt"
+autobins = false
 
-[[bin]]
+[lib]
 name = "quotick"
-path = "src/main.rs"
-
-[[bin]]
-name = "dbn_importer"
-path = "src/bin/dbn_importer.rs"
+path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0.99"
-bincode = "2.0.1"
-bytemuck = { version = "1.23.2", features = ["aarch64_simd", "avx512_simd", "bytemuck_derive", "derive"] }
-clap = { version = "4.5.47", features = ["derive"] }
-memmap2 = "0.9.8"
-miniz_oxide = { version = "0.8.9", features = ["simd"] }
-serde = "1.0.221"
-serde_derive = "1.0.221"
-time = "0.3.43"
 
 [profile.release]
-lto = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+overflow-checks = true
+strip = "debuginfo"
 
 [profile.dev]
+overflow-checks = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

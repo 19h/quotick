@@ -1,0 +1,74 @@
+# Assumption Register
+
+Each dependent result is valid only while its tagged assumptions survive the
+listed falsification probe.
+
+| ID | Assumption | Dependent results | Stress test / falsification probe |
+|---|---|---|---|
+| A1 | The supplied immutable instrument definition is the authoritative and externally correct interpretation of each raw price quantum, tick, collar, lot increment, size bound, and trading state. Internal consistency is validated; correctness against an exchange or legal specification is external. | Admission, price priority, crossing, and replay. | Import independently sourced conformance fixtures for every rule regime and boundary. Any accepted off-grid/out-of-collar order or disagreement with the source specification falsifies A1. |
+| A2 | `Quantity` is lots; the exact execution version's `base_units_per_lot` and `quote_units_per_price_unit` are authoritative economic conversions. | Level depth, base delivery, and quote notional. | Replay minimum, maximum, negative-price, and overflow-boundary trades across multiplier changes; independently calculate all `i128` postings. Any accepted version mismatch or numerical disagreement falsifies A2. |
+| A3 | Exactly one thread mutates an `OrderBook`; parallelism is across instrument shards. | Deterministic FIFO, event order, absence of locks on the hot path. | Attempt concurrent mutation behind the final dispatcher and run concurrency model checking. More than one accepted writer for a shard falsifies A3. |
+| A4 | `CommandId` is unique within a book, `OrderId` is never reused after acceptance, `TradeId` is book-local, and `TransactionId` is globally unique. | Idempotency, trace correlation, exactly-once ledger effect. | Inject exact retries and differing-content collisions across shards and restarts. Any second state transition for the same scoped identifier falsifies A4. |
+| A5 | Receive timestamps are trace data, not matching-priority inputs; command arrival at the single writer defines priority. | FIFO determinism and replay. | Feed decreasing/equal timestamps and confirm identical arrival-order matching. Timestamp-based reordering falsifies A5. |
+| A6 | Negative account balances are valid general-ledger state; the order-risk layer is separate from ledger posting and does not make ledger acceptance imply credit authorization. | Atomic posting, settlement, and risk/ledger separation. | Add a blocking balance policy in the posting path. If ledger acceptance begins to imply credit authorization, A6 is no longer valid. |
+| A7 | Negative and zero prices are valid for some instruments. | Price type range and settlement cash-flow direction. | Execute zero and negative boundary prices and reconcile all per-asset sums to zero. A hard positive-price assertion falsifies A7. |
+| A8 | Durable matching, durable risk, and durable ledger guarantees are scoped to one local WAL and the selected acknowledgement policy; `SyncAll` is the default. | Command/report/profile recovery after process termination. | Inject process termination, torn frames, delayed writes, power loss, filesystem remount, and device-cache reordering. Loss of an acknowledged frame falsifies the storage assumptions behind A8. |
+| A9 | Retaining every processed command report is acceptable only for bounded test/runtime horizons. | Exact replay response, memory complexity `O(C)`. | Run a production-duration command-volume soak under a fixed memory limit. Unbounded growth falsifies A9 and requires durable deduplication plus eviction watermarks. |
+| A10 | Hash iteration order is never externally observable; all exposed ordered data comes from price trees, FIFO links, or journal vectors. | Deterministic public outputs across process seeds. | Replay identical command streams under varied hash seeds and byte-compare reports, depth, and journal order. Any difference falsifies A10. |
+| A11 | A trade is durably settled once using a caller-supplied globally unique transaction ID and the definition-correlated settlement path; the lower-level convention API is not an authorization boundary. | Delivery-versus-payment balances, WAL reconstruction, and retry behavior. | Submit exact retries, transaction collisions, mismatched instrument versions, and terminate between WAL append and balance commit. Any mismatched-version posting, duplicate economic effect, or lost acknowledged entry falsifies A11. |
+| A12 | Allocator failure and process abort are outside the current recoverable error model. | Fallible business/arithmetic paths; no crash-safety claim. | Inject allocation failure at each allocation site. Any requirement for continued in-process service falsifies A12 and requires bounded/preallocated structures. |
+| A13 | Every writer uses the canonical WAL pathname and its protected sidecar lease; no participant introduces a hard-link alias, replaces path components, or deletes a live lease. | Exclusive canonical-path writer ownership, contiguous sequence assignment, and append offsets. | Start concurrent writers through identical, relative, symlinked, and hard-linked paths while replacing lease/path entries. More than one successful writer falsifies A13 and requires a kernel inode lock or consensus ownership. |
+| A14 | CRC-32C protects against accidental corruption, not deliberate record forgery. | Corruption detection and torn-tail classification. | Modify a payload without updating CRC, then modify it while recomputing CRC. Acceptance of the first falsifies implementation integrity; concern about the second requires authenticated records. |
+| A15 | Format version 1 is immutable; incompatible evolution uses a new frame version and explicit migration. | Deterministic decoding and historical replay. | Run golden version-1 fixtures through every supported release. Any changed bytes or interpretation falsifies A15. |
+| A16 | At most one final command can lack a report because submission is serial and command/report pairs are not interleaved. | Automatic interrupted-report completion. | Inject termination at every protocol boundary and introduce command pipelining. More than one outstanding command falsifies A16 and requires transaction/correlation identifiers in the WAL grammar. |
+| A17 | The gateway or sequencer selects the definition effective at the authoritative event time, and one `OrderBook` remains bound to that version for its lifetime. In-place rule changes are not performed. | Effective-time rule selection, FIFO continuity, and deterministic replay across rule regimes. | Exercise events at `effective_from - 1 ns`, `effective_from`, and `effective_from + 1 ns`, including delayed and reordered arrivals. Any command admitted under a version other than the selected authoritative-time version falsifies A17. |
+| A18 | Seeded account positions and immutable risk profiles are authoritative at shard start; no external fill, bust, transfer, or profile change occurs outside the command trace. | Position limits, reduce-only behavior, and deterministic risk replay. | Reconcile seeded and replayed positions against an independent clearing source; inject an out-of-band position/profile change. Any unexplained difference falsifies A18 and requires durable administrative/clearing events. |
+| A19 | Risk notional limits are denominated in absolute raw price quanta multiplied by lots, not a normalized reporting currency. Instrument collars bound every reachable matching price. | Per-order and aggregate notional rejections, including negative prices. | Calculate side-specific reachable-price extrema independently for positive, zero-crossing, and negative collars. Any execution outside the collar or normalized-currency interpretation of these thresholds falsifies A19. |
+| A20 | `RiskManagedOrderBook` is the sole mutation path for a risk-controlled shard; its accepted matching trace is sufficient to update every reservation and position without a second fallible business decision. | In-process matching/risk atomicity and durable reconstruction. | Apply model-generated combinations of fills, cancels, replacements, and all STP modes; cross-audit after every command and compare recovery byte-for-byte. Any active order without exactly one matching reservation or any duplicate position effect falsifies A20. |
+| A21 | After bootstrap, one publisher receives every non-replayed report from its authoritative book in matching-event order; no second publisher state is merged into that sequence. | One-to-one incremental publication, exact-retry suppression, and publisher/book cross-audit. | Drop, duplicate, reorder, and splice reports from another instrument/version. Any undetected sequence or identity discontinuity, or any aggregate mismatch that passes cross-audit, falsifies A21. |
+| A22 | All resting leaves are publicly displayed; the matching model currently has no hidden, reserve, discretionary, pegged, or implied quantity. | Level-2 aggregate quantity and order count exactly equal private active-order aggregates. | Introduce hidden/reserve semantics into matching and compare public versus total leaves. Any legitimate difference falsifies A22 and requires distinct displayed fields plus refresh events. |
+| A23 | A recovery snapshot and buffered incrementals originate from the same immutable instrument-version shard, and the consumer applies only the contiguous suffix beginning at `snapshot sequence + 1`. | Race-free public replica recovery after sequence loss. | Delay snapshot capture while dropping/reordering buffered updates and inject cross-version images. Acceptance of a noncontiguous suffix or convergence to depth unequal to the publisher falsifies A23. |
+| A24 | The host supports opening and synchronizing the WAL parent directory, and successful file/directory `sync_all` calls have the persistence semantics established by the qualified filesystem, mount, controller, and device stack. | Durable creation/repair, lease creation/removal, and `SyncAll` acknowledgements. | Force power loss after every write, file barrier, and directory barrier; remount and compare the verified prefix and directory entries. Any lost acknowledged frame or resurrected/deleted synchronized entry falsifies A24 for that stack. |
+| A25 | Abandoned valid/invalid lease recovery occurs only after independent proof that the observed owner cannot write and while all new writer starts are externally quiesced. | Safe progress after process termination leaves a durable or partially emitted lease. | Invoke recovery while the owner remains live, can resume, or while another writer races between comparison and deletion. Any such topology falsifies A25 and requires kernel-released locking or a fenced lease service. |
+
+## Bounded scope expansion
+
+- **High impact:** local command/event recovery, canonical-path writer exclusion,
+  directory-entry synchronization, explicit abandoned-owner recovery, and
+  deterministic storage-fault injection are implemented; segment rotation,
+  hard-link/inode fencing, storage power-loss qualification, replication, and
+  durable state snapshots remain prerequisites for bounded production recovery
+  claims.
+- **High impact:** entry-before-balance ledger recovery is implemented; external
+  reconciliation, checkpoints, corrections, and snapshot-bounded restart remain.
+- **High impact:** immutable versioned tick, lot, asset, trading-state, and
+  settlement rules are implemented; authoritative source ingestion, calendars,
+  corporate actions, derivative lifecycle rules, and signed configuration
+  distribution remain outside the boundary.
+- **High impact:** deterministic single-instrument order risk, reservations,
+  profile-bound durability, and cross-audit are implemented; ledger-backed
+  available funds, cross-instrument portfolio netting, margin/scenario models,
+  busts, transfers, and replicated ownership remain outside the boundary.
+- **Medium impact:** a bounded idempotency index is required to make memory use
+  stable under continuous operation.
+- **Medium impact:** formal state-machine/model-based tests are required for the
+  combinatorial interaction of TIF, replacement, and self-trade policies.
+- **Medium impact:** local level-2 incrementals, full-depth images, stable
+  payloads, gap detection, and recovery are implemented; authenticated network
+  framing, entitlements, fanout, retransmission sessions, and bandwidth controls
+  remain outside the boundary.
+- **Medium impact:** current asymptotic complexity is established by data
+  structures; throughput and tail-latency claims remain unknown until measured
+  on declared hardware and workloads.
+- **Medium impact opportunity:** definition records make historical re-simulation
+  self-describing at the shard level; deterministic cross-version market-quality
+  and rule-change analyses can be built without inferring tick or multiplier
+  regimes from timestamps alone.
+- **Medium impact opportunity:** sequenced risk rejections and reconstructed
+  reservations provide deterministic inputs for limit-utilization analytics,
+  surveillance, and counterfactual replay under alternative profiles.
+- **Medium impact opportunity:** one-to-one event/public sequences permit exact
+  latency attribution and deterministic public/private book reconciliation
+  without heuristic correlation identifiers.
+- **Low impact:** UI and visualization layers should consume immutable versioned
+  traces and snapshots; they are not authoritative state owners.

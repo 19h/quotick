@@ -1,0 +1,1585 @@
+//! A versioned, checksummed, append-only write-ahead journal.
+//!
+//! Each frame contains a 24-byte header followed by a bounded payload:
+//!
+//! ```text
+//! 0..4   magic "QWAL"
+//! 4..6   format version (`u16`, little-endian)
+//! 6..8   record kind (`u16`, little-endian)
+//! 8..12  payload length (`u32`, little-endian)
+//! 12..16 CRC-32C of header-with-zero-checksum and payload
+//! 16..24 contiguous journal sequence (`u64`, little-endian)
+//! ```
+//!
+//! Recovery can repair only a physically incomplete final frame. A checksum
+//! mismatch, sequence discontinuity, invalid magic, unsupported version, or
+//! unknown record kind is always corruption and is never silently discarded.
+
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::codec::{BinaryCodec, CodecError};
+use crate::instrument::InstrumentDefinition;
+use crate::ledger::JournalEntry;
+use crate::matching::{Command, ExecutionReport};
+use crate::risk::AccountRiskDefinition;
+
+const MAGIC: [u8; 4] = *b"QWAL";
+const FORMAT_VERSION: u16 = 1;
+const HEADER_LENGTH: usize = 24;
+const CHECKSUM_START: usize = 12;
+const CHECKSUM_END: usize = 16;
+const DEFAULT_MAX_PAYLOAD_LENGTH: u32 = 16 * 1024 * 1024;
+const CRC32C_POLYNOMIAL: u32 = 0x82F6_3B78;
+const CRC32C_TABLE: [u32; 256] = make_crc32c_table();
+const LEASE_MAGIC: [u8; 4] = *b"QLCK";
+const LEASE_VERSION: u16 = 1;
+const LEASE_LENGTH: usize = 34;
+static NEXT_LEASE_NONCE: AtomicU64 = AtomicU64::new(1);
+
+/// Stable type identifier for a journal payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordKind {
+    /// A matching-engine command written before application.
+    Command,
+    /// The complete trace resulting from one matching command.
+    ExecutionReport,
+    /// A balanced ledger journal entry.
+    LedgerEntry,
+    /// Exact immutable definition bound to one matching journal.
+    InstrumentDefinition,
+    /// Immutable account risk profile bound to one risk-managed matching journal.
+    AccountRiskDefinition,
+}
+
+impl RecordKind {
+    const fn wire(self) -> u16 {
+        match self {
+            Self::Command => 1,
+            Self::ExecutionReport => 2,
+            Self::LedgerEntry => 3,
+            Self::InstrumentDefinition => 4,
+            Self::AccountRiskDefinition => 5,
+        }
+    }
+
+    fn from_wire(value: u16, offset: u64) -> Result<Self, JournalError> {
+        match value {
+            1 => Ok(Self::Command),
+            2 => Ok(Self::ExecutionReport),
+            3 => Ok(Self::LedgerEntry),
+            4 => Ok(Self::InstrumentDefinition),
+            5 => Ok(Self::AccountRiskDefinition),
+            _ => Err(JournalError::UnknownRecordKind { offset, value }),
+        }
+    }
+}
+
+/// Typed payload accepted by [`Journal::append`].
+pub trait DurableRecord: BinaryCodec {
+    /// Stable frame record kind.
+    const KIND: RecordKind;
+}
+
+impl DurableRecord for Command {
+    const KIND: RecordKind = RecordKind::Command;
+}
+
+impl DurableRecord for ExecutionReport {
+    const KIND: RecordKind = RecordKind::ExecutionReport;
+}
+
+impl DurableRecord for JournalEntry {
+    const KIND: RecordKind = RecordKind::LedgerEntry;
+}
+
+impl DurableRecord for InstrumentDefinition {
+    const KIND: RecordKind = RecordKind::InstrumentDefinition;
+}
+
+impl DurableRecord for AccountRiskDefinition {
+    const KIND: RecordKind = RecordKind::AccountRiskDefinition;
+}
+
+/// A decoded known payload from a journal frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KnownRecord {
+    /// Matching command.
+    Command(Command),
+    /// Matching execution trace.
+    ExecutionReport(ExecutionReport),
+    /// Balanced accounting entry.
+    LedgerEntry(JournalEntry),
+    /// Immutable instrument definition.
+    InstrumentDefinition(InstrumentDefinition),
+    /// Immutable account risk profile.
+    AccountRiskDefinition(AccountRiskDefinition),
+}
+
+/// Acknowledgement policy for successful appends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Durability {
+    /// Return after `write_all`; data may remain only in the operating-system cache.
+    Buffered,
+    /// Flush Rust and operating-system file buffers without a device durability guarantee.
+    Flush,
+    /// Call `File::sync_data` before acknowledging the append.
+    SyncData,
+    /// Call `File::sync_all` before acknowledging, covering data and file metadata.
+    SyncAll,
+}
+
+/// Action allowed when opening a journal with an incomplete final frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryMode {
+    /// Treat every incomplete frame as an error and do not modify the file.
+    Strict,
+    /// Truncate an incomplete final frame to the last verified boundary.
+    RepairTornTail,
+}
+
+/// Journal framing, recovery, and acknowledgement configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalOptions {
+    /// Maximum accepted payload bytes per frame.
+    pub max_payload_length: u32,
+    /// Append acknowledgement policy.
+    pub durability: Durability,
+    /// Incomplete-tail recovery policy.
+    pub recovery: RecoveryMode,
+    /// Expected sequence of the first frame, enabling independently managed segments.
+    pub initial_sequence: u64,
+}
+
+impl Default for JournalOptions {
+    fn default() -> Self {
+        Self {
+            max_payload_length: DEFAULT_MAX_PAYLOAD_LENGTH,
+            durability: Durability::SyncAll,
+            recovery: RecoveryMode::Strict,
+            initial_sequence: 1,
+        }
+    }
+}
+
+/// Diagnostic identity stored in an exclusive journal-writer lease.
+///
+/// This identity is a compare token, not an authentication credential. An
+/// operator may use it to recover an abandoned lease only after independently
+/// proving that the owning process has terminated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WriterLeaseOwner {
+    process_id: u32,
+    acquired_at_unix_nanos: u128,
+    nonce: u64,
+}
+
+impl WriterLeaseOwner {
+    /// Returns the operating-system process identifier recorded at acquisition.
+    #[must_use]
+    pub const fn process_id(self) -> u32 {
+        self.process_id
+    }
+
+    /// Returns lease acquisition time in nanoseconds since the Unix epoch.
+    #[must_use]
+    pub const fn acquired_at_unix_nanos(self) -> u128 {
+        self.acquired_at_unix_nanos
+    }
+
+    /// Returns the process-local acquisition nonce.
+    #[must_use]
+    pub const fn nonce(self) -> u64 {
+        self.nonce
+    }
+}
+
+/// Result of scanning and optionally repairing an existing journal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryReport {
+    /// Last verified frame sequence, or `None` for an empty journal.
+    pub last_sequence: Option<u64>,
+    /// Bytes covered by verified complete frames.
+    pub valid_bytes: u64,
+    /// Bytes removed from an incomplete final frame.
+    pub truncated_bytes: u64,
+}
+
+/// Successful append metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AppendReceipt {
+    /// Assigned contiguous journal sequence.
+    pub sequence: u64,
+    /// Starting byte offset of the frame.
+    pub offset: u64,
+    /// Complete header-plus-payload length.
+    pub frame_length: usize,
+    /// Durability policy satisfied before this receipt was returned.
+    pub durability: Durability,
+}
+
+#[derive(Clone, Debug)]
+struct EncodedRecord {
+    kind: RecordKind,
+    payload: Vec<u8>,
+}
+
+/// A heterogeneous group of pre-encoded records committed with one write and
+/// one durability barrier.
+///
+/// A batch reduces syscall and synchronization overhead. It is an
+/// acknowledgement group, not a transactional frame: recovery after a torn
+/// write can retain a verified prefix. Consumers use command and transaction
+/// idempotency to replay the unacknowledged suffix.
+#[derive(Clone, Debug, Default)]
+pub struct JournalBatch {
+    records: Vec<EncodedRecord>,
+}
+
+impl JournalBatch {
+    /// Creates an empty batch.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            records: Vec::new(),
+        }
+    }
+
+    /// Encodes and adds one typed record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] if the record cannot be represented by its stable
+    /// payload format.
+    pub fn push<T: DurableRecord>(&mut self, record: &T) -> Result<(), CodecError> {
+        self.records.push(EncodedRecord {
+            kind: T::KIND,
+            payload: record.encode()?,
+        });
+        Ok(())
+    }
+
+    /// Adds already encoded payload bytes.
+    pub fn push_raw(&mut self, kind: RecordKind, payload: Vec<u8>) {
+        self.records.push(EncodedRecord { kind, payload });
+    }
+
+    /// Returns the number of records in the batch.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Returns whether the batch contains no records.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Removes all records while retaining allocated batch capacity.
+    pub fn clear(&mut self) {
+        self.records.clear();
+    }
+}
+
+/// A verified frame returned by [`JournalReader`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalFrame {
+    offset: u64,
+    sequence: u64,
+    kind: RecordKind,
+    payload: Vec<u8>,
+}
+
+impl JournalFrame {
+    /// Returns the frame's starting byte offset.
+    #[must_use]
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Returns the contiguous journal sequence.
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Returns the payload kind.
+    #[must_use]
+    pub const fn kind(&self) -> RecordKind {
+        self.kind
+    }
+
+    /// Returns verified raw payload bytes.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Returns the complete encoded frame length.
+    #[must_use]
+    pub fn frame_length(&self) -> usize {
+        HEADER_LENGTH + self.payload.len()
+    }
+
+    /// Decodes the payload as a specific durable type and verifies its kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::RecordKindMismatch`] for a type mismatch or
+    /// [`JournalError::Codec`] for an invalid payload.
+    pub fn decode<T: DurableRecord>(&self) -> Result<T, JournalError> {
+        if self.kind != T::KIND {
+            return Err(JournalError::RecordKindMismatch {
+                expected: T::KIND,
+                actual: self.kind,
+            });
+        }
+        T::decode(&self.payload).map_err(JournalError::Codec)
+    }
+
+    /// Decodes the payload according to the frame's record kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Codec`] when the typed payload is invalid.
+    pub fn decode_known(&self) -> Result<KnownRecord, JournalError> {
+        match self.kind {
+            RecordKind::Command => self.decode().map(KnownRecord::Command),
+            RecordKind::ExecutionReport => self.decode().map(KnownRecord::ExecutionReport),
+            RecordKind::LedgerEntry => self.decode().map(KnownRecord::LedgerEntry),
+            RecordKind::InstrumentDefinition => {
+                self.decode().map(KnownRecord::InstrumentDefinition)
+            }
+            RecordKind::AccountRiskDefinition => {
+                self.decode().map(KnownRecord::AccountRiskDefinition)
+            }
+        }
+    }
+}
+
+/// Journal I/O, framing, sequencing, corruption, or payload error.
+#[derive(Debug)]
+pub enum JournalError {
+    /// Filesystem operation failed.
+    Io(io::Error),
+    /// Typed payload codec failed before writing or after reading.
+    Codec(CodecError),
+    /// Journal operations were attempted after an ambiguous write or sync failure.
+    Poisoned,
+    /// Another writer owns the canonical journal path.
+    WriterLeaseHeld {
+        /// Canonical sidecar lease path.
+        lease_path: PathBuf,
+        /// Observed writer identity.
+        owner: WriterLeaseOwner,
+    },
+    /// An abandoned-writer recovery token no longer matches the lease on disk.
+    WriterLeaseOwnerMismatch {
+        /// Owner identity supplied by the recovery caller.
+        expected: WriterLeaseOwner,
+        /// Owner identity currently stored on disk.
+        actual: WriterLeaseOwner,
+    },
+    /// A writer lease was truncated or used unsupported framing.
+    InvalidWriterLease {
+        /// Canonical sidecar lease path.
+        lease_path: PathBuf,
+    },
+    /// No unique process-local writer-lease nonce remains representable.
+    WriterLeaseIdentityExhausted,
+    /// Segment sequence zero is invalid.
+    InvalidInitialSequence,
+    /// No subsequent `u64` sequence can be represented.
+    SequenceExhausted,
+    /// Header-plus-payload or file offset arithmetic exceeded its representation.
+    FrameLengthOverflow,
+    /// Payload exceeded the configured frame limit.
+    PayloadTooLarge {
+        /// Requested payload bytes.
+        length: usize,
+        /// Configured maximum bytes.
+        maximum: u32,
+    },
+    /// A physically incomplete frame was encountered.
+    TruncatedFrame {
+        /// Frame starting byte offset.
+        offset: u64,
+        /// Complete frame bytes required.
+        expected_length: u64,
+        /// Bytes available from `offset` to end of file.
+        available_length: u64,
+    },
+    /// Frame magic did not match `QWAL`.
+    InvalidMagic {
+        /// Frame starting byte offset.
+        offset: u64,
+        /// Bytes found in the magic field.
+        found: [u8; 4],
+    },
+    /// Frame version is not supported by this reader.
+    UnsupportedVersion {
+        /// Frame starting byte offset.
+        offset: u64,
+        /// Version found in the frame.
+        version: u16,
+    },
+    /// Frame record kind is not defined by this version.
+    UnknownRecordKind {
+        /// Frame starting byte offset.
+        offset: u64,
+        /// Raw record-kind value.
+        value: u16,
+    },
+    /// Payload checksum did not match the frame.
+    ChecksumMismatch {
+        /// Frame starting byte offset.
+        offset: u64,
+        /// Checksum stored in the frame.
+        expected: u32,
+        /// Checksum calculated from the frame.
+        actual: u32,
+    },
+    /// A frame sequence was not the next expected value.
+    SequenceDiscontinuity {
+        /// Frame starting byte offset.
+        offset: u64,
+        /// Required sequence.
+        expected: u64,
+        /// Sequence found in the frame.
+        actual: u64,
+    },
+    /// A frame was decoded using a type with another record kind.
+    RecordKindMismatch {
+        /// Kind required by the requested type.
+        expected: RecordKind,
+        /// Kind stored in the frame.
+        actual: RecordKind,
+    },
+}
+
+impl fmt::Display for JournalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "journal I/O error: {error}"),
+            Self::Codec(error) => write!(formatter, "journal payload error: {error}"),
+            Self::Poisoned => {
+                formatter.write_str("journal is poisoned after an ambiguous I/O failure")
+            }
+            Self::WriterLeaseHeld { lease_path, owner } => write!(
+                formatter,
+                "journal writer lease {} is held by process {} (nonce {})",
+                lease_path.display(),
+                owner.process_id,
+                owner.nonce
+            ),
+            Self::WriterLeaseOwnerMismatch { expected, actual } => write!(
+                formatter,
+                "writer lease owner changed: expected process {} nonce {}, found process {} nonce {}",
+                expected.process_id, expected.nonce, actual.process_id, actual.nonce
+            ),
+            Self::InvalidWriterLease { lease_path } => write!(
+                formatter,
+                "writer lease {} is truncated or has unsupported framing",
+                lease_path.display()
+            ),
+            Self::WriterLeaseIdentityExhausted => {
+                formatter.write_str("writer lease identity space exhausted")
+            }
+            Self::InvalidInitialSequence => {
+                formatter.write_str("initial journal sequence must be non-zero")
+            }
+            Self::SequenceExhausted => formatter.write_str("journal sequence exhausted"),
+            Self::FrameLengthOverflow => formatter.write_str("journal frame length overflow"),
+            Self::PayloadTooLarge { length, maximum } => {
+                write!(
+                    formatter,
+                    "payload length {length} exceeds configured maximum {maximum}"
+                )
+            }
+            Self::TruncatedFrame {
+                offset,
+                expected_length,
+                available_length,
+            } => write!(
+                formatter,
+                "truncated frame at {offset}: requires {expected_length} bytes, has {available_length}"
+            ),
+            Self::InvalidMagic { offset, found } => {
+                write!(formatter, "invalid journal magic at {offset}: {found:02X?}")
+            }
+            Self::UnsupportedVersion { offset, version } => {
+                write!(
+                    formatter,
+                    "unsupported journal version {version} at {offset}"
+                )
+            }
+            Self::UnknownRecordKind { offset, value } => {
+                write!(formatter, "unknown journal record kind {value} at {offset}")
+            }
+            Self::ChecksumMismatch {
+                offset,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "journal checksum mismatch at {offset}: stored {expected:#010x}, calculated {actual:#010x}"
+            ),
+            Self::SequenceDiscontinuity {
+                offset,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "journal sequence discontinuity at {offset}: expected {expected}, found {actual}"
+            ),
+            Self::RecordKindMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "record kind mismatch: expected {expected:?}, found {actual:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for JournalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Codec(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for JournalError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+#[derive(Debug)]
+struct WriterLease {
+    path: PathBuf,
+    owner: WriterLeaseOwner,
+    file: Option<File>,
+}
+
+impl WriterLease {
+    fn acquire(journal_path: &Path) -> Result<Self, JournalError> {
+        let path = writer_lease_path(journal_path);
+        let nonce = next_lease_nonce()?;
+        let owner = WriterLeaseOwner {
+            process_id: std::process::id(),
+            acquired_at_unix_nanos: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            nonce,
+        };
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let actual = read_writer_lease(&path)?;
+                return Err(JournalError::WriterLeaseHeld {
+                    lease_path: path,
+                    owner: actual,
+                });
+            }
+            Err(error) => return Err(JournalError::Io(error)),
+        };
+        let bytes = encode_writer_lease(owner);
+        if let Err(error) = file
+            .write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| sync_parent(&path))
+        {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            let _ = sync_parent(&path);
+            return Err(JournalError::Io(error));
+        }
+        Ok(Self {
+            path,
+            owner,
+            file: Some(file),
+        })
+    }
+
+    fn release(&mut self) -> Result<(), JournalError> {
+        self.file.take();
+        let current = match read_writer_lease(&self.path) {
+            Ok(owner) => owner,
+            Err(JournalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if current != self.owner {
+            return Err(JournalError::WriterLeaseOwnerMismatch {
+                expected: self.owner,
+                actual: current,
+            });
+        }
+        fs::remove_file(&self.path)?;
+        sync_parent(&self.path)?;
+        Ok(())
+    }
+}
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
+fn normalize_journal_path(path: &Path) -> io::Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let file_name = path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "journal path has no file name")
+            })?;
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            Ok(fs::canonicalize(parent)?.join(file_name))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn next_lease_nonce() -> Result<u64, JournalError> {
+    let mut current = NEXT_LEASE_NONCE.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(1)
+            .ok_or(JournalError::WriterLeaseIdentityExhausted)?;
+        match NEXT_LEASE_NONCE.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(current),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn writer_lease_path(journal_path: &Path) -> PathBuf {
+    let mut value = journal_path.as_os_str().to_os_string();
+    value.push(".writer.lock");
+    PathBuf::from(value)
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
+}
+
+fn encode_writer_lease(owner: WriterLeaseOwner) -> [u8; LEASE_LENGTH] {
+    let mut bytes = [0_u8; LEASE_LENGTH];
+    bytes[0..4].copy_from_slice(&LEASE_MAGIC);
+    bytes[4..6].copy_from_slice(&LEASE_VERSION.to_le_bytes());
+    bytes[6..10].copy_from_slice(&owner.process_id.to_le_bytes());
+    bytes[10..26].copy_from_slice(&owner.acquired_at_unix_nanos.to_le_bytes());
+    bytes[26..34].copy_from_slice(&owner.nonce.to_le_bytes());
+    bytes
+}
+
+fn read_writer_lease(path: &Path) -> Result<WriterLeaseOwner, JournalError> {
+    let bytes = fs::read(path)?;
+    if bytes.len() != LEASE_LENGTH
+        || bytes[0..4] != LEASE_MAGIC
+        || u16::from_le_bytes(
+            bytes[4..6]
+                .try_into()
+                .expect("lease version has a fixed width"),
+        ) != LEASE_VERSION
+    {
+        return Err(JournalError::InvalidWriterLease {
+            lease_path: path.to_path_buf(),
+        });
+    }
+    Ok(WriterLeaseOwner {
+        process_id: u32::from_le_bytes(
+            bytes[6..10]
+                .try_into()
+                .expect("lease process ID has a fixed width"),
+        ),
+        acquired_at_unix_nanos: u128::from_le_bytes(
+            bytes[10..26]
+                .try_into()
+                .expect("lease acquisition time has a fixed width"),
+        ),
+        nonce: u64::from_le_bytes(
+            bytes[26..34]
+                .try_into()
+                .expect("lease nonce has a fixed width"),
+        ),
+    })
+}
+
+/// Single-writer append-only journal.
+#[derive(Debug)]
+pub struct Journal {
+    path: PathBuf,
+    file: File,
+    writer_lease: WriterLease,
+    options: JournalOptions,
+    recovery: RecoveryReport,
+    next_sequence: u64,
+    offset: u64,
+    poisoned: bool,
+    #[cfg(test)]
+    injected_fault: Option<InjectedFault>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InjectedFault {
+    PartialWrite(usize),
+    DurabilityBarrier,
+    SyncAll,
+    SyncData,
+}
+
+impl Journal {
+    /// Opens or creates a journal, verifies every existing frame, and optionally
+    /// repairs an incomplete final frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError`] for I/O failure, corruption, sequence gaps,
+    /// unsupported framing, oversized payloads, an existing writer lease, or a
+    /// strict-mode torn tail.
+    pub fn open(path: impl AsRef<Path>, options: JournalOptions) -> Result<Self, JournalError> {
+        if options.initial_sequence == 0 {
+            return Err(JournalError::InvalidInitialSequence);
+        }
+        let path = normalize_journal_path(path.as_ref())?;
+        let writer_lease = WriterLease::acquire(&path)?;
+        let (mut file, created) = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (
+                OpenOptions::new().read(true).write(true).open(&path)?,
+                false,
+            ),
+            Err(error) => return Err(JournalError::Io(error)),
+        };
+        if created {
+            file.sync_all()?;
+            sync_parent(&path)?;
+        }
+        let recovery = scan_and_recover(&mut file, options)?;
+        let next_sequence = match recovery.last_sequence {
+            Some(last) => last.checked_add(1).ok_or(JournalError::SequenceExhausted)?,
+            None => options.initial_sequence,
+        };
+        file.seek(SeekFrom::Start(recovery.valid_bytes))?;
+        Ok(Self {
+            path,
+            file,
+            writer_lease,
+            options,
+            recovery,
+            next_sequence,
+            offset: recovery.valid_bytes,
+            poisoned: false,
+            #[cfg(test)]
+            injected_fault: None,
+        })
+    }
+
+    /// Returns the canonical journal path owned by this writer.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the diagnostic identity of this journal's exclusive writer lease.
+    #[must_use]
+    pub const fn writer_lease_owner(&self) -> WriterLeaseOwner {
+        self.writer_lease.owner
+    }
+
+    /// Resolves the canonical writer-lease sidecar path for a journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Io`] when the journal path or its parent cannot
+    /// be canonicalized.
+    pub fn writer_lease_path(path: impl AsRef<Path>) -> Result<PathBuf, JournalError> {
+        let journal_path = normalize_journal_path(path.as_ref())?;
+        Ok(writer_lease_path(&journal_path))
+    }
+
+    /// Removes an abandoned writer lease only when its on-disk identity still
+    /// equals the caller's previously observed identity.
+    ///
+    /// The caller must independently establish that the recorded process is no
+    /// longer capable of writing the journal and must prevent new writers from
+    /// starting until recovery returns. Owner comparison and deletion are
+    /// separate filesystem operations, not an atomic compare-and-delete.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::WriterLeaseOwnerMismatch`] if another owner has
+    /// replaced the observed lease, [`JournalError::InvalidWriterLease`] for a
+    /// malformed lease, or [`JournalError::Io`] for filesystem failure.
+    pub fn recover_abandoned_writer(
+        path: impl AsRef<Path>,
+        expected: WriterLeaseOwner,
+    ) -> Result<(), JournalError> {
+        let journal_path = normalize_journal_path(path.as_ref())?;
+        let lease_path = writer_lease_path(&journal_path);
+        let actual = read_writer_lease(&lease_path)?;
+        if actual != expected {
+            return Err(JournalError::WriterLeaseOwnerMismatch { expected, actual });
+        }
+        fs::remove_file(&lease_path)?;
+        sync_parent(&lease_path)?;
+        Ok(())
+    }
+
+    /// Removes a malformed abandoned lease after verifying that it cannot be
+    /// decoded as any supported owner identity.
+    ///
+    /// The caller must independently prove that no writer remains live and
+    /// must prevent new writers from starting until recovery returns. A valid
+    /// lease is never removed by this operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::WriterLeaseHeld`] if the lease becomes valid, or
+    /// [`JournalError::Io`] for filesystem failure.
+    pub fn recover_abandoned_invalid_writer(path: impl AsRef<Path>) -> Result<(), JournalError> {
+        let journal_path = normalize_journal_path(path.as_ref())?;
+        let lease_path = writer_lease_path(&journal_path);
+        match read_writer_lease(&lease_path) {
+            Ok(owner) => {
+                return Err(JournalError::WriterLeaseHeld { lease_path, owner });
+            }
+            Err(JournalError::InvalidWriterLease { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        fs::remove_file(&lease_path)?;
+        sync_parent(&lease_path)?;
+        Ok(())
+    }
+
+    /// Returns the verified recovery outcome from open.
+    #[must_use]
+    pub const fn recovery(&self) -> RecoveryReport {
+        self.recovery
+    }
+
+    /// Returns the sequence that will be assigned to the next successful append.
+    #[must_use]
+    pub const fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
+    /// Returns whether an ambiguous write or synchronization failure has made
+    /// this writer unusable until reopen and recovery.
+    #[must_use]
+    pub const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Encodes and appends one typed durable record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError`] for encoding, payload limits, sequence
+    /// exhaustion, I/O failure, or use after an ambiguous I/O failure.
+    pub fn append<T: DurableRecord>(&mut self, record: &T) -> Result<AppendReceipt, JournalError> {
+        let payload = record.encode().map_err(JournalError::Codec)?;
+        self.append_raw(T::KIND, &payload)
+    }
+
+    /// Appends already encoded payload bytes under an explicit record kind.
+    ///
+    /// This method validates framing but intentionally does not validate the
+    /// payload codec; [`JournalFrame::decode`] performs typed validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError`] for payload limits, sequence exhaustion, I/O
+    /// failure, or use after an ambiguous I/O failure.
+    pub fn append_raw(
+        &mut self,
+        kind: RecordKind,
+        payload: &[u8],
+    ) -> Result<AppendReceipt, JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Poisoned);
+        }
+        let payload_length =
+            u32::try_from(payload.len()).map_err(|_| JournalError::PayloadTooLarge {
+                length: payload.len(),
+                maximum: self.options.max_payload_length,
+            })?;
+        if payload_length > self.options.max_payload_length {
+            return Err(JournalError::PayloadTooLarge {
+                length: payload.len(),
+                maximum: self.options.max_payload_length,
+            });
+        }
+        let sequence = self.next_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(JournalError::SequenceExhausted)?;
+        let frame_length = HEADER_LENGTH
+            .checked_add(payload.len())
+            .ok_or(JournalError::FrameLengthOverflow)?;
+        let next_offset = self
+            .offset
+            .checked_add(
+                u64::try_from(frame_length).map_err(|_| JournalError::FrameLengthOverflow)?,
+            )
+            .ok_or(JournalError::FrameLengthOverflow)?;
+        let frame = encode_frame(kind, sequence, payload_length, payload);
+        let receipt = AppendReceipt {
+            sequence,
+            offset: self.offset,
+            frame_length: frame.len(),
+            durability: self.options.durability,
+        };
+
+        if let Err(error) = self.write_bytes(&frame) {
+            self.poisoned = true;
+            return Err(JournalError::Io(error));
+        }
+        if let Err(error) = self.apply_configured_durability() {
+            self.poisoned = true;
+            return Err(JournalError::Io(error));
+        }
+        self.next_sequence = next_sequence;
+        self.offset = next_offset;
+        Ok(receipt)
+    }
+
+    /// Appends a heterogeneous record group using one write and durability barrier.
+    ///
+    /// An empty batch is a successful no-op. A failed write or durability
+    /// barrier poisons the writer because the committed prefix is ambiguous
+    /// until reopen and recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError`] for payload limits, length or sequence
+    /// exhaustion, I/O failure, or use after an ambiguous I/O failure.
+    pub fn append_batch(
+        &mut self,
+        batch: &JournalBatch,
+    ) -> Result<Vec<AppendReceipt>, JournalError> {
+        self.ensure_healthy()?;
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        let record_count =
+            u64::try_from(batch.len()).map_err(|_| JournalError::SequenceExhausted)?;
+        let next_sequence = self
+            .next_sequence
+            .checked_add(record_count)
+            .ok_or(JournalError::SequenceExhausted)?;
+        let mut total_length = 0_usize;
+        for record in &batch.records {
+            self.validate_payload(&record.payload)?;
+            total_length = total_length
+                .checked_add(HEADER_LENGTH)
+                .and_then(|value| value.checked_add(record.payload.len()))
+                .ok_or(JournalError::FrameLengthOverflow)?;
+        }
+        let next_offset = self
+            .offset
+            .checked_add(
+                u64::try_from(total_length).map_err(|_| JournalError::FrameLengthOverflow)?,
+            )
+            .ok_or(JournalError::FrameLengthOverflow)?;
+
+        let mut bytes = Vec::with_capacity(total_length);
+        let mut receipts = Vec::with_capacity(batch.len());
+        let mut offset = self.offset;
+        for (sequence, record) in (self.next_sequence..).zip(&batch.records) {
+            let payload_length = u32::try_from(record.payload.len())
+                .map_err(|_| JournalError::FrameLengthOverflow)?;
+            let frame = encode_frame(record.kind, sequence, payload_length, &record.payload);
+            receipts.push(AppendReceipt {
+                sequence,
+                offset,
+                frame_length: frame.len(),
+                durability: self.options.durability,
+            });
+            bytes.extend_from_slice(&frame);
+            offset += u64::try_from(frame.len()).map_err(|_| JournalError::FrameLengthOverflow)?;
+        }
+
+        if let Err(error) = self.write_bytes(&bytes) {
+            self.poisoned = true;
+            return Err(JournalError::Io(error));
+        }
+        if let Err(error) = self.apply_configured_durability() {
+            self.poisoned = true;
+            return Err(JournalError::Io(error));
+        }
+        self.next_sequence = next_sequence;
+        self.offset = next_offset;
+        Ok(receipts)
+    }
+
+    /// Establishes a data-and-metadata durability barrier for all prior appends.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Io`] and poisons this writer if `sync_all` fails.
+    pub fn sync_all(&mut self) -> Result<(), JournalError> {
+        self.ensure_healthy()?;
+        if let Err(error) = self.sync_all_file() {
+            self.poisoned = true;
+            return Err(JournalError::Io(error));
+        }
+        Ok(())
+    }
+
+    /// Establishes a data durability barrier for all prior appends.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Io`] and poisons this writer if `sync_data` fails.
+    pub fn sync_data(&mut self) -> Result<(), JournalError> {
+        self.ensure_healthy()?;
+        if let Err(error) = self.sync_data_file() {
+            self.poisoned = true;
+            return Err(JournalError::Io(error));
+        }
+        Ok(())
+    }
+
+    /// Synchronizes journal data and metadata, then releases the writer lease
+    /// and synchronizes its parent-directory removal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError`] if the journal is poisoned or either
+    /// synchronization/release operation fails.
+    pub fn close(mut self) -> Result<(), JournalError> {
+        self.sync_all()?;
+        self.writer_lease.release()?;
+        Ok(())
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(InjectedFault::PartialWrite(limit)) = self.injected_fault {
+            self.injected_fault = None;
+            let length = limit.min(bytes.len());
+            self.file.write_all(&bytes[..length])?;
+            return Err(injected_io_error("partial journal write"));
+        }
+        self.file.write_all(bytes)
+    }
+
+    fn apply_configured_durability(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.injected_fault == Some(InjectedFault::DurabilityBarrier) {
+            self.injected_fault = None;
+            return Err(injected_io_error("journal durability barrier"));
+        }
+        apply_durability(&mut self.file, self.options.durability)
+    }
+
+    fn sync_all_file(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.injected_fault == Some(InjectedFault::SyncAll) {
+            self.injected_fault = None;
+            return Err(injected_io_error("journal sync_all"));
+        }
+        self.file.sync_all()
+    }
+
+    fn sync_data_file(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.injected_fault == Some(InjectedFault::SyncData) {
+            self.injected_fault = None;
+            return Err(injected_io_error("journal sync_data"));
+        }
+        self.file.sync_data()
+    }
+
+    fn ensure_healthy(&self) -> Result<(), JournalError> {
+        if self.poisoned {
+            Err(JournalError::Poisoned)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_payload(&self, payload: &[u8]) -> Result<(), JournalError> {
+        let payload_length =
+            u32::try_from(payload.len()).map_err(|_| JournalError::PayloadTooLarge {
+                length: payload.len(),
+                maximum: self.options.max_payload_length,
+            })?;
+        if payload_length > self.options.max_payload_length {
+            Err(JournalError::PayloadTooLarge {
+                length: payload.len(),
+                maximum: self.options.max_payload_length,
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Streaming verifier for an immutable journal length captured at open.
+#[derive(Debug)]
+pub struct JournalReader {
+    file: File,
+    file_length: u64,
+    offset: u64,
+    expected_sequence: u64,
+    maximum_payload_length: u32,
+    finished: bool,
+}
+
+impl JournalReader {
+    /// Opens a journal for streaming verification and typed decoding.
+    ///
+    /// The reader observes the file length at open and does not tail subsequent
+    /// appends.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Io`] when the file cannot be opened or inspected,
+    /// or [`JournalError::InvalidInitialSequence`] for a zero segment sequence.
+    pub fn open(path: impl AsRef<Path>, options: JournalOptions) -> Result<Self, JournalError> {
+        if options.initial_sequence == 0 {
+            return Err(JournalError::InvalidInitialSequence);
+        }
+        let file = File::open(path)?;
+        let file_length = file.metadata()?.len();
+        Ok(Self {
+            file,
+            file_length,
+            offset: 0,
+            expected_sequence: options.initial_sequence,
+            maximum_payload_length: options.max_payload_length,
+            finished: false,
+        })
+    }
+}
+
+impl Iterator for JournalReader {
+    type Item = Result<JournalFrame, JournalError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished || self.offset == self.file_length {
+            self.finished = true;
+            return None;
+        }
+        match read_frame_at(
+            &mut self.file,
+            self.file_length,
+            self.offset,
+            self.expected_sequence,
+            self.maximum_payload_length,
+        ) {
+            Ok(frame) => {
+                self.offset += u64::try_from(frame.frame_length())
+                    .expect("bounded frame length always fits in u64");
+                self.expected_sequence = if let Some(next) = self.expected_sequence.checked_add(1) {
+                    next
+                } else {
+                    self.finished = true;
+                    return Some(Err(JournalError::SequenceExhausted));
+                };
+                Some(Ok(frame))
+            }
+            Err(error) => {
+                self.finished = true;
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+fn scan_and_recover(
+    file: &mut File,
+    options: JournalOptions,
+) -> Result<RecoveryReport, JournalError> {
+    let file_length = file.metadata()?.len();
+    let mut offset = 0_u64;
+    let mut expected_sequence = options.initial_sequence;
+    let mut last_sequence = None;
+    while offset < file_length {
+        match read_frame_at(
+            file,
+            file_length,
+            offset,
+            expected_sequence,
+            options.max_payload_length,
+        ) {
+            Ok(frame) => {
+                let frame_length = u64::try_from(frame.frame_length())
+                    .map_err(|_| JournalError::SequenceExhausted)?;
+                offset = offset
+                    .checked_add(frame_length)
+                    .ok_or(JournalError::SequenceExhausted)?;
+                last_sequence = Some(frame.sequence);
+                expected_sequence = expected_sequence
+                    .checked_add(1)
+                    .ok_or(JournalError::SequenceExhausted)?;
+            }
+            Err(JournalError::TruncatedFrame { .. })
+                if options.recovery == RecoveryMode::RepairTornTail =>
+            {
+                let truncated_bytes = file_length - offset;
+                file.set_len(offset)?;
+                file.sync_all()?;
+                return Ok(RecoveryReport {
+                    last_sequence,
+                    valid_bytes: offset,
+                    truncated_bytes,
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(RecoveryReport {
+        last_sequence,
+        valid_bytes: offset,
+        truncated_bytes: 0,
+    })
+}
+
+fn read_frame_at(
+    file: &mut File,
+    file_length: u64,
+    offset: u64,
+    expected_sequence: u64,
+    maximum_payload_length: u32,
+) -> Result<JournalFrame, JournalError> {
+    let available = file_length - offset;
+    if available < u64::try_from(HEADER_LENGTH).expect("header length fits u64") {
+        return Err(JournalError::TruncatedFrame {
+            offset,
+            expected_length: u64::try_from(HEADER_LENGTH).expect("header length fits u64"),
+            available_length: available,
+        });
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut header = [0_u8; HEADER_LENGTH];
+    file.read_exact(&mut header)?;
+    let found_magic = header[0..4]
+        .try_into()
+        .expect("four-byte slice converts to four-byte array");
+    if found_magic != MAGIC {
+        return Err(JournalError::InvalidMagic {
+            offset,
+            found: found_magic,
+        });
+    }
+    let version = u16::from_le_bytes(header[4..6].try_into().expect("two-byte version field"));
+    if version != FORMAT_VERSION {
+        return Err(JournalError::UnsupportedVersion { offset, version });
+    }
+    let kind = RecordKind::from_wire(
+        u16::from_le_bytes(header[6..8].try_into().expect("two-byte kind field")),
+        offset,
+    )?;
+    let payload_length = u32::from_le_bytes(
+        header[8..12]
+            .try_into()
+            .expect("four-byte payload length field"),
+    );
+    if payload_length > maximum_payload_length {
+        return Err(JournalError::PayloadTooLarge {
+            length: usize::try_from(payload_length).expect("u32 fits usize"),
+            maximum: maximum_payload_length,
+        });
+    }
+    let frame_length = u64::try_from(HEADER_LENGTH)
+        .expect("header length fits u64")
+        .checked_add(u64::from(payload_length))
+        .ok_or(JournalError::SequenceExhausted)?;
+    if available < frame_length {
+        return Err(JournalError::TruncatedFrame {
+            offset,
+            expected_length: frame_length,
+            available_length: available,
+        });
+    }
+    let stored_checksum = u32::from_le_bytes(
+        header[CHECKSUM_START..CHECKSUM_END]
+            .try_into()
+            .expect("four-byte checksum field"),
+    );
+    let sequence = u64::from_le_bytes(
+        header[16..24]
+            .try_into()
+            .expect("eight-byte sequence field"),
+    );
+    let mut payload = vec![0_u8; usize::try_from(payload_length).expect("u32 fits usize")];
+    file.read_exact(&mut payload)?;
+    let calculated_checksum = frame_checksum(&header, &payload);
+    if stored_checksum != calculated_checksum {
+        return Err(JournalError::ChecksumMismatch {
+            offset,
+            expected: stored_checksum,
+            actual: calculated_checksum,
+        });
+    }
+    if sequence != expected_sequence {
+        return Err(JournalError::SequenceDiscontinuity {
+            offset,
+            expected: expected_sequence,
+            actual: sequence,
+        });
+    }
+    Ok(JournalFrame {
+        offset,
+        sequence,
+        kind,
+        payload,
+    })
+}
+
+fn encode_frame(kind: RecordKind, sequence: u64, payload_length: u32, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(HEADER_LENGTH + payload.len());
+    frame.extend_from_slice(&MAGIC);
+    frame.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    frame.extend_from_slice(&kind.wire().to_le_bytes());
+    frame.extend_from_slice(&payload_length.to_le_bytes());
+    frame.extend_from_slice(&0_u32.to_le_bytes());
+    frame.extend_from_slice(&sequence.to_le_bytes());
+    frame.extend_from_slice(payload);
+    let checksum = frame_checksum(
+        frame[..HEADER_LENGTH]
+            .try_into()
+            .expect("complete frame has a fixed header"),
+        payload,
+    );
+    frame[CHECKSUM_START..CHECKSUM_END].copy_from_slice(&checksum.to_le_bytes());
+    frame
+}
+
+fn apply_durability(file: &mut File, durability: Durability) -> io::Result<()> {
+    match durability {
+        Durability::Buffered => Ok(()),
+        Durability::Flush => file.flush(),
+        Durability::SyncData => file.sync_data(),
+        Durability::SyncAll => file.sync_all(),
+    }
+}
+
+#[cfg(test)]
+fn injected_io_error(operation: &'static str) -> io::Error {
+    io::Error::other(format!("injected failure during {operation}"))
+}
+
+fn frame_checksum(header: &[u8; HEADER_LENGTH], payload: &[u8]) -> u32 {
+    let mut state = u32::MAX;
+    state = update_crc32c(state, &header[..CHECKSUM_START]);
+    state = update_crc32c(state, &[0_u8; CHECKSUM_END - CHECKSUM_START]);
+    state = update_crc32c(state, &header[CHECKSUM_END..]);
+    state = update_crc32c(state, payload);
+    !state
+}
+
+fn update_crc32c(mut state: u32, bytes: &[u8]) -> u32 {
+    for &byte in bytes {
+        let index = usize::try_from((state ^ u32::from(byte)) & 0xFF)
+            .expect("CRC table index is at most 255");
+        state = CRC32C_TABLE[index] ^ (state >> 8);
+    }
+    state
+}
+
+const fn make_crc32c_table() -> [u32; 256] {
+    let mut table = [0_u32; 256];
+    let mut index = 0_usize;
+    let mut initial_value = 0_u32;
+    while index < table.len() {
+        let mut value = initial_value;
+        let mut bit = 0;
+        while bit < 8 {
+            value = if value & 1 == 0 {
+                value >> 1
+            } else {
+                (value >> 1) ^ CRC32C_POLYNOMIAL
+            };
+            bit += 1;
+        }
+        table[index] = value;
+        index += 1;
+        initial_value += 1;
+    }
+    table
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{
+        CRC32C_TABLE, Durability, HEADER_LENGTH, InjectedFault, Journal, JournalBatch,
+        JournalError, JournalOptions, RecordKind, RecoveryMode, update_crc32c,
+    };
+
+    static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
+
+    fn test_path(label: &str) -> PathBuf {
+        let nonce = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "quotick-unit-{label}-{}-{nonce}.wal",
+            std::process::id()
+        ))
+    }
+
+    fn buffered_options() -> JournalOptions {
+        JournalOptions {
+            durability: Durability::Buffered,
+            ..JournalOptions::default()
+        }
+    }
+
+    fn remove_test_files(path: &PathBuf) {
+        let _ = fs::remove_file(path);
+        if let Ok(lease_path) = Journal::writer_lease_path(path) {
+            let _ = fs::remove_file(lease_path);
+        }
+    }
+
+    #[test]
+    fn crc32c_matches_the_standard_check_value() {
+        let checksum = !update_crc32c(u32::MAX, b"123456789");
+        assert_eq!(checksum, 0xE306_9283);
+        assert_ne!(CRC32C_TABLE[1], 0);
+    }
+
+    #[test]
+    fn injected_partial_write_poisoning_repairs_only_the_torn_frame() {
+        let path = test_path("partial-write");
+        remove_test_files(&path);
+        let mut journal = Journal::open(&path, buffered_options()).expect("journal opens");
+        journal.injected_fault = Some(InjectedFault::PartialWrite(10));
+        assert!(matches!(
+            journal.append_raw(RecordKind::Command, &[1, 2, 3]),
+            Err(JournalError::Io(_))
+        ));
+        assert!(journal.is_poisoned());
+        assert!(matches!(
+            journal.append_raw(RecordKind::Command, &[4]),
+            Err(JournalError::Poisoned)
+        ));
+        drop(journal);
+        assert!(matches!(
+            Journal::open(&path, buffered_options()),
+            Err(JournalError::TruncatedFrame { .. })
+        ));
+        let repair = JournalOptions {
+            recovery: RecoveryMode::RepairTornTail,
+            ..buffered_options()
+        };
+        let repaired = Journal::open(&path, repair).expect("torn frame repairs");
+        assert_eq!(repaired.recovery().valid_bytes, 0);
+        assert_eq!(repaired.recovery().truncated_bytes, 10);
+        repaired.close().expect("journal closes");
+        remove_test_files(&path);
+    }
+
+    #[test]
+    fn injected_barrier_failure_recovers_the_ambiguous_complete_frame() {
+        let path = test_path("barrier-failure");
+        remove_test_files(&path);
+        let mut journal = Journal::open(&path, JournalOptions::default()).expect("journal opens");
+        journal.injected_fault = Some(InjectedFault::DurabilityBarrier);
+        assert!(matches!(
+            journal.append_raw(RecordKind::Command, &[1, 2, 3]),
+            Err(JournalError::Io(_))
+        ));
+        assert!(journal.is_poisoned());
+        drop(journal);
+
+        let recovered = Journal::open(&path, buffered_options()).expect("journal recovers");
+        assert_eq!(recovered.recovery().last_sequence, Some(1));
+        assert_eq!(recovered.next_sequence(), 2);
+        recovered.close().expect("journal closes");
+        remove_test_files(&path);
+    }
+
+    #[test]
+    fn injected_batch_failure_retains_only_its_complete_verified_prefix() {
+        let path = test_path("batch-partial");
+        remove_test_files(&path);
+        let mut batch = JournalBatch::new();
+        batch.push_raw(RecordKind::Command, vec![1; 8]);
+        batch.push_raw(RecordKind::Command, vec![2; 8]);
+        let mut journal = Journal::open(&path, buffered_options()).expect("journal opens");
+        journal.injected_fault = Some(InjectedFault::PartialWrite(HEADER_LENGTH + 8 + 5));
+        assert!(matches!(
+            journal.append_batch(&batch),
+            Err(JournalError::Io(_))
+        ));
+        drop(journal);
+
+        let repair = JournalOptions {
+            recovery: RecoveryMode::RepairTornTail,
+            ..buffered_options()
+        };
+        let recovered = Journal::open(&path, repair).expect("batch prefix recovers");
+        assert_eq!(recovered.recovery().last_sequence, Some(1));
+        assert_eq!(
+            recovered.recovery().valid_bytes,
+            u64::try_from(HEADER_LENGTH + 8).expect("frame length fits u64")
+        );
+        assert_eq!(recovered.recovery().truncated_bytes, 5);
+        recovered.close().expect("journal closes");
+        remove_test_files(&path);
+    }
+
+    #[test]
+    fn injected_explicit_sync_failures_poison_without_changing_logical_offsets() {
+        let path = test_path("explicit-sync");
+        remove_test_files(&path);
+        let mut journal = Journal::open(&path, buffered_options()).expect("journal opens");
+        journal
+            .append_raw(RecordKind::Command, &[1])
+            .expect("buffered append succeeds");
+        journal.injected_fault = Some(InjectedFault::SyncData);
+        assert!(matches!(journal.sync_data(), Err(JournalError::Io(_))));
+        assert!(journal.is_poisoned());
+        drop(journal);
+
+        let mut recovered = Journal::open(&path, buffered_options()).expect("journal recovers");
+        assert_eq!(recovered.next_sequence(), 2);
+        recovered.injected_fault = Some(InjectedFault::SyncAll);
+        assert!(matches!(recovered.sync_all(), Err(JournalError::Io(_))));
+        assert!(recovered.is_poisoned());
+        drop(recovered);
+        remove_test_files(&path);
+    }
+}
