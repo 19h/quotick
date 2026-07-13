@@ -4,9 +4,11 @@ use std::fmt;
 use std::path::Path;
 
 use crate::domain::TransactionId;
+use crate::durable_storage::{StorageError, StorageOptions, StorageReader, StorageWriter};
 use crate::instrument::InstrumentDefinition;
 use crate::journal::{
-    Journal, JournalError, JournalOptions, JournalReader, RecordKind, RecoveryReport,
+    JournalError, JournalOptions, RecordKind, SegmentedJournalError, SegmentedJournalOptions,
+    StorageRecoveryReport,
 };
 use crate::ledger::{
     JournalEntry, Ledger, LedgerError, PostReceipt, PostingPreparation, SettlementConvention,
@@ -17,7 +19,7 @@ use crate::matching::Trade;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DurableLedgerRecoveryReport {
     /// Physical journal recovery performed at open.
-    pub journal: RecoveryReport,
+    pub journal: StorageRecoveryReport,
     /// Balanced entries replayed into account balances.
     pub replayed_entries: u64,
 }
@@ -27,6 +29,8 @@ pub struct DurableLedgerRecoveryReport {
 pub enum DurableLedgerError {
     /// Journal framing, codec, recovery, or I/O failure.
     Journal(JournalError),
+    /// Segmented-journal inventory, rotation, framing, recovery, or I/O failure.
+    SegmentedJournal(SegmentedJournalError),
     /// Entry validation, collision, arithmetic, or preparation failure.
     Ledger(LedgerError),
     /// A matching record appeared in a ledger-only journal.
@@ -51,6 +55,7 @@ impl fmt::Display for DurableLedgerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Journal(error) => error.fmt(formatter),
+            Self::SegmentedJournal(error) => error.fmt(formatter),
             Self::Ledger(error) => error.fmt(formatter),
             Self::UnexpectedRecord { sequence, kind } => {
                 write!(
@@ -76,6 +81,7 @@ impl std::error::Error for DurableLedgerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Journal(error) => Some(error),
+            Self::SegmentedJournal(error) => Some(error),
             Self::Ledger(error) => Some(error),
             _ => None,
         }
@@ -85,6 +91,21 @@ impl std::error::Error for DurableLedgerError {
 impl From<JournalError> for DurableLedgerError {
     fn from(error: JournalError) -> Self {
         Self::Journal(error)
+    }
+}
+
+impl From<SegmentedJournalError> for DurableLedgerError {
+    fn from(error: SegmentedJournalError) -> Self {
+        Self::SegmentedJournal(error)
+    }
+}
+
+impl From<StorageError> for DurableLedgerError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::Journal(error) => Self::Journal(error),
+            StorageError::Segmented(error) => Self::SegmentedJournal(error),
+        }
     }
 }
 
@@ -98,7 +119,7 @@ impl From<LedgerError> for DurableLedgerError {
 #[derive(Debug)]
 pub struct DurableLedger {
     ledger: Ledger,
-    journal: Journal,
+    journal: StorageWriter,
     recovery: DurableLedgerRecoveryReport,
     poisoned: bool,
 }
@@ -115,10 +136,26 @@ impl DurableLedger {
         path: impl AsRef<Path>,
         options: JournalOptions,
     ) -> Result<Self, DurableLedgerError> {
-        let path = path.as_ref();
-        let journal = Journal::open(path, options)?;
+        Self::open_storage(path.as_ref(), StorageOptions::Single(options))
+    }
+
+    /// Opens and reconstructs a ledger over an automatically rotating WAL directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableLedgerError`] for segmented storage, grammar,
+    /// duplicate-transaction, or ledger validation failure.
+    pub fn open_segmented(
+        directory: impl AsRef<Path>,
+        options: SegmentedJournalOptions,
+    ) -> Result<Self, DurableLedgerError> {
+        Self::open_storage(directory.as_ref(), StorageOptions::Segmented(options))
+    }
+
+    fn open_storage(path: &Path, options: StorageOptions) -> Result<Self, DurableLedgerError> {
+        let journal = StorageWriter::open(path, options)?;
         let journal_recovery = journal.recovery();
-        let reader = JournalReader::open(path, options)?;
+        let reader = StorageReader::open(path, options)?;
         let mut ledger = Ledger::new();
         let mut replayed_entries = 0_u64;
         for frame_result in reader {
@@ -183,7 +220,7 @@ impl DurableLedger {
         };
         if let Err(error) = self.journal.append(prepared.entry()) {
             self.poisoned = self.journal.is_poisoned();
-            return Err(DurableLedgerError::Journal(error));
+            return Err(error.into());
         }
         match self.ledger.commit(prepared) {
             Ok(receipt) => Ok(receipt),
@@ -237,7 +274,7 @@ impl DurableLedger {
         }
         if let Err(error) = self.journal.sync_all() {
             self.poisoned = true;
-            return Err(DurableLedgerError::Journal(error));
+            return Err(error.into());
         }
         Ok(())
     }
@@ -253,6 +290,6 @@ impl DurableLedger {
         if self.poisoned {
             return Err(DurableLedgerError::Poisoned);
         }
-        self.journal.close().map_err(DurableLedgerError::Journal)
+        self.journal.close().map_err(Into::into)
     }
 }

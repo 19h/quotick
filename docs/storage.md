@@ -1,9 +1,10 @@
 # Local storage contract
 
-This document bounds the guarantees of `Journal`, `DurableOrderBook`,
-`DurableRiskOrderBook`, and `DurableLedger`. It distinguishes properties proved
-by the state machines from properties conditional on the operating system,
-filesystem, and storage device.
+This document bounds the guarantees of `Journal`, `SegmentedJournal`,
+`DurableOrderBook`, `DurableRiskOrderBook`, and `DurableLedger`. The durable
+runtimes expose both single-file `open` and directory-backed `open_segmented`
+constructors. It distinguishes properties proved by the state machines from
+properties conditional on the operating system, filesystem, and storage device.
 
 ## Canonical-path writer ownership
 
@@ -42,6 +43,71 @@ components, or deletes a live lease can violate it. Network filesystems are
 unsupported until their exclusive-create and cache-coherence behavior is
 qualified.
 
+## Segmented directory ownership and format
+
+`SegmentedJournal` manages one dedicated canonical directory under a single
+manager lease. The manager lease uses the same 34-byte `QLCK` record and
+exclusive-create protocol as a raw journal; its path is
+`.quotick-segments.writer.lock`. Raw `Journal` writers reject files whose parent
+contains the segmented marker, so per-file writers cannot bypass the manager.
+Readers do not acquire the manager lease.
+
+The directory inventory is deliberately closed:
+
+| Entry | Meaning |
+|---|---|
+| `format.qseg` | immutable 26-byte segmented-format marker |
+| `.quotick-segments.writer.lock` | live manager ownership, present only while owned or abandoned |
+| `segment-SSSSSSSSSSSSSSSSSSSS.qwal` | WAL segment; `S` is the zero-padded 20-digit first global sequence |
+
+The marker uses little-endian integers:
+
+| Offset (bytes) | Width (bytes) | Field |
+|---:|---:|---|
+| 0 | 4 | ASCII magic `QSEG` |
+| 4 | 2 | marker version `1` |
+| 6 | 8 | maximum physical segment bytes `u64` |
+| 14 | 8 | first global sequence `u64` |
+| 22 | 4 | maximum frame payload bytes `u32` |
+
+The segment capacity includes `QWAL` headers and payloads, but not the marker or
+lease. Capacity, first sequence, and maximum payload are immutable and must
+exactly equal the marker on reopen. Acknowledgement and tail-recovery policies
+are runtime policies and are not marker fields. Unknown entries, noncanonical
+names, an absent marker in a nonempty directory, or marker drift fail closed.
+If termination interrupts the initial marker write before any segment exists,
+`recover_incomplete_initialization` acquires the manager lease and removes only
+an invalid marker in an otherwise empty persistent inventory. It refuses a
+valid marker and refuses to act when any segment or unknown entry exists.
+
+Rotation is size-triggered and sequence-preserving:
+
+1. Encoding, payload, total-length, capacity, and sequence-space checks finish
+   before filesystem mutation.
+2. If the complete frame or acknowledgement batch does not fit a nonempty
+   active segment, that segment is closed with `sync_all`.
+3. The manager creates and synchronizes a segment named by the next global
+   sequence and synchronizes the directory entry.
+4. The complete frame or batch is appended to the new active segment. A batch
+   is never intentionally split by rotation.
+
+No mutable manifest is required: sorted canonical names plus strict frame scans
+derive the inventory and global sequence. A crash before new-file creation
+leaves the prior file active. A crash after creation can leave one empty final
+segment, which is valid and reused. Only the final segment can use
+`RepairTornTail`; every earlier segment is always opened strictly, and an empty
+non-final segment is invalid. Corruption, truncation, oversize files, or a
+sequence gap in a closed segment are never skipped or repaired.
+
+`SegmentedJournalReader` streams a fixed inventory one file at a time and
+verifies one global contiguous sequence. Its memory overhead is `O(S)` for `S`
+segment descriptors plus one bounded frame payload; it does not materialize the
+complete WAL. Durable matching, risk, and ledger recovery use this streaming
+path while holding manager ownership. A standalone reader does not provide an
+atomic point-in-time snapshot of a concurrently appending active segment; it is
+a verified prefix reader, and callers requiring authoritative recovery must
+exclude concurrent mutation.
+
 ## Abandoned writer recovery
 
 Process termination can leave a durable lease. Recovery is deliberately not
@@ -66,6 +132,11 @@ fail-closed and `recover_abandoned_invalid_writer` removes it only after proving
 that it does not decode as a supported owner. This operation has the same
 liveness and quiescence preconditions. Process ID and nonce are diagnostic
 correlation values, not credentials.
+
+For a segmented directory, the equivalent operations are
+`SegmentedJournal::recover_abandoned_writer` and
+`SegmentedJournal::recover_abandoned_invalid_writer`. They act only on the
+manager lease; individual managed segments do not carry writer leases.
 
 ## File and directory durability
 
@@ -106,16 +177,24 @@ loss and remount tests.
 | failed explicit `sync_data`/`sync_all` | poisoned | scan verified prefix; caller treats last operation as ambiguous |
 | partial grouped append | poisoned | every complete verified frame remains; incomplete suffix is repairable |
 | complete frame with bad CRC/header/sequence | reopen fails | never repaired or skipped |
+| rotation after prior close but before next-file creation | current instance fails/terminates | prior final segment is reopened as active |
+| rotation after next-file creation but before append | current instance fails/terminates | one empty final segment is reused |
+| termination during initial marker write | open reports invalid marker | explicit recovery removes it only when no segment/unknown entry exists |
+| torn append in active segment | poisoned | strict error; repair can truncate only that final tail |
+| any defect in a closed segment | reopen fails | never repaired, skipped, or converted into a new boundary |
 
 Deterministic injected-fault tests exercise partial frame writes, complete writes
 with failed acknowledgement barriers, partial grouped writes, explicit sync
-failures, poison behavior, strict reopening, and verified-prefix repair. A
+failures, poison behavior, strict reopening, and verified-prefix repair.
+Segment tests exercise exact-boundary and whole-batch rotation, configuration
+drift, closed-file corruption, active-tail repair, manager exclusion,
+interrupted empty-file creation, and pre-rotation sequence exhaustion. A
 forced-process-termination test additionally proves recovery after an abandoned
 writer lease and a possible torn tail.
 
 ## Unimplemented storage properties
 
-- automatic segment rotation and retention;
+- automatic segment retention, archival, and deletion fencing;
 - checksummed semantic state snapshots and WAL cutover;
 - authenticated records against deliberate forgery;
 - kernel inode locks covering hard-link aliases;

@@ -1,0 +1,1125 @@
+//! Size-bounded physical WAL segments with one global logical sequence.
+
+use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use crate::journal::{
+    AppendReceipt, DurableRecord, HEADER_LENGTH, Journal, JournalBatch, JournalError, JournalFrame,
+    JournalOptions, JournalReader, RecordKind, SEGMENT_DIRECTORY_MARKER, WriterLease,
+    WriterLeaseOwner, normalize_journal_path, sync_parent,
+};
+
+const SEGMENT_MARKER_MAGIC: [u8; 4] = *b"QSEG";
+const SEGMENT_MARKER_VERSION: u16 = 1;
+const SEGMENT_MARKER_LENGTH: usize = 26;
+const SEGMENT_PREFIX: &str = "segment-";
+const SEGMENT_SUFFIX: &str = ".qwal";
+const SEGMENT_DIGITS: usize = 20;
+const MANAGER_LEASE_BASE: &str = ".quotick-segments";
+const MANAGER_LEASE_FILE: &str = ".quotick-segments.writer.lock";
+const DEFAULT_MAXIMUM_SEGMENT_BYTES: u64 = 1_073_741_824;
+
+/// Configuration for an automatically rotating journal directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentedJournalOptions {
+    /// Maximum complete frame bytes in one physical segment.
+    pub maximum_segment_bytes: u64,
+    /// Per-frame payload, durability, recovery, and initial-sequence options.
+    pub journal: JournalOptions,
+}
+
+impl Default for SegmentedJournalOptions {
+    fn default() -> Self {
+        Self {
+            maximum_segment_bytes: DEFAULT_MAXIMUM_SEGMENT_BYTES,
+            journal: JournalOptions::default(),
+        }
+    }
+}
+
+/// One physical segment in a logical journal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SegmentDescriptor {
+    start_sequence: u64,
+    path: PathBuf,
+    valid_bytes: u64,
+}
+
+impl SegmentDescriptor {
+    /// Returns the global sequence assigned to this segment's first frame.
+    #[must_use]
+    pub const fn start_sequence(&self) -> u64 {
+        self.start_sequence
+    }
+
+    /// Returns the canonical physical segment path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns bytes occupied by complete verified frames.
+    #[must_use]
+    pub const fn valid_bytes(&self) -> u64 {
+        self.valid_bytes
+    }
+}
+
+/// Recovery summary across every physical segment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentedRecoveryReport {
+    /// Number of physical segment files, including a possible empty active segment.
+    pub segment_count: u64,
+    /// First configured global sequence.
+    pub first_sequence: u64,
+    /// Last verified frame sequence, or `None` for a new empty journal.
+    pub last_sequence: Option<u64>,
+    /// Sum of verified frame bytes across all segments.
+    pub valid_bytes: u128,
+    /// Bytes removed from an incomplete active-segment tail.
+    pub truncated_bytes: u64,
+    /// Start sequence encoded by the active segment name.
+    pub active_segment_start: u64,
+}
+
+/// Append metadata correlated to a physical segment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentedAppendReceipt {
+    segment_start_sequence: u64,
+    inner: AppendReceipt,
+}
+
+impl SegmentedAppendReceipt {
+    /// Returns the assigned global frame sequence.
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.inner.sequence
+    }
+
+    /// Returns the first sequence of the containing physical segment.
+    #[must_use]
+    pub const fn segment_start_sequence(self) -> u64 {
+        self.segment_start_sequence
+    }
+
+    /// Returns the byte offset within the containing segment.
+    #[must_use]
+    pub const fn segment_offset(self) -> u64 {
+        self.inner.offset
+    }
+
+    /// Returns the complete frame length.
+    #[must_use]
+    pub const fn frame_length(self) -> usize {
+        self.inner.frame_length
+    }
+}
+
+/// Segmented directory, continuity, capacity, or underlying journal failure.
+#[derive(Debug)]
+pub enum SegmentedJournalError {
+    /// Directory or manager-lease storage failure.
+    Storage(JournalError),
+    /// Failure tied to one named physical segment.
+    Segment {
+        /// Segment path.
+        path: PathBuf,
+        /// Underlying framing or I/O error.
+        error: JournalError,
+    },
+    /// Segment capacity cannot contain even one frame header.
+    InvalidSegmentCapacity {
+        /// Requested maximum bytes.
+        actual: u64,
+        /// Minimum permitted bytes.
+        minimum: u64,
+    },
+    /// One frame or atomic append batch exceeds segment capacity.
+    SegmentCapacityExceeded {
+        /// Complete requested bytes.
+        required: u64,
+        /// Configured segment maximum.
+        maximum: u64,
+    },
+    /// An existing marker does not equal requested immutable format settings.
+    ConfigurationMismatch {
+        /// Persisted segment capacity.
+        persisted_maximum_segment_bytes: u64,
+        /// Requested segment capacity.
+        requested_maximum_segment_bytes: u64,
+        /// Persisted first sequence.
+        persisted_initial_sequence: u64,
+        /// Requested first sequence.
+        requested_initial_sequence: u64,
+        /// Persisted payload maximum.
+        persisted_maximum_payload_length: u32,
+        /// Requested payload maximum.
+        requested_maximum_payload_length: u32,
+    },
+    /// A nonempty directory did not contain its versioned format marker.
+    MarkerMissing,
+    /// The format marker was truncated, malformed, or unsupported.
+    InvalidMarker,
+    /// Incomplete-initialization recovery found a valid marker and refused removal.
+    MarkerRecoveryNotRequired,
+    /// Incomplete-initialization recovery found an entry proving initialization advanced.
+    MarkerRecoveryUnsafe(PathBuf),
+    /// The dedicated directory contained an unrecognized entry.
+    UnexpectedDirectoryEntry(PathBuf),
+    /// A segment file name did not use the canonical fixed-width grammar.
+    InvalidSegmentName(PathBuf),
+    /// The first segment did not begin at the configured initial sequence.
+    FirstSegmentMismatch {
+        /// Configured first sequence.
+        expected: u64,
+        /// Segment name sequence.
+        actual: u64,
+    },
+    /// Adjacent physical segments did not form one contiguous global sequence.
+    SegmentDiscontinuity {
+        /// Required next segment start.
+        expected: u64,
+        /// Observed segment start.
+        actual: u64,
+    },
+    /// A closed segment contained no frames.
+    EmptyNonFinalSegment(PathBuf),
+    /// A recovered segment exceeds the immutable capacity.
+    ExistingSegmentTooLarge {
+        /// Segment path.
+        path: PathBuf,
+        /// Physical bytes.
+        actual: u64,
+        /// Configured maximum.
+        maximum: u64,
+    },
+    /// No segment exists in an otherwise valid reader directory.
+    NoSegments,
+    /// A rotation failure left this manager unusable until reopen.
+    Poisoned,
+}
+
+impl fmt::Display for SegmentedJournalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Storage(error) => error.fmt(formatter),
+            Self::Segment { path, error } => {
+                write!(formatter, "segment {}: {error}", path.display())
+            }
+            Self::InvalidSegmentCapacity { actual, minimum } => write!(
+                formatter,
+                "segment capacity {actual} bytes is below minimum {minimum}"
+            ),
+            Self::SegmentCapacityExceeded { required, maximum } => write!(
+                formatter,
+                "append requires {required} segment bytes but maximum is {maximum}"
+            ),
+            Self::ConfigurationMismatch { .. } => {
+                formatter.write_str("segmented journal configuration differs from its marker")
+            }
+            Self::MarkerMissing => {
+                formatter.write_str("nonempty segmented directory has no format marker")
+            }
+            Self::InvalidMarker => formatter.write_str("invalid segmented journal marker"),
+            Self::MarkerRecoveryNotRequired => {
+                formatter.write_str("segmented journal marker is valid and cannot be recovered")
+            }
+            Self::MarkerRecoveryUnsafe(path) => write!(
+                formatter,
+                "segmented marker recovery is unsafe while {} exists",
+                path.display()
+            ),
+            Self::UnexpectedDirectoryEntry(path) => {
+                write!(
+                    formatter,
+                    "unexpected segmented-directory entry {}",
+                    path.display()
+                )
+            }
+            Self::InvalidSegmentName(path) => {
+                write!(formatter, "invalid segment file name {}", path.display())
+            }
+            Self::FirstSegmentMismatch { expected, actual } => write!(
+                formatter,
+                "first segment starts at {actual}, expected {expected}"
+            ),
+            Self::SegmentDiscontinuity { expected, actual } => write!(
+                formatter,
+                "segment sequence discontinuity: expected {expected}, found {actual}"
+            ),
+            Self::EmptyNonFinalSegment(path) => {
+                write!(formatter, "closed segment {} is empty", path.display())
+            }
+            Self::ExistingSegmentTooLarge {
+                path,
+                actual,
+                maximum,
+            } => write!(
+                formatter,
+                "segment {} has {actual} bytes, exceeding maximum {maximum}",
+                path.display()
+            ),
+            Self::NoSegments => formatter.write_str("segmented journal contains no segments"),
+            Self::Poisoned => formatter.write_str("segmented journal is poisoned"),
+        }
+    }
+}
+
+impl std::error::Error for SegmentedJournalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Storage(error) | Self::Segment { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<JournalError> for SegmentedJournalError {
+    fn from(error: JournalError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Marker {
+    maximum_segment_bytes: u64,
+    initial_sequence: u64,
+    maximum_payload_length: u32,
+}
+
+/// One exclusive writer over an automatically rotating segment directory.
+#[derive(Debug)]
+pub struct SegmentedJournal {
+    directory: PathBuf,
+    options: SegmentedJournalOptions,
+    manager_lease: WriterLease,
+    current: Option<Journal>,
+    segments: Vec<SegmentDescriptor>,
+    recovery: SegmentedRecoveryReport,
+    poisoned: bool,
+}
+
+impl SegmentedJournal {
+    /// Opens or creates a dedicated segmented directory and verifies global continuity.
+    ///
+    /// Closed segments are always strict. The configured recovery mode applies
+    /// only to the final active segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SegmentedJournalError`] for ownership, marker, directory,
+    /// capacity, framing, corruption, or sequence-continuity failure.
+    pub fn open(
+        directory: impl AsRef<Path>,
+        options: SegmentedJournalOptions,
+    ) -> Result<Self, SegmentedJournalError> {
+        validate_options(options)?;
+        let directory = prepare_directory(directory.as_ref())?;
+        let manager_lease = WriterLease::acquire(&manager_lease_base(&directory))?;
+        ensure_marker(&directory, options)?;
+        let mut segments = discover_segments(&directory)?;
+        if segments.is_empty() {
+            let start = options.journal.initial_sequence;
+            let path = segment_path(&directory, start);
+            let current = Journal::open_managed(&path, segment_options(options, start))
+                .map_err(|error| segment_error(path.clone(), error))?;
+            segments.push(SegmentDescriptor {
+                start_sequence: start,
+                path,
+                valid_bytes: 0,
+            });
+            return Ok(Self {
+                directory,
+                options,
+                manager_lease,
+                current: Some(current),
+                segments,
+                recovery: SegmentedRecoveryReport {
+                    segment_count: 1,
+                    first_sequence: start,
+                    last_sequence: None,
+                    valid_bytes: 0,
+                    truncated_bytes: 0,
+                    active_segment_start: start,
+                },
+                poisoned: false,
+            });
+        }
+
+        verify_first_segment(&segments, options.journal.initial_sequence)?;
+        let (closed_last, closed_bytes) = verify_closed_segments(&mut segments, options)?;
+        let active_index = segments.len() - 1;
+        let active_start_sequence = segments[active_index].start_sequence;
+        let active_path = segments[active_index].path.clone();
+        let expected_active = closed_last
+            .map(next_sequence)
+            .transpose()?
+            .unwrap_or(options.journal.initial_sequence);
+        if active_start_sequence != expected_active {
+            return Err(SegmentedJournalError::SegmentDiscontinuity {
+                expected: expected_active,
+                actual: active_start_sequence,
+            });
+        }
+        reject_oversized_existing(&segments[active_index], options.maximum_segment_bytes)?;
+        let current = Journal::open_managed(
+            &active_path,
+            segment_options(options, active_start_sequence),
+        )
+        .map_err(|error| segment_error(active_path.clone(), error))?;
+        let active_recovery = current.recovery();
+        let active_bytes = current.current_offset();
+        segments[active_index].valid_bytes = active_bytes;
+        let last_sequence = active_recovery.last_sequence.or(closed_last);
+        let valid_bytes = closed_bytes
+            .checked_add(u128::from(active_bytes))
+            .ok_or(JournalError::FrameLengthOverflow)?;
+        let segment_count =
+            u64::try_from(segments.len()).map_err(|_| JournalError::FrameLengthOverflow)?;
+        Ok(Self {
+            directory,
+            options,
+            manager_lease,
+            current: Some(current),
+            recovery: SegmentedRecoveryReport {
+                segment_count,
+                first_sequence: options.journal.initial_sequence,
+                last_sequence,
+                valid_bytes,
+                truncated_bytes: active_recovery.truncated_bytes,
+                active_segment_start: active_start_sequence,
+            },
+            segments,
+            poisoned: false,
+        })
+    }
+
+    /// Returns recovery state captured at open.
+    #[must_use]
+    pub const fn recovery(&self) -> SegmentedRecoveryReport {
+        self.recovery
+    }
+
+    /// Returns physical segments in global sequence order.
+    #[must_use]
+    pub fn segments(&self) -> &[SegmentDescriptor] {
+        &self.segments
+    }
+
+    /// Returns the global sequence assigned to the next append.
+    #[must_use]
+    pub fn next_sequence(&self) -> u64 {
+        self.current.as_ref().map_or(
+            self.options.journal.initial_sequence,
+            Journal::next_sequence,
+        )
+    }
+
+    /// Returns the directory manager's diagnostic lease identity.
+    #[must_use]
+    pub const fn writer_lease_owner(&self) -> WriterLeaseOwner {
+        self.manager_lease.owner()
+    }
+
+    /// Returns whether rotation or journal I/O left the writer unusable.
+    #[must_use]
+    pub const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Encodes and appends one typed record, rotating before it when necessary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SegmentedJournalError`] for encoding, capacity, rotation,
+    /// journal, or poisoned-state failure.
+    pub fn append<T: DurableRecord>(
+        &mut self,
+        record: &T,
+    ) -> Result<SegmentedAppendReceipt, SegmentedJournalError> {
+        let payload = record
+            .encode()
+            .map_err(JournalError::Codec)
+            .map_err(SegmentedJournalError::Storage)?;
+        self.append_raw(T::KIND, &payload)
+    }
+
+    /// Appends encoded payload bytes under an explicit record kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SegmentedJournalError`] for payload, capacity, rotation,
+    /// journal, or poisoned-state failure.
+    pub fn append_raw(
+        &mut self,
+        kind: RecordKind,
+        payload: &[u8],
+    ) -> Result<SegmentedAppendReceipt, SegmentedJournalError> {
+        self.ensure_healthy()?;
+        let payload_length =
+            u32::try_from(payload.len()).map_err(|_| JournalError::PayloadTooLarge {
+                length: payload.len(),
+                maximum: self.options.journal.max_payload_length,
+            })?;
+        if payload_length > self.options.journal.max_payload_length {
+            return Err(JournalError::PayloadTooLarge {
+                length: payload.len(),
+                maximum: self.options.journal.max_payload_length,
+            }
+            .into());
+        }
+        self.next_sequence()
+            .checked_add(1)
+            .ok_or(JournalError::SequenceExhausted)?;
+        let frame_length = u64::try_from(HEADER_LENGTH)
+            .map_err(|_| JournalError::FrameLengthOverflow)?
+            .checked_add(u64::from(payload_length))
+            .ok_or(JournalError::FrameLengthOverflow)?;
+        self.rotate_if_needed(frame_length)?;
+        let segment_start = self.active_segment_start();
+        let active_path = self.active_segment_path().to_path_buf();
+        let result = self
+            .current
+            .as_mut()
+            .ok_or(SegmentedJournalError::Poisoned)?
+            .append_raw(kind, payload);
+        let receipt = match result {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.poisoned = self.current.as_ref().is_none_or(Journal::is_poisoned);
+                return Err(segment_error(active_path, error));
+            }
+        };
+        self.update_active_bytes(
+            u64::try_from(receipt.frame_length).map_err(|_| JournalError::FrameLengthOverflow)?,
+        )?;
+        Ok(SegmentedAppendReceipt {
+            segment_start_sequence: segment_start,
+            inner: receipt,
+        })
+    }
+
+    /// Appends one acknowledgement group without splitting it across segments.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SegmentedJournalError`] for capacity, rotation, journal, or
+    /// poisoned-state failure.
+    pub fn append_batch(
+        &mut self,
+        batch: &JournalBatch,
+    ) -> Result<Vec<SegmentedAppendReceipt>, SegmentedJournalError> {
+        self.ensure_healthy()?;
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        let length = batch
+            .encoded_frame_length(self.options.journal.max_payload_length)
+            .map_err(SegmentedJournalError::Storage)?;
+        let record_count =
+            u64::try_from(batch.len()).map_err(|_| JournalError::SequenceExhausted)?;
+        self.next_sequence()
+            .checked_add(record_count)
+            .ok_or(JournalError::SequenceExhausted)?;
+        self.rotate_if_needed(length)?;
+        let segment_start = self.active_segment_start();
+        let active_path = self.active_segment_path().to_path_buf();
+        let result = self
+            .current
+            .as_mut()
+            .ok_or(SegmentedJournalError::Poisoned)?
+            .append_batch(batch);
+        let receipts = match result {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                self.poisoned = self.current.as_ref().is_none_or(Journal::is_poisoned);
+                return Err(segment_error(active_path, error));
+            }
+        };
+        self.update_active_bytes(length)?;
+        Ok(receipts
+            .into_iter()
+            .map(|inner| SegmentedAppendReceipt {
+                segment_start_sequence: segment_start,
+                inner,
+            })
+            .collect())
+    }
+
+    /// Synchronizes active-segment data and metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SegmentedJournalError`] for poison or synchronization failure.
+    pub fn sync_all(&mut self) -> Result<(), SegmentedJournalError> {
+        self.ensure_healthy()?;
+        let path = self.active_segment_path().to_path_buf();
+        self.current
+            .as_mut()
+            .ok_or(SegmentedJournalError::Poisoned)?
+            .sync_all()
+            .map_err(|error| {
+                self.poisoned = true;
+                segment_error(path, error)
+            })
+    }
+
+    /// Synchronizes the active segment and durably releases manager ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SegmentedJournalError`] for poison, segment synchronization,
+    /// or manager-lease release failure.
+    pub fn close(mut self) -> Result<(), SegmentedJournalError> {
+        self.ensure_healthy()?;
+        if let Some(current) = self.current.take() {
+            let path = self.active_segment_path().to_path_buf();
+            current
+                .close()
+                .map_err(|error| segment_error(path, error))?;
+        }
+        self.manager_lease.release()?;
+        Ok(())
+    }
+
+    /// Resolves the manager lease sidecar for operational diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SegmentedJournalError::Storage`] if the directory cannot be canonicalized.
+    pub fn writer_lease_path(
+        directory: impl AsRef<Path>,
+    ) -> Result<PathBuf, SegmentedJournalError> {
+        let directory = fs::canonicalize(directory).map_err(JournalError::Io)?;
+        Journal::writer_lease_path(manager_lease_base(&directory)).map_err(Into::into)
+    }
+
+    /// Removes an abandoned directory-manager lease under the single-file
+    /// recovery preconditions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SegmentedJournalError::Storage`] for identity or filesystem failure.
+    pub fn recover_abandoned_writer(
+        directory: impl AsRef<Path>,
+        owner: WriterLeaseOwner,
+    ) -> Result<(), SegmentedJournalError> {
+        let directory = fs::canonicalize(directory).map_err(JournalError::Io)?;
+        Journal::recover_abandoned_writer(manager_lease_base(&directory), owner).map_err(Into::into)
+    }
+
+    /// Removes a malformed abandoned manager lease after verifying that it is
+    /// not a decodable owner identity.
+    ///
+    /// The caller must independently establish manager quiescence and prevent
+    /// new managers from starting until recovery returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SegmentedJournalError::Storage`] if the lease becomes valid or
+    /// a filesystem operation fails.
+    pub fn recover_abandoned_invalid_writer(
+        directory: impl AsRef<Path>,
+    ) -> Result<(), SegmentedJournalError> {
+        let directory = fs::canonicalize(directory).map_err(JournalError::Io)?;
+        Journal::recover_abandoned_invalid_writer(manager_lease_base(&directory))
+            .map_err(Into::into)
+    }
+
+    /// Removes a malformed marker left before initial segment creation.
+    ///
+    /// The operation acquires the manager lease and refuses removal if the
+    /// marker is valid or if any segment or unknown directory entry exists.
+    /// The caller must externally prevent competing recovery operations until
+    /// this operation returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SegmentedJournalError::MarkerRecoveryNotRequired`] for a valid
+    /// marker, [`SegmentedJournalError::MarkerRecoveryUnsafe`] when any other
+    /// persistent entry exists, or a storage error for lease/filesystem failure.
+    pub fn recover_incomplete_initialization(
+        directory: impl AsRef<Path>,
+    ) -> Result<(), SegmentedJournalError> {
+        let directory = fs::canonicalize(directory).map_err(JournalError::Io)?;
+        let mut manager_lease = WriterLease::acquire(&manager_lease_base(&directory))?;
+        let marker_path = directory.join(SEGMENT_DIRECTORY_MARKER);
+        let bytes = fs::read(&marker_path).map_err(JournalError::Io)?;
+        if decode_marker(&bytes).is_ok() {
+            return Err(SegmentedJournalError::MarkerRecoveryNotRequired);
+        }
+        for result in fs::read_dir(&directory).map_err(JournalError::Io)? {
+            let entry = result.map_err(JournalError::Io)?;
+            let name = entry.file_name();
+            if name != SEGMENT_DIRECTORY_MARKER && name != MANAGER_LEASE_FILE {
+                return Err(SegmentedJournalError::MarkerRecoveryUnsafe(entry.path()));
+            }
+        }
+        fs::remove_file(&marker_path).map_err(JournalError::Io)?;
+        sync_parent(&marker_path).map_err(JournalError::Io)?;
+        manager_lease.release()?;
+        Ok(())
+    }
+
+    fn rotate_if_needed(&mut self, required: u64) -> Result<(), SegmentedJournalError> {
+        if required > self.options.maximum_segment_bytes {
+            return Err(SegmentedJournalError::SegmentCapacityExceeded {
+                required,
+                maximum: self.options.maximum_segment_bytes,
+            });
+        }
+        let current_bytes = self
+            .current
+            .as_ref()
+            .ok_or(SegmentedJournalError::Poisoned)?
+            .current_offset();
+        let fits = current_bytes
+            .checked_add(required)
+            .is_some_and(|total| total <= self.options.maximum_segment_bytes);
+        if current_bytes == 0 || fits {
+            return Ok(());
+        }
+        let start = self.next_sequence();
+        let current_path = self.active_segment_path().to_path_buf();
+        let current = self.current.take().ok_or(SegmentedJournalError::Poisoned)?;
+        if let Err(error) = current.close() {
+            self.poisoned = true;
+            return Err(segment_error(current_path, error));
+        }
+        let path = segment_path(&self.directory, start);
+        let next = match Journal::open_managed(&path, segment_options(self.options, start)) {
+            Ok(journal) => journal,
+            Err(error) => {
+                self.poisoned = true;
+                return Err(segment_error(path, error));
+            }
+        };
+        self.segments.push(SegmentDescriptor {
+            start_sequence: start,
+            path,
+            valid_bytes: 0,
+        });
+        self.current = Some(next);
+        Ok(())
+    }
+
+    fn active_segment_start(&self) -> u64 {
+        self.segments
+            .last()
+            .map_or(self.options.journal.initial_sequence, |segment| {
+                segment.start_sequence
+            })
+    }
+
+    fn active_segment_path(&self) -> &Path {
+        self.segments
+            .last()
+            .map_or(self.directory.as_path(), |segment| segment.path())
+    }
+
+    fn update_active_bytes(&mut self, appended: u64) -> Result<(), SegmentedJournalError> {
+        let active = self
+            .segments
+            .last_mut()
+            .ok_or(SegmentedJournalError::Poisoned)?;
+        active.valid_bytes = active
+            .valid_bytes
+            .checked_add(appended)
+            .ok_or(JournalError::FrameLengthOverflow)?;
+        Ok(())
+    }
+
+    fn ensure_healthy(&self) -> Result<(), SegmentedJournalError> {
+        if self.poisoned {
+            Err(SegmentedJournalError::Poisoned)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Streaming verifier across a fixed segment inventory captured at open.
+#[derive(Debug)]
+pub struct SegmentedJournalReader {
+    segments: Vec<SegmentDescriptor>,
+    options: SegmentedJournalOptions,
+    index: usize,
+    current: Option<JournalReader>,
+    current_had_frame: bool,
+    expected_sequence: u64,
+    finished: bool,
+}
+
+impl SegmentedJournalReader {
+    /// Opens an immutable view of the current segment inventory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SegmentedJournalError`] for marker, directory, configuration,
+    /// capacity, or inventory failure.
+    pub fn open(
+        directory: impl AsRef<Path>,
+        options: SegmentedJournalOptions,
+    ) -> Result<Self, SegmentedJournalError> {
+        validate_options(options)?;
+        let directory = fs::canonicalize(directory).map_err(JournalError::Io)?;
+        read_and_validate_marker(&directory, options)?;
+        let segments = discover_segments(&directory)?;
+        if segments.is_empty() {
+            return Err(SegmentedJournalError::NoSegments);
+        }
+        verify_first_segment(&segments, options.journal.initial_sequence)?;
+        for segment in &segments {
+            reject_oversized_existing(segment, options.maximum_segment_bytes)?;
+        }
+        Ok(Self {
+            segments,
+            options,
+            index: 0,
+            current: None,
+            current_had_frame: false,
+            expected_sequence: options.journal.initial_sequence,
+            finished: false,
+        })
+    }
+}
+
+impl Iterator for SegmentedJournalReader {
+    type Item = Result<JournalFrame, SegmentedJournalError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.finished {
+                return None;
+            }
+            if self.current.is_none() {
+                let Some(segment) = self.segments.get(self.index) else {
+                    self.finished = true;
+                    return None;
+                };
+                if segment.start_sequence != self.expected_sequence {
+                    self.finished = true;
+                    return Some(Err(SegmentedJournalError::SegmentDiscontinuity {
+                        expected: self.expected_sequence,
+                        actual: segment.start_sequence,
+                    }));
+                }
+                let options = segment_options(self.options, segment.start_sequence);
+                match JournalReader::open(&segment.path, options) {
+                    Ok(reader) => self.current = Some(reader),
+                    Err(error) => {
+                        self.finished = true;
+                        return Some(Err(segment_error(segment.path.clone(), error)));
+                    }
+                }
+                self.current_had_frame = false;
+            }
+            let segment = &self.segments[self.index];
+            match self
+                .current
+                .as_mut()
+                .expect("reader was initialized")
+                .next()
+            {
+                Some(Ok(frame)) => {
+                    self.current_had_frame = true;
+                    self.expected_sequence = if let Some(next) = frame.sequence().checked_add(1) {
+                        next
+                    } else {
+                        self.finished = true;
+                        return Some(Err(SegmentedJournalError::Storage(
+                            JournalError::SequenceExhausted,
+                        )));
+                    };
+                    return Some(Ok(frame));
+                }
+                Some(Err(error)) => {
+                    self.finished = true;
+                    return Some(Err(segment_error(segment.path.clone(), error)));
+                }
+                None => {
+                    let is_final = self.index + 1 == self.segments.len();
+                    if !self.current_had_frame && !is_final {
+                        self.finished = true;
+                        return Some(Err(SegmentedJournalError::EmptyNonFinalSegment(
+                            segment.path.clone(),
+                        )));
+                    }
+                    self.current = None;
+                    self.index += 1;
+                }
+            }
+        }
+    }
+}
+
+fn validate_options(options: SegmentedJournalOptions) -> Result<(), SegmentedJournalError> {
+    let minimum = u64::try_from(HEADER_LENGTH).map_err(|_| JournalError::FrameLengthOverflow)?;
+    if options.maximum_segment_bytes < minimum {
+        return Err(SegmentedJournalError::InvalidSegmentCapacity {
+            actual: options.maximum_segment_bytes,
+            minimum,
+        });
+    }
+    if options.journal.initial_sequence == 0 {
+        return Err(JournalError::InvalidInitialSequence.into());
+    }
+    Ok(())
+}
+
+fn prepare_directory(path: &Path) -> Result<PathBuf, SegmentedJournalError> {
+    match fs::create_dir(path) {
+        Ok(()) => sync_parent(path).map_err(JournalError::Io)?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if !fs::metadata(path).map_err(JournalError::Io)?.is_dir() {
+                return Err(JournalError::Io(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "segmented journal path is not a directory",
+                ))
+                .into());
+            }
+        }
+        Err(error) => return Err(JournalError::Io(error).into()),
+    }
+    fs::canonicalize(path)
+        .map_err(JournalError::Io)
+        .map_err(Into::into)
+}
+
+fn ensure_marker(
+    directory: &Path,
+    options: SegmentedJournalOptions,
+) -> Result<(), SegmentedJournalError> {
+    let path = directory.join(SEGMENT_DIRECTORY_MARKER);
+    if path.exists() {
+        return read_and_validate_marker(directory, options);
+    }
+    let mut entries = fs::read_dir(directory).map_err(JournalError::Io)?;
+    if entries.any(|entry| {
+        entry.is_ok_and(|entry| entry.file_name().to_string_lossy() != MANAGER_LEASE_FILE)
+    }) {
+        return Err(SegmentedJournalError::MarkerMissing);
+    }
+    let marker = Marker {
+        maximum_segment_bytes: options.maximum_segment_bytes,
+        initial_sequence: options.journal.initial_sequence,
+        maximum_payload_length: options.journal.max_payload_length,
+    };
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(JournalError::Io)?;
+    if let Err(error) = file
+        .write_all(&encode_marker(marker))
+        .and_then(|()| file.sync_all())
+        .and_then(|()| sync_parent(&path))
+    {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        let _ = sync_parent(&path);
+        return Err(JournalError::Io(error).into());
+    }
+    Ok(())
+}
+
+fn read_and_validate_marker(
+    directory: &Path,
+    options: SegmentedJournalOptions,
+) -> Result<(), SegmentedJournalError> {
+    let bytes = fs::read(directory.join(SEGMENT_DIRECTORY_MARKER)).map_err(JournalError::Io)?;
+    let marker = decode_marker(&bytes)?;
+    if marker.maximum_segment_bytes != options.maximum_segment_bytes
+        || marker.initial_sequence != options.journal.initial_sequence
+        || marker.maximum_payload_length != options.journal.max_payload_length
+    {
+        return Err(SegmentedJournalError::ConfigurationMismatch {
+            persisted_maximum_segment_bytes: marker.maximum_segment_bytes,
+            requested_maximum_segment_bytes: options.maximum_segment_bytes,
+            persisted_initial_sequence: marker.initial_sequence,
+            requested_initial_sequence: options.journal.initial_sequence,
+            persisted_maximum_payload_length: marker.maximum_payload_length,
+            requested_maximum_payload_length: options.journal.max_payload_length,
+        });
+    }
+    Ok(())
+}
+
+fn encode_marker(marker: Marker) -> [u8; SEGMENT_MARKER_LENGTH] {
+    let mut bytes = [0_u8; SEGMENT_MARKER_LENGTH];
+    bytes[0..4].copy_from_slice(&SEGMENT_MARKER_MAGIC);
+    bytes[4..6].copy_from_slice(&SEGMENT_MARKER_VERSION.to_le_bytes());
+    bytes[6..14].copy_from_slice(&marker.maximum_segment_bytes.to_le_bytes());
+    bytes[14..22].copy_from_slice(&marker.initial_sequence.to_le_bytes());
+    bytes[22..26].copy_from_slice(&marker.maximum_payload_length.to_le_bytes());
+    bytes
+}
+
+fn decode_marker(bytes: &[u8]) -> Result<Marker, SegmentedJournalError> {
+    if bytes.len() != SEGMENT_MARKER_LENGTH
+        || bytes[0..4] != SEGMENT_MARKER_MAGIC
+        || u16::from_le_bytes(
+            bytes[4..6]
+                .try_into()
+                .expect("marker version has fixed width"),
+        ) != SEGMENT_MARKER_VERSION
+    {
+        return Err(SegmentedJournalError::InvalidMarker);
+    }
+    Ok(Marker {
+        maximum_segment_bytes: u64::from_le_bytes(
+            bytes[6..14]
+                .try_into()
+                .expect("marker segment capacity has fixed width"),
+        ),
+        initial_sequence: u64::from_le_bytes(
+            bytes[14..22]
+                .try_into()
+                .expect("marker initial sequence has fixed width"),
+        ),
+        maximum_payload_length: u32::from_le_bytes(
+            bytes[22..26]
+                .try_into()
+                .expect("marker payload capacity has fixed width"),
+        ),
+    })
+}
+
+fn discover_segments(directory: &Path) -> Result<Vec<SegmentDescriptor>, SegmentedJournalError> {
+    let mut segments = Vec::new();
+    for result in fs::read_dir(directory).map_err(JournalError::Io)? {
+        let entry = result.map_err(JournalError::Io)?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == SEGMENT_DIRECTORY_MARKER || name == MANAGER_LEASE_FILE {
+            continue;
+        }
+        let path = entry.path();
+        if !entry.file_type().map_err(JournalError::Io)?.is_file() {
+            return Err(SegmentedJournalError::UnexpectedDirectoryEntry(path));
+        }
+        let Some(start_sequence) = parse_segment_name(&name) else {
+            return Err(SegmentedJournalError::InvalidSegmentName(path));
+        };
+        segments.push(SegmentDescriptor {
+            start_sequence,
+            valid_bytes: fs::metadata(&path).map_err(JournalError::Io)?.len(),
+            path: normalize_journal_path(&path).map_err(JournalError::Io)?,
+        });
+    }
+    segments.sort_unstable_by_key(|segment| segment.start_sequence);
+    Ok(segments)
+}
+
+fn parse_segment_name(name: &str) -> Option<u64> {
+    if name.len() != SEGMENT_PREFIX.len() + SEGMENT_DIGITS + SEGMENT_SUFFIX.len()
+        || !name.starts_with(SEGMENT_PREFIX)
+        || !name.ends_with(SEGMENT_SUFFIX)
+    {
+        return None;
+    }
+    let digits = &name[SEGMENT_PREFIX.len()..SEGMENT_PREFIX.len() + SEGMENT_DIGITS];
+    digits
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+fn segment_path(directory: &Path, start_sequence: u64) -> PathBuf {
+    directory.join(format!(
+        "{SEGMENT_PREFIX}{start_sequence:020}{SEGMENT_SUFFIX}"
+    ))
+}
+
+fn manager_lease_base(directory: &Path) -> PathBuf {
+    directory.join(MANAGER_LEASE_BASE)
+}
+
+fn segment_options(options: SegmentedJournalOptions, initial_sequence: u64) -> JournalOptions {
+    JournalOptions {
+        initial_sequence,
+        ..options.journal
+    }
+}
+
+fn verify_first_segment(
+    segments: &[SegmentDescriptor],
+    expected: u64,
+) -> Result<(), SegmentedJournalError> {
+    let actual = segments
+        .first()
+        .ok_or(SegmentedJournalError::NoSegments)?
+        .start_sequence;
+    if actual != expected {
+        return Err(SegmentedJournalError::FirstSegmentMismatch { expected, actual });
+    }
+    Ok(())
+}
+
+fn verify_closed_segments(
+    segments: &mut [SegmentDescriptor],
+    options: SegmentedJournalOptions,
+) -> Result<(Option<u64>, u128), SegmentedJournalError> {
+    let closed_length = segments.len().saturating_sub(1);
+    let mut last_sequence = None;
+    let mut total_bytes = 0_u128;
+    for index in 0..closed_length {
+        let segment = &segments[index];
+        reject_oversized_existing(segment, options.maximum_segment_bytes)?;
+        let mut reader = JournalReader::open(
+            &segment.path,
+            segment_options(options, segment.start_sequence),
+        )
+        .map_err(|error| segment_error(segment.path.clone(), error))?;
+        let mut segment_last = None;
+        for result in &mut reader {
+            let frame = result.map_err(|error| segment_error(segment.path.clone(), error))?;
+            segment_last = Some(frame.sequence());
+        }
+        let segment_last = segment_last
+            .ok_or_else(|| SegmentedJournalError::EmptyNonFinalSegment(segment.path.clone()))?;
+        let expected_next = next_sequence(segment_last)?;
+        let actual_next = segments[index + 1].start_sequence;
+        if actual_next != expected_next {
+            return Err(SegmentedJournalError::SegmentDiscontinuity {
+                expected: expected_next,
+                actual: actual_next,
+            });
+        }
+        let bytes = fs::metadata(&segment.path).map_err(JournalError::Io)?.len();
+        segments[index].valid_bytes = bytes;
+        total_bytes = total_bytes
+            .checked_add(u128::from(bytes))
+            .ok_or(JournalError::FrameLengthOverflow)?;
+        last_sequence = Some(segment_last);
+    }
+    Ok((last_sequence, total_bytes))
+}
+
+fn reject_oversized_existing(
+    segment: &SegmentDescriptor,
+    maximum: u64,
+) -> Result<(), SegmentedJournalError> {
+    let actual = fs::metadata(&segment.path).map_err(JournalError::Io)?.len();
+    if actual > maximum {
+        return Err(SegmentedJournalError::ExistingSegmentTooLarge {
+            path: segment.path.clone(),
+            actual,
+            maximum,
+        });
+    }
+    Ok(())
+}
+
+fn next_sequence(sequence: u64) -> Result<u64, SegmentedJournalError> {
+    sequence
+        .checked_add(1)
+        .ok_or_else(|| JournalError::SequenceExhausted.into())
+}
+
+fn segment_error(path: PathBuf, error: JournalError) -> SegmentedJournalError {
+    SegmentedJournalError::Segment { path, error }
+}

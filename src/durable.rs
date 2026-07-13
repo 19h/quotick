@@ -9,9 +9,11 @@ use std::fmt;
 use std::path::Path;
 
 use crate::domain::{InstrumentId, InstrumentVersion};
+use crate::durable_storage::{StorageError, StorageOptions, StorageReader, StorageWriter};
 use crate::instrument::InstrumentDefinition;
 use crate::journal::{
-    Journal, JournalError, JournalOptions, JournalReader, RecordKind, RecoveryReport,
+    JournalError, JournalOptions, RecordKind, SegmentedJournalError, SegmentedJournalOptions,
+    StorageRecoveryReport,
 };
 use crate::matching::{Command, ExecutionReport, InvariantViolation, MatchingError, OrderBook};
 
@@ -19,7 +21,7 @@ use crate::matching::{Command, ExecutionReport, InvariantViolation, MatchingErro
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DurableRecoveryReport {
     /// Physical frame recovery performed by the journal.
-    pub journal: RecoveryReport,
+    pub journal: StorageRecoveryReport,
     /// Commands reconstructed from complete command/report pairs.
     pub replayed_commands: u64,
     /// Whether a final durable command lacked a report and was completed.
@@ -31,6 +33,8 @@ pub struct DurableRecoveryReport {
 pub enum DurableError {
     /// Journal framing, recovery, codec, or I/O failure.
     Journal(JournalError),
+    /// Segmented-journal inventory, rotation, framing, recovery, or I/O failure.
+    SegmentedJournal(SegmentedJournalError),
     /// Matching operational error.
     Matching(MatchingError),
     /// Reconstructed book structure violated an internal invariant.
@@ -89,6 +93,7 @@ impl fmt::Display for DurableError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Journal(error) => error.fmt(formatter),
+            Self::SegmentedJournal(error) => error.fmt(formatter),
             Self::Matching(error) => error.fmt(formatter),
             Self::Invariant(error) => error.fmt(formatter),
             Self::DefinitionRecordRequired { sequence, actual } => write!(
@@ -143,6 +148,7 @@ impl std::error::Error for DurableError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Journal(error) => Some(error),
+            Self::SegmentedJournal(error) => Some(error),
             Self::Matching(error) => Some(error),
             Self::Invariant(error) => Some(error),
             _ => None,
@@ -156,6 +162,21 @@ impl From<JournalError> for DurableError {
     }
 }
 
+impl From<SegmentedJournalError> for DurableError {
+    fn from(error: SegmentedJournalError) -> Self {
+        Self::SegmentedJournal(error)
+    }
+}
+
+impl From<StorageError> for DurableError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::Journal(error) => Self::Journal(error),
+            StorageError::Segmented(error) => Self::SegmentedJournal(error),
+        }
+    }
+}
+
 impl From<MatchingError> for DurableError {
     fn from(error: MatchingError) -> Self {
         Self::Matching(error)
@@ -166,7 +187,7 @@ impl From<MatchingError> for DurableError {
 #[derive(Debug)]
 pub struct DurableOrderBook {
     book: OrderBook,
-    journal: Journal,
+    journal: StorageWriter,
     recovery: DurableRecoveryReport,
     poisoned: bool,
 }
@@ -185,13 +206,41 @@ impl DurableOrderBook {
         definition: InstrumentDefinition,
         options: JournalOptions,
     ) -> Result<Self, DurableError> {
-        let path = path.as_ref();
-        let mut journal = Journal::open(path, options)?;
+        Self::open_storage(path.as_ref(), definition, StorageOptions::Single(options))
+    }
+
+    /// Opens a matching shard over an automatically rotating WAL directory.
+    ///
+    /// Recovery streams all strictly verified closed segments and the active
+    /// segment as one globally sequenced journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] for segmented storage, grammar, matching, or
+    /// deterministic replay failure.
+    pub fn open_segmented(
+        directory: impl AsRef<Path>,
+        definition: InstrumentDefinition,
+        options: SegmentedJournalOptions,
+    ) -> Result<Self, DurableError> {
+        Self::open_storage(
+            directory.as_ref(),
+            definition,
+            StorageOptions::Segmented(options),
+        )
+    }
+
+    fn open_storage(
+        path: &Path,
+        definition: InstrumentDefinition,
+        options: StorageOptions,
+    ) -> Result<Self, DurableError> {
+        let mut journal = StorageWriter::open(path, options)?;
         let journal_recovery = journal.recovery();
         if journal_recovery.last_sequence.is_none() {
             journal.append(&definition)?;
         }
-        let mut reader = JournalReader::open(path, options)?;
+        let mut reader = StorageReader::open(path, options)?;
         let Some(definition_frame) = reader.next().transpose()? else {
             return Err(DurableError::DefinitionRecordMissing);
         };
@@ -307,7 +356,7 @@ impl DurableOrderBook {
         }
         if let Err(error) = self.journal.append(&command) {
             self.poisoned = self.journal.is_poisoned();
-            return Err(DurableError::Journal(error));
+            return Err(error.into());
         }
         let report = match self.book.submit(command) {
             Ok(report) => report,
@@ -318,7 +367,7 @@ impl DurableOrderBook {
         };
         if let Err(error) = self.journal.append(&report) {
             self.poisoned = true;
-            return Err(DurableError::Journal(error));
+            return Err(error.into());
         }
         Ok(report)
     }
@@ -334,7 +383,7 @@ impl DurableOrderBook {
         }
         if let Err(error) = self.journal.sync_all() {
             self.poisoned = true;
-            return Err(DurableError::Journal(error));
+            return Err(error.into());
         }
         Ok(())
     }
@@ -350,6 +399,6 @@ impl DurableOrderBook {
         if self.poisoned {
             return Err(DurableError::Poisoned);
         }
-        self.journal.close().map_err(DurableError::Journal)
+        self.journal.close().map_err(Into::into)
     }
 }

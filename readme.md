@@ -165,6 +165,10 @@ reservation release, market-data reconstruction, settlement and arithmetic
 rollback, stable wire layouts, corruption and torn-tail handling, concurrent
 writer exclusion, injected write and barrier failures, forced process
 termination, recovery equivalence, and replay-divergence detection.
+Segmented-storage tests additionally force record-by-record and whole-batch
+rotation, cross-segment matching/risk/ledger replay, strict closed-segment
+corruption handling, active-tail repair, manager exclusion, and interrupted
+empty-segment recovery.
 
 ## Complexity
 
@@ -183,6 +187,9 @@ events and `O(1)` for no-change events. Publisher bootstrap is `O(O log O + P)`,
 a full-depth snapshot is `O(P)`, and a complete publisher cross-audit is
 `O(O log O + P)`.
 
-WAL scanning is `O(B)` for `B` persisted bytes. Appending a frame performs
-`O(F)` checksum and copy work for frame length `F`; a `JournalBatch` amortizes
-one write and one configured durability barrier across multiple frames.
+WAL scanning is `O(B + S)` for `B` persisted bytes across `S` physical segments.
+A segmented reader retains `O(S)` descriptors and one bounded payload rather
+than the complete WAL. Appending a frame performs `O(F)` checksum and copy work
+for frame length `F`; a `JournalBatch` amortizes one write and one configured
+durability barrier across multiple frames. Rotation adds one closing barrier,
+exclusive file creation, and a parent-directory barrier at a size boundary.

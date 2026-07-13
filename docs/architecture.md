@@ -181,7 +181,7 @@ collateral from ledger balances.
 ## Journal and recovery invariants
 
 1. Every frame carries `QWAL` magic, format version, typed record kind, bounded
-   payload length, CRC-32C, and contiguous segment sequence.
+   payload length, CRC-32C, and a contiguous global sequence.
 2. CRC-32C covers the complete header with its checksum field zeroed plus the
    payload.
 3. Payload allocation occurs only after the declared length is checked against
@@ -216,6 +216,22 @@ collateral from ledger balances.
 15. The default append acknowledgement is `SyncAll`. Partial writes, failed
     barriers, and failed explicit synchronization poison the writer; injected
     failures verify complete-prefix recovery and ambiguous complete-frame replay.
+16. A segmented directory has one versioned `QSEG` marker binding capacity,
+    initial sequence, and payload limit; one canonical manager lease excludes
+    other managers and raw member-file writers.
+17. Rotation completes encoding, capacity, length, and sequence-space preflight
+    before closing the active file. A frame or batch is placed wholly in one
+    segment and names the next segment by its first global sequence.
+18. Every closed segment is nonempty and scanned strictly. Only the final
+    segment can be empty or can repair a physically incomplete tail; no closed
+    corruption is repaired or skipped.
+19. Interruption between next-segment creation and append can leave one empty
+    final file. Reopen validates its expected start sequence and reuses it.
+20. Matching, risk, and ledger segmented recovery streams one segment at a time
+    while applying the same logical record grammars as single-file recovery.
+21. Explicit incomplete-initialization recovery removes an invalid `QSEG`
+    marker only under manager ownership and only when no segment or unknown
+    persistent entry exists; a valid marker is immutable.
 
 The authoritative version-1 framing and payload schema is
 [WAL format version 1](wal-v1.md). Filesystem and device assumptions are bounded
@@ -229,9 +245,10 @@ operations. Matching state, risk reservations/positions, and ledger balances
 can be reconstructed from verified local WALs. Public depth can bootstrap from
 that recovered matching state; consumers repair an incremental gap with a
 newer full-depth snapshot. Forced-process-termination, concurrent-writer,
-abandoned/malformed-lease, injected-write/barrier, torn-report, metadata-prefix,
-replay-divergence, entry-reconstruction, feed-gap, and publisher cross-audit
-tests exercise these paths. There is no claim of
+abandoned/malformed-lease, injected-write/barrier, exact-boundary/batch rotation,
+closed-segment corruption, active-tail repair, cross-segment replay, torn-report,
+metadata-prefix, replay-divergence, entry-reconstruction, feed-gap, and publisher
+cross-audit tests exercise these paths. There is no claim of
 replicated durability, remote consensus, snapshot recovery, or storage-device
 power-loss behavior.
 
@@ -258,7 +275,7 @@ power-loss behavior.
 
 | Impact | Capability | Evidence required for completion |
 |---|---|---|
-| High | Durable storage completion | automatic segment rotation/retention; kernel inode locking or qualified alias exclusion; forced-power-loss filesystem/device evidence |
+| High | Durable storage completion | segment retention/archival with deletion fencing; kernel inode locking or qualified alias exclusion; forced-power-loss filesystem/device evidence |
 | High | Ledger reconciliation and checkpoints | independent trial balances, external statement reconciliation, checkpoint proofs, corrections, and bounded restart time |
 | High | Snapshots and compaction | checksummed state snapshots, WAL cutover proof, bounded restart time, and retained audit history |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |

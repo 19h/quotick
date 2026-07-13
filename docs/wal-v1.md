@@ -20,6 +20,32 @@ CRC-32C uses the reflected Castagnoli polynomial `0x82F63B78`, initial state
 `0xFFFFFFFF`, and final XOR `0xFFFFFFFF`. The checksum covers the complete
 header with bytes 12–15 set to zero, followed by the payload.
 
+## Segmented-directory marker version 1
+
+Segmentation does not alter `QWAL` frames or their global sequence. A segmented
+WAL is a dedicated directory containing `format.qseg` and canonical files named
+`segment-SSSSSSSSSSSSSSSSSSSS.qwal`, where the 20 decimal digits encode the
+first frame sequence assigned to that file.
+
+The 26-byte `format.qseg` marker is:
+
+| Offset (bytes) | Width (bytes) | Field |
+|---:|---:|---|
+| 0 | 4 | ASCII magic `QSEG` |
+| 4 | 2 | marker version `1` |
+| 6 | 8 | maximum segment bytes `u64` |
+| 14 | 8 | initial global sequence `u64` |
+| 22 | 4 | maximum payload bytes `u32` |
+
+All marker integers are little-endian. These three configuration values are
+immutable for the directory. The active acknowledgement policy and recovery
+mode are intentionally not persisted because they do not change frame or
+segment interpretation.
+
+An invalid partial marker is recoverable only while no segment or unknown
+directory entry exists. A valid marker is never removed by incomplete-
+initialization recovery.
+
 ## Scalar notation
 
 - `u8`, `u32`, `u64`, `u128`, `i64`, `i128`: fixed-width integers.
@@ -133,6 +159,15 @@ A frame is authoritative only after its header, declared payload, CRC-32C, and
 expected sequence verify. Repair mode may truncate bytes beginning at an
 incomplete final frame. It never repairs or skips a complete corrupt frame.
 
+Across a segmented directory, canonical filenames are sorted by their encoded
+start sequence and frames remain one contiguous global sequence. Every
+non-final file is scanned in strict mode and must contain at least one frame.
+Only the final file may be empty or may repair a physically incomplete tail.
+The final empty-file case represents interruption between segment creation and
+the first append and is reused on reopen. A frame or grouped append larger than
+the configured segment capacity is rejected before rotation; grouped appends
+are placed wholly within one segment.
+
 A matching journal begins with exactly one instrument-definition record. The
 remaining grammar is alternating command and execution-report records, with at
 most one final command lacking a report. An empty journal is initialized by
@@ -152,10 +187,11 @@ reservations are reconstructed deterministically.
 
 ## Writer ownership and acknowledgement
 
-The `QWAL` frame format does not encode writer ownership. Before opening a WAL,
-the runtime atomically creates the canonical-path sidecar lease specified in the
-[Local storage contract](storage.md). Lease framing has its own `QLCK` magic and
-version and is not a journal record.
+The `QWAL` frame format does not encode writer ownership. Before opening a raw
+WAL, the runtime atomically creates the canonical-path sidecar lease specified
+in the [Local storage contract](storage.md). A segmented directory instead has
+one manager lease and rejects raw writers for its member files. Lease framing
+has its own `QLCK` magic and version and is not a journal record.
 
 `SyncAll` is the default append policy. A receipt states which configured
 barrier returned successfully; it does not alter frame bytes. Any partial write

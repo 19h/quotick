@@ -28,9 +28,14 @@ use crate::ledger::JournalEntry;
 use crate::matching::{Command, ExecutionReport};
 use crate::risk::AccountRiskDefinition;
 
+pub use crate::segmented_journal::{
+    SegmentDescriptor, SegmentedAppendReceipt, SegmentedJournal, SegmentedJournalError,
+    SegmentedJournalOptions, SegmentedJournalReader, SegmentedRecoveryReport,
+};
+
 const MAGIC: [u8; 4] = *b"QWAL";
 const FORMAT_VERSION: u16 = 1;
-const HEADER_LENGTH: usize = 24;
+pub(crate) const HEADER_LENGTH: usize = 24;
 const CHECKSUM_START: usize = 12;
 const CHECKSUM_END: usize = 16;
 const DEFAULT_MAX_PAYLOAD_LENGTH: u32 = 16 * 1024 * 1024;
@@ -39,6 +44,7 @@ const CRC32C_TABLE: [u32; 256] = make_crc32c_table();
 const LEASE_MAGIC: [u8; 4] = *b"QLCK";
 const LEASE_VERSION: u16 = 1;
 const LEASE_LENGTH: usize = 34;
+pub(crate) const SEGMENT_DIRECTORY_MARKER: &str = "format.qseg";
 static NEXT_LEASE_NONCE: AtomicU64 = AtomicU64::new(1);
 
 /// Stable type identifier for a journal payload.
@@ -209,6 +215,34 @@ pub struct RecoveryReport {
     pub truncated_bytes: u64,
 }
 
+/// Physical layout represented by a durable-runtime recovery report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JournalLayout {
+    /// One append-only file and one writer lease.
+    SingleFile,
+    /// A marker-bound directory of size-limited files and one manager lease.
+    Segmented,
+}
+
+/// Layout-independent physical recovery summary used by durable runtimes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StorageRecoveryReport {
+    /// Physical storage layout opened by the runtime.
+    pub layout: JournalLayout,
+    /// First configured global frame sequence.
+    pub first_sequence: u64,
+    /// Last verified global frame sequence, or `None` for empty storage.
+    pub last_sequence: Option<u64>,
+    /// Sum of bytes covered by complete verified frames.
+    pub valid_bytes: u128,
+    /// Bytes removed from the only tail eligible for repair.
+    pub truncated_bytes: u64,
+    /// Number of physical files, including an empty active file.
+    pub segment_count: u64,
+    /// First global sequence assigned to the active physical file.
+    pub active_segment_start: u64,
+}
+
 /// Successful append metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AppendReceipt {
@@ -283,6 +317,34 @@ impl JournalBatch {
     /// Removes all records while retaining allocated batch capacity.
     pub fn clear(&mut self) {
         self.records.clear();
+    }
+
+    pub(crate) fn encoded_frame_length(
+        &self,
+        maximum_payload_length: u32,
+    ) -> Result<u64, JournalError> {
+        let mut total = 0_u64;
+        for record in &self.records {
+            let payload_length =
+                u32::try_from(record.payload.len()).map_err(|_| JournalError::PayloadTooLarge {
+                    length: record.payload.len(),
+                    maximum: maximum_payload_length,
+                })?;
+            if payload_length > maximum_payload_length {
+                return Err(JournalError::PayloadTooLarge {
+                    length: record.payload.len(),
+                    maximum: maximum_payload_length,
+                });
+            }
+            let frame_length = u64::try_from(HEADER_LENGTH)
+                .map_err(|_| JournalError::FrameLengthOverflow)?
+                .checked_add(u64::from(payload_length))
+                .ok_or(JournalError::FrameLengthOverflow)?;
+            total = total
+                .checked_add(frame_length)
+                .ok_or(JournalError::FrameLengthOverflow)?;
+        }
+        Ok(total)
     }
 }
 
@@ -392,6 +454,11 @@ pub enum JournalError {
     },
     /// No unique process-local writer-lease nonce remains representable.
     WriterLeaseIdentityExhausted,
+    /// A raw writer attempted to open a file owned by a segmented-journal manager.
+    ManagedSegment {
+        /// Marker proving that the parent is a dedicated segmented directory.
+        marker_path: PathBuf,
+    },
     /// Segment sequence zero is invalid.
     InvalidInitialSequence,
     /// No subsequent `u64` sequence can be represented.
@@ -490,6 +557,11 @@ impl fmt::Display for JournalError {
             Self::WriterLeaseIdentityExhausted => {
                 formatter.write_str("writer lease identity space exhausted")
             }
+            Self::ManagedSegment { marker_path } => write!(
+                formatter,
+                "raw journal writer is forbidden inside segmented directory {}",
+                marker_path.display()
+            ),
             Self::InvalidInitialSequence => {
                 formatter.write_str("initial journal sequence must be non-zero")
             }
@@ -564,14 +636,18 @@ impl From<io::Error> for JournalError {
 }
 
 #[derive(Debug)]
-struct WriterLease {
+pub(crate) struct WriterLease {
     path: PathBuf,
     owner: WriterLeaseOwner,
     file: Option<File>,
 }
 
 impl WriterLease {
-    fn acquire(journal_path: &Path) -> Result<Self, JournalError> {
+    pub(crate) const fn owner(&self) -> WriterLeaseOwner {
+        self.owner
+    }
+
+    pub(crate) fn acquire(journal_path: &Path) -> Result<Self, JournalError> {
         let path = writer_lease_path(journal_path);
         let nonce = next_lease_nonce()?;
         let owner = WriterLeaseOwner {
@@ -616,7 +692,7 @@ impl WriterLease {
         })
     }
 
-    fn release(&mut self) -> Result<(), JournalError> {
+    pub(crate) fn release(&mut self) -> Result<(), JournalError> {
         self.file.take();
         let current = match read_writer_lease(&self.path) {
             Ok(owner) => owner,
@@ -643,7 +719,7 @@ impl Drop for WriterLease {
     }
 }
 
-fn normalize_journal_path(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn normalize_journal_path(path: &Path) -> io::Result<PathBuf> {
     match fs::canonicalize(path) {
         Ok(path) => Ok(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -686,7 +762,7 @@ fn writer_lease_path(journal_path: &Path) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn sync_parent(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     File::open(parent)?.sync_all()
 }
@@ -739,7 +815,7 @@ fn read_writer_lease(path: &Path) -> Result<WriterLeaseOwner, JournalError> {
 pub struct Journal {
     path: PathBuf,
     file: File,
-    writer_lease: WriterLease,
+    writer_lease: Option<WriterLease>,
     options: JournalOptions,
     recovery: RecoveryReport,
     next_sequence: u64,
@@ -768,11 +844,34 @@ impl Journal {
     /// unsupported framing, oversized payloads, an existing writer lease, or a
     /// strict-mode torn tail.
     pub fn open(path: impl AsRef<Path>, options: JournalOptions) -> Result<Self, JournalError> {
+        Self::open_internal(path.as_ref(), options, false)
+    }
+
+    pub(crate) fn open_managed(path: &Path, options: JournalOptions) -> Result<Self, JournalError> {
+        Self::open_internal(path, options, true)
+    }
+
+    fn open_internal(
+        path: &Path,
+        options: JournalOptions,
+        managed: bool,
+    ) -> Result<Self, JournalError> {
         if options.initial_sequence == 0 {
             return Err(JournalError::InvalidInitialSequence);
         }
-        let path = normalize_journal_path(path.as_ref())?;
-        let writer_lease = WriterLease::acquire(&path)?;
+        let path = normalize_journal_path(path)?;
+        let marker_path = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(SEGMENT_DIRECTORY_MARKER);
+        if !managed && marker_path.exists() {
+            return Err(JournalError::ManagedSegment { marker_path });
+        }
+        let writer_lease = if managed {
+            None
+        } else {
+            Some(WriterLease::acquire(&path)?)
+        };
         let (mut file, created) = match OpenOptions::new()
             .read(true)
             .write(true)
@@ -817,9 +916,18 @@ impl Journal {
     }
 
     /// Returns the diagnostic identity of this journal's exclusive writer lease.
+    ///
+    /// # Panics
+    ///
+    /// This cannot panic for a [`Journal`] returned by the public [`Journal::open`]
+    /// constructor. Internally managed segment writers do not have per-file
+    /// leases and are never exposed as raw [`Journal`] values.
     #[must_use]
     pub const fn writer_lease_owner(&self) -> WriterLeaseOwner {
-        self.writer_lease.owner
+        match &self.writer_lease {
+            Some(writer_lease) => writer_lease.owner(),
+            None => panic!("managed journals are not exposed as raw Journal values"),
+        }
     }
 
     /// Resolves the canonical writer-lease sidecar path for a journal.
@@ -1085,8 +1193,14 @@ impl Journal {
     /// synchronization/release operation fails.
     pub fn close(mut self) -> Result<(), JournalError> {
         self.sync_all()?;
-        self.writer_lease.release()?;
+        if let Some(writer_lease) = &mut self.writer_lease {
+            writer_lease.release()?;
+        }
         Ok(())
+    }
+
+    pub(crate) const fn current_offset(&self) -> u64 {
+        self.offset
     }
 
     fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {

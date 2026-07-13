@@ -13,12 +13,14 @@ pub mod domain;
 pub mod durable;
 pub mod durable_ledger;
 pub mod durable_risk;
+mod durable_storage;
 pub mod instrument;
 pub mod journal;
 pub mod ledger;
 pub mod market_data;
 pub mod matching;
 pub mod risk;
+mod segmented_journal;
 
 pub use domain::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,

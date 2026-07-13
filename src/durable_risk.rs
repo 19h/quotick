@@ -8,9 +8,11 @@ use std::fmt;
 use std::path::Path;
 
 use crate::domain::{InstrumentId, InstrumentVersion};
+use crate::durable_storage::{StorageError, StorageOptions, StorageReader, StorageWriter};
 use crate::instrument::InstrumentDefinition;
 use crate::journal::{
-    Journal, JournalError, JournalFrame, JournalOptions, JournalReader, RecordKind, RecoveryReport,
+    JournalError, JournalFrame, JournalOptions, RecordKind, SegmentedJournalError,
+    SegmentedJournalOptions, StorageRecoveryReport,
 };
 use crate::matching::{Command, ExecutionReport, MatchingError};
 use crate::risk::{AccountRiskDefinition, RiskError, RiskInvariantViolation, RiskManagedOrderBook};
@@ -19,7 +21,7 @@ use crate::risk::{AccountRiskDefinition, RiskError, RiskInvariantViolation, Risk
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DurableRiskRecoveryReport {
     /// Physical frame recovery performed by the journal.
-    pub journal: RecoveryReport,
+    pub journal: StorageRecoveryReport,
     /// Complete command/report pairs replayed.
     pub replayed_commands: u64,
     /// Profiles appended to complete interrupted metadata initialization.
@@ -33,6 +35,8 @@ pub struct DurableRiskRecoveryReport {
 pub enum DurableRiskError {
     /// Journal framing, codec, I/O, or recovery failure.
     Journal(JournalError),
+    /// Segmented-journal inventory, rotation, framing, recovery, or I/O failure.
+    SegmentedJournal(SegmentedJournalError),
     /// Matching operational failure.
     Matching(MatchingError),
     /// Risk-profile validation failure.
@@ -100,6 +104,7 @@ impl fmt::Display for DurableRiskError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Journal(error) => error.fmt(formatter),
+            Self::SegmentedJournal(error) => error.fmt(formatter),
             Self::Matching(error) => error.fmt(formatter),
             Self::Risk(error) => error.fmt(formatter),
             Self::Invariant(error) => error.fmt(formatter),
@@ -160,6 +165,7 @@ impl std::error::Error for DurableRiskError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Journal(error) => Some(error),
+            Self::SegmentedJournal(error) => Some(error),
             Self::Matching(error) => Some(error),
             Self::Risk(error) => Some(error),
             Self::Invariant(error) => Some(error),
@@ -171,6 +177,21 @@ impl std::error::Error for DurableRiskError {
 impl From<JournalError> for DurableRiskError {
     fn from(error: JournalError) -> Self {
         Self::Journal(error)
+    }
+}
+
+impl From<SegmentedJournalError> for DurableRiskError {
+    fn from(error: SegmentedJournalError) -> Self {
+        Self::SegmentedJournal(error)
+    }
+}
+
+impl From<StorageError> for DurableRiskError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::Journal(error) => Self::Journal(error),
+            StorageError::Segmented(error) => Self::SegmentedJournal(error),
+        }
     }
 }
 
@@ -190,17 +211,17 @@ impl From<RiskError> for DurableRiskError {
 #[derive(Debug)]
 pub struct DurableRiskOrderBook {
     managed: RiskManagedOrderBook,
-    journal: Journal,
+    journal: StorageWriter,
     recovery: DurableRiskRecoveryReport,
     poisoned: bool,
 }
 
 struct OpenedRiskJournal {
-    journal: Journal,
-    reader: JournalReader,
+    journal: StorageWriter,
+    reader: StorageReader,
     first_data_frame: Option<JournalFrame>,
     reader_exhausted: bool,
-    recovery: RecoveryReport,
+    recovery: StorageRecoveryReport,
     completed_profile_records: u64,
 }
 
@@ -221,8 +242,41 @@ impl DurableRiskOrderBook {
         profiles: &[AccountRiskDefinition],
         options: JournalOptions,
     ) -> Result<Self, DurableRiskError> {
+        Self::open_storage(
+            path.as_ref(),
+            definition,
+            profiles,
+            StorageOptions::Single(options),
+        )
+    }
+
+    /// Opens a risk-managed matching shard over an automatically rotating WAL directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableRiskError`] for segmented storage, metadata, risk,
+    /// matching, grammar, or deterministic replay failure.
+    pub fn open_segmented(
+        directory: impl AsRef<Path>,
+        definition: InstrumentDefinition,
+        profiles: &[AccountRiskDefinition],
+        options: SegmentedJournalOptions,
+    ) -> Result<Self, DurableRiskError> {
+        Self::open_storage(
+            directory.as_ref(),
+            definition,
+            profiles,
+            StorageOptions::Segmented(options),
+        )
+    }
+
+    fn open_storage(
+        path: &Path,
+        definition: InstrumentDefinition,
+        profiles: &[AccountRiskDefinition],
+        options: StorageOptions,
+    ) -> Result<Self, DurableRiskError> {
         let profiles = canonical_profiles(profiles)?;
-        let path = path.as_ref();
         let OpenedRiskJournal {
             mut journal,
             mut reader,
@@ -336,7 +390,7 @@ impl DurableRiskOrderBook {
         }
         if let Err(error) = self.journal.append(&command) {
             self.poisoned = self.journal.is_poisoned();
-            return Err(DurableRiskError::Journal(error));
+            return Err(error.into());
         }
         let report = match self.managed.submit(command) {
             Ok(report) => report,
@@ -347,7 +401,7 @@ impl DurableRiskOrderBook {
         };
         if let Err(error) = self.journal.append(&report) {
             self.poisoned = true;
-            return Err(DurableRiskError::Journal(error));
+            return Err(error.into());
         }
         Ok(report)
     }
@@ -363,7 +417,7 @@ impl DurableRiskOrderBook {
         }
         if let Err(error) = self.journal.sync_all() {
             self.poisoned = true;
-            return Err(DurableRiskError::Journal(error));
+            return Err(error.into());
         }
         Ok(())
     }
@@ -379,7 +433,7 @@ impl DurableRiskOrderBook {
         if self.poisoned {
             return Err(DurableRiskError::Poisoned);
         }
-        self.journal.close().map_err(DurableRiskError::Journal)
+        self.journal.close().map_err(Into::into)
     }
 }
 
@@ -387,15 +441,15 @@ fn open_risk_metadata(
     path: &Path,
     definition: InstrumentDefinition,
     profiles: &[AccountRiskDefinition],
-    options: JournalOptions,
+    options: StorageOptions,
 ) -> Result<OpenedRiskJournal, DurableRiskError> {
-    let mut journal = Journal::open(path, options)?;
+    let mut journal = StorageWriter::open(path, options)?;
     let recovery = journal.recovery();
     if recovery.last_sequence.is_none() {
         journal.append(&definition)?;
     }
 
-    let mut reader = JournalReader::open(path, options)?;
+    let mut reader = StorageReader::open(path, options)?;
     let Some(definition_frame) = reader.next().transpose()? else {
         return Err(DurableRiskError::DefinitionRecordMissing);
     };
