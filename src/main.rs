@@ -1,126 +1,117 @@
-use std::fs::OpenOptions;
-use std::io::Read;
+// quotick/src/main.rs
+use anyhow::Result;
+use quotick::prelude::*;
+use std::fs;
+use std::path::Path;
 
-use serde_derive::{Deserialize, Serialize};
+const TEST_DATA_DIR: &str = "./test_data/qtb-db";
+const OUTPUT_FILE: &str = "./test_data/qtb-db/example.qtb";
 
-use quotick::quotick::Quotick;
-
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-struct Trade {
-    size: u32,
-    price: u32,
+/// Generates a sample OHLCV record for a given instrument ID and timestamp.
+fn make_ohlcv_record(instrument_id: u32, ts_event: u64) -> OhlcvMsg {
+    OhlcvMsg::new(
+        1, // publisher_id
+        instrument_id,
+        ts_event,
+        15000, // open: Prices are fixed-point integers
+        15100, // high
+        14900, // low
+        15050, // close
+        1_000_000, // volume
+    )
 }
 
-impl quotick::tick::Tick for Trade {
-    #[inline(always)]
-    fn epoch(&self, time: u64) -> u64 {
-        // one day
-        time / 86_400_000_000_000
-    }
-}
+/// Creates and writes a sample `.qtb` file.
+fn write_example_file() -> Result<()> {
+    println!("--- Writing Example QTB File ---");
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct TestDataTrade {
-    #[serde(rename = "T")]
-    T: Option<String>,
-    // AAPL
-    #[serde(rename = "t")]
-    t: i64,
-    // 1547787608999125800
-    #[serde(rename = "y")]
-    y: Option<i64>,
-    // 1547787608999125800
-    #[serde(rename = "f")]
-    f: Option<i64>,
-    // 1547787608999125800
-    #[serde(rename = "q")]
-    q: i64,
-    // 23547
-    #[serde(rename = "i")]
-    i: String,
-    // 00MGON
-    #[serde(rename = "x")]
-    x: i64,
-    // 11
-    #[serde(rename = "s")]
-    s: i64,
-    // 100
-    #[serde(rename = "c")]
-    c: Option<Vec<i64>>,
-    #[serde(rename = "p")]
-    p: Option<f32>,
-    // 223.001
-    #[serde(rename = "z")]
-    z: i64,              // 1
-}
-
-#[inline(always)]
-fn run(ticks: &[TestDataTrade]) {
-    let mut quotick =
-        Quotick::<Trade>::new(
-            "SYMBL",
-            "./test_data/qt-db",
-        )
-            .expect("Could not open test database.");
-
-    for tick in ticks {
-        if let Some(_) = tick.p {
-            //let p = tick.p.unwrap();
-
-            //println!("{} {} {} = ${}", tick.t, tick.s, p, tick.s as f64 * p as f64);
-        }
-
-        quotick.insert(
-            &quotick::Frame::new(
-                tick.t as u64,
-                Trade {
-                    size: tick.s as u32,
-                    price: match tick.p {
-                        Some(p) => p as u32,
-                        None => { continue; }
-                    },
-                },
-            )
-        );
+    // Ensure the output directory exists
+    let path = Path::new(OUTPUT_FILE);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
 
-    quotick.persist();
+    let symbols = &["AAPL", "MSFT"];
+    let mut store = QtbStore::file_create(path, Schema::Ohlcv, symbols)?;
 
-    quotick
-        .epochs()
-        .for_each(
-            |mut epoch| {
-                epoch
-                    .frames()
-                    .for_each(
-                        |frame| {
-                            frame.time();
-                        },
-                    );
-            }
-        );
+    println!("Created store for symbols: {:?}", symbols);
 
-    dbg!(quotick.oldest_frame());
-    dbg!(quotick.newest_frame());
+    let mut records = Vec::new();
+    let base_ts = 1672531200_000_000_000; // 2023-01-01 00:00:00 UTC
+
+    // Generate 5 records for AAPL (instrument_id 1)
+    for i in 0..5 {
+        records.push(make_ohlcv_record(1, base_ts + i * 1_000_000_000));
+    }
+    // Generate 5 records for MSFT (instrument_id 2)
+    for i in 0..5 {
+        records.push(make_ohlcv_record(2, base_ts + i * 1_000_000_000));
+    }
+
+    for record in &records {
+        store.write_record(record)?;
+    }
+    println!("Wrote {} records.", records.len());
+
+    store.finish()?;
+    println!("Finalized and closed file: {}", OUTPUT_FILE);
+    println!();
+    Ok(())
 }
 
-fn main() {
-    let mut file =
-        OpenOptions::new()
-            .read(true)
-            .write(false)
-            .open("./test_data/test_data")
-            .expect("Could not open ./test_data/test_data for reading.");
+/// Reads and verifies the sample `.qtb` file.
+fn read_example_file() -> Result<()> {
+    println!("--- Reading Example QTB File ---");
 
-    let mut test_data = Vec::<u8>::new();
+    let store = QtbStore::file_open(OUTPUT_FILE)?;
+    let metadata = store.metadata();
 
-    file.read_to_end(&mut test_data);
+    println!("Successfully opened file and parsed metadata.");
+    println!("  Version: {}", metadata.version());
+    println!("  Schema: {}", metadata.schema());
+    println!("  Symbols: {:?}", metadata.symbols);
+    println!(
+        "  Timestamp range: {} to {}",
+        metadata.start(),
+        metadata.end()
+    );
+    println!("  Record count: {}", store.record_count());
+    println!();
 
-    let ticks =
-        bincode::deserialize::<Vec<TestDataTrade>>(
-            &test_data,
-        )
-            .expect("Could not parse test data.");
+    let mut record_count = 0;
+    println!("Iterating through OHLCV records...");
+    // Use the safe, borrowing iterator `iter`
+    for record_result in store.iter::<OhlcvMsg>() {
+        let record = record_result?;
+        println!(
+            "  Read record for instrument_id {}: {:?}",
+            record.header().instrument_id(),
+            record
+        );
+        record_count += 1;
+    }
 
-    run(&ticks);
+    println!(
+        "\nFinished reading. Total records processed: {}",
+        record_count
+    );
+    assert_eq!(
+        record_count, 10,
+        "Mismatch in record count"
+    );
+    println!("Record count verified successfully.");
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    // Clean up previous runs if necessary
+    if Path::new(TEST_DATA_DIR).exists() {
+        fs::remove_dir_all(TEST_DATA_DIR)?;
+    }
+
+    write_example_file()?;
+    read_example_file()?;
+
+    println!("\n✅ QTB round-trip example completed successfully!");
+    Ok(())
 }
