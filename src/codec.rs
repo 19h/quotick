@@ -1186,7 +1186,7 @@ impl BinaryCodec for ExecutionReport {
         Ok(Self {
             command_id: report_command_id,
             outcome,
-            events,
+            events: events.into(),
             replayed,
         })
     }

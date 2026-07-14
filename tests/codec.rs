@@ -414,6 +414,36 @@ fn execution_reports_round_trip_without_losing_trace_information() {
 }
 
 #[test]
+fn execution_report_codec_has_a_stable_little_endian_layout() {
+    let command_id = id(CommandId::new(1));
+    let report = ExecutionReport {
+        command_id,
+        outcome: CommandOutcome::Rejected(RejectReason::UnknownOrder),
+        events: vec![Event {
+            sequence: 1,
+            command_id,
+            occurred_at: TimestampNs::from_unix_nanos(1),
+            kind: EventKind::CommandRejected(RejectReason::UnknownOrder),
+        }]
+        .into(),
+        replayed: false,
+    };
+    assert_eq!(
+        report.encode().unwrap(),
+        vec![
+            1, 0, 0, 0, 0, 0, 0, 0, // command identifier
+            1, 2, // rejected outcome and UnknownOrder
+            0, // not replayed
+            1, 0, 0, 0, // one event
+            1, 0, 0, 0, 0, 0, 0, 0, // event sequence
+            1, 0, 0, 0, 0, 0, 0, 0, // event command identifier
+            1, 0, 0, 0, 0, 0, 0, 0, // event timestamp
+            6, 2, // CommandRejected and UnknownOrder
+        ]
+    );
+}
+
+#[test]
 fn report_decoder_rejects_cross_field_outcome_contradictions() {
     let command_id = id(CommandId::new(1));
     let invalid = ExecutionReport {
@@ -424,7 +454,8 @@ fn report_decoder_rejects_cross_field_outcome_contradictions() {
             command_id,
             occurred_at: TimestampNs::from_unix_nanos(1),
             kind: EventKind::CommandRejected(RejectReason::UnknownOrder),
-        }],
+        }]
+        .into(),
         replayed: false,
     };
     let bytes = invalid.encode().expect("structurally encodable report");
@@ -478,7 +509,8 @@ fn every_rejection_reason_has_a_stable_round_trip() {
                 command_id,
                 occurred_at: TimestampNs::from_unix_nanos(1),
                 kind: EventKind::CommandRejected(reason),
-            }],
+            }]
+            .into(),
             replayed: false,
         };
         let bytes = report.encode().expect("rejection report encodes");
@@ -560,7 +592,7 @@ fn every_event_variant_round_trips() {
             cancelled_quantity_lots: 26,
         },
     ];
-    let events = kinds
+    let events: Vec<Event> = kinds
         .into_iter()
         .enumerate()
         .map(|(index, kind)| Event {
@@ -573,7 +605,7 @@ fn every_event_variant_round_trips() {
     let report = ExecutionReport {
         command_id,
         outcome: CommandOutcome::Accepted,
-        events,
+        events: events.into(),
         replayed: false,
     };
     let bytes = report.encode().expect("all event variants encode");
@@ -590,7 +622,8 @@ fn every_event_variant_round_trips() {
             command_id,
             occurred_at: TimestampNs::from_unix_nanos(20),
             kind: EventKind::CommandRejected(RejectReason::PostOnlyWouldCross),
-        }],
+        }]
+        .into(),
         replayed: false,
     };
     let bytes = rejected.encode().expect("rejection encodes");

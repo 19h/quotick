@@ -412,7 +412,7 @@ fn publisher_rejects_mass_cancel_summary_divergence() {
     let EventKind::MassCancelCompleted {
         cancelled_quantity_lots,
         ..
-    } = &mut report.events.last_mut().unwrap().kind
+    } = &mut report.events.make_mut().last_mut().unwrap().kind
     else {
         panic!("mass cancel must end with its completion event");
     };
@@ -436,9 +436,10 @@ fn publisher_rejects_noncanonical_mass_cancel_order_sequence() {
     let mut publisher = MarketDataPublisher::from_book(&book).unwrap();
     let command = mass_cancel(3, 11, MassCancelScope::All);
     let mut report = book.submit(command).unwrap();
-    let first = report.events[0].kind;
-    report.events[0].kind = report.events[1].kind;
-    report.events[1].kind = first;
+    let events = report.events.make_mut();
+    let first = events[0].kind;
+    events[0].kind = events[1].kind;
+    events[1].kind = first;
     assert!(matches!(
         publisher.publish(command, &report, &book),
         Err(MarketDataError::TraceMismatch(_))

@@ -10,9 +10,9 @@ use std::fmt;
 use crate::domain::{AccountId, OrderId, Price, Side};
 use crate::instrument::InstrumentDefinition;
 use crate::matching::{
-    Command, CommandOutcome, EventKind, ExecutionReport, MatchingError, NewOrder, OrderBook,
-    OrderBookCheckpoint, OrderBookCheckpointError, OrderBookLimits, OrderType, RejectReason,
-    ReplaceOrder, SelfTradePrevention, TimeInForce, Trade,
+    Command, CommandOutcome, CommandPreparation, EventKind, ExecutionReport, MatchingError,
+    NewOrder, OrderBook, OrderBookCheckpoint, OrderBookCheckpointError, OrderBookLimits, OrderType,
+    PreparedCommand, RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce, Trade,
 };
 
 /// Account-level order-entry state.
@@ -1085,7 +1085,8 @@ impl RiskManagedOrderBook {
     ///
     /// # Panics
     ///
-    /// Panics when requested constructor-time matching hash reservation fails.
+    /// Panics when requested constructor-time matching hash reservation or
+    /// process-local book identity allocation fails.
     #[must_use]
     pub fn with_limits(definition: InstrumentDefinition, limits: OrderBookLimits) -> Self {
         Self::try_with_limits(definition, limits)
@@ -1097,7 +1098,9 @@ impl RiskManagedOrderBook {
     /// # Errors
     ///
     /// Returns [`MatchingError::CapacityReservationFailed`] when a configured
-    /// matching hash reservation cannot be represented or allocated.
+    /// matching hash reservation cannot be represented or allocated, or
+    /// [`MatchingError::BookInstanceIdExhausted`] when process-local book
+    /// identity is exhausted.
     pub fn try_with_limits(
         definition: InstrumentDefinition,
         limits: OrderBookLimits,
@@ -1132,29 +1135,46 @@ impl RiskManagedOrderBook {
     /// Returns [`MatchingError`] for command collision, matching capacity, or
     /// sequence/identifier exhaustion.
     pub fn submit(&mut self, command: Command) -> Result<ExecutionReport, MatchingError> {
-        if let Some(report) = self.book.preflight(command)? {
-            return Ok(report);
+        match self.prepare(command)? {
+            CommandPreparation::Replay(report) => Ok(report),
+            CommandPreparation::Ready(prepared) => self.commit(prepared),
         }
-        if self.book.check_business_rules(command).is_err() {
-            return self.book.submit(command);
-        }
-        if let Err(reason) = self.risk.authorize(command) {
-            return self.book.reject_by_gate(command, reason);
-        }
-        let report = self.book.submit(command)?;
-        self.risk.apply(command, &report);
-        debug_assert!(self.validate().is_ok());
-        Ok(report)
     }
 
-    /// Performs operational idempotency/capacity checks without mutation.
+    /// Prepares matching operational and core business checks exactly once.
     ///
     /// # Errors
     ///
     /// Returns [`MatchingError`] for command collision, configured matching
     /// capacity, or exhausted sequence capacity.
-    pub fn preflight(&self, command: Command) -> Result<Option<ExecutionReport>, MatchingError> {
-        self.book.preflight(command)
+    pub fn prepare(&mut self, command: Command) -> Result<CommandPreparation, MatchingError> {
+        self.book.prepare(command)
+    }
+
+    /// Applies risk authorization and commits one generation-bound command.
+    ///
+    /// Core business rejection stored in the preparation precedes risk. An
+    /// accepted non-replay trace updates matching and risk state exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MatchingError`] if the preparation is stale, collides, or
+    /// contradicts a preflighted sequence invariant.
+    pub fn commit(&mut self, prepared: PreparedCommand) -> Result<ExecutionReport, MatchingError> {
+        let command = prepared.command();
+        let core_rejection = prepared.core_rejection();
+        let risk_rejection = if core_rejection.is_none() {
+            self.risk.authorize(command).err()
+        } else {
+            None
+        };
+        let apply_risk = core_rejection.is_none() && risk_rejection.is_none();
+        let report = self.book.commit_with_gate(prepared, risk_rejection)?;
+        if apply_risk && !report.replayed {
+            self.risk.apply(command, &report);
+        }
+        debug_assert!(self.validate().is_ok());
+        Ok(report)
     }
 
     /// Captures and independently audits coupled matching, positions, and reservations.

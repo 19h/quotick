@@ -384,7 +384,7 @@ fn publisher_bootstraps_from_an_existing_book_and_fails_closed_on_a_trace_gap() 
         SelfTradePrevention::CancelAggressor,
     );
     let mut report = book.submit(second).expect("second command applies");
-    for event in &mut report.events {
+    for event in report.events.make_mut() {
         event.sequence += 1;
     }
     assert_eq!(

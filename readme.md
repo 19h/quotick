@@ -91,12 +91,28 @@ recovery.
   reachable and current displayed slices before an aggressor-blocking self-order
   barrier, without constructing replenishment queues.
 - Validated finite matching limits for active orders/accounts, occupied levels,
-  accepted identifiers, and retained reports; optional constructor-time hash
-  reservation prevents index growth/rehash through the selected maxima.
+  accepted identifiers, retained reports, and events per report; optional
+  constructor-time hash reservation prevents index growth/rehash through the
+  selected maxima.
 - A protected retained-history tail sized to at least the maximum active-order
   population. Ordinary admission closes first; only currently valid cancel and
   mass-cancel controls may consume the reserve, and exact retries bypass all
   capacity gates.
+- Residual-aware capacity admission for GTC/post-only orders. A boundary scan
+  proves whether fills or self-trade prevention leave anything to rest, without
+  mutating the book or materializing reserve replenishment slices, and accounts
+  exactly for maker-order and complete-account capacity released before append.
+- Opaque generation-bound command preparation shared by direct matching, risk,
+  and durable orchestration. Capacity, identifier, FOK, and core business checks
+  execute once; the token owns the fallibly reserved report buffer, and durable
+  paths append the prepared command only after that reservation succeeds.
+- Immutable `EventTrace` storage shared in `O(1)` across the returned report,
+  idempotency cache, exact retries, and in-memory checkpoints. Diagnostic trace
+  mutation is explicit copy-on-write and cannot alter cached history.
+- Mutation-maintained per-level, per-side, and per-account future event-work
+  aggregates. Preparation derives safe command-specific event/trade bounds in
+  constant time, checks identifier space, and allocates the complete report
+  vector before matching; event insertion cannot grow it during mutation.
 - Complete execution traces suitable for replay, downstream publication, and
   risk reconstruction.
 
@@ -257,17 +273,52 @@ visited at most once; complexity is independent of the number of reserve slices
 that subsequent execution emits.
 
 Default matching limits are 4,096 active orders, 4,096 active accounts, 4,096
-occupied prices per side, 65,536 accepted order IDs, and 65,536 retained
-commands, with the final 4,096 history slots reserved for valid cancellation
-controls. Defaults are finite but do not preallocate; production constructors
-accept an explicit `OrderBookLimits`, and `preallocate=true` reserves all four
-hash indexes to their maxima. `try_with_limits` reports the exact hash resource
-when a requested reservation cannot be represented or allocated; durable
-recovery uses this fallible path. Capacity preflight is `O(1)` expected time except
-for validating a reserve-lane control through the ordinary core lookup. Capacity
+occupied prices per side, 65,536 accepted order IDs, 65,536 retained commands,
+and 65,536 events per report, with the final 4,096 history slots reserved for
+valid cancellation controls. The report limit must be at least
+`max_active_orders + 1`, preserving one cancellation event per maximally active
+order plus the mass-cancel completion event. Defaults are finite but do not
+preallocate; production constructors accept an explicit `OrderBookLimits`, and
+`preallocate=true` reserves all four hash indexes to their maxima.
+`try_with_limits` reports the exact hash resource when a requested reservation
+cannot be represented or allocated. Even when construction does not preallocate,
+command preparation fallibly reserves the hash headroom needed for retained
+history, a newly accepted identity, and any possible new active order/account;
+it also reserves the complete event buffer and `K`-identifier mass-cancel
+selection buffer before durable command append. Capacity preflight is expected
+`O(1)` on the normal path, except for
+validating a reserve-lane control through the ordinary core lookup. If an
+active-order, active-account, or same-side price-level bound
+is already full, a GTC/post-only limit order performs an allocation-free
+residual preview in `O(O_c + P_c log P)` time and `O(1)` auxiliary space for
+`O_c` orders in `P_c` crossed levels. A proved no-residual order bypasses the
+resting-capacity gate. If a new account arrives at a full account bound, exact
+release proof can additionally inspect all `O` active account memberships in
+expected `O(O)` time and `O(1)` auxiliary space. Active-order, active-account,
+and same-side price-level decisions use the exact final cardinalities. A
+price-changing replacement whose old level remains occupied uses the same
+allocation-free liquidity proof only at a full same-side level bound: a full
+fill or aggressor-terminating STP result creates no target level, while a
+resting residual is rejected when no level slot is released. Capacity
 errors are not sequenced and durable wrappers reject them before WAL append.
-A unique GTC/post-only limit order reserves potential resting capacity before
-matching; IOC, FOK, and market orders do not consume that gate.
+IOC, FOK, and market orders do not consume a resting-capacity gate.
+One `PreparedCommand` carries the completed operational/core proof through risk
+authorization and WAL append, together with the already-reserved unique report
+buffer and optional mass-cancel selection buffer. Matching hash-table insertion
+cannot rehash after command persistence. Commit validates book identity and
+retained-command generation in expected `O(1)` time; foreign and stale tokens
+cannot mutate state. Ordered price/account tree nodes, the Arc control block,
+and coupled risk reservation insertion remain outside this fallible preparation
+boundary.
+For `E` report events, construction and encoding are `O(E)`, while Arc-backed
+builder finalization is `O(1)` and retains the original vector event buffer
+without allocation or event copy. Cache, retry, and checkpoint trace clones are
+`O(1)` time and space per handle and do not allocate or copy that buffer. Report
+encoding emits the unchanged ordered event sequence. Preparation computes a safe
+event/trade bound in `O(1)` from mutation-maintained side and account work
+aggregates and allocates that vector capacity before the first matching
+transition, so report insertion cannot reallocate. The bound includes uncrossed
+opposite-side work and may retain unused capacity.
 
 Risk authorization and trace application are expected `O(1)` per order event.
 A complete risk cross-audit is `O(O + A)` for `A` registered accounts, and risk

@@ -3,8 +3,9 @@ use quotick::instrument::{
     QuantityRules, TradingState,
 };
 use quotick::matching::{
-    CancelOrder, Command, CommandOutcome, EventKind, MatchingError, NewOrder, OrderBook, OrderType,
-    RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce, Trade,
+    CancelOrder, Command, CommandOutcome, CommandPreparation, Event, EventKind, EventTrace,
+    MatchingError, NewOrder, OrderBook, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention,
+    TimeInForce, Trade,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -107,6 +108,27 @@ fn trades(report: &quotick::matching::ExecutionReport) -> Vec<Trade> {
             _ => None,
         })
         .collect()
+}
+
+#[test]
+fn event_trace_is_send_and_sync() {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<EventTrace>();
+}
+
+#[test]
+fn event_trace_from_vec_retains_the_event_buffer() {
+    let command_id = CommandId::new(1).expect("non-zero command");
+    let mut events = Vec::with_capacity(8);
+    events.push(Event {
+        sequence: 1,
+        command_id,
+        occurred_at: TimestampNs::from_unix_nanos(1),
+        kind: EventKind::CommandRejected(RejectReason::UnknownOrder),
+    });
+    let original_buffer = events.as_ptr();
+    let trace = EventTrace::from(events);
+    assert_eq!(trace.as_ptr(), original_buffer);
 }
 
 #[test]
@@ -423,7 +445,21 @@ fn exact_command_retries_are_idempotent_and_collisions_are_detected() {
     assert!(!first.replayed);
     assert!(replay.replayed);
     assert_eq!(first.events, replay.events);
+    assert!(first.events.shares_storage_with(&replay.events));
     assert_eq!(book.active_order_count(), 1);
+
+    let cached_events = replay.events.to_vec();
+    let mut locally_corrupted = first;
+    locally_corrupted.events.make_mut()[0].kind =
+        EventKind::CommandRejected(RejectReason::UnknownOrder);
+    assert!(!locally_corrupted.events.shares_storage_with(&replay.events));
+    let replay_after_copy_on_write = book.submit(command).expect("second exact replay");
+    assert_eq!(replay_after_copy_on_write.events.as_slice(), cached_events);
+    assert!(
+        replay_after_copy_on_write
+            .events
+            .shares_storage_with(&replay.events)
+    );
 
     let collision = limit_order(
         1,
@@ -442,6 +478,76 @@ fn exact_command_retries_are_idempotent_and_collisions_are_detected() {
         ))
     );
     assert_eq!(book.active_order_count(), 1);
+}
+
+#[test]
+fn prepared_commands_are_generation_bound_and_exact_races_replay() {
+    let command = limit_order(
+        1,
+        1,
+        11,
+        Side::Buy,
+        2,
+        99,
+        TimeInForce::GoodTilCancelled,
+        SelfTradePrevention::CancelAggressor,
+    );
+    let unrelated = limit_order(
+        2,
+        2,
+        12,
+        Side::Sell,
+        1,
+        101,
+        TimeInForce::GoodTilCancelled,
+        SelfTradePrevention::CancelAggressor,
+    );
+
+    let mut direct = OrderBook::new(definition());
+    let CommandPreparation::Ready(prepared) = direct.prepare(command).unwrap() else {
+        panic!("a unique command must produce a ready preparation")
+    };
+    let committed = direct.commit(prepared).unwrap();
+    assert_eq!(committed.outcome, CommandOutcome::Accepted);
+    assert!(!committed.replayed);
+    assert!(direct.order(OrderId::new(1).unwrap()).is_some());
+    direct.validate().unwrap();
+
+    let mut stale = OrderBook::new(definition());
+    let CommandPreparation::Ready(prepared) = stale.prepare(command).unwrap() else {
+        panic!("a unique command must produce a ready preparation")
+    };
+    assert_eq!(prepared.command(), command);
+    stale.submit(unrelated).unwrap();
+    assert_eq!(stale.commit(prepared), Err(MatchingError::StalePreparation));
+    assert!(stale.order(OrderId::new(1).unwrap()).is_none());
+    assert!(stale.order(OrderId::new(2).unwrap()).is_some());
+
+    let mut exact_race = OrderBook::new(definition());
+    let CommandPreparation::Ready(prepared) = exact_race.prepare(command).unwrap() else {
+        panic!("a unique command must produce a ready preparation")
+    };
+    let first = exact_race.submit(command).unwrap();
+    let replay = exact_race.commit(prepared).unwrap();
+    assert!(!first.replayed);
+    assert!(replay.replayed);
+    assert_eq!(first.events, replay.events);
+    assert!(matches!(
+        exact_race.prepare(command).unwrap(),
+        CommandPreparation::Replay(report) if report.replayed
+    ));
+    exact_race.validate().unwrap();
+
+    let mut source = OrderBook::new(definition());
+    let CommandPreparation::Ready(foreign) = source.prepare(command).unwrap() else {
+        panic!("a unique command must produce a ready preparation")
+    };
+    let mut target = OrderBook::new(definition());
+    assert_eq!(
+        target.commit(foreign),
+        Err(MatchingError::ForeignPreparation)
+    );
+    assert_eq!(target.active_order_count(), 0);
 }
 
 #[test]

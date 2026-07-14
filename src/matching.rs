@@ -14,12 +14,36 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::ops::Deref;
+use std::slice;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::domain::{
     AccountId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
     TimestampNs, TradeId,
 };
 use crate::instrument::{AdmissionError, InstrumentDefinition};
+
+static NEXT_ORDER_BOOK_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_order_book_instance_id() -> Result<u64, MatchingError> {
+    let mut current = NEXT_ORDER_BOOK_INSTANCE_ID.load(Ordering::Relaxed);
+    loop {
+        let next = current
+            .checked_add(1)
+            .ok_or(MatchingError::BookInstanceIdExhausted)?;
+        match NEXT_ORDER_BOOK_INSTANCE_ID.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 /// The price constraint attached to a new order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -478,6 +502,130 @@ pub struct Event {
     pub kind: EventKind,
 }
 
+/// Immutable shared event sequence for one execution report.
+///
+/// Cloning a trace is `O(1)` and shares the same control block and event buffer.
+/// Ordinary consumers receive slice semantics through [`Deref`].
+/// [`Self::make_mut`] performs explicit copy-on-write for diagnostic mutation
+/// without corrupting the idempotency cache. Conversion from `Vec<Event>` keeps
+/// that vector's event buffer and allocates only the shared-owner control block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventTrace(Arc<Vec<Event>>);
+
+impl EventTrace {
+    /// Returns the complete immutable event slice.
+    #[must_use]
+    pub fn as_slice(&self) -> &[Event] {
+        self.0.as_slice()
+    }
+
+    /// Returns a mutable event slice, copying first when storage is shared.
+    pub fn make_mut(&mut self) -> &mut [Event] {
+        Arc::make_mut(&mut self.0).as_mut_slice()
+    }
+
+    /// Returns whether two traces reference the identical immutable owner and buffer.
+    #[must_use]
+    pub fn shares_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl From<Vec<Event>> for EventTrace {
+    fn from(events: Vec<Event>) -> Self {
+        Self(Arc::new(events))
+    }
+}
+
+#[derive(Debug)]
+struct EventTraceBuilder {
+    events: Arc<Vec<Event>>,
+    maximum_events: usize,
+}
+
+impl EventTraceBuilder {
+    fn try_with_capacity(maximum_events: usize) -> Result<Self, MatchingError> {
+        let mut events = Vec::new();
+        events.try_reserve_exact(maximum_events).map_err(|_| {
+            MatchingError::CapacityReservationFailed(MatchingCapacity::ReportEvents)
+        })?;
+        Ok(Self {
+            events: Arc::new(events),
+            maximum_events,
+        })
+    }
+
+    fn push(&mut self, event: Event) {
+        assert!(
+            self.events.len() < self.maximum_events,
+            "prepared event bound must cover the complete execution report"
+        );
+        Arc::get_mut(&mut self.events)
+            .expect("event builder must have unique storage")
+            .push(event);
+    }
+
+    fn finish(self) -> EventTrace {
+        EventTrace(self.events)
+    }
+}
+
+#[cfg(test)]
+mod event_trace_builder_tests {
+    use super::{
+        Event, EventKind, EventTraceBuilder, MatchingCapacity, MatchingError, RejectReason,
+    };
+    use crate::{CommandId, TimestampNs};
+
+    #[test]
+    fn finalization_retains_the_builder_event_buffer() {
+        let command_id = CommandId::new(1).expect("non-zero command");
+        let mut builder = EventTraceBuilder::try_with_capacity(8).unwrap();
+        builder.push(Event {
+            sequence: 1,
+            command_id,
+            occurred_at: TimestampNs::from_unix_nanos(1),
+            kind: EventKind::CommandRejected(RejectReason::UnknownOrder),
+        });
+        let original_buffer = builder.events.as_ptr();
+        let trace = builder.finish();
+        assert_eq!(trace.as_ptr(), original_buffer);
+    }
+
+    #[test]
+    fn unrepresentable_event_capacity_is_a_typed_preparation_failure() {
+        assert!(matches!(
+            EventTraceBuilder::try_with_capacity(usize::MAX),
+            Err(MatchingError::CapacityReservationFailed(
+                MatchingCapacity::ReportEvents
+            ))
+        ));
+    }
+}
+
+impl Deref for EventTrace {
+    type Target = [Event];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[Event]> for EventTrace {
+    fn as_ref(&self) -> &[Event] {
+        self.as_slice()
+    }
+}
+
+impl<'a> IntoIterator for &'a EventTrace {
+    type Item = &'a Event;
+    type IntoIter = slice::Iter<'a, Event>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 /// Overall disposition of a command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandOutcome {
@@ -495,9 +643,51 @@ pub struct ExecutionReport {
     /// Accepted or rejected disposition.
     pub outcome: CommandOutcome,
     /// Contiguous events caused by this command.
-    pub events: Vec<Event>,
+    pub events: EventTrace,
     /// True when this report came from the exact-command idempotency cache.
     pub replayed: bool,
+}
+
+/// Result of preparing one command against an unchanged semantic matching generation.
+#[derive(Debug)]
+pub enum CommandPreparation {
+    /// The exact command is already committed and its cached trace is returned.
+    Replay(ExecutionReport),
+    /// Operational and core business preflight completed for one generation.
+    Ready(PreparedCommand),
+}
+
+/// Opaque single-use command validated against one retained-history generation.
+///
+/// A prepared command contains no borrowed book state and can be written to a
+/// WAL before commit. It owns the empty Arc-backed event vector and, for mass
+/// cancellation, the empty order-selection vector whose complete command-specific
+/// capacities were fallibly reserved during preparation. Preparation also reserves
+/// the hash-table headroom required by the command without changing semantic state.
+/// [`OrderBook::commit`] rejects it if an unrelated command changes the book
+/// generation after preparation.
+#[derive(Debug)]
+pub struct PreparedCommand {
+    command: Command,
+    book_instance_id: u64,
+    expected_retained_commands: usize,
+    core_rejection: Option<RejectReason>,
+    events: EventTraceBuilder,
+    selected_order_ids: Option<Vec<OrderId>>,
+}
+
+impl PreparedCommand {
+    /// Returns the immutable command represented by this preparation.
+    #[must_use]
+    pub const fn command(&self) -> Command {
+        self.command
+    }
+
+    /// Returns the core matching rejection already established by preparation.
+    #[must_use]
+    pub const fn core_rejection(&self) -> Option<RejectReason> {
+        self.core_rejection
+    }
 }
 
 /// A visible aggregate price level.
@@ -883,6 +1073,15 @@ fn validate_checkpoint_capacity(
             "checkpoint command history exceeds selected capacity",
         ));
     }
+    if checkpoint
+        .history
+        .iter()
+        .any(|entry| entry.report.events.len() > limits.max_report_events())
+    {
+        return Err(OrderBookCheckpointError::new(
+            "checkpoint report exceeds selected event capacity",
+        ));
+    }
     let accepted_order_ids = checkpoint
         .history
         .iter()
@@ -945,6 +1144,10 @@ pub enum MatchingCapacity {
     BidPriceLevels,
     /// Occupied ask price levels.
     AskPriceLevels,
+    /// Events retained in one execution report.
+    ReportEvents,
+    /// Active-order identifiers selected by one mass cancellation.
+    MassCancelSelection,
 }
 
 impl fmt::Display for MatchingCapacity {
@@ -957,6 +1160,8 @@ impl fmt::Display for MatchingCapacity {
             Self::ActiveAccounts => "active accounts",
             Self::BidPriceLevels => "bid price levels",
             Self::AskPriceLevels => "ask price levels",
+            Self::ReportEvents => "execution-report events",
+            Self::MassCancelSelection => "mass-cancel order selection",
         })
     }
 }
@@ -972,8 +1177,14 @@ pub enum MatchingError {
     TradeIdExhausted,
     /// A configured bounded matching resource has no admissible capacity.
     CapacityExhausted(MatchingCapacity),
-    /// Constructor-time hash reservation failed for the configured resource.
+    /// A fallible configured-resource memory reservation failed.
     CapacityReservationFailed(MatchingCapacity),
+    /// The book generation changed after a command was prepared.
+    StalePreparation,
+    /// A prepared command belongs to another order-book instance.
+    ForeignPreparation,
+    /// Process-local order-book identity exhausted its `u64` representation.
+    BookInstanceIdExhausted,
 }
 
 impl fmt::Display for MatchingError {
@@ -996,6 +1207,13 @@ impl fmt::Display for MatchingError {
                     "matching capacity reservation failed: {resource}"
                 )
             }
+            Self::StalePreparation => formatter.write_str("prepared matching command is stale"),
+            Self::ForeignPreparation => {
+                formatter.write_str("prepared matching command belongs to another order book")
+            }
+            Self::BookInstanceIdExhausted => {
+                formatter.write_str("order-book instance identifier exhausted")
+            }
         }
     }
 }
@@ -1017,6 +1235,8 @@ pub struct OrderBookLimitsSpec {
     pub max_retained_commands: usize,
     /// Tail history slots reserved exclusively for cancel and mass-cancel commands.
     pub cancellation_reserve: usize,
+    /// Maximum events retained by one execution report.
+    pub max_report_events: usize,
     /// Whether hash indexes reserve their declared maxima at construction.
     pub preallocate: bool,
 }
@@ -1034,6 +1254,8 @@ pub enum OrderBookLimitsError {
     ZeroAcceptedOrderIds,
     /// Retained-command maximum is zero.
     ZeroRetainedCommands,
+    /// Per-report event maximum is zero.
+    ZeroReportEvents,
     /// More active accounts than active orders were configured.
     ActiveAccountsExceedActiveOrders,
     /// More price levels per side than total active orders were configured.
@@ -1042,6 +1264,8 @@ pub enum OrderBookLimitsError {
     ActiveOrdersExceedAcceptedOrderIds,
     /// The reserve cannot individually cancel every maximally active order.
     CancellationReserveBelowActiveOrders,
+    /// One maximum-size mass cancellation cannot fit in one report.
+    ReportEventsBelowMassCancelMaximum,
     /// Cancellation reservation consumes the complete history capacity.
     NoOrdinaryCommandCapacity,
     /// Ordinary history cannot admit the configured maximum active population.
@@ -1056,6 +1280,7 @@ impl fmt::Display for OrderBookLimitsError {
             Self::ZeroPriceLevels => "per-side price-level limit is zero",
             Self::ZeroAcceptedOrderIds => "accepted-order-identifier limit is zero",
             Self::ZeroRetainedCommands => "retained-command limit is zero",
+            Self::ZeroReportEvents => "execution-report event limit is zero",
             Self::ActiveAccountsExceedActiveOrders => {
                 "active-account limit exceeds active-order limit"
             }
@@ -1067,6 +1292,9 @@ impl fmt::Display for OrderBookLimitsError {
             }
             Self::CancellationReserveBelowActiveOrders => {
                 "cancellation reserve is smaller than active-order limit"
+            }
+            Self::ReportEventsBelowMassCancelMaximum => {
+                "execution-report event limit cannot hold a maximum-size mass cancellation"
             }
             Self::NoOrdinaryCommandCapacity => {
                 "cancellation reserve leaves no ordinary command capacity"
@@ -1089,6 +1317,7 @@ pub struct OrderBookLimits {
     max_accepted_order_ids: usize,
     max_retained_commands: usize,
     cancellation_reserve: usize,
+    max_report_events: usize,
     preallocate: bool,
 }
 
@@ -1105,6 +1334,8 @@ impl OrderBookLimits {
     pub const DEFAULT_MAX_RETAINED_COMMANDS: usize = 65_536;
     /// Default tail slots reserved for cancellation controls.
     pub const DEFAULT_CANCELLATION_RESERVE: usize = 4_096;
+    /// Default maximum events retained by one execution report.
+    pub const DEFAULT_MAX_REPORT_EVENTS: usize = 65_536;
 
     /// Validates a finite matching-resource policy.
     ///
@@ -1127,6 +1358,9 @@ impl OrderBookLimits {
         if spec.max_retained_commands == 0 {
             return Err(OrderBookLimitsError::ZeroRetainedCommands);
         }
+        if spec.max_report_events == 0 {
+            return Err(OrderBookLimitsError::ZeroReportEvents);
+        }
         if spec.max_active_accounts > spec.max_active_orders {
             return Err(OrderBookLimitsError::ActiveAccountsExceedActiveOrders);
         }
@@ -1138,6 +1372,12 @@ impl OrderBookLimits {
         }
         if spec.cancellation_reserve < spec.max_active_orders {
             return Err(OrderBookLimitsError::CancellationReserveBelowActiveOrders);
+        }
+        let Some(maximum_mass_cancel_events) = spec.max_active_orders.checked_add(1) else {
+            return Err(OrderBookLimitsError::ReportEventsBelowMassCancelMaximum);
+        };
+        if spec.max_report_events < maximum_mass_cancel_events {
+            return Err(OrderBookLimitsError::ReportEventsBelowMassCancelMaximum);
         }
         if spec.cancellation_reserve >= spec.max_retained_commands {
             return Err(OrderBookLimitsError::NoOrdinaryCommandCapacity);
@@ -1152,6 +1392,7 @@ impl OrderBookLimits {
             max_accepted_order_ids: spec.max_accepted_order_ids,
             max_retained_commands: spec.max_retained_commands,
             cancellation_reserve: spec.cancellation_reserve,
+            max_report_events: spec.max_report_events,
             preallocate: spec.preallocate,
         })
     }
@@ -1192,6 +1433,12 @@ impl OrderBookLimits {
         self.cancellation_reserve
     }
 
+    /// Maximum events retained by one execution report.
+    #[must_use]
+    pub const fn max_report_events(self) -> usize {
+        self.max_report_events
+    }
+
     /// Maximum new/replace command history before the cancellation lane begins.
     #[must_use]
     pub const fn ordinary_command_capacity(self) -> usize {
@@ -1214,6 +1461,7 @@ impl Default for OrderBookLimits {
             max_accepted_order_ids: Self::DEFAULT_MAX_ACCEPTED_ORDER_IDS,
             max_retained_commands: Self::DEFAULT_MAX_RETAINED_COMMANDS,
             cancellation_reserve: Self::DEFAULT_CANCELLATION_RESERVE,
+            max_report_events: Self::DEFAULT_MAX_REPORT_EVENTS,
             preallocate: false,
         })
         .expect("built-in order-book limits are valid")
@@ -1262,12 +1510,30 @@ struct RestingOrder {
     next: Option<OrderId>,
 }
 
+impl RestingOrder {
+    fn remaining_event_units(self) -> u128 {
+        let slices = match self.display {
+            OrderDisplay::FullyDisplayed => 1,
+            OrderDisplay::Reserve { peak } => {
+                let hidden = u128::from(self.leaves - self.displayed);
+                let peak = u128::from(peak.lots());
+                1 + hidden.div_ceil(peak)
+            }
+        };
+        slices
+            .checked_mul(2)
+            .and_then(|value| value.checked_sub(1))
+            .expect("u64 order quantity has representable event work")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PriceLevel {
     head: OrderId,
     tail: OrderId,
     total_quantity: u128,
     order_count: u64,
+    event_units: u128,
 }
 
 /// Ordered occupied prices for one side with a mutation-maintained market
@@ -1277,11 +1543,13 @@ struct PriceLevel {
 /// cached best price is redundant derived state, updated only by `insert` and
 /// `remove` and independently checked by `validate_extremum`. Read-only best
 /// price discovery therefore does not traverse the tree.
+#[cfg_attr(test, derive(Clone))]
 #[derive(Debug, Eq, PartialEq)]
 struct PriceLevels {
     side: Side,
     by_price: BTreeMap<Price, PriceLevel>,
     best: Option<(Price, PriceLevel)>,
+    event_units: u128,
 }
 
 impl PriceLevels {
@@ -1290,6 +1558,7 @@ impl PriceLevels {
             side,
             by_price: BTreeMap::new(),
             best: None,
+            event_units: 0,
         }
     }
 
@@ -1309,6 +1578,10 @@ impl PriceLevels {
         self.by_price.len()
     }
 
+    fn event_units(&self) -> u128 {
+        self.event_units
+    }
+
     fn best_price(&self) -> Option<Price> {
         self.best.map(|(price, _)| price)
     }
@@ -1319,6 +1592,11 @@ impl PriceLevels {
 
     fn insert(&mut self, price: Price, level: PriceLevel) -> Option<PriceLevel> {
         let replaced = self.by_price.insert(price, level);
+        self.event_units = self
+            .event_units
+            .checked_sub(replaced.map_or(0, |value| value.event_units))
+            .and_then(|value| value.checked_add(level.event_units))
+            .expect("active-order event work must fit u128");
         if self
             .best
             .is_none_or(|(current, _)| current == price || self.is_better(price, current))
@@ -1329,11 +1607,17 @@ impl PriceLevels {
     }
 
     fn update<R>(&mut self, price: Price, update: impl FnOnce(&mut PriceLevel) -> R) -> Option<R> {
-        let (result, snapshot) = {
+        let (result, snapshot, previous_event_units) = {
             let level = self.by_price.get_mut(&price)?;
+            let previous_event_units = level.event_units;
             let result = update(level);
-            (result, *level)
+            (result, *level, previous_event_units)
         };
+        self.event_units = self
+            .event_units
+            .checked_sub(previous_event_units)
+            .and_then(|value| value.checked_add(snapshot.event_units))
+            .expect("active-order event work must fit u128");
         if self.best.is_some_and(|(best_price, _)| best_price == price) {
             self.best = Some((price, snapshot));
         }
@@ -1342,6 +1626,12 @@ impl PriceLevels {
 
     fn remove(&mut self, price: Price) -> Option<PriceLevel> {
         let removed = self.by_price.remove(&price);
+        if let Some(level) = removed {
+            self.event_units = self
+                .event_units
+                .checked_sub(level.event_units)
+                .expect("removed level event work must be indexed");
+        }
         if removed.is_some() && self.best.is_some_and(|(best_price, _)| best_price == price) {
             self.best = self.map_extremum();
         }
@@ -1374,6 +1664,16 @@ impl PriceLevels {
                 self.side, self.best, actual
             )));
         }
+        let actual_event_units = self
+            .by_price
+            .values()
+            .try_fold(0_u128, |total, level| total.checked_add(level.event_units));
+        if actual_event_units != Some(self.event_units) {
+            return Err(InvariantViolation::new(format!(
+                "{:?} cached event work {} differs from ordered-map aggregate {:?}",
+                self.side, self.event_units, actual_event_units
+            )));
+        }
         Ok(())
     }
 
@@ -1398,10 +1698,13 @@ impl PriceLevels {
     }
 }
 
+#[cfg_attr(test, derive(Clone))]
 #[derive(Debug, Default, Eq, PartialEq)]
 struct AccountOrderIndex {
     buys: BTreeSet<OrderId>,
     sells: BTreeSet<OrderId>,
+    buy_event_units: u128,
+    sell_event_units: u128,
 }
 
 impl AccountOrderIndex {
@@ -1417,6 +1720,50 @@ impl AccountOrderIndex {
             Side::Buy => &mut self.buys,
             Side::Sell => &mut self.sells,
         }
+    }
+
+    fn event_units(&self, side: Side) -> u128 {
+        match side {
+            Side::Buy => self.buy_event_units,
+            Side::Sell => self.sell_event_units,
+        }
+    }
+
+    fn event_units_mut(&mut self, side: Side) -> &mut u128 {
+        match side {
+            Side::Buy => &mut self.buy_event_units,
+            Side::Sell => &mut self.sell_event_units,
+        }
+    }
+
+    fn add_event_units(&mut self, side: Side, additional: u128) {
+        let updated = self
+            .event_units(side)
+            .checked_add(additional)
+            .expect("account event work must fit u128");
+        *self.event_units_mut(side) = updated;
+    }
+
+    fn remove_event_units(&mut self, side: Side, removed: u128) {
+        let updated = self
+            .event_units(side)
+            .checked_sub(removed)
+            .expect("removed order event work must be indexed by account");
+        *self.event_units_mut(side) = updated;
+    }
+
+    fn replace_event_units(&mut self, side: Side, old: u128, new: u128) {
+        let updated = self
+            .event_units(side)
+            .checked_sub(old)
+            .and_then(|value| value.checked_add(new))
+            .expect("replacement event work must fit account aggregate");
+        *self.event_units_mut(side) = updated;
+    }
+
+    fn take_orders(&mut self, side: Side) -> BTreeSet<OrderId> {
+        *self.event_units_mut(side) = 0;
+        std::mem::take(self.orders_mut(side))
     }
 
     fn is_empty(&self) -> bool {
@@ -1442,6 +1789,27 @@ struct IncomingOrder {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct IncomingPreview {
+    account_id: AccountId,
+    side: Side,
+    order_type: OrderType,
+    leaves: u64,
+    self_trade_prevention: SelfTradePrevention,
+}
+
+impl From<NewOrder> for IncomingPreview {
+    fn from(order: NewOrder) -> Self {
+        Self {
+            account_id: order.account_id,
+            side: order.side,
+            order_type: order.order_type,
+            leaves: order.quantity.lots(),
+            self_trade_prevention: order.self_trade_prevention,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct ReserveRefresh {
     order_id: OrderId,
     price: Price,
@@ -1450,15 +1818,17 @@ struct ReserveRefresh {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FokLevelLiquidity {
+enum LevelLiquidity {
     Filled,
     Remaining(u64),
     BlockedBySelfTrade,
 }
 
 /// A deterministic single-instrument central limit order book.
-#[derive(Debug, Eq, PartialEq)]
+#[cfg_attr(test, derive(Clone))]
+#[derive(Debug)]
 pub struct OrderBook {
+    instance_id: u64,
     definition: InstrumentDefinition,
     limits: OrderBookLimits,
     bids: PriceLevels,
@@ -1470,6 +1840,23 @@ pub struct OrderBook {
     next_sequence: u64,
     next_trade_id: u64,
 }
+
+impl PartialEq for OrderBook {
+    fn eq(&self, other: &Self) -> bool {
+        self.definition == other.definition
+            && self.limits == other.limits
+            && self.bids == other.bids
+            && self.asks == other.asks
+            && self.orders == other.orders
+            && self.account_orders == other.account_orders
+            && self.seen_order_ids == other.seen_order_ids
+            && self.reports == other.reports
+            && self.next_sequence == other.next_sequence
+            && self.next_trade_id == other.next_trade_id
+    }
+}
+
+impl Eq for OrderBook {}
 
 impl OrderBook {
     /// Creates an empty finitely bounded order book using [`OrderBookLimits::default`].
@@ -1486,7 +1873,8 @@ impl OrderBook {
     ///
     /// # Panics
     ///
-    /// Panics when constructor-time hash reservation fails.
+    /// Panics when constructor-time hash reservation or process-local instance
+    /// identity allocation fails.
     #[must_use]
     pub fn with_limits(definition: InstrumentDefinition, limits: OrderBookLimits) -> Self {
         Self::try_with_limits(definition, limits)
@@ -1498,7 +1886,9 @@ impl OrderBook {
     /// # Errors
     ///
     /// Returns [`MatchingError::CapacityReservationFailed`] naming the first
-    /// hash index whose requested reservation cannot be represented or allocated.
+    /// hash index whose requested reservation cannot be represented or allocated,
+    /// or [`MatchingError::BookInstanceIdExhausted`] if process-local book
+    /// identity is exhausted.
     pub fn try_with_limits(
         definition: InstrumentDefinition,
         limits: OrderBookLimits,
@@ -1529,7 +1919,9 @@ impl OrderBook {
                     MatchingError::CapacityReservationFailed(MatchingCapacity::CommandHistory)
                 })?;
         }
+        let instance_id = next_order_book_instance_id()?;
         Ok(Self {
+            instance_id,
             definition,
             limits,
             bids: PriceLevels::new(Side::Buy),
@@ -1747,21 +2139,10 @@ impl OrderBook {
     /// Returns [`MatchingError`] for an idempotency-key collision, configured
     /// capacity exhaustion, or sequence/trade-identifier exhaustion.
     pub fn submit(&mut self, command: Command) -> Result<ExecutionReport, MatchingError> {
-        if let Some(report) = self.preflight(command)? {
-            return Ok(report);
+        match self.prepare(command)? {
+            CommandPreparation::Replay(report) => Ok(report),
+            CommandPreparation::Ready(prepared) => self.commit(prepared),
         }
-        let report = if let Err(reason) = self.check_business_rules(command) {
-            self.rejected(command.command_id(), command.received_at(), reason)?
-        } else {
-            match command {
-                Command::New(new_order) => self.apply_new(new_order)?,
-                Command::Cancel(cancel) => self.apply_cancel(cancel)?,
-                Command::Replace(replace) => self.apply_replace(replace)?,
-                Command::MassCancel(mass_cancel) => self.apply_mass_cancel(mass_cancel)?,
-            }
-        };
-        self.cache_report(command, &report);
-        Ok(report)
     }
 
     /// Evaluates all matching and instrument business rules without mutation.
@@ -1867,30 +2248,29 @@ impl OrderBook {
         command: Command,
         gate_reason: RejectReason,
     ) -> Result<ExecutionReport, MatchingError> {
-        if let Some(report) = self.preflight(command)? {
-            return Ok(report);
+        match self.prepare(command)? {
+            CommandPreparation::Replay(report) => Ok(report),
+            CommandPreparation::Ready(prepared) => {
+                self.commit_with_gate(prepared, Some(gate_reason))
+            }
         }
-        let reason = self
-            .check_business_rules(command)
-            .err()
-            .unwrap_or(gate_reason);
-        let report = self.rejected(command.command_id(), command.received_at(), reason)?;
-        self.cache_report(command, &report);
-        Ok(report)
     }
 
-    /// Checks idempotency and operational capacity without mutating book state.
+    /// Prepares a command against the current matching generation.
     ///
-    /// `Ok(Some(report))` is an exact-command replay. `Ok(None)` guarantees that
-    /// [`OrderBook::submit`] cannot subsequently fail with an operational error
-    /// while this exclusively owned book remains unchanged. Business rejection
-    /// remains a normal execution report.
+    /// Preparation checks idempotency, all operational capacity and identifier
+    /// bounds, and core matching business rules exactly once. It also fallibly
+    /// reserves the complete report event buffer, mass-cancel selection buffer,
+    /// and required hash-table headroom. The reservation changes allocator
+    /// capacity but not semantic book state. A ready token can be durably written
+    /// through [`PreparedCommand::command`] and then applied with
+    /// [`OrderBook::commit`] without event/scratch growth or hash-table rehashing.
     ///
     /// # Errors
     ///
     /// Returns [`MatchingError`] for command-identifier collision, configured
     /// capacity, or sequence/trade-identifier exhaustion.
-    pub fn preflight(&self, command: Command) -> Result<Option<ExecutionReport>, MatchingError> {
+    pub fn prepare(&mut self, command: Command) -> Result<CommandPreparation, MatchingError> {
         let command_id = command.command_id();
         if let Some(cached) = self.reports.get(&command_id) {
             if cached.command != command {
@@ -1898,62 +2278,299 @@ impl OrderBook {
             }
             let mut report = cached.report.clone();
             report.replayed = true;
-            return Ok(Some(report));
+            return Ok(CommandPreparation::Replay(report));
         }
 
-        self.check_capacity(command)?;
-
-        // Reserve enough identifier space for the worst case before the first
-        // mutation. Each displayed slice can produce at most three events under
-        // cancel-both STP. The instrument's per-state replenishment cap provides
-        // an O(1) bound without scanning active orders.
-        let active_orders =
-            u64::try_from(self.orders.len()).map_err(|_| MatchingError::SequenceExhausted)?;
-        let maximum_slices_per_order = u64::from(
-            self.definition
-                .reserve_order_rules()
-                .maximum_replenishments(),
-        ) + 1;
-        let maximum_slices = active_orders
-            .checked_mul(maximum_slices_per_order)
-            .ok_or(MatchingError::SequenceExhausted)?;
-        let maximum_events = maximum_slices
-            .checked_mul(3)
-            .and_then(|value| value.checked_add(3))
-            .ok_or(MatchingError::SequenceExhausted)?;
+        let core_rejection = self.check_history_capacity_and_business(command)?;
+        self.check_command_capacity(command)?;
+        let (maximum_events, maximum_trades) = self.maximum_report_work(command, core_rejection)?;
+        if maximum_events > self.limits.max_report_events() {
+            return Err(MatchingError::CapacityExhausted(
+                MatchingCapacity::ReportEvents,
+            ));
+        }
+        let maximum_events_u64 =
+            u64::try_from(maximum_events).map_err(|_| MatchingError::SequenceExhausted)?;
         self.next_sequence
-            .checked_add(maximum_events)
+            .checked_add(maximum_events_u64)
             .ok_or(MatchingError::SequenceExhausted)?;
         self.next_trade_id
-            .checked_add(maximum_slices)
+            .checked_add(maximum_trades)
             .ok_or(MatchingError::TradeIdExhausted)?;
-        Ok(None)
+        self.reserve_command_hash_capacity(command, core_rejection)?;
+        let events = EventTraceBuilder::try_with_capacity(maximum_events)?;
+        let selected_order_ids = match (core_rejection, command) {
+            (None, Command::MassCancel(command)) => {
+                let selected_count =
+                    self.account_active_order_count(command.account_id, command.scope);
+                let mut selected = Vec::new();
+                selected.try_reserve_exact(selected_count).map_err(|_| {
+                    MatchingError::CapacityReservationFailed(MatchingCapacity::MassCancelSelection)
+                })?;
+                Some(selected)
+            }
+            _ => None,
+        };
+        Ok(CommandPreparation::Ready(PreparedCommand {
+            command,
+            book_instance_id: self.instance_id,
+            expected_retained_commands: self.reports.len(),
+            core_rejection,
+            events,
+            selected_order_ids,
+        }))
     }
 
-    fn check_capacity(&self, command: Command) -> Result<(), MatchingError> {
+    fn reserve_command_hash_capacity(
+        &mut self,
+        command: Command,
+        core_rejection: Option<RejectReason>,
+    ) -> Result<(), MatchingError> {
+        self.reports.try_reserve(1).map_err(|_| {
+            MatchingError::CapacityReservationFailed(MatchingCapacity::CommandHistory)
+        })?;
+        let Command::New(order) = command else {
+            return Ok(());
+        };
+        if core_rejection.is_some() {
+            return Ok(());
+        }
+        self.seen_order_ids.try_reserve(1).map_err(|_| {
+            MatchingError::CapacityReservationFailed(MatchingCapacity::AcceptedOrderIds)
+        })?;
+        let can_rest = matches!(order.order_type, OrderType::Limit(_))
+            && matches!(
+                order.time_in_force,
+                TimeInForce::GoodTilCancelled | TimeInForce::PostOnly
+            );
+        if !can_rest {
+            return Ok(());
+        }
+        if self.orders.len() < self.limits.max_active_orders() {
+            self.orders.try_reserve(1).map_err(|_| {
+                MatchingError::CapacityReservationFailed(MatchingCapacity::ActiveOrders)
+            })?;
+        }
+        if !self.account_orders.contains_key(&order.account_id)
+            && self.account_orders.len() < self.limits.max_active_accounts()
+        {
+            self.account_orders.try_reserve(1).map_err(|_| {
+                MatchingError::CapacityReservationFailed(MatchingCapacity::ActiveAccounts)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Computes a safe command-specific report/trade bound in `O(1)` from
+    /// mutation-maintained side and account aggregates.
+    fn maximum_report_work(
+        &self,
+        command: Command,
+        core_rejection: Option<RejectReason>,
+    ) -> Result<(usize, u64), MatchingError> {
+        if core_rejection.is_some() {
+            return Ok((1, 0));
+        }
+
+        let (events, trades) = match command {
+            Command::New(order) if order.time_in_force == TimeInForce::PostOnly => (2_u128, 0),
+            Command::New(order) => {
+                let terminal_events = u128::from(order.time_in_force != TimeInForce::FillOrKill);
+                self.maximum_matching_work(IncomingPreview::from(order), terminal_events)?
+            }
+            Command::Cancel(_) => (1, 0),
+            Command::MassCancel(command) => {
+                let selected = self.account_active_order_count(command.account_id, command.scope);
+                let events = selected
+                    .checked_add(1)
+                    .ok_or(MatchingError::SequenceExhausted)?;
+                return Ok((events, 0));
+            }
+            Command::Replace(command) => {
+                let old = self
+                    .orders
+                    .get(&command.order_id)
+                    .expect("accepted replacement must reference an active order");
+                let priority_retained = old.price == command.new_price
+                    && command.new_quantity.lots() <= old.leaves
+                    && old.display == command.new_display;
+                if priority_retained {
+                    (1, 0)
+                } else {
+                    self.maximum_matching_work(
+                        IncomingPreview {
+                            account_id: old.account_id,
+                            side: old.side,
+                            order_type: OrderType::Limit(command.new_price),
+                            leaves: command.new_quantity.lots(),
+                            self_trade_prevention: old.self_trade_prevention,
+                        },
+                        1,
+                    )?
+                }
+            }
+        };
+        let events = usize::try_from(events).map_err(|_| MatchingError::SequenceExhausted)?;
+        Ok((events, trades))
+    }
+
+    fn maximum_matching_work(
+        &self,
+        incoming: IncomingPreview,
+        terminal_events: u128,
+    ) -> Result<(u128, u64), MatchingError> {
+        let quantity_steps = incoming.leaves / self.definition.quantity_rules().increment_lots();
+        let quantity_steps = u128::from(quantity_steps);
+        let opposite = incoming.side.opposite();
+        let total_event_units = self.levels(opposite).event_units();
+        let (self_order_count, self_event_units) = self
+            .account_orders
+            .get(&incoming.account_id)
+            .map_or((0_u128, 0_u128), |index| {
+                (
+                    u128::try_from(index.orders(opposite).len())
+                        .expect("active-order count must fit u128"),
+                    index.event_units(opposite),
+                )
+            });
+        let external_event_units = total_event_units
+            .checked_sub(self_event_units)
+            .expect("account event work must be a subset of side event work");
+        let consuming_event_limit = quantity_steps
+            .checked_mul(2)
+            .ok_or(MatchingError::SequenceExhausted)?;
+        let matching_and_terminal = match incoming.self_trade_prevention {
+            SelfTradePrevention::CancelResting => consuming_event_limit
+                .min(external_event_units)
+                .checked_add(
+                    self_order_count
+                        .checked_mul(2)
+                        .ok_or(MatchingError::SequenceExhausted)?,
+                )
+                .and_then(|value| value.checked_add(terminal_events))
+                .ok_or(MatchingError::SequenceExhausted)?,
+            SelfTradePrevention::CancelAggressor => consuming_event_limit
+                .min(external_event_units)
+                .checked_add(terminal_events.max(if self_order_count == 0 { 0 } else { 2 }))
+                .ok_or(MatchingError::SequenceExhausted)?,
+            SelfTradePrevention::CancelBoth => consuming_event_limit
+                .min(external_event_units)
+                .checked_add(terminal_events.max(if self_order_count == 0 { 0 } else { 3 }))
+                .ok_or(MatchingError::SequenceExhausted)?,
+            SelfTradePrevention::DecrementAndCancel => consuming_event_limit
+                .min(total_event_units)
+                .checked_add(terminal_events)
+                .ok_or(MatchingError::SequenceExhausted)?,
+        };
+        let events = matching_and_terminal
+            .checked_add(1)
+            .ok_or(MatchingError::SequenceExhausted)?;
+        let maximum_trades = quantity_steps.min(external_event_units);
+        let maximum_trades =
+            u64::try_from(maximum_trades).map_err(|_| MatchingError::TradeIdExhausted)?;
+        Ok((events, maximum_trades))
+    }
+
+    /// Commits one prepared command without repeating preflight.
+    ///
+    /// If the exact command was committed after preparation, this resolves to
+    /// its cached replay. Any unrelated intervening command makes the token
+    /// stale. The retained-history generation check precedes every mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MatchingError::CommandIdCollision`] if another command reused
+    /// the identifier, [`MatchingError::StalePreparation`] if an unrelated
+    /// command committed after preparation, or a sequence error only if an
+    /// internal invariant contradicts successful preparation.
+    pub fn commit(&mut self, prepared: PreparedCommand) -> Result<ExecutionReport, MatchingError> {
+        self.commit_with_gate(prepared, None)
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "opaque prepared commands are intentionally single-use capabilities"
+    )]
+    pub(crate) fn commit_with_gate(
+        &mut self,
+        prepared: PreparedCommand,
+        gate_reason: Option<RejectReason>,
+    ) -> Result<ExecutionReport, MatchingError> {
+        let PreparedCommand {
+            command,
+            book_instance_id,
+            expected_retained_commands,
+            core_rejection,
+            events,
+            selected_order_ids,
+        } = prepared;
+        if self.instance_id != book_instance_id {
+            return Err(MatchingError::ForeignPreparation);
+        }
+        let command_id = command.command_id();
+        if let Some(cached) = self.reports.get(&command_id) {
+            if cached.command != command {
+                return Err(MatchingError::CommandIdCollision(command_id));
+            }
+            let mut report = cached.report.clone();
+            report.replayed = true;
+            return Ok(report);
+        }
+        if self.reports.len() != expected_retained_commands {
+            return Err(MatchingError::StalePreparation);
+        }
+
+        let report = if let Some(reason) = core_rejection.or(gate_reason) {
+            self.rejected(command_id, command.received_at(), reason, events)?
+        } else {
+            match command {
+                Command::New(new_order) => self.apply_new(new_order, events)?,
+                Command::Cancel(cancel) => self.apply_cancel(cancel, events)?,
+                Command::Replace(replace) => self.apply_replace(replace, events)?,
+                Command::MassCancel(mass_cancel) => self.apply_mass_cancel(
+                    mass_cancel,
+                    events,
+                    selected_order_ids
+                        .expect("accepted mass cancellation must own selection storage"),
+                )?,
+            }
+        };
+        self.cache_report(command, &report);
+        Ok(report)
+    }
+
+    fn check_history_capacity_and_business(
+        &self,
+        command: Command,
+    ) -> Result<Option<RejectReason>, MatchingError> {
         if self.reports.len() >= self.limits.max_retained_commands() {
             return Err(MatchingError::CapacityExhausted(
                 MatchingCapacity::CommandHistory,
             ));
         }
-        if self.reports.len() >= self.limits.ordinary_command_capacity()
-            && !self.is_reserved_control(command)
-        {
-            return Err(MatchingError::CapacityExhausted(
-                MatchingCapacity::AdmissionCommandHistory,
-            ));
+        if self.reports.len() >= self.limits.ordinary_command_capacity() {
+            if !matches!(command, Command::Cancel(_) | Command::MassCancel(_)) {
+                return Err(MatchingError::CapacityExhausted(
+                    MatchingCapacity::AdmissionCommandHistory,
+                ));
+            }
+            let core_rejection = self.check_business_rules(command).err();
+            if core_rejection.is_some() {
+                return Err(MatchingError::CapacityExhausted(
+                    MatchingCapacity::AdmissionCommandHistory,
+                ));
+            }
+            return Ok(None);
         }
+        Ok(self.check_business_rules(command).err())
+    }
 
+    fn check_command_capacity(&self, command: Command) -> Result<(), MatchingError> {
         match command {
             Command::New(command) => self.check_new_capacity(command),
             Command::Replace(command) => self.check_replace_capacity(command),
             Command::Cancel(_) | Command::MassCancel(_) => Ok(()),
         }
-    }
-
-    fn is_reserved_control(&self, command: Command) -> bool {
-        matches!(command, Command::Cancel(_) | Command::MassCancel(_))
-            && self.check_business_rules(command).is_ok()
     }
 
     fn check_new_capacity(&self, command: NewOrder) -> Result<(), MatchingError> {
@@ -1974,20 +2591,47 @@ impl OrderBook {
         ) {
             return Ok(());
         }
-        if self.orders.len() >= self.limits.max_active_orders() {
-            return Err(MatchingError::CapacityExhausted(
-                MatchingCapacity::ActiveOrders,
-            ));
-        }
-        if !self.account_orders.contains_key(&command.account_id)
-            && self.account_orders.len() >= self.limits.max_active_accounts()
-        {
-            return Err(MatchingError::CapacityExhausted(
-                MatchingCapacity::ActiveAccounts,
-            ));
-        }
+        let active_orders_full = self.orders.len() >= self.limits.max_active_orders();
+        let active_accounts_full = !self.account_orders.contains_key(&command.account_id)
+            && self.account_orders.len() >= self.limits.max_active_accounts();
         let levels = self.levels(command.side);
-        if levels.get(price).is_none() && levels.len() >= self.limits.max_price_levels_per_side() {
+        let price_levels_full =
+            levels.get(price).is_none() && levels.len() >= self.limits.max_price_levels_per_side();
+        if !active_orders_full && !active_accounts_full && !price_levels_full {
+            return Ok(());
+        }
+        let preview = IncomingPreview::from(command);
+        let Some(removed_orders) = self.resting_residual_removed_orders(preview) else {
+            return Ok(());
+        };
+        if active_orders_full {
+            let final_active_orders = self
+                .orders
+                .len()
+                .checked_sub(removed_orders)
+                .and_then(|remaining| remaining.checked_add(1))
+                .expect("residual preview removal count must describe active makers");
+            if final_active_orders > self.limits.max_active_orders() {
+                return Err(MatchingError::CapacityExhausted(
+                    MatchingCapacity::ActiveOrders,
+                ));
+            }
+        }
+        if active_accounts_full {
+            let released_accounts = self.resting_residual_released_accounts(preview);
+            let final_active_accounts = self
+                .account_orders
+                .len()
+                .checked_sub(released_accounts)
+                .and_then(|remaining| remaining.checked_add(1))
+                .expect("residual preview release count must describe active accounts");
+            if final_active_accounts > self.limits.max_active_accounts() {
+                return Err(MatchingError::CapacityExhausted(
+                    MatchingCapacity::ActiveAccounts,
+                ));
+            }
+        }
+        if price_levels_full {
             return Err(MatchingError::CapacityExhausted(
                 Self::price_level_capacity(command.side),
             ));
@@ -2008,12 +2652,26 @@ impl OrderBook {
                 .get(order.price)
                 .is_some_and(|level| level.order_count == 1);
         let levels_after_removal = levels.len() - usize::from(old_level_is_released);
-        if levels_after_removal >= self.limits.max_price_levels_per_side() {
-            return Err(MatchingError::CapacityExhausted(
-                Self::price_level_capacity(order.side),
-            ));
+        if levels_after_removal < self.limits.max_price_levels_per_side() {
+            return Ok(());
         }
-        Ok(())
+        // Replacement removes the old same-side order before executing. It
+        // therefore changes no opposite-side input to the residual theorem: at
+        // a full level bound, only a proved non-zero residual needs the absent
+        // target level.
+        let preview = IncomingPreview {
+            account_id: order.account_id,
+            side: order.side,
+            order_type: OrderType::Limit(command.new_price),
+            leaves: command.new_quantity.lots(),
+            self_trade_prevention: order.self_trade_prevention,
+        };
+        if self.resting_residual_removed_orders(preview).is_none() {
+            return Ok(());
+        }
+        Err(MatchingError::CapacityExhausted(
+            Self::price_level_capacity(order.side),
+        ))
     }
 
     const fn price_level_capacity(side: Side) -> MatchingCapacity {
@@ -2268,6 +2926,15 @@ impl OrderBook {
                 )));
             }
         }
+        if self
+            .reports
+            .values()
+            .any(|cached| cached.report.events.len() > self.limits.max_report_events())
+        {
+            return Err(InvariantViolation::new(
+                "retained report exceeds configured event capacity",
+            ));
+        }
         Ok(())
     }
 
@@ -2280,6 +2947,7 @@ impl OrderBook {
                 )));
             }
             for side in [Side::Buy, Side::Sell] {
+                let mut event_units = 0_u128;
                 for &order_id in index.orders(side) {
                     if !indexed.insert(order_id) {
                         return Err(InvariantViolation::new(format!(
@@ -2296,6 +2964,16 @@ impl OrderBook {
                             "order {order_id} is indexed under the wrong account or side"
                         )));
                     }
+                    event_units = event_units
+                        .checked_add(order.remaining_event_units())
+                        .expect("active account event work must fit u128");
+                }
+                if event_units != index.event_units(side) {
+                    return Err(InvariantViolation::new(format!(
+                        "account {account_id} {side:?} event work {} differs from indexed aggregate {}",
+                        event_units,
+                        index.event_units(side)
+                    )));
                 }
             }
         }
@@ -2332,6 +3010,7 @@ impl OrderBook {
             let mut previous = None;
             let mut count = 0_u64;
             let mut total = 0_u128;
+            let mut event_units = 0_u128;
             while let Some(order_id) = current {
                 if !visited.insert(order_id) {
                     return Err(InvariantViolation::new(format!(
@@ -2371,6 +3050,9 @@ impl OrderBook {
                 }
                 count += 1;
                 total += u128::from(order.displayed);
+                event_units = event_units
+                    .checked_add(order.remaining_event_units())
+                    .expect("active level event work must fit u128");
                 previous = Some(order_id);
                 current = order.next;
             }
@@ -2380,7 +3062,10 @@ impl OrderBook {
                     price.raw()
                 )));
             }
-            if count != level.order_count || total != level.total_quantity {
+            if count != level.order_count
+                || total != level.total_quantity
+                || event_units != level.event_units
+            {
                 return Err(InvariantViolation::new(format!(
                     "{side:?} level at {} has inconsistent aggregates",
                     price.raw()
@@ -2390,7 +3075,11 @@ impl OrderBook {
         Ok(())
     }
 
-    fn apply_new(&mut self, command: NewOrder) -> Result<ExecutionReport, MatchingError> {
+    fn apply_new(
+        &mut self,
+        command: NewOrder,
+        mut events: EventTraceBuilder,
+    ) -> Result<ExecutionReport, MatchingError> {
         assert!(
             self.seen_order_ids.len() < self.limits.max_accepted_order_ids(),
             "new-order preflight must reserve accepted-order identity capacity"
@@ -2399,7 +3088,6 @@ impl OrderBook {
             self.seen_order_ids.insert(command.order_id),
             "business preflight must reject reused order identifiers"
         );
-        let mut events = Vec::with_capacity(4);
         self.push_event(
             &mut events,
             command.command_id,
@@ -2431,14 +3119,17 @@ impl OrderBook {
         Ok(ExecutionReport {
             command_id: command.command_id,
             outcome: CommandOutcome::Accepted,
-            events,
+            events: events.finish(),
             replayed: false,
         })
     }
 
-    fn apply_cancel(&mut self, command: CancelOrder) -> Result<ExecutionReport, MatchingError> {
+    fn apply_cancel(
+        &mut self,
+        command: CancelOrder,
+        mut events: EventTraceBuilder,
+    ) -> Result<ExecutionReport, MatchingError> {
         let removed = self.remove_order(command.order_id);
-        let mut events = Vec::with_capacity(1);
         self.push_event(
             &mut events,
             command.command_id,
@@ -2453,18 +3144,28 @@ impl OrderBook {
         Ok(ExecutionReport {
             command_id: command.command_id,
             outcome: CommandOutcome::Accepted,
-            events,
+            events: events.finish(),
             replayed: false,
         })
     }
 
-    fn apply_mass_cancel(&mut self, command: MassCancel) -> Result<ExecutionReport, MatchingError> {
-        let selected = self.take_account_orders(command.account_id, command.scope);
+    fn apply_mass_cancel(
+        &mut self,
+        command: MassCancel,
+        mut events: EventTraceBuilder,
+        mut selected: Vec<OrderId>,
+    ) -> Result<ExecutionReport, MatchingError> {
+        let selected_count = self.account_active_order_count(command.account_id, command.scope);
+        debug_assert_eq!(events.maximum_events, selected_count + 1);
+        debug_assert!(selected.capacity() >= selected_count);
+        let selected_buffer = selected.as_ptr();
+        self.take_account_orders_into(command.account_id, command.scope, &mut selected);
+        debug_assert_eq!(selected.len(), selected_count);
+        debug_assert_eq!(selected.as_ptr(), selected_buffer);
 
         let cancelled_order_count =
             u64::try_from(selected.len()).map_err(|_| MatchingError::SequenceExhausted)?;
         let mut cancelled_quantity_lots = 0_u128;
-        let mut events = Vec::with_capacity(selected.len().saturating_add(1));
         for order_id in selected {
             let removed = self.remove_order_preserving_account_index(order_id);
             cancelled_quantity_lots = cancelled_quantity_lots
@@ -2493,12 +3194,16 @@ impl OrderBook {
         Ok(ExecutionReport {
             command_id: command.command_id,
             outcome: CommandOutcome::Accepted,
-            events,
+            events: events.finish(),
             replayed: false,
         })
     }
 
-    fn apply_replace(&mut self, command: ReplaceOrder) -> Result<ExecutionReport, MatchingError> {
+    fn apply_replace(
+        &mut self,
+        command: ReplaceOrder,
+        mut events: EventTraceBuilder,
+    ) -> Result<ExecutionReport, MatchingError> {
         let old = self
             .orders
             .get(&command.order_id)
@@ -2508,7 +3213,6 @@ impl OrderBook {
         let priority_retained = old.price == command.new_price
             && new_quantity <= old.leaves
             && old.display == command.new_display;
-        let mut events = Vec::with_capacity(4);
         self.push_event(
             &mut events,
             command.command_id,
@@ -2529,17 +3233,32 @@ impl OrderBook {
         if priority_retained {
             let new_displayed = old.displayed.min(new_quantity);
             let displayed_reduction = old.displayed - new_displayed;
+            let new = RestingOrder {
+                leaves: new_quantity,
+                displayed: new_displayed,
+                ..old
+            };
+            let old_event_units = old.remaining_event_units();
+            let new_event_units = new.remaining_event_units();
             self.levels_mut(old.side)
                 .update(old.price, |level| {
                     level.total_quantity -= u128::from(displayed_reduction);
+                    level.event_units = level
+                        .event_units
+                        .checked_sub(old_event_units)
+                        .and_then(|value| value.checked_add(new_event_units))
+                        .expect("replacement event work must fit level aggregate");
                 })
                 .expect("resting order must reference an existing level");
+            self.account_orders
+                .get_mut(&old.account_id)
+                .expect("replacement account index must exist")
+                .replace_event_units(old.side, old_event_units, new_event_units);
             let order = self
                 .orders
                 .get_mut(&command.order_id)
                 .expect("validated order must exist");
-            order.leaves = new_quantity;
-            order.displayed = new_displayed;
+            *order = new;
         } else {
             self.remove_order(command.order_id);
             let incoming = IncomingOrder {
@@ -2563,7 +3282,7 @@ impl OrderBook {
         Ok(ExecutionReport {
             command_id: command.command_id,
             outcome: CommandOutcome::Accepted,
-            events,
+            events: events.finish(),
             replayed: false,
         })
     }
@@ -2573,8 +3292,8 @@ impl OrderBook {
         command_id: CommandId,
         occurred_at: TimestampNs,
         reason: RejectReason,
+        mut events: EventTraceBuilder,
     ) -> Result<ExecutionReport, MatchingError> {
-        let mut events = Vec::with_capacity(1);
         self.push_event(
             &mut events,
             command_id,
@@ -2584,7 +3303,7 @@ impl OrderBook {
         Ok(ExecutionReport {
             command_id,
             outcome: CommandOutcome::Rejected(reason),
-            events,
+            events: events.finish(),
             replayed: false,
         })
     }
@@ -2614,7 +3333,7 @@ impl OrderBook {
         time_in_force: TimeInForce,
         command_id: CommandId,
         occurred_at: TimestampNs,
-        events: &mut Vec<Event>,
+        events: &mut EventTraceBuilder,
     ) -> Result<(), MatchingError> {
         while incoming.leaves > 0 {
             let Some(resting_id) = self.best_opposite_order(incoming.side, incoming.order_type)
@@ -2692,7 +3411,7 @@ impl OrderBook {
         resting: RestingOrder,
         command_id: CommandId,
         occurred_at: TimestampNs,
-        events: &mut Vec<Event>,
+        events: &mut EventTraceBuilder,
     ) -> Result<(), MatchingError> {
         let prevented = incoming.leaves.min(resting.displayed);
         self.push_event(
@@ -2759,7 +3478,7 @@ impl OrderBook {
         reason: CancelReason,
         command_id: CommandId,
         occurred_at: TimestampNs,
-        events: &mut Vec<Event>,
+        events: &mut EventTraceBuilder,
     ) -> Result<(), MatchingError> {
         let quantity = incoming.leaves;
         incoming.leaves = 0;
@@ -2775,7 +3494,7 @@ impl OrderBook {
 
     fn push_cancelled(
         &mut self,
-        events: &mut Vec<Event>,
+        events: &mut EventTraceBuilder,
         command_id: CommandId,
         occurred_at: TimestampNs,
         order_id: OrderId,
@@ -2796,7 +3515,7 @@ impl OrderBook {
 
     fn push_refresh(
         &mut self,
-        events: &mut Vec<Event>,
+        events: &mut EventTraceBuilder,
         command_id: CommandId,
         occurred_at: TimestampNs,
         refresh: ReserveRefresh,
@@ -2861,7 +3580,7 @@ impl OrderBook {
 
     fn push_event(
         &mut self,
-        events: &mut Vec<Event>,
+        events: &mut EventTraceBuilder,
         command_id: CommandId,
         occurred_at: TimestampNs,
         kind: EventKind,
@@ -2903,6 +3622,92 @@ impl OrderBook {
         crosses.then_some(level.head)
     }
 
+    /// Returns the number of makers removed before a non-zero residual rests.
+    ///
+    /// This follows the same reserve/STP liquidity theorem as FOK inspection and
+    /// does not mutate or materialize replenishment slices. A blocking self
+    /// encounter cancels the aggressor, cancel-resting excludes self leaves, and
+    /// decrement-and-cancel consumes both external and self leaves. Therefore,
+    /// if a residual remains, every crossed level inspected by this function was
+    /// completely removed and its cached order count is the exact cardinality
+    /// released before the residual is appended.
+    fn resting_residual_removed_orders(&self, incoming: IncomingPreview) -> Option<usize> {
+        let mut remaining = incoming.leaves;
+        let mut removed_orders = 0_usize;
+        let mut price = self.best_price(incoming.side.opposite());
+        while let Some(current_price) = price {
+            let crosses = match (incoming.side, incoming.order_type) {
+                (_, OrderType::Market) => true,
+                (Side::Buy, OrderType::Limit(limit)) => limit >= current_price,
+                (Side::Sell, OrderType::Limit(limit)) => limit <= current_price,
+            };
+            if !crosses {
+                break;
+            }
+            let level = self
+                .levels(incoming.side.opposite())
+                .get(current_price)
+                .expect("enumerated price must have a level");
+            let liquidity = match incoming.self_trade_prevention {
+                SelfTradePrevention::CancelResting => {
+                    self.cancel_resting_liquidity(incoming.account_id, level.head, remaining)
+                }
+                SelfTradePrevention::CancelAggressor | SelfTradePrevention::CancelBoth => {
+                    self.blocking_liquidity(incoming.account_id, level.head, remaining)
+                }
+                SelfTradePrevention::DecrementAndCancel => {
+                    self.total_level_liquidity(level.head, remaining)
+                }
+            };
+            match liquidity {
+                LevelLiquidity::Filled | LevelLiquidity::BlockedBySelfTrade => return None,
+                LevelLiquidity::Remaining(next) => {
+                    remaining = next;
+                    removed_orders = removed_orders
+                        .checked_add(usize::try_from(level.order_count).expect(
+                            "one price level cannot contain more orders than addressable memory",
+                        ))
+                        .expect("crossed order count cannot exceed active order count");
+                }
+            }
+            price = self.next_worse_price(incoming.side.opposite(), current_price);
+        }
+        debug_assert_ne!(remaining, 0);
+        Some(removed_orders)
+    }
+
+    /// Counts current accounts that lose every active order before the predicted
+    /// residual is appended.
+    ///
+    /// This is called only after [`Self::resting_residual_removed_orders`]
+    /// proves that every crossed opposite level is completely removed. Account
+    /// memberships are disjoint, so the scan visits at most every active order
+    /// once and requires no auxiliary storage.
+    fn resting_residual_released_accounts(&self, incoming: IncomingPreview) -> usize {
+        debug_assert!(!self.account_orders.contains_key(&incoming.account_id));
+        self.account_orders
+            .values()
+            .filter(|index| {
+                !index.is_empty()
+                    && [Side::Buy, Side::Sell]
+                        .into_iter()
+                        .flat_map(|side| index.orders(side))
+                        .all(|order_id| {
+                            let order = self
+                                .orders
+                                .get(order_id)
+                                .expect("account index order must exist");
+                            order.side == incoming.side.opposite()
+                                && match (incoming.side, incoming.order_type) {
+                                    (_, OrderType::Market) => true,
+                                    (Side::Buy, OrderType::Limit(limit)) => limit >= order.price,
+                                    (Side::Sell, OrderType::Limit(limit)) => limit <= order.price,
+                                }
+                        })
+            })
+            .count()
+    }
+
     fn can_fill(&self, incoming: &NewOrder) -> bool {
         let mut remaining = incoming.quantity.lots();
         let mut price = self.best_price(incoming.side.opposite());
@@ -2920,9 +3725,9 @@ impl OrderBook {
                 .get(current_price)
                 .expect("enumerated price must have a level");
             match self.fok_level_liquidity(incoming, level.head, remaining) {
-                FokLevelLiquidity::Filled => return true,
-                FokLevelLiquidity::Remaining(next) => remaining = next,
-                FokLevelLiquidity::BlockedBySelfTrade => return false,
+                LevelLiquidity::Filled => return true,
+                LevelLiquidity::Remaining(next) => remaining = next,
+                LevelLiquidity::BlockedBySelfTrade => return false,
             }
             price = self.next_worse_price(incoming.side.opposite(), current_price);
         }
@@ -2943,24 +3748,24 @@ impl OrderBook {
         incoming: &NewOrder,
         head: OrderId,
         remaining: u64,
-    ) -> FokLevelLiquidity {
+    ) -> LevelLiquidity {
         match incoming.self_trade_prevention {
             SelfTradePrevention::CancelResting => {
-                self.fok_cancel_resting_liquidity(incoming.account_id, head, remaining)
+                self.cancel_resting_liquidity(incoming.account_id, head, remaining)
             }
             SelfTradePrevention::CancelAggressor | SelfTradePrevention::CancelBoth => {
-                self.fok_blocking_liquidity(incoming.account_id, head, remaining)
+                self.blocking_liquidity(incoming.account_id, head, remaining)
             }
-            SelfTradePrevention::DecrementAndCancel => FokLevelLiquidity::BlockedBySelfTrade,
+            SelfTradePrevention::DecrementAndCancel => LevelLiquidity::BlockedBySelfTrade,
         }
     }
 
-    fn fok_cancel_resting_liquidity(
+    fn cancel_resting_liquidity(
         &self,
         account_id: AccountId,
         head: OrderId,
         mut remaining: u64,
-    ) -> FokLevelLiquidity {
+    ) -> LevelLiquidity {
         let mut current = Some(head);
         while let Some(order_id) = current {
             let order = self
@@ -2973,18 +3778,18 @@ impl OrderBook {
             }
             remaining = remaining.saturating_sub(order.leaves);
             if remaining == 0 {
-                return FokLevelLiquidity::Filled;
+                return LevelLiquidity::Filled;
             }
         }
-        FokLevelLiquidity::Remaining(remaining)
+        LevelLiquidity::Remaining(remaining)
     }
 
-    fn fok_blocking_liquidity(
+    fn blocking_liquidity(
         &self,
         account_id: AccountId,
         head: OrderId,
         remaining: u64,
-    ) -> FokLevelLiquidity {
+    ) -> LevelLiquidity {
         let mut total_path_remaining = remaining;
         let mut pre_barrier_remaining = remaining;
         let mut current = Some(head);
@@ -2995,19 +3800,35 @@ impl OrderBook {
                 .expect("price-level order must exist");
             current = order.next;
             if order.account_id == account_id {
-                return FokLevelLiquidity::BlockedBySelfTrade;
+                return LevelLiquidity::BlockedBySelfTrade;
             }
             total_path_remaining = total_path_remaining.saturating_sub(order.leaves);
             pre_barrier_remaining = pre_barrier_remaining.saturating_sub(order.displayed);
             if pre_barrier_remaining == 0 {
-                return FokLevelLiquidity::Filled;
+                return LevelLiquidity::Filled;
             }
         }
         if total_path_remaining == 0 {
-            FokLevelLiquidity::Filled
+            LevelLiquidity::Filled
         } else {
-            FokLevelLiquidity::Remaining(total_path_remaining)
+            LevelLiquidity::Remaining(total_path_remaining)
         }
+    }
+
+    fn total_level_liquidity(&self, head: OrderId, mut remaining: u64) -> LevelLiquidity {
+        let mut current = Some(head);
+        while let Some(order_id) = current {
+            let order = self
+                .orders
+                .get(&order_id)
+                .expect("price-level order must exist");
+            current = order.next;
+            remaining = remaining.saturating_sub(order.leaves);
+            if remaining == 0 {
+                return LevelLiquidity::Filled;
+            }
+        }
+        LevelLiquidity::Remaining(remaining)
     }
 
     fn next_worse_price(&self, side: Side, current: Price) -> Option<Price> {
@@ -3025,26 +3846,29 @@ impl OrderBook {
         }
     }
 
-    fn take_account_orders(
+    fn take_account_orders_into(
         &mut self,
         account_id: AccountId,
         scope: MassCancelScope,
-    ) -> Vec<OrderId> {
+        selected: &mut Vec<OrderId>,
+    ) {
+        debug_assert!(selected.is_empty());
         match scope {
-            MassCancelScope::All => self
-                .account_orders
-                .remove(&account_id)
-                .map_or_else(Vec::new, |index| merge_order_ids(index.buys, index.sells)),
+            MassCancelScope::All => {
+                if let Some(index) = self.account_orders.remove(&account_id) {
+                    merge_order_ids_into(index.buys, index.sells, selected);
+                }
+            }
             MassCancelScope::Side(side) => {
                 let Some(index) = self.account_orders.get_mut(&account_id) else {
-                    return Vec::new();
+                    return;
                 };
-                let selected = std::mem::take(index.orders_mut(side));
+                let orders = index.take_orders(side);
                 let remove_account = index.is_empty();
                 if remove_account {
                     self.account_orders.remove(&account_id);
                 }
-                selected.into_iter().collect()
+                selected.extend(orders);
             }
         }
     }
@@ -3071,17 +3895,16 @@ impl OrderBook {
                 || self.levels(order.side).len() < self.limits.max_price_levels_per_side(),
             "resting-order preflight must reserve price-level capacity"
         );
-        let inserted = self
-            .account_orders
-            .entry(order.account_id)
-            .or_default()
-            .orders_mut(order.side)
-            .insert(order.order_id);
+        let event_units = order.remaining_event_units();
+        let index = self.account_orders.entry(order.account_id).or_default();
+        let inserted = index.orders_mut(order.side).insert(order.order_id);
         assert!(inserted, "active order must be absent from account index");
+        index.add_event_units(order.side, event_units);
         self.append_order_preserving_account_index(order);
     }
 
     fn append_order_preserving_account_index(&mut self, mut order: RestingOrder) {
+        let event_units = order.remaining_event_units();
         let existing_tail = self
             .levels(order.side)
             .get(order.price)
@@ -3098,6 +3921,7 @@ impl OrderBook {
                     level.tail = order.order_id;
                     level.total_quantity += u128::from(order.displayed);
                     level.order_count += 1;
+                    level.event_units += event_units;
                 })
                 .expect("tail implies existing price level");
         } else {
@@ -3108,6 +3932,7 @@ impl OrderBook {
                     tail: order.order_id,
                     total_quantity: u128::from(order.displayed),
                     order_count: 1,
+                    event_units,
                 },
             );
         }
@@ -3141,6 +3966,7 @@ impl OrderBook {
             None
         } else {
             let mut refreshed = self.remove_order_preserving_account_index(order_id);
+            let old_event_units = refreshed.remaining_event_units();
             refreshed.leaves -= quantity;
             refreshed.displayed = refreshed.display.displayed_lots(refreshed.leaves);
             refreshed.previous = None;
@@ -3151,6 +3977,11 @@ impl OrderBook {
                 displayed: refreshed.displayed,
                 leaves: refreshed.leaves,
             };
+            let new_event_units = refreshed.remaining_event_units();
+            self.account_orders
+                .get_mut(&refreshed.account_id)
+                .expect("refreshed order account index must exist")
+                .replace_event_units(refreshed.side, old_event_units, new_event_units);
             self.append_order_preserving_account_index(refreshed);
             Some(result)
         }
@@ -3166,6 +3997,7 @@ impl OrderBook {
             index.orders_mut(order.side).remove(&order_id),
             "active order must exist in its account index"
         );
+        index.remove_event_units(order.side, order.remaining_event_units());
         if index.is_empty() {
             self.account_orders.remove(&order.account_id);
         }
@@ -3195,6 +4027,7 @@ impl OrderBook {
             .update(order.price, |level| {
                 level.total_quantity -= u128::from(order.displayed);
                 level.order_count -= 1;
+                level.event_units -= order.remaining_event_units();
                 if order.previous.is_none() {
                     if let Some(next) = order.next {
                         level.head = next;
@@ -3215,12 +4048,16 @@ impl OrderBook {
     }
 }
 
-fn merge_order_ids(buys: BTreeSet<OrderId>, sells: BTreeSet<OrderId>) -> Vec<OrderId> {
-    let capacity = buys
+fn merge_order_ids_into(
+    buys: BTreeSet<OrderId>,
+    sells: BTreeSet<OrderId>,
+    merged: &mut Vec<OrderId>,
+) {
+    let additional = buys
         .len()
         .checked_add(sells.len())
         .expect("disjoint active-order subsets cannot exceed total address space");
-    let mut merged = Vec::with_capacity(capacity);
+    debug_assert!(merged.capacity() - merged.len() >= additional);
     let mut buys = buys.into_iter().peekable();
     let mut sells = sells.into_iter().peekable();
     while let (Some(buy), Some(sell)) = (buys.peek(), sells.peek()) {
@@ -3233,14 +4070,15 @@ fn merge_order_ids(buys: BTreeSet<OrderId>, sells: BTreeSet<OrderId>) -> Vec<Ord
     }
     merged.extend(buys);
     merged.extend(sells);
-    merged
 }
 
 #[cfg(test)]
 mod price_level_index_tests {
     use super::{
-        InvariantViolation, NewOrder, OrderBook, OrderDisplay, OrderType, PriceLevel, PriceLevels,
-        RestingOrder, SelfTradePrevention, TimeInForce,
+        Command, CommandPreparation, EventTraceBuilder, IncomingPreview, InvariantViolation,
+        MassCancel, MassCancelScope, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsSpec,
+        OrderDisplay, OrderType, PriceLevel, PriceLevels, ReplaceOrder, RestingOrder,
+        SelfTradePrevention, TimeInForce,
     };
     use crate::instrument::{
         InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -3276,7 +4114,7 @@ mod price_level_index_tests {
             kind: InstrumentKind::Future,
             base_asset_id: AssetId::new(1).unwrap(),
             quote_asset_id: AssetId::new(2).unwrap(),
-            price: PriceRules::new(0, 1, Price::from_raw(1), Price::from_raw(1_000)).unwrap(),
+            price: PriceRules::new(0, 1, Price::from_raw(-1_000), Price::from_raw(1_000)).unwrap(),
             quantity: QuantityRules::new(1, 1, u64::MAX).unwrap(),
             reserve: ReserveOrderRules::new(64).unwrap(),
             base_units_per_lot: 1,
@@ -3338,6 +4176,12 @@ mod price_level_index_tests {
 
     fn generated_book_and_fok(generator: &mut Generator) -> (OrderBook, NewOrder) {
         let mut book = OrderBook::new(reserve_definition());
+        let incoming_side = if generator.bounded(2) == 0 {
+            Side::Buy
+        } else {
+            Side::Sell
+        };
+        let base_price = if generator.bounded(2) == 0 { -100 } else { 100 };
         let level_count = generator.bounded(3) + 1;
         let mut next_order_id = 1_u64;
         for level_index in 0..level_count {
@@ -3361,11 +4205,17 @@ mod price_level_index_tests {
                 } else {
                     AccountId::new(generator.bounded(8) + 2).unwrap()
                 };
+                let level_offset = i64::try_from(level_index).unwrap();
+                let price = match incoming_side {
+                    Side::Buy => base_price + level_offset,
+                    Side::Sell => base_price - level_offset,
+                };
+                let order_id = OrderId::new(next_order_id).unwrap();
                 book.append_order(RestingOrder {
-                    order_id: OrderId::new(next_order_id).unwrap(),
+                    order_id,
                     account_id,
-                    side: Side::Sell,
-                    price: Price::from_raw(100 + i64::try_from(level_index).unwrap()),
+                    side: incoming_side.opposite(),
+                    price: Price::from_raw(price),
                     leaves,
                     displayed,
                     display,
@@ -3373,6 +4223,7 @@ mod price_level_index_tests {
                     previous: None,
                     next: None,
                 });
+                book.seen_order_ids.insert(order_id);
                 next_order_id += 1;
             }
         }
@@ -3387,15 +4238,92 @@ mod price_level_index_tests {
             account_id: AccountId::new(1).unwrap(),
             instrument_id: InstrumentId::new(1).unwrap(),
             instrument_version: InstrumentVersion::new(1).unwrap(),
-            side: Side::Buy,
+            side: incoming_side,
             quantity: Quantity::new(generator.bounded(80) + 1).unwrap(),
             display: OrderDisplay::FullyDisplayed,
-            order_type: OrderType::Limit(Price::from_raw(102)),
+            order_type: OrderType::Limit(Price::from_raw(match incoming_side {
+                Side::Buy => base_price + 2,
+                Side::Sell => base_price - 2,
+            })),
             time_in_force: TimeInForce::FillOrKill,
             self_trade_prevention: policy,
             received_at: TimestampNs::from_unix_nanos(1),
         };
         (book, incoming)
+    }
+
+    fn append_full_replacement_level(
+        book: &mut OrderBook,
+        incoming: NewOrder,
+        generator: &mut Generator,
+    ) -> RestingOrder {
+        let old_price = match incoming.side {
+            Side::Buy => Price::from_raw(-500),
+            Side::Sell => Price::from_raw(500),
+        };
+        let old_leaves = generator.bounded(20) + 1;
+        let old = RestingOrder {
+            order_id: incoming.order_id,
+            account_id: incoming.account_id,
+            side: incoming.side,
+            price: old_price,
+            leaves: old_leaves,
+            displayed: old_leaves,
+            display: OrderDisplay::FullyDisplayed,
+            self_trade_prevention: incoming.self_trade_prevention,
+            previous: None,
+            next: None,
+        };
+        book.append_order(old);
+        book.seen_order_ids.insert(old.order_id);
+
+        let peer_id = OrderId::new(old.order_id.get() + 1).unwrap();
+        book.append_order(RestingOrder {
+            order_id: peer_id,
+            account_id: AccountId::new(99).unwrap(),
+            side: incoming.side,
+            price: old_price,
+            leaves: 1,
+            displayed: 1,
+            display: OrderDisplay::FullyDisplayed,
+            self_trade_prevention: SelfTradePrevention::CancelAggressor,
+            previous: None,
+            next: None,
+        });
+        book.seen_order_ids.insert(peer_id);
+
+        for offset in 0..2 {
+            let order_id = OrderId::new(old.order_id.get() + 2 + offset).unwrap();
+            let price = match incoming.side {
+                Side::Buy => Price::from_raw(-600 - i64::try_from(offset).unwrap() * 100),
+                Side::Sell => Price::from_raw(600 + i64::try_from(offset).unwrap() * 100),
+            };
+            book.append_order(RestingOrder {
+                order_id,
+                account_id: AccountId::new(98).unwrap(),
+                side: incoming.side,
+                price,
+                leaves: 1,
+                displayed: 1,
+                display: OrderDisplay::FullyDisplayed,
+                self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                previous: None,
+                next: None,
+            });
+            book.seen_order_ids.insert(order_id);
+        }
+        book.limits = OrderBookLimits::new(OrderBookLimitsSpec {
+            max_active_orders: 32,
+            max_active_accounts: 32,
+            max_price_levels_per_side: 3,
+            max_accepted_order_ids: 64,
+            max_retained_commands: 64,
+            cancellation_reserve: 32,
+            max_report_events: 256,
+            preallocate: false,
+        })
+        .unwrap();
+        old
     }
 
     fn level(order_id: u64) -> PriceLevel {
@@ -3405,6 +4333,7 @@ mod price_level_index_tests {
             tail: order_id,
             total_quantity: u128::from(order_id.get()),
             order_count: 1,
+            event_units: u128::from(order_id.get()),
         }
     }
 
@@ -3465,6 +4394,35 @@ mod price_level_index_tests {
     }
 
     #[test]
+    fn invariant_validation_recomputes_level_and_account_event_work() {
+        let mut generator = Generator(0x72d4_0a9e_61bc_35f8);
+        let (book, incoming) = generated_book_and_fok(&mut generator);
+        book.validate().expect("generated book must be valid");
+
+        let side = incoming.side.opposite();
+        let price = book.best_price(side).expect("generated side is non-empty");
+        let level = *book.levels(side).get(price).unwrap();
+        let account_id = book.orders.get(&level.head).unwrap().account_id;
+
+        let mut corrupted_level = book.clone();
+        corrupted_level
+            .levels_mut(side)
+            .update(price, |level| level.event_units += 1)
+            .unwrap();
+        let error = corrupted_level.validate().unwrap_err();
+        assert!(error.detail().contains("inconsistent aggregates"));
+
+        let mut corrupted_account = book;
+        corrupted_account
+            .account_orders
+            .get_mut(&account_id)
+            .unwrap()
+            .add_event_units(side, 1);
+        let error = corrupted_account.validate().unwrap_err();
+        assert!(error.detail().contains("event work"));
+    }
+
+    #[test]
     fn allocation_free_fok_scan_matches_slice_queue_reference() {
         let mut generator = Generator(0x91c7_5a2b_d4e8_603f);
         for case in 0..20_000 {
@@ -3474,6 +4432,297 @@ mod price_level_index_tests {
                 reference_can_fill(&book, &incoming),
                 "FOK model divergence in generated case {case}"
             );
+        }
+    }
+
+    #[test]
+    fn command_specific_event_bound_admits_the_last_complete_report() {
+        let mut book = OrderBook::new(reserve_definition());
+        book.next_sequence = u64::MAX - 2;
+        let command = NewOrder {
+            command_id: CommandId::new(1).unwrap(),
+            order_id: OrderId::new(1).unwrap(),
+            account_id: AccountId::new(1).unwrap(),
+            instrument_id: InstrumentId::new(1).unwrap(),
+            instrument_version: InstrumentVersion::new(1).unwrap(),
+            side: Side::Buy,
+            quantity: Quantity::new(1).unwrap(),
+            display: OrderDisplay::FullyDisplayed,
+            order_type: OrderType::Limit(Price::from_raw(1)),
+            time_in_force: TimeInForce::GoodTilCancelled,
+            self_trade_prevention: SelfTradePrevention::CancelAggressor,
+            received_at: TimestampNs::from_unix_nanos(1),
+        };
+        let CommandPreparation::Ready(prepared) = book.prepare(Command::New(command)).unwrap()
+        else {
+            panic!("new command cannot be a replay")
+        };
+        let prepared_buffer = prepared.events.events.as_ptr();
+        let report = book
+            .commit(prepared)
+            .expect("two-event report fits before sequence exhaustion");
+        assert_eq!(report.events.len(), 2);
+        assert_eq!(report.events.as_ptr(), prepared_buffer);
+        assert_eq!(report.events[0].sequence, u64::MAX - 2);
+        assert_eq!(report.events[1].sequence, u64::MAX - 1);
+        assert_eq!(book.next_sequence, u64::MAX);
+    }
+
+    #[test]
+    fn preparation_owns_hash_headroom_and_mass_cancel_selection_storage() {
+        let mut book = OrderBook::new(reserve_definition());
+        let new = NewOrder {
+            command_id: CommandId::new(1).unwrap(),
+            order_id: OrderId::new(1).unwrap(),
+            account_id: AccountId::new(1).unwrap(),
+            instrument_id: InstrumentId::new(1).unwrap(),
+            instrument_version: InstrumentVersion::new(1).unwrap(),
+            side: Side::Buy,
+            quantity: Quantity::new(1).unwrap(),
+            display: OrderDisplay::FullyDisplayed,
+            order_type: OrderType::Limit(Price::from_raw(1)),
+            time_in_force: TimeInForce::GoodTilCancelled,
+            self_trade_prevention: SelfTradePrevention::CancelAggressor,
+            received_at: TimestampNs::from_unix_nanos(1),
+        };
+        assert_eq!(book.orders.capacity(), 0);
+        assert_eq!(book.account_orders.capacity(), 0);
+        assert_eq!(book.seen_order_ids.capacity(), 0);
+        assert_eq!(book.reports.capacity(), 0);
+        let CommandPreparation::Ready(prepared) = book.prepare(Command::New(new)).unwrap() else {
+            panic!("new command cannot be a replay")
+        };
+        assert!(book.orders.capacity() >= 1);
+        assert!(book.account_orders.capacity() >= 1);
+        assert!(book.seen_order_ids.capacity() >= 1);
+        assert!(book.reports.capacity() >= 1);
+        let capacities = (
+            book.orders.capacity(),
+            book.account_orders.capacity(),
+            book.seen_order_ids.capacity(),
+            book.reports.capacity(),
+        );
+        book.commit(prepared).unwrap();
+        assert_eq!(
+            capacities,
+            (
+                book.orders.capacity(),
+                book.account_orders.capacity(),
+                book.seen_order_ids.capacity(),
+                book.reports.capacity(),
+            )
+        );
+
+        let mass_cancel = Command::MassCancel(MassCancel {
+            command_id: CommandId::new(2).unwrap(),
+            account_id: AccountId::new(1).unwrap(),
+            instrument_id: InstrumentId::new(1).unwrap(),
+            instrument_version: InstrumentVersion::new(1).unwrap(),
+            scope: MassCancelScope::All,
+            received_at: TimestampNs::from_unix_nanos(2),
+        });
+        let CommandPreparation::Ready(prepared) = book.prepare(mass_cancel).unwrap() else {
+            panic!("mass cancel cannot be a replay")
+        };
+        let selected = prepared
+            .selected_order_ids
+            .as_ref()
+            .expect("mass cancellation owns selection storage");
+        assert!(selected.is_empty());
+        assert!(selected.capacity() >= 1);
+        book.commit(prepared).unwrap();
+        assert_eq!(book.active_order_count(), 0);
+    }
+
+    #[test]
+    fn command_specific_work_bound_covers_generated_reports() {
+        let mut generator = Generator(0x3e19_85ab_c742_d601);
+        for case in 0..20_000 {
+            let (mut book, mut incoming) = generated_book_and_fok(&mut generator);
+            incoming.time_in_force = match generator.bounded(4) {
+                0 => TimeInForce::GoodTilCancelled,
+                1 => TimeInForce::ImmediateOrCancel,
+                2 => TimeInForce::FillOrKill,
+                _ => TimeInForce::PostOnly,
+            };
+            incoming.self_trade_prevention = match generator.bounded(4) {
+                0 => SelfTradePrevention::CancelAggressor,
+                1 => SelfTradePrevention::CancelResting,
+                2 => SelfTradePrevention::CancelBoth,
+                _ => SelfTradePrevention::DecrementAndCancel,
+            };
+            let command = Command::New(incoming);
+            let core_rejection = book.check_business_rules(command).err();
+            let (maximum_events, maximum_trades) = book
+                .maximum_report_work(command, core_rejection)
+                .expect("generated command work must be representable");
+            let report = book
+                .submit(command)
+                .expect("generated command cannot exhaust operational capacity");
+            let actual_trades = report
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind, super::EventKind::Trade(_)))
+                .count();
+            assert!(
+                report.events.len() <= maximum_events,
+                "event bound was exceeded in generated case {case}: {} > {maximum_events}",
+                report.events.len()
+            );
+            assert!(
+                report.events.0.capacity() >= maximum_events,
+                "prepared allocation was smaller than its bound in generated case {case}"
+            );
+            assert!(
+                u64::try_from(actual_trades).unwrap() <= maximum_trades,
+                "trade bound was exceeded in generated case {case}: {actual_trades} > {maximum_trades}"
+            );
+            book.validate()
+                .expect("generated execution must preserve all maintained aggregates");
+        }
+    }
+
+    #[test]
+    fn residual_preview_matches_real_gtc_execution() {
+        let mut generator = Generator(0x4d82_107f_a639_ce55);
+        for case in 0..20_000 {
+            let (book, mut incoming) = generated_book_and_fok(&mut generator);
+            incoming.time_in_force = TimeInForce::GoodTilCancelled;
+            incoming.self_trade_prevention = match generator.bounded(4) {
+                0 => SelfTradePrevention::CancelAggressor,
+                1 => SelfTradePrevention::CancelResting,
+                2 => SelfTradePrevention::CancelBoth,
+                _ => SelfTradePrevention::DecrementAndCancel,
+            };
+            let predicted = book.resting_residual_removed_orders(IncomingPreview::from(incoming));
+            let mut executed = book.clone();
+            executed
+                .submit(Command::New(incoming))
+                .expect("generated GTC command is valid");
+            let actual = executed.order(incoming.order_id).is_some();
+            assert_eq!(
+                predicted.is_some(),
+                actual,
+                "residual preview diverged in generated case {case}"
+            );
+            if let Some(predicted_removed) = predicted {
+                let actual_removed = book
+                    .active_order_count()
+                    .checked_add(1)
+                    .and_then(|with_incoming| {
+                        with_incoming.checked_sub(executed.active_order_count())
+                    })
+                    .expect("a resting residual adds exactly one active order");
+                assert_eq!(
+                    predicted_removed, actual_removed,
+                    "removed-order preview diverged in generated case {case}"
+                );
+            }
+
+            let mut external = incoming;
+            external.account_id = AccountId::new(100).unwrap();
+            let external_preview =
+                book.resting_residual_removed_orders(IncomingPreview::from(external));
+            if external_preview.is_some() {
+                let predicted_released_accounts =
+                    book.resting_residual_released_accounts(IncomingPreview::from(external));
+                let initial_accounts = book.account_orders.len();
+                let mut external_execution = book.clone();
+                external_execution
+                    .submit(Command::New(external))
+                    .expect("generated external-account GTC command is valid");
+                assert!(external_execution.order(external.order_id).is_some());
+                let released_accounts = initial_accounts
+                    .checked_add(1)
+                    .and_then(|with_incoming| {
+                        with_incoming.checked_sub(external_execution.account_orders.len())
+                    })
+                    .expect("a new residual account changes final account cardinality exactly");
+                assert_eq!(
+                    predicted_released_accounts, released_accounts,
+                    "account-release preview diverged in generated case {case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_residual_preview_matches_real_execution() {
+        let mut generator = Generator(0xa763_84f1_09de_2bc5);
+        for case in 0..20_000 {
+            let (mut book, mut incoming) = generated_book_and_fok(&mut generator);
+            incoming.time_in_force = TimeInForce::GoodTilCancelled;
+            incoming.self_trade_prevention = match generator.bounded(4) {
+                0 => SelfTradePrevention::CancelAggressor,
+                1 => SelfTradePrevention::CancelResting,
+                2 => SelfTradePrevention::CancelBoth,
+                _ => SelfTradePrevention::DecrementAndCancel,
+            };
+            let old = append_full_replacement_level(&mut book, incoming, &mut generator);
+
+            let preview = IncomingPreview {
+                account_id: old.account_id,
+                side: old.side,
+                order_type: incoming.order_type,
+                leaves: incoming.quantity.lots(),
+                self_trade_prevention: old.self_trade_prevention,
+            };
+            let predicted = book.resting_residual_removed_orders(preview);
+            let initial_active_orders = book.active_order_count();
+            let OrderType::Limit(new_price) = incoming.order_type else {
+                unreachable!("generated replacement preview is limit-priced")
+            };
+            let replacement = ReplaceOrder {
+                command_id: incoming.command_id,
+                order_id: old.order_id,
+                account_id: old.account_id,
+                instrument_id: incoming.instrument_id,
+                instrument_version: incoming.instrument_version,
+                new_quantity: incoming.quantity,
+                new_price,
+                new_display: OrderDisplay::FullyDisplayed,
+                received_at: incoming.received_at,
+            };
+            assert_eq!(
+                book.check_replace_capacity(replacement).is_ok(),
+                predicted.is_none(),
+                "replacement capacity decision diverged in generated case {case}"
+            );
+            book.limits = OrderBookLimits::default();
+            let (maximum_events, maximum_trades) = book
+                .maximum_report_work(Command::Replace(replacement), None)
+                .expect("generated replacement work is representable");
+            let events = EventTraceBuilder::try_with_capacity(maximum_events)
+                .expect("generated replacement trace allocation must succeed");
+            let report = book
+                .apply_replace(replacement, events)
+                .expect("generated replacement execution cannot exhaust identifiers");
+            assert!(report.events.len() <= maximum_events);
+            assert!(
+                u64::try_from(
+                    report
+                        .events
+                        .iter()
+                        .filter(|event| matches!(event.kind, super::EventKind::Trade(_)))
+                        .count()
+                )
+                .unwrap()
+                    <= maximum_trades,
+                "replacement trade bound was exceeded in generated case {case}"
+            );
+
+            assert_eq!(
+                predicted.is_some(),
+                book.order(old.order_id).is_some(),
+                "replacement residual preview diverged in generated case {case}"
+            );
+            if let Some(predicted_removed) = predicted {
+                assert_eq!(
+                    predicted_removed,
+                    initial_active_orders - book.active_order_count(),
+                    "replacement maker-removal preview diverged in generated case {case}"
+                );
+            }
         }
     }
 }

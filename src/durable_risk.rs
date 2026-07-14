@@ -14,7 +14,9 @@ use crate::journal::{
     Journal, JournalError, JournalFrame, JournalLayout, JournalOptions, RecordKind,
     SegmentedJournalError, SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
 };
-use crate::matching::{Command, ExecutionReport, MatchingError, OrderBookLimits};
+use crate::matching::{
+    Command, CommandPreparation, ExecutionReport, MatchingError, OrderBookLimits,
+};
 use crate::risk::{
     AccountRiskDefinition, RiskError, RiskInvariantViolation, RiskManagedCheckpoint,
     RiskManagedCheckpointError, RiskManagedOrderBook,
@@ -604,20 +606,21 @@ impl DurableRiskOrderBook {
     ///
     /// # Errors
     ///
-    /// Returns [`DurableRiskError`] for preflight, journal, or matching failure.
+    /// Returns [`DurableRiskError`] for preparation, journal, or matching failure.
     /// A failure after command acknowledgement poisons this instance.
     pub fn submit(&mut self, command: Command) -> Result<ExecutionReport, DurableRiskError> {
         if self.poisoned {
             return Err(DurableRiskError::Poisoned);
         }
-        if let Some(report) = self.managed.preflight(command)? {
-            return Ok(report);
-        }
-        if let Err(error) = self.journal.append(&command) {
+        let prepared = match self.managed.prepare(command)? {
+            CommandPreparation::Replay(report) => return Ok(report),
+            CommandPreparation::Ready(prepared) => prepared,
+        };
+        if let Err(error) = self.journal.append(&prepared.command()) {
             self.poisoned = self.journal.is_poisoned();
             return Err(error.into());
         }
-        let report = match self.managed.submit(command) {
+        let report = match self.managed.commit(prepared) {
             Ok(report) => report,
             Err(error) => {
                 self.poisoned = true;

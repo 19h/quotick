@@ -94,9 +94,11 @@ gateway -> authentication -> portfolio/collateral risk -> replicated sequencer a
     one completion event.
 22. Every active order appears exactly once in the ordered account/side index.
     Reserve FIFO-tail refresh preserves that membership without index churn.
-    Mass cancellation detaches the selected side or account index atomically,
-    traverses only selected order IDs in ascending order, and never scans
-    unrelated active orders.
+    Mass-cancel preparation determines `K` and fallibly reserves capacity for
+    `K` canonical IDs and `K + 1` events before durable command append or book
+    mutation. Commit then detaches the selected side or account index atomically.
+    Neither vector grows during cancellation; execution traverses only selected
+    order IDs in ascending order and never scans unrelated active orders.
 23. Each side caches its complete best `PriceLevel`. The cached price, FIFO
     head/tail, displayed-lot sum, and visible order count equal the corresponding
     extremal entry in the authoritative ordered price map. Every level aggregate
@@ -110,22 +112,76 @@ gateway -> authentication -> portfolio/collateral risk -> replicated sequencer a
     slices rejoin at the tail. The scan visits each inspected active order at
     most once and uses constant auxiliary space.
 25. Every book has finite validated maxima for active orders, active accounts,
-    occupied prices per side, accepted order IDs, and retained commands. Active
-    accounts and per-side levels cannot exceed active-order capacity; accepted
-    identity and ordinary history can establish every maximum active order.
+    occupied prices per side, accepted order IDs, retained commands, and events
+    per execution report. Active accounts and per-side levels cannot exceed
+    active-order capacity; accepted identity and ordinary history can establish
+    every maximum active order. Report capacity is at least
+    `max_active_orders + 1`, so one maximum-size mass cancellation always fits.
 26. The tail of retained-command capacity reserves at least one slot per maximum
     active order. Once ordinary history fills, new and replace commands stop.
     Only a cancel or mass-cancel that passes current core business validation may
     enter the reserve; malformed, unknown, wrong-owner, or wrong-instrument
     controls cannot consume it. Exact cached retries remain available even at
     total exhaustion.
-27. Capacity checks precede the first matching mutation. Durable wrappers run
-    the same preflight before appending a command frame, so capacity failure is
-    an unsequenced operational result and cannot leave a dangling WAL command.
-28. Checkpoint restoration rejects current cardinalities above selected limits.
-    Raw WAL replay reconstructs under the selected limits and fails explicitly
-    if any retained historical transition exceeds them. Limits may be enlarged
-    at restart; lowering them is valid only when the selected recovery path fits.
+27. Capacity checks, required matching hash-table `try_reserve` calls, and
+    fallible event/mass-cancel vector reservations precede the first matching
+    mutation. `PreparedCommand` owns the unique empty vectors; mutable
+    preparation may increase hash capacity but changes no semantic state.
+    Durable wrappers run the same preflight before appending a command frame, so
+    these reservation failures are unsequenced operational results and cannot
+    leave a dangling WAL command. Ordered price/account tree nodes remain outside
+    this recoverable boundary.
+28. Checkpoint restoration rejects current cardinalities or retained report
+    event counts above selected limits. Raw WAL replay reconstructs under the
+    selected limits and fails explicitly if any retained historical transition
+    exceeds them. Limits may be enlarged at restart; lowering them is valid only
+    when the selected recovery path fits.
+29. A GTC/post-only capacity preview is invoked only when an active-order,
+    active-account, or same-side price-level bound is already full. It predicts
+    whether a residual will rest without mutation or reserve-slice
+    materialization: cancel-resting excludes self leaves; cancel-aggressor and
+    cancel-both stop at the first self FIFO barrier; decrement-and-cancel consumes
+    self and external total leaves through replenishment. A proved no-residual
+    order bypasses resting-capacity rejection. A proved residual means every
+    crossed opposite level was completely removed, so its cached order counts
+    and the account index yield exact final active-order and active-account
+    cardinalities before append; same-side price-level capacity is unchanged by
+    opposite-side matching. A price-changing replacement invokes the same
+    preview only when its target price is absent, its old level remains occupied
+    after removal, and the same-side level bound is full. Full execution or an
+    aggressor-terminating STP encounter proves that no target level is created;
+    only a proved resting residual consumes the new level.
+30. Command preparation binds the command, completed core business result,
+    process-local non-reused book identity, retained-command cardinality, and
+    fallibly reserved unique event buffer in one opaque token. Commit rejects a
+    foreign token or an unrelated intervening command before mutation; an
+    intervening exact command returns its cached replay. Direct, risk-managed,
+    durable, and durable-risk submission consume this token without repeating
+    capacity, identifier, FOK, core business, or report-buffer preparation.
+    Durable paths append the token's command only after the buffer exists.
+31. Every completed report owns an immutable `EventTrace`. The first response,
+    retained idempotency entry, exact retries, and in-memory checkpoint copies
+    share one `Arc<Vec<Event>>` owner and its event buffer; cloning is `O(1)`.
+    Preparation allocates the Arc control block and fallibly reserves the
+    complete safe vector buffer before durable append or the first transition.
+    Builder finalization moves the owner in `O(1)` without allocation or event
+    copy. Explicit diagnostic mutation is
+    copy-on-write and cannot modify cached history. Equality, validation, and
+    encoding depend only on ordered event values, so pointer identity and spare
+    vector capacity never enter replay or wire semantics.
+32. Every resting order contributes mutation-maintained future event work. A
+    fully displayed order contributes one unit. A reserve order with leaves
+    `L`, displayed leaves `D`, and peak `p` has
+    `s = 1 + ceil((L - D) / p)` remaining slices and contributes `2s - 1`
+    interaction/refresh units. Each price level, side, and account/side index
+    equals the independently recomputable sum of its orders. Preparation combines
+    these aggregates with the incoming quantity in lot-increment units, STP
+    policy, TIF terminal event, and command prefix to obtain a safe `O(1)` event
+    and trade bound. Sequence/trade identifiers and the complete report-vector
+    capacity are reserved against that bound before durable append or the first
+    transition; an event push beyond it is an invariant failure. Side-wide aggregates include
+    uncrossed prices and may therefore overestimate storage and reject earlier
+    near sequence exhaustion, but cannot underestimate execution.
 
 The book wraps each `BTreeMap<Price, PriceLevel>` in a side-aware index with a
 mutation-maintained complete best-level cache. This provides `O(1)` best-price,
@@ -139,6 +195,24 @@ construction-time hash reservation covers active orders, active accounts,
 accepted IDs, and retained reports; ordered price/account trees remain bounded
 but allocate nodes on demand. Fallible construction and durable recovery use
 `try_reserve` and report the first failed hash resource before state exists.
+Normal capacity preflight is expected `O(1)`. Only at a full resting bound—or
+the equivalent full same-side-level replacement boundary—does the residual
+preview inspect `O_c` orders in `P_c` crossed levels in
+`O(O_c + P_c log P)` time. At a full new-account bound, proving complete account
+release can additionally inspect all `O` active account memberships in expected
+`O(O)` time. Both paths use `O(1)` auxiliary space.
+Preparation performs these costs at most once per composed submission and owns
+the unique empty report vector after `try_reserve_exact` succeeds. Commit adds
+expected `O(1)` identity, idempotency, and generation validation before the
+already-prepared transition.
+For `E` events, event construction and binary encoding remain `O(E)`, while
+builder finalization is `O(1)` and retains the original event buffer. Preparation
+derives a safe command-specific event/trade bound in `O(1)` from level, side,
+and account aggregates. The complete vector capacity is allocated before
+matching mutation, so no event insertion reallocates. Retained
+cache/replay/checkpoint trace cloning is `O(1)` and adds only a shared-owner
+handle; it neither allocates nor copies that buffer. Conservative inclusion of
+uncrossed opposite prices can retain unused vector capacity.
 
 ## Instrument invariants
 

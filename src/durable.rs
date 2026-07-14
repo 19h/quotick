@@ -17,8 +17,8 @@ use crate::journal::{
     SegmentedJournalError, SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
 };
 use crate::matching::{
-    Command, ExecutionReport, InvariantViolation, MatchingError, OrderBook, OrderBookCheckpoint,
-    OrderBookCheckpointError, OrderBookLimits,
+    Command, CommandPreparation, ExecutionReport, InvariantViolation, MatchingError, OrderBook,
+    OrderBookCheckpoint, OrderBookCheckpointError, OrderBookLimits,
 };
 use crate::snapshot::{SnapshotError, SnapshotFile, SnapshotOptions, SnapshotReceipt};
 
@@ -509,21 +509,22 @@ impl DurableOrderBook {
     ///
     /// # Errors
     ///
-    /// Returns [`DurableError`] for matching preflight or journal failure. A
+    /// Returns [`DurableError`] for matching preparation or journal failure. A
     /// failure after the command frame is acknowledged poisons this instance;
     /// reopening completes recovery deterministically.
     pub fn submit(&mut self, command: Command) -> Result<ExecutionReport, DurableError> {
         if self.poisoned {
             return Err(DurableError::Poisoned);
         }
-        if let Some(report) = self.book.preflight(command)? {
-            return Ok(report);
-        }
-        if let Err(error) = self.journal.append(&command) {
+        let prepared = match self.book.prepare(command)? {
+            CommandPreparation::Replay(report) => return Ok(report),
+            CommandPreparation::Ready(prepared) => prepared,
+        };
+        if let Err(error) = self.journal.append(&prepared.command()) {
             self.poisoned = self.journal.is_poisoned();
             return Err(error.into());
         }
-        let report = match self.book.submit(command) {
+        let report = match self.book.commit(prepared) {
             Ok(report) => report,
             Err(error) => {
                 self.poisoned = true;

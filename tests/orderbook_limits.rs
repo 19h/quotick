@@ -8,7 +8,9 @@ use quotick::matching::{
     MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsError, OrderBookLimitsSpec,
     OrderDisplay, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce,
 };
-use quotick::risk::RiskManagedOrderBook;
+use quotick::risk::{
+    AccountRiskState, RiskLimitSpec, RiskLimits, RiskManagedOrderBook, RiskProfile,
+};
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
     TimestampNs,
@@ -81,6 +83,7 @@ fn limits(
         max_accepted_order_ids: accepted_ids,
         max_retained_commands: history,
         cancellation_reserve,
+        max_report_events: 64,
         preallocate: false,
     })
     .unwrap()
@@ -123,6 +126,21 @@ fn resting(command_id: u64, order_id: u64, account_id: u64, side: Side, price: i
         OrderType::Limit(Price::from_raw(price)),
         TimeInForce::GoodTilCancelled,
     )
+}
+
+fn resting_quantity(
+    command_id: u64,
+    order_id: u64,
+    account_id: u64,
+    side: Side,
+    price: i64,
+    quantity: u64,
+) -> Command {
+    let Command::New(mut order) = resting(command_id, order_id, account_id, side, price) else {
+        unreachable!("resting helper always constructs a new order")
+    };
+    order.quantity = Quantity::new(quantity).unwrap();
+    Command::New(order)
 }
 
 fn ioc(command_id: u64, order_id: u64, account_id: u64, side: Side, price: i64) -> Command {
@@ -192,6 +210,7 @@ fn limit_spec_rejects_zero_incoherent_and_under_reserved_configurations() {
         max_accepted_order_ids: 8,
         max_retained_commands: 8,
         cancellation_reserve: 2,
+        max_report_events: 3,
         preallocate: false,
     };
     assert_eq!(
@@ -228,6 +247,20 @@ fn limit_spec_rejects_zero_incoherent_and_under_reserved_configurations() {
         }),
         Err(OrderBookLimitsError::NoOrdinaryCommandCapacity)
     );
+    assert_eq!(
+        OrderBookLimits::new(OrderBookLimitsSpec {
+            max_report_events: 0,
+            ..base
+        }),
+        Err(OrderBookLimitsError::ZeroReportEvents)
+    );
+    assert_eq!(
+        OrderBookLimits::new(OrderBookLimitsSpec {
+            max_report_events: 2,
+            ..base
+        }),
+        Err(OrderBookLimitsError::ReportEventsBelowMassCancelMaximum)
+    );
     let preallocated = OrderBookLimits::new(OrderBookLimitsSpec {
         preallocate: true,
         ..base
@@ -250,6 +283,87 @@ fn limit_spec_rejects_zero_incoherent_and_under_reserved_configurations() {
             MatchingCapacity::AcceptedOrderIds
         ))
     );
+}
+
+#[test]
+fn report_event_capacity_fails_before_matching_mutation() {
+    let constrained = OrderBookLimits::new(OrderBookLimitsSpec {
+        max_active_orders: 1,
+        max_active_accounts: 1,
+        max_price_levels_per_side: 1,
+        max_accepted_order_ids: 4,
+        max_retained_commands: 8,
+        cancellation_reserve: 1,
+        max_report_events: 2,
+        preallocate: false,
+    })
+    .unwrap();
+    let mut book = OrderBook::with_limits(definition(), constrained);
+    book.submit(resting(1, 1, 11, Side::Sell, 100)).unwrap();
+    let before = book.active_orders().unwrap();
+    let last_sequence = book.last_event_sequence();
+
+    assert_eq!(
+        book.submit(resting_quantity(2, 2, 12, Side::Buy, 100, 2)),
+        Err(MatchingError::CapacityExhausted(
+            MatchingCapacity::ReportEvents
+        ))
+    );
+    assert_eq!(book.active_orders().unwrap(), before);
+    assert_eq!(book.last_event_sequence(), last_sequence);
+    assert!(book.order(OrderId::new(2).unwrap()).is_none());
+    book.validate().unwrap();
+
+    let mass_cancelled = book.submit(mass_cancel(2, 11)).unwrap();
+    assert_eq!(mass_cancelled.events.len(), 2);
+    assert_eq!(book.active_order_count(), 0);
+    book.validate().unwrap();
+}
+
+#[test]
+fn durable_report_event_capacity_failure_precedes_command_append() {
+    let wal = TestWal::new();
+    let constrained = OrderBookLimits::new(OrderBookLimitsSpec {
+        max_active_orders: 1,
+        max_active_accounts: 1,
+        max_price_levels_per_side: 1,
+        max_accepted_order_ids: 4,
+        max_retained_commands: 8,
+        cancellation_reserve: 1,
+        max_report_events: 2,
+        preallocate: false,
+    })
+    .unwrap();
+    let mut durable = DurableOrderBook::open_with_limits(
+        wal.path(),
+        definition(),
+        constrained,
+        journal_options(),
+    )
+    .unwrap();
+    durable.submit(resting(1, 1, 11, Side::Sell, 100)).unwrap();
+    let wal_bytes = fs::metadata(wal.path()).unwrap().len();
+
+    assert!(matches!(
+        durable.submit(resting_quantity(2, 2, 12, Side::Buy, 100, 2)),
+        Err(DurableError::Matching(MatchingError::CapacityExhausted(
+            MatchingCapacity::ReportEvents
+        )))
+    ));
+    assert_eq!(fs::metadata(wal.path()).unwrap().len(), wal_bytes);
+    assert_eq!(durable.book().active_order_count(), 1);
+    durable.close().unwrap();
+
+    let mut recovered = DurableOrderBook::open_with_limits(
+        wal.path(),
+        definition(),
+        constrained,
+        journal_options(),
+    )
+    .unwrap();
+    assert_eq!(recovered.book().active_order_count(), 1);
+    recovered.submit(cancel(2, 1, 11)).unwrap();
+    recovered.close().unwrap();
 }
 
 #[test]
@@ -337,6 +451,125 @@ fn active_and_account_limits_gate_only_commands_that_can_rest() {
 }
 
 #[test]
+fn resting_capacity_does_not_reject_gtc_without_a_resting_residual() {
+    let mut filled = OrderBook::with_limits(definition(), limits(2, 2, 1, 8, 16, 2));
+    filled.submit(resting(1, 1, 11, Side::Buy, 80)).unwrap();
+    filled.submit(resting(2, 2, 12, Side::Sell, 100)).unwrap();
+    let report = filled
+        .submit(resting(3, 3, 13, Side::Buy, 100))
+        .expect("fully executed GTC consumes no resting capacity");
+    assert_eq!(report.outcome, CommandOutcome::Accepted);
+    assert!(filled.order(OrderId::new(3).unwrap()).is_none());
+    assert_eq!(filled.active_order_count(), 1);
+    filled.validate().unwrap();
+
+    let mut stp = OrderBook::with_limits(definition(), limits(1, 1, 1, 4, 8, 1));
+    stp.submit(resting(1, 1, 11, Side::Sell, 100)).unwrap();
+    let report = stp
+        .submit(resting(2, 2, 11, Side::Buy, 100))
+        .expect("cancel-aggressor GTC consumes no resting capacity");
+    assert_eq!(report.outcome, CommandOutcome::Accepted);
+    assert!(report.events.iter().any(|event| matches!(
+        event.kind,
+        quotick::matching::EventKind::OrderCancelled {
+            order_id,
+            reason: quotick::matching::CancelReason::SelfTradeAggressor,
+            ..
+        } if order_id == OrderId::new(2).unwrap()
+    )));
+    assert!(stp.order(OrderId::new(2).unwrap()).is_none());
+    assert_eq!(stp.active_order_count(), 1);
+    stp.validate().unwrap();
+}
+
+#[test]
+fn resting_residual_reuses_capacity_released_by_fully_removed_makers() {
+    let mut active = OrderBook::with_limits(definition(), limits(1, 1, 1, 8, 12, 1));
+    active
+        .submit(resting_quantity(1, 1, 11, Side::Sell, 100, 1))
+        .unwrap();
+    active
+        .submit(resting_quantity(2, 2, 12, Side::Buy, 100, 2))
+        .expect("maker removal must release both the active-order and account slot");
+    let residual = active.order(OrderId::new(2).unwrap()).unwrap();
+    assert_eq!(residual.account_id, AccountId::new(12).unwrap());
+    assert_eq!(residual.leaves_quantity, Quantity::new(1).unwrap());
+    assert_eq!(active.active_order_count(), 1);
+    assert_eq!(
+        active.account_active_order_count(AccountId::new(11).unwrap(), MassCancelScope::All,),
+        0
+    );
+    active.validate().unwrap();
+
+    let mut multi_order_account = OrderBook::with_limits(definition(), limits(3, 1, 3, 10, 16, 3));
+    multi_order_account
+        .submit(resting_quantity(1, 1, 11, Side::Sell, 100, 1))
+        .unwrap();
+    multi_order_account
+        .submit(resting_quantity(2, 2, 11, Side::Sell, 101, 1))
+        .unwrap();
+    multi_order_account
+        .submit(resting_quantity(3, 3, 12, Side::Buy, 101, 3))
+        .expect("removing every maker for one account must release its account slot");
+    assert!(
+        multi_order_account
+            .order(OrderId::new(1).unwrap())
+            .is_none()
+    );
+    assert!(
+        multi_order_account
+            .order(OrderId::new(2).unwrap())
+            .is_none()
+    );
+    assert_eq!(
+        multi_order_account
+            .order(OrderId::new(3).unwrap())
+            .unwrap()
+            .leaves_quantity,
+        Quantity::new(1).unwrap()
+    );
+    assert_eq!(multi_order_account.active_order_count(), 1);
+    multi_order_account.validate().unwrap();
+
+    let mut cancel_resting = OrderBook::with_limits(definition(), limits(2, 1, 2, 8, 12, 2));
+    cancel_resting
+        .submit(resting_quantity(1, 1, 11, Side::Sell, 100, 1))
+        .unwrap();
+    cancel_resting
+        .submit(resting_quantity(2, 2, 11, Side::Buy, 80, 1))
+        .unwrap();
+    let Command::New(mut replacement) = resting_quantity(3, 3, 11, Side::Buy, 100, 2) else {
+        unreachable!("resting helper always constructs a new order")
+    };
+    replacement.self_trade_prevention = SelfTradePrevention::CancelResting;
+    cancel_resting
+        .submit(Command::New(replacement))
+        .expect("cancel-resting must release a maker slot before residual append");
+    assert!(cancel_resting.order(OrderId::new(1).unwrap()).is_none());
+    assert_eq!(cancel_resting.active_order_count(), 2);
+    cancel_resting.validate().unwrap();
+}
+
+#[test]
+fn resting_residual_does_not_release_an_account_with_an_uncrossed_order() {
+    let mut book = OrderBook::with_limits(definition(), limits(3, 1, 2, 8, 12, 3));
+    book.submit(resting_quantity(1, 1, 11, Side::Sell, 100, 1))
+        .unwrap();
+    book.submit(resting_quantity(2, 2, 11, Side::Buy, 80, 1))
+        .unwrap();
+    assert_eq!(
+        book.submit(resting_quantity(3, 3, 12, Side::Buy, 100, 2)),
+        Err(MatchingError::CapacityExhausted(
+            MatchingCapacity::ActiveAccounts
+        ))
+    );
+    assert!(book.order(OrderId::new(1).unwrap()).is_some());
+    assert!(book.order(OrderId::new(2).unwrap()).is_some());
+    assert!(book.order(OrderId::new(3).unwrap()).is_none());
+    book.validate().unwrap();
+}
+
+#[test]
 fn side_level_limit_accounts_for_a_level_released_by_replacement() {
     let mut book = OrderBook::with_limits(definition(), limits(3, 1, 1, 10, 20, 3));
     book.submit(resting(1, 1, 11, Side::Sell, 100)).unwrap();
@@ -368,6 +601,74 @@ fn side_level_limit_accounts_for_a_level_released_by_replacement() {
         ))
     );
     bids.validate().unwrap();
+}
+
+#[test]
+fn replacement_level_capacity_uses_the_exact_final_resting_state() {
+    let mut filled = OrderBook::with_limits(definition(), limits(3, 2, 1, 8, 16, 3));
+    filled.submit(resting(1, 1, 11, Side::Sell, 110)).unwrap();
+    filled.submit(resting(2, 2, 11, Side::Sell, 110)).unwrap();
+    filled.submit(resting(3, 3, 12, Side::Buy, 100)).unwrap();
+
+    let report = filled
+        .submit(replace(4, 1, 11, 100))
+        .expect("a fully executed replacement creates no new ask level");
+    assert_eq!(report.outcome, CommandOutcome::Accepted);
+    assert!(filled.order(OrderId::new(1).unwrap()).is_none());
+    assert!(filled.order(OrderId::new(2).unwrap()).is_some());
+    assert!(filled.order(OrderId::new(3).unwrap()).is_none());
+    assert!(filled.level(Side::Sell, Price::from_raw(100)).is_none());
+    assert!(filled.level(Side::Sell, Price::from_raw(110)).is_some());
+    filled.validate().unwrap();
+
+    let mut stp = OrderBook::with_limits(definition(), limits(3, 1, 1, 8, 16, 3));
+    stp.submit(resting(1, 1, 11, Side::Sell, 110)).unwrap();
+    stp.submit(resting(2, 2, 11, Side::Sell, 110)).unwrap();
+    stp.submit(resting(3, 3, 11, Side::Buy, 100)).unwrap();
+
+    let report = stp
+        .submit(replace(4, 1, 11, 100))
+        .expect("an STP-terminated replacement creates no new ask level");
+    assert_eq!(report.outcome, CommandOutcome::Accepted);
+    assert!(report.events.iter().any(|event| matches!(
+        event.kind,
+        quotick::matching::EventKind::OrderCancelled {
+            order_id,
+            reason: quotick::matching::CancelReason::SelfTradeAggressor,
+            ..
+        } if order_id == OrderId::new(1).unwrap()
+    )));
+    assert!(stp.order(OrderId::new(1).unwrap()).is_none());
+    assert!(stp.order(OrderId::new(2).unwrap()).is_some());
+    assert!(stp.order(OrderId::new(3).unwrap()).is_some());
+    assert!(stp.level(Side::Sell, Price::from_raw(100)).is_none());
+    stp.validate().unwrap();
+
+    let mut residual = OrderBook::with_limits(definition(), limits(3, 2, 1, 8, 16, 3));
+    residual
+        .submit(resting_quantity(1, 1, 11, Side::Sell, 110, 2))
+        .unwrap();
+    residual.submit(resting(2, 2, 11, Side::Sell, 110)).unwrap();
+    residual.submit(resting(3, 3, 12, Side::Buy, 100)).unwrap();
+    let Command::Replace(mut replacement) = replace(4, 1, 11, 100) else {
+        unreachable!("replace helper always constructs a replacement")
+    };
+    replacement.new_quantity = Quantity::new(2).unwrap();
+    assert_eq!(
+        residual.submit(Command::Replace(replacement)),
+        Err(MatchingError::CapacityExhausted(
+            MatchingCapacity::AskPriceLevels
+        ))
+    );
+    assert_eq!(
+        residual
+            .order(OrderId::new(1).unwrap())
+            .unwrap()
+            .leaves_quantity,
+        Quantity::new(2).unwrap()
+    );
+    assert!(residual.order(OrderId::new(3).unwrap()).is_some());
+    residual.validate().unwrap();
 }
 
 #[test]
@@ -409,6 +710,60 @@ fn checkpoint_restoration_rejects_insufficient_limits_and_adopts_sufficient_limi
 }
 
 #[test]
+fn checkpoint_and_wal_recovery_reject_a_lower_report_event_limit() {
+    let original_limits = limits(1, 1, 1, 4, 8, 1);
+    let mut book = OrderBook::with_limits(definition(), original_limits);
+    book.submit(resting(1, 1, 11, Side::Sell, 100)).unwrap();
+    let report = book
+        .submit(resting_quantity(2, 2, 12, Side::Buy, 100, 2))
+        .unwrap();
+    assert_eq!(report.events.len(), 3);
+    let checkpoint = book.checkpoint(1, 5).unwrap();
+    let lower_limit = OrderBookLimits::new(OrderBookLimitsSpec {
+        max_active_orders: 1,
+        max_active_accounts: 1,
+        max_price_levels_per_side: 1,
+        max_accepted_order_ids: 4,
+        max_retained_commands: 8,
+        cancellation_reserve: 1,
+        max_report_events: 2,
+        preallocate: false,
+    })
+    .unwrap();
+    let error = OrderBook::from_checkpoint_with_limits(checkpoint, lower_limit).unwrap_err();
+    assert!(
+        error
+            .detail()
+            .contains("report exceeds selected event capacity")
+    );
+
+    let wal = TestWal::new();
+    let mut durable = DurableOrderBook::open_with_limits(
+        wal.path(),
+        definition(),
+        original_limits,
+        journal_options(),
+    )
+    .unwrap();
+    durable.submit(resting(1, 1, 11, Side::Sell, 100)).unwrap();
+    durable
+        .submit(resting_quantity(2, 2, 12, Side::Buy, 100, 2))
+        .unwrap();
+    durable.close().unwrap();
+    assert!(matches!(
+        DurableOrderBook::open_with_limits(
+            wal.path(),
+            definition(),
+            lower_limit,
+            journal_options()
+        ),
+        Err(DurableError::Matching(MatchingError::CapacityExhausted(
+            MatchingCapacity::ReportEvents
+        )))
+    ));
+}
+
+#[test]
 fn durable_capacity_failure_precedes_wal_append_and_preserves_cancel_recovery() {
     let wal = TestWal::new();
     let selected = limits(1, 1, 1, 8, 3, 1);
@@ -441,6 +796,78 @@ fn durable_capacity_failure_precedes_wal_append_and_preserves_cancel_recovery() 
         )))
     ));
     recovered.close().unwrap();
+}
+
+#[test]
+fn durable_replacement_recovery_preserves_exact_final_level_admission() {
+    let wal = TestWal::new();
+    let selected = limits(3, 2, 1, 8, 16, 3);
+    let replacement = replace(4, 1, 11, 100);
+    let mut durable =
+        DurableOrderBook::open_with_limits(wal.path(), definition(), selected, journal_options())
+            .unwrap();
+    durable.submit(resting(1, 1, 11, Side::Sell, 110)).unwrap();
+    durable.submit(resting(2, 2, 11, Side::Sell, 110)).unwrap();
+    durable.submit(resting(3, 3, 12, Side::Buy, 100)).unwrap();
+    let committed = durable.submit(replacement).unwrap();
+    assert_eq!(committed.outcome, CommandOutcome::Accepted);
+    assert!(durable.book().order(OrderId::new(1).unwrap()).is_none());
+    assert!(durable.book().order(OrderId::new(2).unwrap()).is_some());
+    assert!(durable.book().order(OrderId::new(3).unwrap()).is_none());
+    durable.close().unwrap();
+
+    let mut recovered =
+        DurableOrderBook::open_with_limits(wal.path(), definition(), selected, journal_options())
+            .unwrap();
+    let replay = recovered.submit(replacement).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.events, committed.events);
+    assert!(recovered.book().order(OrderId::new(1).unwrap()).is_none());
+    assert!(recovered.book().order(OrderId::new(2).unwrap()).is_some());
+    assert!(recovered.book().order(OrderId::new(3).unwrap()).is_none());
+    recovered.book().validate().unwrap();
+    recovered.close().unwrap();
+}
+
+#[test]
+fn risk_checkpoint_preserves_exact_final_replacement_level_admission() {
+    let selected = limits(3, 2, 1, 8, 16, 3);
+    let risk_limits = RiskLimits::new(RiskLimitSpec {
+        max_order_quantity_lots: 10,
+        max_order_notional: 10_000,
+        max_open_orders: 3,
+        max_open_quantity_lots: 10,
+        max_open_notional: 10_000,
+        max_long_position_lots: 10,
+        max_short_position_lots: 10,
+    })
+    .unwrap();
+    let profile = RiskProfile::new(AccountRiskState::Active, 0, risk_limits).unwrap();
+    let mut managed = RiskManagedOrderBook::with_limits(definition(), selected);
+    managed
+        .register_account(AccountId::new(11).unwrap(), profile)
+        .unwrap();
+    managed
+        .register_account(AccountId::new(12).unwrap(), profile)
+        .unwrap();
+    managed.submit(resting(1, 1, 11, Side::Sell, 110)).unwrap();
+    managed.submit(resting(2, 2, 11, Side::Sell, 110)).unwrap();
+    managed.submit(resting(3, 3, 12, Side::Buy, 100)).unwrap();
+    let replacement = replace(4, 1, 11, 100);
+    let committed = managed.submit(replacement).unwrap();
+    assert_eq!(committed.outcome, CommandOutcome::Accepted);
+    managed.validate().unwrap();
+
+    let checkpoint = managed.checkpoint(1, 3, 11).unwrap();
+    let mut restored =
+        RiskManagedOrderBook::from_checkpoint_with_limits(&checkpoint, selected).unwrap();
+    let replay = restored.submit(replacement).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.events, committed.events);
+    assert!(restored.book().order(OrderId::new(1).unwrap()).is_none());
+    assert!(restored.book().order(OrderId::new(2).unwrap()).is_some());
+    assert!(restored.book().order(OrderId::new(3).unwrap()).is_none());
+    restored.validate().unwrap();
 }
 
 #[test]

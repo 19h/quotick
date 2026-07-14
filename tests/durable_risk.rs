@@ -9,7 +9,8 @@ use quotick::instrument::{
 };
 use quotick::journal::{Durability, Journal, JournalOptions, JournalReader, RecordKind};
 use quotick::matching::{
-    Command, CommandOutcome, NewOrder, OrderType, RejectReason, SelfTradePrevention, TimeInForce,
+    Command, CommandOutcome, MatchingCapacity, MatchingError, NewOrder, OrderBookLimits,
+    OrderBookLimitsSpec, OrderType, RejectReason, SelfTradePrevention, TimeInForce,
 };
 use quotick::risk::{
     AccountRiskDefinition, AccountRiskState, RiskLimitSpec, RiskLimits, RiskManagedOrderBook,
@@ -178,6 +179,53 @@ fn durable_risk_round_trip_binds_sorted_profiles_and_restores_reservations() {
         5
     );
     reopened.managed().validate().unwrap();
+}
+
+#[test]
+fn report_event_capacity_failure_precedes_durable_risk_command_append() {
+    let file = TestFile::new("report-events");
+    let limits = OrderBookLimits::new(OrderBookLimitsSpec {
+        max_active_orders: 1,
+        max_active_accounts: 1,
+        max_price_levels_per_side: 1,
+        max_accepted_order_ids: 4,
+        max_retained_commands: 8,
+        cancellation_reserve: 1,
+        max_report_events: 2,
+        preallocate: false,
+    })
+    .unwrap();
+    let mut durable = DurableRiskOrderBook::open_with_limits(
+        file.path(),
+        definition(),
+        &profiles(),
+        limits,
+        options(),
+    )
+    .unwrap();
+    let Command::New(mut maker) = command(1, 1, 11, 1) else {
+        unreachable!("command helper constructs new orders")
+    };
+    maker.side = Side::Sell;
+    durable.submit(Command::New(maker)).unwrap();
+    let frame_count = frames(file.path()).len();
+
+    assert!(matches!(
+        durable.submit(command(2, 2, 12, 2)),
+        Err(DurableRiskError::Matching(
+            MatchingError::CapacityExhausted(MatchingCapacity::ReportEvents)
+        ))
+    ));
+    assert_eq!(frames(file.path()).len(), frame_count);
+    assert_eq!(durable.managed().book().active_order_count(), 1);
+    assert!(
+        durable
+            .managed()
+            .risk()
+            .reservation(OrderId::new(2).unwrap())
+            .is_none()
+    );
+    durable.close().unwrap();
 }
 
 #[test]

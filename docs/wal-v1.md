@@ -131,10 +131,38 @@ admitted in every trading state after identity validation.
 
 `OrderBookLimits` is finite operational process policy and is not encoded in
 version-1 financial metadata. It does not change the interpretation of an
-existing frame. Durable matching and risk wrappers execute matching preflight
+existing frame. Durable matching and risk wrappers prepare matching state
 before appending a command frame. A capacity failure therefore has no event
 sequence, report, or WAL representation and the command identifier remains
 unused.
+
+Successful preparation produces an opaque process-local token bound to the
+exact book instance and retained-command generation. Durable matching and risk
+append `PreparedCommand.command()` and then commit the same token, so capacity,
+identifier-space, FOK, and core business checks are not repeated after WAL
+append. Commit rejects foreign or stale tokens before mutation; recovery never
+serializes a token and instead prepares the persisted command against recovered
+state. Preparation may increase allocator capacity without changing semantic
+book state: it fallibly reserves every matching hash insertion required by the
+command, the complete report vector, and the exact `K`-identifier mass-cancel
+selection vector. Those structures cannot grow or rehash during matching commit.
+Ordered-tree nodes, Arc control blocks, and coupled risk reservation storage are
+not covered by this operational guarantee.
+
+`EventTrace` is an in-memory immutable shared representation only. WAL report
+encoding still serializes the same event count and ordered event values; `Arc`
+identity, ownership count, and copy-on-write state are absent from version-1
+bytes. Decoding constructs a new vector event buffer plus shared-owner control
+block, retains that vector buffer without a final event copy, and applies the
+same semantic report validation.
+
+When a resting bound is full, the same pre-WAL preparation performs an
+allocation-free GTC/post-only residual preview. A command proved to be fully
+executed or aggressor-cancelled proceeds without a resting slot; a residual that
+would rest proves complete removal of every crossed opposite level. Cached level
+counts and account membership then provide exact final active-order and
+active-account cardinalities; same-side price-level capacity is unchanged by
+opposite-side matching. All three limits are decided before WAL append.
 
 Retained command history has an ordinary prefix and a protected cancellation
 tail. Once the ordinary prefix fills, new and replace commands fail preflight.
