@@ -24,6 +24,6 @@ mod segmented_journal;
 pub mod snapshot;
 
 pub use domain::{
-    AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
-    TimestampNs, TradeId, TransactionId,
+    AccountId, AccountingDate, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price,
+    Quantity, ReconciliationId, Side, TimestampNs, TradeId, TransactionId,
 };

@@ -6,7 +6,8 @@ The implemented system is a deterministic state machine with local durable
 matching and ledger runtimes. One `OrderBook` owns one instrument and accepts
 commands from exactly one mutating thread. `DurableOrderBook` records each
 command before matching and records its trace afterward. `DurableLedger`
-records each prepared entry before committing calculated balances.
+records each prepared entry or indivisible correction before committing
+calculated balances.
 
 ```text
 implemented
@@ -29,7 +30,7 @@ validated command -> account risk -> command WAL -> instrument book
                                                                        |
                                                             balanced journal entry
                                                                        |
-                                                               ledger-entry WAL
+                                                               ledger-event WAL
                                                                        |
                                                                  account balances
 
@@ -49,8 +50,10 @@ gateway -> authentication -> portfolio/collateral risk -> replicated sequencer a
    in `Open`, `CancelOnly`, `Halted`, and `Closed` states after identity checks.
 4. An active order appears in exactly one hash-index entry and one FIFO level.
 5. A level head has no previous order; a level tail has no next order.
-6. Level quantity equals the sum of leaves quantities and is represented as
-   `u128`; each individual leaves quantity is a non-zero `u64`.
+6. Every active order has non-zero total and displayed leaves. Fully displayed
+   orders expose all total leaves; reserve orders expose at most their fixed
+   peak. Level quantity is the `u128` sum of displayed leaves, not hidden total
+   leaves.
 7. Bids execute from highest price to lowest; asks execute from lowest price to
    highest; equal-price orders execute in insertion order.
 8. Trade price is the resting order price and every trade carries the book's
@@ -61,6 +64,34 @@ gateway -> authentication -> portfolio/collateral risk -> replicated sequencer a
 11. A command identifier reused for different content cannot mutate state.
 12. Event sequences are strictly increasing within a book.
 13. Order identifiers cannot be reused after an accepted new order.
+14. Reserve admission is immutable per instrument version. A reserve peak is
+    lot-grid aligned, strictly smaller than total quantity, and the
+    replenishment count implied by an admitted quantity/display state cannot
+    exceed the configured `u32` cap.
+15. A reserve qualifier is accepted only for a resting-capable limit order.
+    A marketable GTC reserve order may execute from its total incoming leaves;
+    the peak applies only to a residual that joins the book.
+16. Maker execution and decrement-and-cancel STP consume at most the current
+    displayed slice. When that slice reaches zero with hidden leaves remaining,
+    the same order ID exposes `min(peak, total leaves)`, moves to the price-level
+    FIFO tail, and emits a separately sequenced refresh event.
+17. FOK liquidity inspection uses total resting leaves, including hidden
+    reserve quantity, while public depth and visible order count use only active
+    displayed slices.
+18. Cancellation removes total leaves. A same-price quantity reduction retains
+    priority only when the display policy is byte-for-byte unchanged; changing
+    a reserve peak loses priority, and conversion between reserve and fully
+    displayed modes is rejected.
+19. Identifier-capacity preflight uses the instrument's replenishment cap to
+    bound all possible trade and event identifiers before mutation in `O(1)`.
+20. Mass cancellation is account-scoped within one instrument-version shard and
+    optionally side-scoped. It remains admissible in every trading state,
+    selects only active orders owned by that account, and cancels them in
+    strictly ascending `OrderId` order.
+21. Each selected order emits its ordinary cancellation event with total leaves
+    and a mass-cancel reason. A final completion event reports the exact `u64`
+    order count and `u128` total cancelled lots; an empty selection still emits
+    one completion event.
 
 The book uses `BTreeMap<Price, PriceLevel>` for deterministic ordered price
 discovery, `HashMap<OrderId, RestingOrder>` for direct lookup, and doubly linked
@@ -87,9 +118,10 @@ order identifiers for FIFO removal without scanning a level.
 
 ## Ledger invariants
 
-1. Every entry has at least two non-zero legs.
-2. An entry contains at most one leg per `(account, asset)` pair.
-3. Signed posting amounts sum to zero independently for every asset.
+1. Every financial entry has an effective date and at least two non-zero legs;
+   an administrative period control has no effective date and zero legs.
+2. A financial entry contains at most one leg per `(account, asset)` pair.
+3. Financial posting amounts sum to zero independently for every asset.
 4. Validation and all checked balance calculations complete before commit.
 5. Journal sequence, balances, idempotency index, and journal order change
    together after successful validation.
@@ -100,22 +132,56 @@ order identifiers for FIFO removal without scanning a level.
    identifiers are only local to one instrument shard.
 9. Preparation calculates every next balance without mutation and binds it to
    the current ledger generation.
-10. Durable posting writes the canonical entry before committing its prepared
-    balances; stale preparations cannot commit.
-11. Recovery accepts only ledger-entry records and reconstructs every balance
-    from the canonical WAL sequence.
+10. Durable posting writes the canonical entry or correction before committing
+    its prepared balances; stale preparations cannot commit.
+11. Recovery accepts only ledger-entry and ledger-correction records and
+    reconstructs every balance, reversal link, period boundary, and last
+    booking timestamp from the canonical WAL sequence.
 12. A complete invariant audit cross-checks journal order and sequence,
     transaction index identity, deterministic entry replay, canonical balances,
     and independently accumulated positive/negative totals per asset.
-13. A checkpoint contains all journal entries plus a redundant, strictly
+13. A checkpoint contains all ledger records plus a redundant, strictly
     `(asset, account)`-ordered image of non-zero balances. Its generation equals
-    its entry count, and decoding rejects exact duplicate records or transaction
-    collisions while replaying every entry before accepting that balance image.
+    its record count. Decoding rejects exact duplicate records, partial
+    corrections, or transaction collisions while replaying every record before
+    accepting that balance image.
 14. Durable checkpoint publication follows a successful WAL `sync_all` barrier
     and a successful live-ledger invariant audit.
 15. Checkpoint-assisted recovery accepts the checkpoint only when its complete
-    entry history equals the exact WAL prefix. It then applies only the suffix
+    record history equals the exact WAL prefix. It then applies only the suffix
     and reruns the complete live-ledger audit.
+16. Every entry carries an immutable lifecycle kind. A reversal names one
+    preceding transaction and its postings must be the exact signed inverse of
+    that target in the same canonical key order.
+17. One entry can have at most one committed reversal. A reversal entry may
+    itself be reversed once, creating an explicit append-only reinstatement
+    chain rather than mutating or deleting prior history.
+18. The reversal index changes atomically with balances, journal order, and the
+    transaction index. Deterministic replay and checkpoint restoration
+    reconstruct and cross-audit that index.
+19. A correction contains exactly one target reversal followed by one standard
+    replacement. Both transactions share one event sequence and one
+    CRC-protected WAL frame. Admission calculates exact final balances from both
+    posting sets without exposing or requiring a representable intermediate
+    state.
+20. A reconciliation statement is a complete non-zero balance image at one
+    exact ledger generation. It has unique `(asset, account)` keys and
+    independently equal positive/negative totals for every represented asset.
+21. Reconciliation rejects a stale/future generation and an observation time
+    preceding that generation's last journal event before comparison; it emits
+    only non-zero `external - internal` differences in canonical order.
+22. Every financial effective date must be later than the current inclusive
+    `closed_through` boundary. Reversals carry their own effective date and do
+    not bypass the fence.
+23. `recorded_at` timestamps are nondecreasing in journal order; equality is
+    valid. Exact transaction retries are resolved before timestamp and period-
+    transition checks and cannot create a second effect.
+24. A period close is a zero-posting journal event that strictly advances the
+    inclusive boundary. A reopen is a zero-posting event that moves an existing
+    boundary backward or removes it. Administrative controls cannot be reversed
+    as financial postings.
+25. Checkpoint replay and WAL-suffix replay apply the same timestamp, dated-
+    posting, close, and reopen rules, then cross-audit the reconstructed fence.
 
 Signed balances are intentional accounting state. Credit limits, collateral,
 and margin are not inferred by the ledger. The implemented order risk layer
@@ -148,12 +214,18 @@ collateral from ledger balances.
    all reducing reservations plus the new quantity not to cross zero.
 9. Matching traces release maker reservations on fills, all reservations on
    cancellation, old exposure before replacement, and prevented resting lots
-   under decrement-and-cancel STP. Trades update buyer/seller positions once.
-10. Exact command retries do not apply risk state twice. Risk rejections are
+   under decrement-and-cancel STP. Reserve risk and notional are based on total
+   leaves; replenishing a displayed slice has no independent risk effect.
+   Trades update buyer/seller positions once.
+10. Single-order and mass cancellation bypass entry limits after instrument
+    identity validation. Each mass-cancelled order releases its complete total-
+    leaves reservation exactly once before the completion summary is ignored by
+    risk state.
+11. Exact command retries do not apply risk state twice. Risk rejections are
     normal sequenced and durable rejection events.
-11. Cross-audit recomputes account aggregates from reservations and verifies a
+12. Cross-audit recomputes account aggregates from reservations and verifies a
     one-to-one structural match with every active book order.
-12. A durable risk shard binds the complete instrument definition followed by
+13. A durable risk shard binds the complete instrument definition followed by
     account-ID-sorted immutable profiles. Recovery completes only an exact
     metadata prefix before the first command.
 
@@ -172,21 +244,28 @@ collateral from ledger balances.
    quantity, aggressor side, and the absolute maker level after execution. A
    replica proves that aggregate maker quantity falls by exactly the printed
    quantity and that maker order count is unchanged or decreases by one.
-6. The publisher tracks active order side, price, and leaves solely to translate
-   private traces. It removes or decrements makers on fills, handles every STP
-   policy, and removes old exposure before non-priority-retaining replacement.
-7. Exact command retries produce no second public update.
-8. Publisher bootstrap from a live or WAL-recovered book captures all active
+6. The publisher tracks active order side, price, total leaves, displayed
+   leaves, and display policy solely to translate private traces. It publishes
+   only displayed leaves, removes a depleted slice from visible order count,
+   restores that count on a separately sequenced reserve refresh, handles every
+   STP policy, and removes old exposure before non-priority-retaining replacement.
+7. Each mass-cancelled order produces the same absolute visible-level update as
+   an individual cancel; the aggregate completion produces `NoBookChange`.
+   Publisher validation proves account/scope membership, ascending order-ID
+   trace order, and exact count/total agreement without exposing those private
+   fields publicly.
+8. Exact command retries produce no second public update.
+9. Publisher bootstrap from a live or WAL-recovered book captures all active
    orders, depth, final event sequence, and final trade ID, then cross-audits
    the private and public aggregates.
-9. A full-depth snapshot contains occupied bids in descending price order and
+10. A full-depth snapshot contains occupied bids in descending price order and
    asks in ascending price order at one source sequence. Locked or crossed
    snapshots are invalid.
-10. A replica rejects a missing, duplicated, or reordered sequence before
+11. A replica rejects a missing, duplicated, or reordered sequence before
     mutating depth. A non-stale full-depth snapshot resets the recovery boundary.
-11. Trace or structural failures after incremental mutation poison publisher or
+12. Trace or structural failures after incremental mutation poison publisher or
     replica state; a fresh authoritative bootstrap/snapshot is required.
-12. The stable complete-value schema is
+13. The stable complete-value schema is
     [Market-data payload format version 1](market-data-v1.md). Network framing,
     fanout, entitlement, and retransmission sessions are outside this boundary.
 
@@ -204,7 +283,8 @@ collateral from ledger balances.
 6. An ambiguous write or durability-barrier failure poisons the writer until
    reopen and recovery.
 7. A batch uses one write and barrier but is not a transactional frame; recovery
-   may retain its verified prefix.
+   may retain its verified prefix. A ledger correction instead uses one typed
+   frame, so recovery retains both correction members or neither.
 8. Typed codecs reject invalid identifiers, quantities, enum tags, booleans,
    lengths, trailing bytes, noncanonical postings, and contradictory reports.
 9. A plain matching journal begins with one complete instrument definition. A
@@ -248,7 +328,8 @@ collateral from ledger balances.
 ## Semantic snapshot invariants
 
 1. A `QSNP` file carries a fixed 28 B header with magic, version, typed payload
-   kind, bounded `u64` length, CRC-32C, and semantic generation.
+   kind (`1` ledger, `2` matching, `3` coupled risk/matching), bounded `u64`
+   length, CRC-32C, and semantic generation.
 2. CRC-32C covers the zero-checksum header and complete payload. Physical and
    declared lengths, typed kind, codec invariants, and header/payload generation
    must all agree before a value is returned.
@@ -259,7 +340,8 @@ collateral from ledger balances.
    lease. An existing pending file always requires explicit recovery.
 5. A normal write cannot regress generation, replace equal-generation state
    with different content, or advance to a history that does not extend the
-   current exact lineage.
+   current exact ledger-record, matching-command/report, or immutable-profile-
+   bound coupled risk lineage.
 6. Pending recovery promotes only an absent-current or newer same-lineage
    value. It discards a stale value only when the current history extends it,
    and preserves both sides on equal-generation or cross-lineage divergence.
@@ -267,9 +349,20 @@ collateral from ledger balances.
    Unsupported versions/kinds and values exceeding the caller's configured
    bound are preserved for a compatible recovery process.
 8. CRC-32C is an accidental-corruption detector, not an authenticity proof.
-9. Ledger checkpoints retain complete history, and durable recovery still scans
-   the complete WAL to prove the prefix. Version 1 performs no WAL cutover,
-   compaction, retention, or bounded-restart protocol.
+9. Ledger, matching, and coupled risk checkpoints retain complete history, and
+   durable recovery still scans the complete WAL to prove the prefix. Version 1
+   performs no WAL cutover, compaction, retention, bounded-memory, or bounded-
+   restart protocol.
+10. Matching capture independently replays complete command/report history and
+    requires exact live-state equality before publication. Recovery reconstructs
+    FIFO/reserve/STP state and exact-retry caches directly, then applies only the
+    suffix after a completed-report WAL boundary.
+11. Coupled risk capture binds the WAL origin, final profile-metadata sequence,
+    definition, and canonical immutable profile set. It reconstructs one total-
+    leaves reservation per active private order, compares redundant account
+    exposures, and independently replays all commands through the risk/matching
+    state machine before publication. Recovery applies state transitions only
+    after the checkpoint generation.
 
 The authoritative version-1 framing and payload schema is
 [WAL format version 1](wal-v1.md) and
@@ -287,12 +380,30 @@ newer full-depth snapshot. Forced-process-termination, concurrent-writer,
 abandoned/malformed-lease, injected-write/barrier, exact-boundary/batch rotation,
 closed-segment corruption, active-tail repair, cross-segment replay, torn-report,
 metadata-prefix, replay-divergence, entry-reconstruction, feed-gap, and publisher
-cross-audit tests exercise these paths. Ledger snapshot framing, generation and
-lineage divergence, interrupted-pending recovery, independent trial balance,
-checkpoint/WAL prefix proof, and segmented suffix replay are also tested. There
-is no claim of replicated durability, remote consensus, matching/risk state
-snapshot recovery, WAL cutover or retention, bounded restart, or qualified
-storage-device power-loss behavior.
+cross-audit tests exercise these paths. Reserve tests additionally cover
+admission bounds, FIFO-tail refresh, repeated slices in one match, hidden-aware
+FOK, STP, total-leaves risk, displayed-only publication, and WAL recovery.
+Mass-cancel tests cover empty and side-scoped selection, canonical audit order,
+hidden-total risk release, displayed-depth publication, malformed summaries,
+exact replay, and WAL reconstruction.
+Matching checkpoint tests cover capture-time replay audit, FIFO-tail reserve
+state, resting STP, exact retry, stable kind/codec, semantic corruption,
+non-default WAL origins, lineage forks, WAL-prefix divergence, ahead-of-WAL
+rejection, path aliasing, and single/segmented suffix replay. Ledger snapshot
+framing, generation and lineage divergence, interrupted-pending recovery,
+independent trial balance,
+checkpoint/WAL prefix proof, segmented suffix replay, reversal lineage and
+reinstatement, indivisible correction replay and torn-tail repair, correction
+arithmetic boundaries, invalid reversal recovery, exact-generation external
+balance reconciliation, dated-entry fences, temporal regression, period
+close/reopen, and checkpoint-plus-WAL period reconstruction are also tested.
+Coupled risk-checkpoint tests cover sequenced risk rejection, executed position,
+hidden total-leaves reservation, exact retry, malformed owner/exposure state,
+profile and same-generation lineage drift, non-default WAL origins, exact WAL-
+prefix proof, ahead-of-WAL rejection, path aliasing, and single/segmented suffix
+replay. There is no claim of replicated durability, remote consensus, WAL
+cutover or retention, bounded restart, durable external-statement anchoring, or
+qualified storage-device power-loss behavior.
 
 ## Standards and primary-source provenance
 
@@ -312,6 +423,29 @@ storage-device power-loss behavior.
 - The signed `Price` domain covers real exchange cases in which negative prices
   are supported. [CME Clearing Advisory 20-152](https://www.cmegroup.com/notices/clearing/2020/04/Chadv20-152.pdf)
   is the primary-source basis for retaining negative futures-price support.
+- Native reserve behavior is venue-specific. CME documents `DisplayQty` as the
+  maximum visible portion, repeated replenishment of hidden quantity, stable
+  native-iceberg `OrderID`, and potentially changed priority on refresh in the
+  [CME Globex Reference Guide](https://www.cmegroup.com/content/dam/cmegroup/globex/files/GlobexRefGd.pdf)
+  and [CME Market by Order FAQ](https://www.cmegroup.com/articles/faqs/market-by-order-mbo.html).
+  Nasdaq Fixed Income likewise specifies peak replenishment and a new timestamp
+  on refresh in its
+  [Fusion Fixed Income Market Model](https://www.nasdaq.com/docs/2026/03/04/Market-Model-Fusion-Fixed%20Income-1.1-March-2-2026.pdf).
+  Quotick's stable private order ID plus FIFO-tail refresh is its explicit
+  instrument-shard contract, not a claim of universal venue equivalence.
+- FIX defines `OrderMassCancelRequest(35=q)` as a separately identified request
+  to cancel remaining quantity for an order group and permits an optional side
+  qualifier in the
+  [FIX Trading Community trade specification](https://www.fixtrading.org/online-specification/business-area-trade/).
+  CME certifies instrument-scoped mass action and requires an audit-trail line
+  per confirmed cancelled order in its
+  [iLink mass-cancel audit test](https://www.cmegroup.com/tools-information/webhelp/autocert-audit-trail-ilink3/Content/moc.html).
+  Quotick maps that pattern to one account in one instrument-version shard;
+  cross-shard and delegated scopes are not inferred.
+- Gregorian calendar strings used at service boundaries follow
+  [ISO 8601-1:2019](https://www.iso.org/standard/70907.html). The internal
+  `AccountingDate` wire scalar is signed days relative to 1970-01-01 and does
+  not itself implement calendar, time-zone, or business-day policy.
 - All other field order, admission, accounting, sequencing, and recovery rules
   in this repository are Quotick's explicitly specified internal contracts,
   verified by the referenced test suites rather than attributed to an external
@@ -322,11 +456,13 @@ storage-device power-loss behavior.
 | Impact | Capability | Evidence required for completion |
 |---|---|---|
 | High | Durable storage completion | segment retention/archival with deletion fencing; kernel inode locking or qualified alias exclusion; forced-power-loss filesystem/device evidence |
-| High | Ledger lifecycle completion | external statement reconciliation, correction/reversal workflows, operational close controls, and externally anchored cutoff proofs |
-| High | Snapshots and compaction | matching/risk semantic snapshots, fenced WAL cutover, bounded restart time, segment retention, and retained audit-history proofs |
+| High | Ledger lifecycle completion | controller authorization; versioned calendar ingestion; durable external-statement evidence; externally anchored cutoff proofs; generalized atomic multi-entry batches |
+| High | Snapshots and compaction | fenced matching/risk/ledger WAL cutover, bounded restart time/memory, segment retention, and externally retained audit/idempotency proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
 | High | Instrument lifecycle expansion | trading calendars, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
+| High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
+| High | Coordinated kill controls | authenticated firm/session/account ownership; atomic admission fence; cross-shard fanout; completion aggregation; cancel-on-behalf audit evidence |
 | High | Clearing lifecycle | novation/allocation, fees, settlement dates, fails, corrections, busts, and reconciliation |
 | High | Security boundary | authenticated principals, authorization policy, secret management, audit export, and abuse controls |
 | Medium | Gateways and schemas | versioned binary protocol, FIX adapter, backpressure, session recovery, and conformance fixtures |

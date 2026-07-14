@@ -5,7 +5,7 @@ use std::fmt;
 
 use crate::domain::{AssetId, InstrumentId, InstrumentVersion, Price, Quantity, TimestampNs};
 use crate::ledger::SettlementConvention;
-use crate::matching::{Command, NewOrder, OrderType, ReplaceOrder, Trade};
+use crate::matching::{Command, NewOrder, OrderDisplay, OrderType, ReplaceOrder, Trade};
 
 const MAX_CODE_LENGTH: usize = 16;
 const MAX_SYMBOL_LENGTH: usize = 32;
@@ -48,6 +48,8 @@ pub enum InstrumentError {
     IdenticalAssets,
     /// A settlement conversion multiplier was zero.
     ZeroSettlementMultiplier,
+    /// Enabled reserve-order rules allowed zero peak replenishments.
+    InvalidReserveOrderRules,
     /// An asset identifier or canonical code was already registered.
     DuplicateAsset,
     /// An instrument version identifier was already registered.
@@ -109,6 +111,8 @@ impl fmt::Display for InstrumentError {
             Self::ZeroSettlementMultiplier => {
                 formatter.write_str("settlement multipliers must be non-zero")
             }
+            Self::InvalidReserveOrderRules => formatter
+                .write_str("enabled reserve-order rules require a positive replenishment limit"),
             Self::DuplicateAsset => formatter.write_str("asset identifier or code already exists"),
             Self::DuplicateInstrumentVersion => {
                 formatter.write_str("instrument version already exists")
@@ -158,6 +162,14 @@ pub enum AdmissionError {
     QuantityOffGrid,
     /// Quantity was outside inclusive order limits.
     QuantityOutsideLimits,
+    /// This instrument version does not admit reserve orders.
+    ReserveOrderNotSupported,
+    /// Display quantity was not aligned to the lot increment.
+    DisplayQuantityOffGrid,
+    /// Display quantity was not smaller than total order quantity.
+    DisplayQuantityNotLessThanOrder,
+    /// The requested peak implies too many replenishments for the admitted state.
+    ReserveReplenishmentLimit,
 }
 
 /// Fixed-capacity canonical asset code.
@@ -481,6 +493,54 @@ impl QuantityRules {
         }
         Ok(())
     }
+
+    const fn display_is_aligned(self, quantity: Quantity) -> bool {
+        quantity.lots() % self.increment == 0
+    }
+}
+
+/// Immutable native reserve-order admission bounds for one instrument version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReserveOrderRules {
+    maximum_replenishments: u32,
+}
+
+impl ReserveOrderRules {
+    /// Disables native reserve orders.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            maximum_replenishments: 0,
+        }
+    }
+
+    /// Enables reserve orders with a bounded number of peak refreshes per
+    /// admitted quantity/display state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstrumentError::InvalidReserveOrderRules`] for zero.
+    pub const fn new(maximum_replenishments: u32) -> Result<Self, InstrumentError> {
+        if maximum_replenishments == 0 {
+            Err(InstrumentError::InvalidReserveOrderRules)
+        } else {
+            Ok(Self {
+                maximum_replenishments,
+            })
+        }
+    }
+
+    /// Returns whether native reserve orders are admitted.
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        self.maximum_replenishments != 0
+    }
+
+    /// Returns the maximum number of replenishments after the initial peak.
+    #[must_use]
+    pub const fn maximum_replenishments(self) -> u32 {
+        self.maximum_replenishments
+    }
 }
 
 /// Constructor input for one immutable instrument version.
@@ -504,6 +564,8 @@ pub struct InstrumentSpec {
     pub price: PriceRules,
     /// Quantity rules.
     pub quantity: QuantityRules,
+    /// Native reserve-order admission and per-state refresh bound.
+    pub reserve: ReserveOrderRules,
     /// Base ledger units delivered by one lot.
     pub base_units_per_lot: u64,
     /// Quote ledger units per raw price unit times one lot.
@@ -589,6 +651,12 @@ impl InstrumentDefinition {
         self.spec.quantity
     }
 
+    /// Returns native reserve-order admission rules.
+    #[must_use]
+    pub const fn reserve_order_rules(self) -> ReserveOrderRules {
+        self.spec.reserve
+    }
+
     /// Returns the trading state.
     #[must_use]
     pub const fn trading_state(self) -> TradingState {
@@ -619,6 +687,9 @@ impl InstrumentDefinition {
                 self.validate_identity(value.instrument_id, value.instrument_version)
             }
             Command::Replace(value) => self.admit_replace(value),
+            Command::MassCancel(value) => {
+                self.validate_identity(value.instrument_id, value.instrument_version)
+            }
         }
     }
 
@@ -642,6 +713,7 @@ impl InstrumentDefinition {
             return Err(AdmissionError::TradingStateDisallowsEntry);
         }
         self.spec.quantity.validate(order.quantity)?;
+        self.validate_display(order.display, order.quantity)?;
         if let OrderType::Limit(price) = order.order_type {
             self.spec.price.validate(price)?;
         }
@@ -654,7 +726,32 @@ impl InstrumentDefinition {
             return Err(AdmissionError::TradingStateDisallowsEntry);
         }
         self.spec.quantity.validate(order.new_quantity)?;
+        self.validate_display(order.new_display, order.new_quantity)?;
         self.spec.price.validate(order.new_price)
+    }
+
+    fn validate_display(
+        self,
+        display: OrderDisplay,
+        total: Quantity,
+    ) -> Result<(), AdmissionError> {
+        let OrderDisplay::Reserve { peak } = display else {
+            return Ok(());
+        };
+        if !self.spec.reserve.enabled() {
+            return Err(AdmissionError::ReserveOrderNotSupported);
+        }
+        if !self.spec.quantity.display_is_aligned(peak) {
+            return Err(AdmissionError::DisplayQuantityOffGrid);
+        }
+        if peak.lots() >= total.lots() {
+            return Err(AdmissionError::DisplayQuantityNotLessThanOrder);
+        }
+        let replenishments = (total.lots() - 1) / peak.lots();
+        if replenishments > u64::from(self.spec.reserve.maximum_replenishments()) {
+            return Err(AdmissionError::ReserveReplenishmentLimit);
+        }
+        Ok(())
     }
 
     fn validate_identity(

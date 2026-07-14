@@ -11,8 +11,8 @@ use quotick::journal::{Durability, Journal, JournalOptions};
 use quotick::ledger::{JournalEntry, LedgerError, Posting};
 use quotick::matching::{Command, NewOrder, OrderType, SelfTradePrevention, TimeInForce};
 use quotick::{
-    AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
-    TimestampNs, TradeId, TransactionId,
+    AccountId, AccountingDate, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price,
+    Quantity, Side, TimestampNs, TradeId, TransactionId,
 };
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
@@ -57,6 +57,8 @@ fn entry(transaction_id: u64, amount: i128) -> JournalEntry {
     JournalEntry::new(
         transaction(transaction_id),
         transaction_id,
+        AccountingDate::UNIX_EPOCH,
+        TimestampNs::from_unix_nanos(0),
         vec![
             Posting {
                 account_id: account(1),
@@ -97,7 +99,7 @@ fn entry_before_balance_reopen_reconstructs_balances_and_idempotency() {
     drop(durable);
 
     let recovered = DurableLedger::open(file.path(), options()).expect("ledger recovers");
-    assert_eq!(recovered.recovery().replayed_entries, 1);
+    assert_eq!(recovered.recovery().replayed_records, 1);
     assert_eq!(recovered.ledger().entry_count(), 1);
     assert_eq!(recovered.ledger().balance(account(1), asset(1)), 500);
     assert_eq!(recovered.ledger().balance(account(2), asset(1)), -500);
@@ -131,6 +133,7 @@ fn recovery_rejects_nonledger_records_and_duplicate_transactions() {
         instrument_version: InstrumentVersion::new(1).expect("instrument version"),
         side: Side::Buy,
         quantity: Quantity::new(1).expect("positive quantity"),
+        display: quotick::matching::OrderDisplay::FullyDisplayed,
         order_type: OrderType::Limit(Price::from_raw(1)),
         time_in_force: TimeInForce::GoodTilCancelled,
         self_trade_prevention: SelfTradePrevention::CancelAggressor,
@@ -189,6 +192,7 @@ fn durable_trade_settlement_reconstructs_delivery_versus_payment() {
         price: PriceRules::new(0, 1, Price::from_raw(i64::MIN), Price::from_raw(i64::MAX))
             .expect("price rules"),
         quantity: QuantityRules::new(1, 1, u64::MAX).expect("quantity rules"),
+        reserve: quotick::instrument::ReserveOrderRules::disabled(),
         base_units_per_lot: 10,
         quote_units_per_price_unit: 100,
         trading_state: TradingState::Open,
@@ -200,14 +204,26 @@ fn durable_trade_settlement_reconstructs_delivery_versus_payment() {
         ..trade
     };
     assert!(matches!(
-        durable.settle_instrument_trade(transaction(6), &wrong_version, definition),
+        durable.settle_instrument_trade(
+            transaction(6),
+            AccountingDate::UNIX_EPOCH,
+            TimestampNs::from_unix_nanos(0),
+            &wrong_version,
+            definition
+        ),
         Err(DurableLedgerError::Ledger(
             LedgerError::SettlementVersionMismatch
         ))
     ));
     assert_eq!(durable.ledger().entry_count(), 0);
     durable
-        .settle_instrument_trade(transaction(7), &trade, definition)
+        .settle_instrument_trade(
+            transaction(7),
+            AccountingDate::UNIX_EPOCH,
+            TimestampNs::from_unix_nanos(0),
+            &trade,
+            definition,
+        )
         .expect("trade settles");
     durable.sync_all().expect("sync");
     drop(durable);

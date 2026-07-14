@@ -48,6 +48,7 @@ fn command(value: u64) -> Command {
         instrument_version: InstrumentVersion::new(1).expect("version"),
         side: Side::Buy,
         quantity: Quantity::new(3).expect("quantity"),
+        display: quotick::matching::OrderDisplay::FullyDisplayed,
         order_type: OrderType::Limit(Price::from_raw(4)),
         time_in_force: TimeInForce::GoodTilCancelled,
         self_trade_prevention: SelfTradePrevention::CancelAggressor,

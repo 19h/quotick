@@ -5,23 +5,29 @@
 //! replays both matching and reservation state and rejects any profile drift.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::domain::{InstrumentId, InstrumentVersion};
 use crate::durable_storage::{StorageError, StorageOptions, StorageReader, StorageWriter};
 use crate::instrument::InstrumentDefinition;
 use crate::journal::{
-    JournalError, JournalFrame, JournalOptions, RecordKind, SegmentedJournalError,
-    SegmentedJournalOptions, StorageRecoveryReport,
+    Journal, JournalError, JournalFrame, JournalLayout, JournalOptions, RecordKind,
+    SegmentedJournalError, SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
 };
 use crate::matching::{Command, ExecutionReport, MatchingError};
-use crate::risk::{AccountRiskDefinition, RiskError, RiskInvariantViolation, RiskManagedOrderBook};
+use crate::risk::{
+    AccountRiskDefinition, RiskError, RiskInvariantViolation, RiskManagedCheckpoint,
+    RiskManagedCheckpointError, RiskManagedOrderBook,
+};
+use crate::snapshot::{SnapshotError, SnapshotFile, SnapshotOptions, SnapshotReceipt};
 
 /// Result of reconstructing a durable risk-managed matching shard.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DurableRiskRecoveryReport {
     /// Physical frame recovery performed by the journal.
     pub journal: StorageRecoveryReport,
+    /// Completed commands restored directly from a verified semantic checkpoint.
+    pub checkpointed_commands: u64,
     /// Complete command/report pairs replayed.
     pub replayed_commands: u64,
     /// Profiles appended to complete interrupted metadata initialization.
@@ -43,6 +49,10 @@ pub enum DurableRiskError {
     Risk(RiskError),
     /// Reconstructed matching/risk state violated an invariant.
     Invariant(RiskInvariantViolation),
+    /// Semantic coupled risk/matching checkpoint failed validation.
+    Checkpoint(RiskManagedCheckpointError),
+    /// Snapshot framing, checksum, ownership, generation, or I/O failed.
+    Snapshot(SnapshotError),
     /// The initialized journal unexpectedly had no first frame.
     DefinitionRecordMissing,
     /// First frame was not an instrument definition.
@@ -69,6 +79,41 @@ pub enum DurableRiskError {
         requested_count: usize,
         /// Persisted profile count.
         persisted_count: usize,
+    },
+    /// A checkpoint belongs to a different physical WAL origin.
+    CheckpointWalLineageMismatch {
+        /// First WAL sequence claimed by the checkpoint.
+        checkpoint_first_sequence: u64,
+        /// First sequence of the opened WAL.
+        wal_first_sequence: u64,
+    },
+    /// A checkpoint's last immutable-metadata frame differs from this WAL.
+    CheckpointMetadataBoundaryMismatch {
+        /// Metadata boundary claimed by the checkpoint.
+        checkpoint_metadata_sequence: u64,
+        /// Metadata boundary derived from the WAL definition/profile grammar.
+        wal_metadata_sequence: u64,
+    },
+    /// A checkpoint's instrument definition differs from the WAL binding.
+    CheckpointDefinitionMismatch,
+    /// A checkpoint's immutable profile set differs from the WAL binding.
+    CheckpointRiskProfileSetMismatch,
+    /// A checkpoint command or report differs from the same WAL sequence.
+    CheckpointPrefixDivergence {
+        /// Physical WAL sequence where values differed.
+        wal_sequence: u64,
+    },
+    /// A checkpoint boundary is newer than the complete verified WAL.
+    CheckpointAheadOfWal {
+        /// Completed report boundary claimed by the checkpoint.
+        checkpoint_sequence: u64,
+        /// Last verified WAL frame sequence.
+        wal_last_sequence: Option<u64>,
+    },
+    /// Snapshot output aliases WAL storage or its ownership namespace.
+    CheckpointPathConflictsWithWal {
+        /// Conflicting normalized path.
+        path: PathBuf,
     },
     /// A payload kind was not permitted in a risk-managed matching journal.
     UnexpectedRecord {
@@ -108,6 +153,8 @@ impl fmt::Display for DurableRiskError {
             Self::Matching(error) => error.fmt(formatter),
             Self::Risk(error) => error.fmt(formatter),
             Self::Invariant(error) => error.fmt(formatter),
+            Self::Checkpoint(error) => error.fmt(formatter),
+            Self::Snapshot(error) => error.fmt(formatter),
             Self::DefinitionRecordMissing => {
                 formatter.write_str("risk matching journal has no instrument definition")
             }
@@ -130,6 +177,41 @@ impl fmt::Display for DurableRiskError {
             } => write!(
                 formatter,
                 "requested {requested_count} risk profiles differ from {persisted_count} persisted profiles"
+            ),
+            Self::CheckpointWalLineageMismatch {
+                checkpoint_first_sequence,
+                wal_first_sequence,
+            } => write!(
+                formatter,
+                "risk checkpoint WAL starts at {checkpoint_first_sequence}, but journal starts at {wal_first_sequence}"
+            ),
+            Self::CheckpointMetadataBoundaryMismatch {
+                checkpoint_metadata_sequence,
+                wal_metadata_sequence,
+            } => write!(
+                formatter,
+                "risk checkpoint metadata ends at {checkpoint_metadata_sequence}, but WAL metadata ends at {wal_metadata_sequence}"
+            ),
+            Self::CheckpointDefinitionMismatch => formatter
+                .write_str("risk checkpoint instrument definition differs from the WAL binding"),
+            Self::CheckpointRiskProfileSetMismatch => {
+                formatter.write_str("risk checkpoint profile set differs from the WAL binding")
+            }
+            Self::CheckpointPrefixDivergence { wal_sequence } => write!(
+                formatter,
+                "risk checkpoint differs from WAL frame {wal_sequence}"
+            ),
+            Self::CheckpointAheadOfWal {
+                checkpoint_sequence,
+                wal_last_sequence,
+            } => write!(
+                formatter,
+                "risk checkpoint covers WAL sequence {checkpoint_sequence}, but verified WAL ends at {wal_last_sequence:?}"
+            ),
+            Self::CheckpointPathConflictsWithWal { path } => write!(
+                formatter,
+                "risk checkpoint path {} conflicts with WAL storage",
+                path.display()
             ),
             Self::UnexpectedRecord { sequence, kind } => {
                 write!(
@@ -169,6 +251,8 @@ impl std::error::Error for DurableRiskError {
             Self::Matching(error) => Some(error),
             Self::Risk(error) => Some(error),
             Self::Invariant(error) => Some(error),
+            Self::Checkpoint(error) => Some(error),
+            Self::Snapshot(error) => Some(error),
             _ => None,
         }
     }
@@ -207,11 +291,24 @@ impl From<RiskError> for DurableRiskError {
     }
 }
 
+impl From<RiskManagedCheckpointError> for DurableRiskError {
+    fn from(error: RiskManagedCheckpointError) -> Self {
+        Self::Checkpoint(error)
+    }
+}
+
+impl From<SnapshotError> for DurableRiskError {
+    fn from(error: SnapshotError) -> Self {
+        Self::Snapshot(error)
+    }
+}
+
 /// One single-writer, definition/profile-bound durable risk matching shard.
 #[derive(Debug)]
 pub struct DurableRiskOrderBook {
     managed: RiskManagedOrderBook,
     journal: StorageWriter,
+    wal_metadata_sequence: u64,
     recovery: DurableRiskRecoveryReport,
     poisoned: bool,
 }
@@ -223,6 +320,16 @@ struct OpenedRiskJournal {
     reader_exhausted: bool,
     recovery: StorageRecoveryReport,
     completed_profile_records: u64,
+    wal_first_sequence: u64,
+    wal_metadata_sequence: u64,
+    checkpoint: Option<RiskManagedCheckpoint>,
+}
+
+struct RiskReplay {
+    managed: RiskManagedOrderBook,
+    pending: Option<(u64, Command)>,
+    checkpointed_commands: u64,
+    replayed_commands: u64,
 }
 
 impl DurableRiskOrderBook {
@@ -247,6 +354,31 @@ impl DurableRiskOrderBook {
             definition,
             profiles,
             StorageOptions::Single(options),
+            None,
+        )
+    }
+
+    /// Opens a risk-managed WAL from a checksum-verified coupled checkpoint,
+    /// proves its complete metadata and command/report lineage, and replays only its suffix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableRiskError`] for snapshot, path, definition/profile,
+    /// prefix, journal, matching, risk, or reconstructed-state failure.
+    pub fn open_with_checkpoint(
+        path: impl AsRef<Path>,
+        checkpoint_path: impl AsRef<Path>,
+        definition: InstrumentDefinition,
+        profiles: &[AccountRiskDefinition],
+        options: JournalOptions,
+        snapshot_options: SnapshotOptions,
+    ) -> Result<Self, DurableRiskError> {
+        Self::open_storage(
+            path.as_ref(),
+            definition,
+            profiles,
+            StorageOptions::Single(options),
+            Some((checkpoint_path.as_ref(), snapshot_options)),
         )
     }
 
@@ -267,6 +399,30 @@ impl DurableRiskOrderBook {
             definition,
             profiles,
             StorageOptions::Segmented(options),
+            None,
+        )
+    }
+
+    /// Opens a segmented risk-managed WAL from a verified coupled checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableRiskError`] for snapshot, managed-path, metadata,
+    /// prefix, segmented storage, matching, risk, or invariant failure.
+    pub fn open_segmented_with_checkpoint(
+        directory: impl AsRef<Path>,
+        checkpoint_path: impl AsRef<Path>,
+        definition: InstrumentDefinition,
+        profiles: &[AccountRiskDefinition],
+        options: SegmentedJournalOptions,
+        snapshot_options: SnapshotOptions,
+    ) -> Result<Self, DurableRiskError> {
+        Self::open_storage(
+            directory.as_ref(),
+            definition,
+            profiles,
+            StorageOptions::Segmented(options),
+            Some((checkpoint_path.as_ref(), snapshot_options)),
         )
     }
 
@@ -275,74 +431,40 @@ impl DurableRiskOrderBook {
         definition: InstrumentDefinition,
         profiles: &[AccountRiskDefinition],
         options: StorageOptions,
+        checkpoint_source: Option<(&Path, SnapshotOptions)>,
     ) -> Result<Self, DurableRiskError> {
         let profiles = canonical_profiles(profiles)?;
+        if let Some((checkpoint_path, _)) = checkpoint_source {
+            validate_checkpoint_path(path, storage_layout(options), checkpoint_path)?;
+        }
+        let checkpoint = checkpoint_source
+            .map(|(checkpoint_path, snapshot_options)| {
+                SnapshotFile::read::<RiskManagedCheckpoint>(checkpoint_path, snapshot_options)
+            })
+            .transpose()?;
         let OpenedRiskJournal {
             mut journal,
-            mut reader,
+            reader,
             first_data_frame,
             reader_exhausted: replay_reader_exhausted,
             recovery: journal_recovery,
             completed_profile_records,
-        } = open_risk_metadata(path, definition, &profiles, options)?;
-
-        let mut managed = RiskManagedOrderBook::new(definition);
-        for profile in &profiles {
-            managed.register_account(profile.account_id(), profile.profile())?;
-        }
-        let mut pending: Option<(u64, Command)> = None;
-        let mut replayed_commands = 0_u64;
-        let mut next_frame = first_data_frame;
-        loop {
-            let frame = if let Some(frame) = next_frame.take() {
-                frame
-            } else {
-                if replay_reader_exhausted {
-                    break;
-                }
-                let Some(frame) = reader.next().transpose()? else {
-                    break;
-                };
-                frame
-            };
-            match frame.kind() {
-                RecordKind::Command => {
-                    if let Some((pending_sequence, _)) = pending {
-                        return Err(DurableRiskError::ConsecutiveCommands {
-                            pending_sequence,
-                            next_sequence: frame.sequence(),
-                        });
-                    }
-                    pending = Some((frame.sequence(), frame.decode()?));
-                }
-                RecordKind::ExecutionReport => {
-                    let Some((command_sequence, command)) = pending.take() else {
-                        return Err(DurableRiskError::ReportWithoutCommand {
-                            sequence: frame.sequence(),
-                        });
-                    };
-                    let persisted: ExecutionReport = frame.decode()?;
-                    let reproduced = managed.submit(command)?;
-                    if reproduced != persisted {
-                        return Err(DurableRiskError::ReplayDivergence {
-                            command_sequence,
-                            report_sequence: frame.sequence(),
-                        });
-                    }
-                    replayed_commands = replayed_commands
-                        .checked_add(1)
-                        .ok_or(MatchingError::SequenceExhausted)?;
-                }
-                kind => {
-                    return Err(DurableRiskError::UnexpectedRecord {
-                        sequence: frame.sequence(),
-                        kind,
-                    });
-                }
-            }
-        }
-
-        let completed_dangling_command = if let Some((_, command)) = pending {
+            wal_first_sequence,
+            wal_metadata_sequence,
+            checkpoint,
+        } = open_risk_metadata(path, definition, &profiles, options, checkpoint)?;
+        debug_assert_eq!(wal_first_sequence, journal.first_sequence());
+        let replay = replay_risk_suffix(
+            reader,
+            first_data_frame,
+            replay_reader_exhausted,
+            definition,
+            &profiles,
+            checkpoint,
+            wal_metadata_sequence,
+        )?;
+        let mut managed = replay.managed;
+        let completed_dangling_command = if let Some((_, command)) = replay.pending {
             let report = managed.submit(command)?;
             journal.append(&report)?;
             true
@@ -353,9 +475,11 @@ impl DurableRiskOrderBook {
         Ok(Self {
             managed,
             journal,
+            wal_metadata_sequence,
             recovery: DurableRiskRecoveryReport {
                 journal: journal_recovery,
-                replayed_commands,
+                checkpointed_commands: replay.checkpointed_commands,
+                replayed_commands: replay.replayed_commands,
                 completed_profile_records,
                 completed_dangling_command,
             },
@@ -406,6 +530,42 @@ impl DurableRiskOrderBook {
         Ok(report)
     }
 
+    /// Synchronizes the risk WAL, audits coupled state, and atomically replaces
+    /// a checksum-protected semantic checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableRiskError`] for poison, path conflict, WAL barrier,
+    /// checkpoint audit/codec, snapshot ownership, or I/O failure.
+    pub fn write_checkpoint(
+        &mut self,
+        path: impl AsRef<Path>,
+        options: SnapshotOptions,
+    ) -> Result<SnapshotReceipt, DurableRiskError> {
+        if self.poisoned {
+            return Err(DurableRiskError::Poisoned);
+        }
+        validate_checkpoint_path(self.journal.path(), self.journal.layout(), path.as_ref())?;
+        self.sync_all()?;
+        let wal_sequence = self
+            .journal
+            .next_sequence()
+            .checked_sub(1)
+            .ok_or(MatchingError::SequenceExhausted)?;
+        let checkpoint = match self.managed.checkpoint(
+            self.journal.first_sequence(),
+            self.wal_metadata_sequence,
+            wal_sequence,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.poisoned = true;
+                return Err(DurableRiskError::Checkpoint(error));
+            }
+        };
+        SnapshotFile::write(path, &checkpoint, options).map_err(Into::into)
+    }
+
     /// Synchronizes journal data and metadata.
     ///
     /// # Errors
@@ -442,6 +602,7 @@ fn open_risk_metadata(
     definition: InstrumentDefinition,
     profiles: &[AccountRiskDefinition],
     options: StorageOptions,
+    checkpoint: Option<RiskManagedCheckpoint>,
 ) -> Result<OpenedRiskJournal, DurableRiskError> {
     let mut journal = StorageWriter::open(path, options)?;
     let recovery = journal.recovery();
@@ -502,6 +663,19 @@ fn open_risk_metadata(
                 .ok_or(MatchingError::SequenceExhausted)?;
         }
     }
+    let profile_count =
+        u64::try_from(profiles.len()).map_err(|_| MatchingError::SequenceExhausted)?;
+    let wal_metadata_sequence = definition_frame
+        .sequence()
+        .checked_add(profile_count)
+        .ok_or(MatchingError::SequenceExhausted)?;
+    validate_checkpoint_binding(
+        checkpoint.as_ref(),
+        definition_frame.sequence(),
+        wal_metadata_sequence,
+        definition,
+        profiles,
+    )?;
     Ok(OpenedRiskJournal {
         journal,
         reader,
@@ -509,7 +683,219 @@ fn open_risk_metadata(
         reader_exhausted,
         recovery,
         completed_profile_records,
+        wal_first_sequence: definition_frame.sequence(),
+        wal_metadata_sequence,
+        checkpoint,
     })
+}
+
+fn validate_checkpoint_binding(
+    checkpoint: Option<&RiskManagedCheckpoint>,
+    wal_first_sequence: u64,
+    wal_metadata_sequence: u64,
+    definition: InstrumentDefinition,
+    profiles: &[AccountRiskDefinition],
+) -> Result<(), DurableRiskError> {
+    let Some(value) = checkpoint else {
+        return Ok(());
+    };
+    if value.wal_first_sequence() != wal_first_sequence {
+        return Err(DurableRiskError::CheckpointWalLineageMismatch {
+            checkpoint_first_sequence: value.wal_first_sequence(),
+            wal_first_sequence,
+        });
+    }
+    if value.matching().wal_metadata_sequence() != wal_metadata_sequence {
+        return Err(DurableRiskError::CheckpointMetadataBoundaryMismatch {
+            checkpoint_metadata_sequence: value.matching().wal_metadata_sequence(),
+            wal_metadata_sequence,
+        });
+    }
+    if value.matching().definition() != definition {
+        return Err(DurableRiskError::CheckpointDefinitionMismatch);
+    }
+    let profiles_match = value.accounts().len() == profiles.len()
+        && value
+            .accounts()
+            .iter()
+            .zip(profiles)
+            .all(|(checkpoint_account, requested)| {
+                checkpoint_account.account_id() == requested.account_id()
+                    && checkpoint_account.profile() == requested.profile()
+            });
+    if !profiles_match {
+        return Err(DurableRiskError::CheckpointRiskProfileSetMismatch);
+    }
+    Ok(())
+}
+
+fn replay_risk_suffix(
+    mut reader: StorageReader,
+    first_data_frame: Option<JournalFrame>,
+    reader_exhausted: bool,
+    definition: InstrumentDefinition,
+    profiles: &[AccountRiskDefinition],
+    mut checkpoint: Option<RiskManagedCheckpoint>,
+    wal_metadata_sequence: u64,
+) -> Result<RiskReplay, DurableRiskError> {
+    let checkpointed_commands = checkpoint
+        .as_ref()
+        .map(|value| u64::try_from(value.matching().command_count()))
+        .transpose()
+        .map_err(|_| MatchingError::SequenceExhausted)?
+        .unwrap_or(0);
+    let mut managed = if checkpoint.is_none() {
+        let mut value = RiskManagedOrderBook::new(definition);
+        for profile in profiles {
+            value.register_account(profile.account_id(), profile.profile())?;
+        }
+        Some(value)
+    } else {
+        None
+    };
+    let mut pending = None;
+    let mut replayed_commands = 0_u64;
+    let mut last_wal_sequence = wal_metadata_sequence;
+    let mut next_frame = first_data_frame;
+    loop {
+        let frame = if let Some(frame) = next_frame.take() {
+            frame
+        } else {
+            if reader_exhausted {
+                break;
+            }
+            let Some(frame) = reader.next().transpose()? else {
+                break;
+            };
+            frame
+        };
+        last_wal_sequence = frame.sequence();
+        if checkpoint
+            .as_ref()
+            .is_some_and(|value| frame.sequence() <= value.generation())
+        {
+            validate_checkpoint_prefix_frame(
+                checkpoint.as_ref().expect("checkpoint presence was tested"),
+                &frame,
+            )?;
+            continue;
+        }
+        if managed.is_none() {
+            let value = checkpoint
+                .take()
+                .expect("first suffix frame follows checkpoint");
+            managed = Some(RiskManagedOrderBook::from_checkpoint(&value)?);
+        }
+        if replay_risk_frame(
+            managed
+                .as_mut()
+                .expect("managed book is initialized before suffix replay"),
+            &mut pending,
+            &frame,
+        )? {
+            replayed_commands = replayed_commands
+                .checked_add(1)
+                .ok_or(MatchingError::SequenceExhausted)?;
+        }
+    }
+    if let Some(value) = checkpoint {
+        if last_wal_sequence < value.generation() {
+            return Err(DurableRiskError::CheckpointAheadOfWal {
+                checkpoint_sequence: value.generation(),
+                wal_last_sequence: Some(last_wal_sequence),
+            });
+        }
+        managed = Some(RiskManagedOrderBook::from_checkpoint(&value)?);
+    }
+    Ok(RiskReplay {
+        managed: managed.expect("managed book exists after WAL/checkpoint recovery"),
+        pending,
+        checkpointed_commands,
+        replayed_commands,
+    })
+}
+
+fn replay_risk_frame(
+    managed: &mut RiskManagedOrderBook,
+    pending: &mut Option<(u64, Command)>,
+    frame: &JournalFrame,
+) -> Result<bool, DurableRiskError> {
+    match frame.kind() {
+        RecordKind::Command => {
+            if let Some((pending_sequence, _)) = pending {
+                return Err(DurableRiskError::ConsecutiveCommands {
+                    pending_sequence: *pending_sequence,
+                    next_sequence: frame.sequence(),
+                });
+            }
+            *pending = Some((frame.sequence(), frame.decode()?));
+            Ok(false)
+        }
+        RecordKind::ExecutionReport => {
+            let Some((command_sequence, command)) = pending.take() else {
+                return Err(DurableRiskError::ReportWithoutCommand {
+                    sequence: frame.sequence(),
+                });
+            };
+            let persisted: ExecutionReport = frame.decode()?;
+            let reproduced = managed.submit(command)?;
+            if reproduced != persisted {
+                return Err(DurableRiskError::ReplayDivergence {
+                    command_sequence,
+                    report_sequence: frame.sequence(),
+                });
+            }
+            Ok(true)
+        }
+        kind => Err(DurableRiskError::UnexpectedRecord {
+            sequence: frame.sequence(),
+            kind,
+        }),
+    }
+}
+
+fn validate_checkpoint_prefix_frame(
+    checkpoint: &RiskManagedCheckpoint,
+    frame: &JournalFrame,
+) -> Result<(), DurableRiskError> {
+    let relative = frame
+        .sequence()
+        .checked_sub(checkpoint.matching().wal_metadata_sequence())
+        .ok_or(DurableRiskError::CheckpointPrefixDivergence {
+            wal_sequence: frame.sequence(),
+        })?;
+    if relative == 0 {
+        return Err(DurableRiskError::CheckpointPrefixDivergence {
+            wal_sequence: frame.sequence(),
+        });
+    }
+    let history_index = usize::try_from((relative - 1) / 2).map_err(|_| {
+        DurableRiskError::CheckpointPrefixDivergence {
+            wal_sequence: frame.sequence(),
+        }
+    })?;
+    let Some(expected) = checkpoint.matching().history().get(history_index) else {
+        return Err(DurableRiskError::CheckpointPrefixDivergence {
+            wal_sequence: frame.sequence(),
+        });
+    };
+    let equal = if relative % 2 == 1 {
+        frame.kind() == RecordKind::Command
+            && frame
+                .decode::<Command>()
+                .is_ok_and(|actual| actual == expected.command())
+    } else {
+        frame.kind() == RecordKind::ExecutionReport
+            && frame
+                .decode::<ExecutionReport>()
+                .is_ok_and(|actual| actual == *expected.report())
+    };
+    if !equal {
+        return Err(DurableRiskError::CheckpointPrefixDivergence {
+            wal_sequence: frame.sequence(),
+        });
+    }
+    Ok(())
 }
 
 fn canonical_profiles(
@@ -523,4 +909,49 @@ fn canonical_profiles(
         }
     }
     Ok(canonical)
+}
+
+const fn storage_layout(options: StorageOptions) -> JournalLayout {
+    match options {
+        StorageOptions::Single(_) => JournalLayout::SingleFile,
+        StorageOptions::Segmented(_) => JournalLayout::Segmented,
+    }
+}
+
+fn validate_checkpoint_path(
+    storage_path: &Path,
+    layout: JournalLayout,
+    checkpoint_path: &Path,
+) -> Result<(), DurableRiskError> {
+    let storage_path = normalize_journal_path(storage_path).map_err(JournalError::Io)?;
+    let checkpoint_path = normalize_journal_path(checkpoint_path).map_err(JournalError::Io)?;
+    let pending_path = normalize_journal_path(&SnapshotFile::pending_path(&checkpoint_path))
+        .map_err(JournalError::Io)?;
+    let checkpoint_lease = SnapshotFile::writer_lease_path(&checkpoint_path)?;
+    let snapshot_mutations = [&checkpoint_path, &pending_path, &checkpoint_lease];
+    match layout {
+        JournalLayout::Segmented => {
+            if let Some(conflict) = snapshot_mutations
+                .into_iter()
+                .find(|path| path.starts_with(&storage_path))
+            {
+                return Err(DurableRiskError::CheckpointPathConflictsWithWal {
+                    path: conflict.clone(),
+                });
+            }
+        }
+        JournalLayout::SingleFile => {
+            let storage_lease = Journal::writer_lease_path(&storage_path)?;
+            let storage_paths = [&storage_path, &storage_lease];
+            if let Some(conflict) = snapshot_mutations
+                .into_iter()
+                .find(|snapshot| storage_paths.contains(snapshot))
+            {
+                return Err(DurableRiskError::CheckpointPathConflictsWithWal {
+                    path: conflict.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }

@@ -42,6 +42,7 @@ fn definition() -> InstrumentDefinition {
         price: PriceRules::new(0, 1, Price::from_raw(-1_000), Price::from_raw(1_000))
             .expect("price rules"),
         quantity: QuantityRules::new(1, 1, 1_000).expect("quantity rules"),
+        reserve: quotick::instrument::ReserveOrderRules::disabled(),
         base_units_per_lot: 1,
         quote_units_per_price_unit: 1,
         trading_state: TradingState::Open,
@@ -71,6 +72,7 @@ fn order(
         instrument_version: version(),
         side,
         quantity: Quantity::new(quantity).expect("quantity"),
+        display: quotick::matching::OrderDisplay::FullyDisplayed,
         order_type: OrderType::Limit(Price::from_raw(price)),
         time_in_force: tif,
         self_trade_prevention: stp,
@@ -98,6 +100,7 @@ fn replace(command_id: u64, order_id: u64, account_id: u64, quantity: u64, price
         instrument_version: version(),
         new_quantity: Quantity::new(quantity).expect("quantity"),
         new_price: Price::from_raw(price),
+        new_display: quotick::matching::OrderDisplay::FullyDisplayed,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }

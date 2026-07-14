@@ -3,7 +3,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::domain::TransactionId;
+use crate::domain::{AccountingDate, TimestampNs, TransactionId};
 use crate::durable_storage::{StorageError, StorageOptions, StorageReader, StorageWriter};
 use crate::instrument::InstrumentDefinition;
 use crate::journal::{
@@ -11,8 +11,9 @@ use crate::journal::{
     SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
 };
 use crate::ledger::{
-    JournalEntry, Ledger, LedgerCheckpoint, LedgerCheckpointError, LedgerError,
-    LedgerInvariantViolation, PostReceipt, PostingPreparation, SettlementConvention,
+    CorrectionPreparation, CorrectionReceipt, JournalEntry, Ledger, LedgerCheckpoint,
+    LedgerCheckpointError, LedgerCorrection, LedgerError, LedgerInvariantViolation, LedgerRecord,
+    PostReceipt, PostingPreparation, SettlementConvention,
 };
 use crate::matching::Trade;
 use crate::snapshot::{SnapshotError, SnapshotFile, SnapshotOptions, SnapshotReceipt};
@@ -22,10 +23,10 @@ use crate::snapshot::{SnapshotError, SnapshotFile, SnapshotOptions, SnapshotRece
 pub struct DurableLedgerRecoveryReport {
     /// Physical journal recovery performed at open.
     pub journal: StorageRecoveryReport,
-    /// Entries restored from a semantically verified checkpoint.
-    pub checkpointed_entries: u64,
-    /// Balanced entries replayed into account balances.
-    pub replayed_entries: u64,
+    /// Ledger events restored from a semantically verified checkpoint.
+    pub checkpointed_records: u64,
+    /// Ledger events replayed into account balances.
+    pub replayed_records: u64,
 }
 
 /// Durable ledger orchestration or replay failure.
@@ -57,19 +58,19 @@ pub enum DurableLedgerError {
         /// Repeated transaction identifier.
         transaction_id: TransactionId,
     },
-    /// A checkpoint entry differed from the same WAL prefix position.
+    /// A checkpoint record differed from the same WAL prefix position.
     CheckpointPrefixDivergence {
         /// Physical WAL frame sequence.
         wal_sequence: u64,
-        /// Zero-based checkpoint entry position.
-        checkpoint_index: u64,
+        /// Zero-based checkpoint record position.
+        checkpoint_record_index: u64,
     },
-    /// A checkpoint claimed more entries than the complete verified WAL.
+    /// A checkpoint claimed more records than the complete verified WAL.
     CheckpointAheadOfWal {
-        /// Entries represented by the checkpoint.
-        checkpoint_entries: u64,
-        /// Complete ledger-entry frames present in the WAL.
-        wal_entries: u64,
+        /// Events represented by the checkpoint.
+        checkpoint_records: u64,
+        /// Complete ledger-event frames present in the WAL.
+        wal_records: u64,
     },
     /// Snapshot output aliases a WAL file, lease, pending path, or managed directory.
     CheckpointPathConflictsWithWal {
@@ -104,17 +105,17 @@ impl fmt::Display for DurableLedgerError {
             ),
             Self::CheckpointPrefixDivergence {
                 wal_sequence,
-                checkpoint_index,
+                checkpoint_record_index,
             } => write!(
                 formatter,
-                "ledger checkpoint entry {checkpoint_index} differs from WAL frame {wal_sequence}"
+                "ledger checkpoint record {checkpoint_record_index} differs from WAL frame {wal_sequence}"
             ),
             Self::CheckpointAheadOfWal {
-                checkpoint_entries,
-                wal_entries,
+                checkpoint_records,
+                wal_records,
             } => write!(
                 formatter,
-                "ledger checkpoint covers {checkpoint_entries} entries but WAL has {wal_entries}"
+                "ledger checkpoint covers {checkpoint_records} records but WAL has {wal_records}"
             ),
             Self::CheckpointPathConflictsWithWal { path } => write!(
                 formatter,
@@ -245,7 +246,7 @@ impl DurableLedger {
     }
 
     /// Opens a segmented ledger WAL using a checksum-verified semantic
-    /// checkpoint and proves its complete entry history against the WAL prefix.
+    /// checkpoint and proves its complete record history against the WAL prefix.
     ///
     /// # Errors
     ///
@@ -280,54 +281,60 @@ impl DurableLedger {
             })
             .transpose()?;
         let reader = StorageReader::open(path, options)?;
-        let checkpointed_entries = checkpoint.as_ref().map_or(0, LedgerCheckpoint::generation);
+        let checkpointed_records = checkpoint.as_ref().map_or(0, LedgerCheckpoint::generation);
         let mut ledger = checkpoint
             .map(Ledger::from_checkpoint)
             .transpose()?
             .unwrap_or_default();
-        let mut replayed_entries = 0_u64;
-        let mut wal_entries = 0_u64;
+        let mut replayed_records = 0_u64;
+        let mut wal_records = 0_u64;
         for frame_result in reader {
             let frame = frame_result?;
-            if frame.kind() != RecordKind::LedgerEntry {
-                return Err(DurableLedgerError::UnexpectedRecord {
-                    sequence: frame.sequence(),
-                    kind: frame.kind(),
-                });
-            }
-            let entry: JournalEntry = frame.decode()?;
-            if wal_entries < checkpointed_entries {
-                let checkpoint_sequence = wal_entries
-                    .checked_add(1)
-                    .ok_or(LedgerError::ArithmeticOverflow)?;
-                if ledger.entry(checkpoint_sequence) != Some(&entry) {
-                    return Err(DurableLedgerError::CheckpointPrefixDivergence {
-                        wal_sequence: frame.sequence(),
-                        checkpoint_index: wal_entries,
+            let record = match frame.kind() {
+                RecordKind::LedgerEntry => LedgerRecord::Entry(frame.decode()?),
+                RecordKind::LedgerCorrection => LedgerRecord::Correction(frame.decode()?),
+                kind => {
+                    return Err(DurableLedgerError::UnexpectedRecord {
+                        sequence: frame.sequence(),
+                        kind,
                     });
                 }
-                wal_entries = checkpoint_sequence;
+            };
+            if wal_records < checkpointed_records {
+                let checkpoint_sequence = wal_records
+                    .checked_add(1)
+                    .ok_or(LedgerError::ArithmeticOverflow)?;
+                if ledger.record(checkpoint_sequence).as_ref() != Some(&record) {
+                    return Err(DurableLedgerError::CheckpointPrefixDivergence {
+                        wal_sequence: frame.sequence(),
+                        checkpoint_record_index: wal_records,
+                    });
+                }
+                wal_records = checkpoint_sequence;
                 continue;
             }
-            let transaction_id = entry.transaction_id();
-            let receipt = ledger.post(entry)?;
-            if receipt.replayed {
+            let transaction_id = record.primary_transaction_id();
+            let replayed = match record {
+                LedgerRecord::Entry(entry) => ledger.post(entry)?.replayed,
+                LedgerRecord::Correction(correction) => ledger.correct(correction)?.replayed,
+            };
+            if replayed {
                 return Err(DurableLedgerError::DuplicateTransactionRecord {
                     sequence: frame.sequence(),
                     transaction_id,
                 });
             }
-            replayed_entries = replayed_entries
+            replayed_records = replayed_records
                 .checked_add(1)
                 .ok_or(LedgerError::ArithmeticOverflow)?;
-            wal_entries = wal_entries
+            wal_records = wal_records
                 .checked_add(1)
                 .ok_or(LedgerError::ArithmeticOverflow)?;
         }
-        if wal_entries < checkpointed_entries {
+        if wal_records < checkpointed_records {
             return Err(DurableLedgerError::CheckpointAheadOfWal {
-                checkpoint_entries: checkpointed_entries,
-                wal_entries,
+                checkpoint_records: checkpointed_records,
+                wal_records,
             });
         }
         ledger.validate()?;
@@ -336,8 +343,8 @@ impl DurableLedger {
             journal,
             recovery: DurableLedgerRecoveryReport {
                 journal: journal_recovery,
-                checkpointed_entries,
-                replayed_entries,
+                checkpointed_records,
+                replayed_records,
             },
             poisoned: false,
         })
@@ -384,6 +391,108 @@ impl DurableLedger {
         }
     }
 
+    /// Durably records and commits one indivisible reversal-plus-replacement event.
+    ///
+    /// The complete correction is encoded in one checksummed WAL frame. A torn
+    /// final frame therefore contributes neither transaction during recovery;
+    /// a complete verified frame contributes both.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableLedgerError`] for correction preparation, WAL, or commit
+    /// failure. Ambiguous I/O or a post-append commit failure poisons the runtime.
+    pub fn correct(
+        &mut self,
+        correction: LedgerCorrection,
+    ) -> Result<CorrectionReceipt, DurableLedgerError> {
+        if self.poisoned {
+            return Err(DurableLedgerError::Poisoned);
+        }
+        let prepared = match self.ledger.prepare_correction(correction)? {
+            CorrectionPreparation::Replay(receipt) => return Ok(receipt),
+            CorrectionPreparation::Ready(prepared) => prepared,
+        };
+        if let Err(error) = self.journal.append(prepared.correction()) {
+            self.poisoned = self.journal.is_poisoned();
+            return Err(error.into());
+        }
+        match self.ledger.commit_correction(prepared) {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => {
+                self.poisoned = true;
+                Err(DurableLedgerError::Ledger(error))
+            }
+        }
+    }
+
+    /// Constructs, durably records, and commits the exact reversal of a prior entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableLedgerError`] if the target is absent/already reversed,
+    /// an inverse amount is unrepresentable, or durable posting fails.
+    pub fn reverse(
+        &mut self,
+        transaction_id: TransactionId,
+        reference: u64,
+        effective_date: AccountingDate,
+        recorded_at: TimestampNs,
+        reversed_transaction_id: TransactionId,
+    ) -> Result<PostReceipt, DurableLedgerError> {
+        let original = self
+            .ledger
+            .transaction(reversed_transaction_id)
+            .ok_or(LedgerError::ReversalTargetMissing(reversed_transaction_id))?;
+        let reversal = JournalEntry::reversal(
+            transaction_id,
+            reference,
+            effective_date,
+            recorded_at,
+            original,
+        )?;
+        self.post(reversal)
+    }
+
+    /// Durably advances the inclusive closed accounting-date boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableLedgerError`] for invalid period progression, timestamp,
+    /// WAL, or commit failure.
+    pub fn close_period(
+        &mut self,
+        transaction_id: TransactionId,
+        reference: u64,
+        recorded_at: TimestampNs,
+        closed_through: AccountingDate,
+    ) -> Result<PostReceipt, DurableLedgerError> {
+        let entry =
+            JournalEntry::period_close(transaction_id, reference, recorded_at, closed_through)?;
+        self.post(entry)
+    }
+
+    /// Durably moves or removes the inclusive closed accounting-date boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableLedgerError`] for invalid period regression, timestamp,
+    /// WAL, or commit failure.
+    pub fn reopen_period(
+        &mut self,
+        transaction_id: TransactionId,
+        reference: u64,
+        recorded_at: TimestampNs,
+        new_closed_through: Option<AccountingDate>,
+    ) -> Result<PostReceipt, DurableLedgerError> {
+        let entry = JournalEntry::period_reopen(
+            transaction_id,
+            reference,
+            recorded_at,
+            new_closed_through,
+        )?;
+        self.post(entry)
+    }
+
     /// Creates and durably posts a delivery-versus-payment entry for a trade.
     ///
     /// # Errors
@@ -393,10 +502,18 @@ impl DurableLedger {
     pub fn settle_trade(
         &mut self,
         transaction_id: TransactionId,
+        effective_date: AccountingDate,
+        recorded_at: TimestampNs,
         trade: &Trade,
         convention: SettlementConvention,
     ) -> Result<PostReceipt, DurableLedgerError> {
-        let entry = JournalEntry::from_trade(transaction_id, trade, convention)?;
+        let entry = JournalEntry::from_trade(
+            transaction_id,
+            effective_date,
+            recorded_at,
+            trade,
+            convention,
+        )?;
         self.post(entry)
     }
 
@@ -409,10 +526,18 @@ impl DurableLedger {
     pub fn settle_instrument_trade(
         &mut self,
         transaction_id: TransactionId,
+        effective_date: AccountingDate,
+        recorded_at: TimestampNs,
         trade: &Trade,
         definition: InstrumentDefinition,
     ) -> Result<PostReceipt, DurableLedgerError> {
-        let entry = JournalEntry::from_instrument(transaction_id, trade, definition)?;
+        let entry = JournalEntry::from_instrument(
+            transaction_id,
+            effective_date,
+            recorded_at,
+            trade,
+            definition,
+        )?;
         self.post(entry)
     }
 

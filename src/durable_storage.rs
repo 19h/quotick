@@ -90,6 +90,17 @@ impl StorageWriter {
         }
     }
 
+    pub(crate) fn first_sequence(&self) -> u64 {
+        self.recovery().first_sequence
+    }
+
+    pub(crate) fn next_sequence(&self) -> u64 {
+        match self {
+            Self::Single { journal, .. } => journal.next_sequence(),
+            Self::Segmented(journal) => journal.next_sequence(),
+        }
+    }
+
     pub(crate) fn append<T: DurableRecord>(&mut self, record: &T) -> Result<(), StorageError> {
         match self {
             Self::Single { journal, .. } => journal

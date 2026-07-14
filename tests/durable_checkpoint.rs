@@ -7,7 +7,7 @@ use quotick::durable_ledger::{DurableLedger, DurableLedgerError};
 use quotick::journal::{Durability, JournalOptions, SegmentedJournalOptions};
 use quotick::ledger::{JournalEntry, Ledger, Posting};
 use quotick::snapshot::{SnapshotFile, SnapshotOptions};
-use quotick::{AccountId, AssetId, TransactionId};
+use quotick::{AccountId, AccountingDate, AssetId, TimestampNs, TransactionId};
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
 
@@ -48,6 +48,8 @@ fn entry(transaction_id: u64, amount: i128) -> JournalEntry {
     JournalEntry::new(
         TransactionId::new(transaction_id).unwrap(),
         transaction_id,
+        AccountingDate::UNIX_EPOCH,
+        TimestampNs::from_unix_nanos(0),
         vec![
             Posting {
                 account_id: account(1),
@@ -116,8 +118,8 @@ fn durable_ledger_restores_checkpoint_and_replays_only_the_wal_suffix() {
         SnapshotOptions::default(),
     )
     .expect("checkpoint and suffix recover");
-    assert_eq!(recovered.recovery().checkpointed_entries, 2);
-    assert_eq!(recovered.recovery().replayed_entries, 1);
+    assert_eq!(recovered.recovery().checkpointed_records, 2);
+    assert_eq!(recovered.recovery().replayed_records, 1);
     assert_eq!(recovered.ledger().balance(account(1), asset()), 60);
     assert!(recovered.post(first).unwrap().replayed);
 }
@@ -141,7 +143,7 @@ fn checkpoint_must_equal_the_exact_wal_prefix_and_cannot_be_ahead() {
         ),
         Err(DurableLedgerError::CheckpointPrefixDivergence {
             wal_sequence: 1,
-            checkpoint_index: 0
+            checkpoint_record_index: 0
         })
     ));
 
@@ -155,8 +157,8 @@ fn checkpoint_must_equal_the_exact_wal_prefix_and_cannot_be_ahead() {
             SnapshotOptions::default()
         ),
         Err(DurableLedgerError::CheckpointAheadOfWal {
-            checkpoint_entries: 2,
-            wal_entries: 1
+            checkpoint_records: 2,
+            wal_records: 1
         })
     ));
 }
@@ -185,8 +187,8 @@ fn segmented_ledger_checkpoint_recovery_crosses_physical_boundaries() {
     )
     .unwrap();
     assert_eq!(recovered.recovery().journal.segment_count, 3);
-    assert_eq!(recovered.recovery().checkpointed_entries, 2);
-    assert_eq!(recovered.recovery().replayed_entries, 1);
+    assert_eq!(recovered.recovery().checkpointed_records, 2);
+    assert_eq!(recovered.recovery().replayed_records, 1);
     assert_eq!(recovered.ledger().balance(account(1), asset()), 60);
 }
 

@@ -12,6 +12,8 @@ use crate::journal::{
     normalize_journal_path, sync_parent,
 };
 use crate::ledger::LedgerCheckpoint;
+use crate::matching::OrderBookCheckpoint;
+use crate::risk::RiskManagedCheckpoint;
 
 const MAGIC: [u8; 4] = *b"QSNP";
 const VERSION: u16 = 1;
@@ -26,6 +28,10 @@ const DEFAULT_MAXIMUM_PAYLOAD_BYTES: u64 = 1_073_741_824;
 pub enum SnapshotKind {
     /// Canonical ledger balances and complete transaction history.
     LedgerCheckpoint = 1,
+    /// Canonical matching state and complete command idempotency history.
+    MatchingCheckpoint = 2,
+    /// Coupled matching, risk-profile, position, and reservation state.
+    RiskManagedCheckpoint = 3,
 }
 
 impl SnapshotKind {
@@ -38,6 +44,8 @@ mod sealed {
     pub trait SnapshotPayload {}
 
     impl SnapshotPayload for crate::ledger::LedgerCheckpoint {}
+    impl SnapshotPayload for crate::matching::OrderBookCheckpoint {}
+    impl SnapshotPayload for crate::risk::RiskManagedCheckpoint {}
 }
 
 /// Typed semantic value with a crate-controlled stable snapshot-kind assignment.
@@ -63,7 +71,31 @@ impl SnapshotPayload for LedgerCheckpoint {
     }
 
     fn is_successor_of(&self, previous: &Self) -> bool {
-        self.generation() >= previous.generation() && self.entries().starts_with(previous.entries())
+        self.generation() >= previous.generation() && self.records().starts_with(previous.records())
+    }
+}
+
+impl SnapshotPayload for OrderBookCheckpoint {
+    const KIND: SnapshotKind = SnapshotKind::MatchingCheckpoint;
+
+    fn generation(&self) -> u64 {
+        self.generation()
+    }
+
+    fn is_successor_of(&self, previous: &Self) -> bool {
+        self.is_successor_of(previous)
+    }
+}
+
+impl SnapshotPayload for RiskManagedCheckpoint {
+    const KIND: SnapshotKind = SnapshotKind::RiskManagedCheckpoint;
+
+    fn generation(&self) -> u64 {
+        self.generation()
+    }
+
+    fn is_successor_of(&self, previous: &Self) -> bool {
+        self.is_successor_of(previous)
     }
 }
 

@@ -2,26 +2,33 @@
 //!
 //! The protocol appends and acknowledges a command before applying it to the
 //! in-memory book, then appends its deterministic execution report. Recovery
-//! replays every verified command/report pair and completes one possible final
-//! command whose report was interrupted by process termination.
+//! either replays every verified command/report pair or proves a direct-state
+//! checkpoint against the complete WAL prefix and replays only its suffix. One
+//! possible final command interrupted before report persistence is completed.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::domain::{InstrumentId, InstrumentVersion};
 use crate::durable_storage::{StorageError, StorageOptions, StorageReader, StorageWriter};
 use crate::instrument::InstrumentDefinition;
 use crate::journal::{
-    JournalError, JournalOptions, RecordKind, SegmentedJournalError, SegmentedJournalOptions,
-    StorageRecoveryReport,
+    Journal, JournalError, JournalFrame, JournalLayout, JournalOptions, RecordKind,
+    SegmentedJournalError, SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
 };
-use crate::matching::{Command, ExecutionReport, InvariantViolation, MatchingError, OrderBook};
+use crate::matching::{
+    Command, ExecutionReport, InvariantViolation, MatchingError, OrderBook, OrderBookCheckpoint,
+    OrderBookCheckpointError,
+};
+use crate::snapshot::{SnapshotError, SnapshotFile, SnapshotOptions, SnapshotReceipt};
 
 /// Result of reconstructing a durable matching shard.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DurableRecoveryReport {
     /// Physical frame recovery performed by the journal.
     pub journal: StorageRecoveryReport,
+    /// Completed commands restored directly from a verified semantic checkpoint.
+    pub checkpointed_commands: u64,
     /// Commands reconstructed from complete command/report pairs.
     pub replayed_commands: u64,
     /// Whether a final durable command lacked a report and was completed.
@@ -39,6 +46,10 @@ pub enum DurableError {
     Matching(MatchingError),
     /// Reconstructed book structure violated an internal invariant.
     Invariant(InvariantViolation),
+    /// Semantic checkpoint construction or restoration failed.
+    Checkpoint(OrderBookCheckpointError),
+    /// Snapshot framing, ownership, checksum, generation, or I/O failed.
+    Snapshot(SnapshotError),
     /// The first journal frame was not an instrument definition.
     DefinitionRecordRequired {
         /// Journal frame sequence.
@@ -85,6 +96,32 @@ pub enum DurableError {
         /// Sequence of the persisted report frame.
         report_sequence: u64,
     },
+    /// A checkpoint's first WAL sequence differs from the journal lineage.
+    CheckpointWalLineageMismatch {
+        /// First sequence retained by the checkpoint.
+        checkpoint_first_sequence: u64,
+        /// First sequence configured for the WAL.
+        wal_first_sequence: u64,
+    },
+    /// A checkpoint definition differs from the requested and persisted definition.
+    CheckpointDefinitionMismatch,
+    /// A checkpoint command or report differs from the same WAL sequence.
+    CheckpointPrefixDivergence {
+        /// Physical WAL frame sequence where values differed.
+        wal_sequence: u64,
+    },
+    /// A checkpoint boundary is newer than the complete verified WAL.
+    CheckpointAheadOfWal {
+        /// Completed report boundary claimed by the checkpoint.
+        checkpoint_sequence: u64,
+        /// Last complete physical frame in the WAL.
+        wal_last_sequence: Option<u64>,
+    },
+    /// Snapshot output aliases WAL storage or its ownership namespace.
+    CheckpointPathConflictsWithWal {
+        /// Conflicting canonical path.
+        path: PathBuf,
+    },
     /// The runtime is unusable until reopened and recovered after an ambiguous transition.
     Poisoned,
 }
@@ -96,6 +133,8 @@ impl fmt::Display for DurableError {
             Self::SegmentedJournal(error) => error.fmt(formatter),
             Self::Matching(error) => error.fmt(formatter),
             Self::Invariant(error) => error.fmt(formatter),
+            Self::Checkpoint(error) => error.fmt(formatter),
+            Self::Snapshot(error) => error.fmt(formatter),
             Self::DefinitionRecordRequired { sequence, actual } => write!(
                 formatter,
                 "first matching-journal frame at sequence {sequence} must be an instrument definition, found {actual:?}"
@@ -138,6 +177,32 @@ impl fmt::Display for DurableError {
                 formatter,
                 "replay of command at {command_sequence} diverged from report at {report_sequence}"
             ),
+            Self::CheckpointWalLineageMismatch {
+                checkpoint_first_sequence,
+                wal_first_sequence,
+            } => write!(
+                formatter,
+                "matching checkpoint WAL starts at {checkpoint_first_sequence}, but journal starts at {wal_first_sequence}"
+            ),
+            Self::CheckpointDefinitionMismatch => formatter.write_str(
+                "matching checkpoint instrument definition differs from the WAL binding",
+            ),
+            Self::CheckpointPrefixDivergence { wal_sequence } => write!(
+                formatter,
+                "matching checkpoint differs from WAL frame {wal_sequence}"
+            ),
+            Self::CheckpointAheadOfWal {
+                checkpoint_sequence,
+                wal_last_sequence,
+            } => write!(
+                formatter,
+                "matching checkpoint covers WAL sequence {checkpoint_sequence}, but verified WAL ends at {wal_last_sequence:?}"
+            ),
+            Self::CheckpointPathConflictsWithWal { path } => write!(
+                formatter,
+                "matching checkpoint path {} conflicts with WAL storage",
+                path.display()
+            ),
             Self::Poisoned => formatter
                 .write_str("durable matching shard is poisoned and must be reopened for recovery"),
         }
@@ -151,6 +216,8 @@ impl std::error::Error for DurableError {
             Self::SegmentedJournal(error) => Some(error),
             Self::Matching(error) => Some(error),
             Self::Invariant(error) => Some(error),
+            Self::Checkpoint(error) => Some(error),
+            Self::Snapshot(error) => Some(error),
             _ => None,
         }
     }
@@ -183,6 +250,18 @@ impl From<MatchingError> for DurableError {
     }
 }
 
+impl From<OrderBookCheckpointError> for DurableError {
+    fn from(error: OrderBookCheckpointError) -> Self {
+        Self::Checkpoint(error)
+    }
+}
+
+impl From<SnapshotError> for DurableError {
+    fn from(error: SnapshotError) -> Self {
+        Self::Snapshot(error)
+    }
+}
+
 /// One crash-recoverable, single-writer instrument matching shard.
 #[derive(Debug)]
 pub struct DurableOrderBook {
@@ -206,7 +285,35 @@ impl DurableOrderBook {
         definition: InstrumentDefinition,
         options: JournalOptions,
     ) -> Result<Self, DurableError> {
-        Self::open_storage(path.as_ref(), definition, StorageOptions::Single(options))
+        Self::open_storage(
+            path.as_ref(),
+            definition,
+            StorageOptions::Single(options),
+            None,
+        )
+    }
+
+    /// Opens a matching WAL from a checksum-verified direct-state checkpoint,
+    /// proves its complete command/report lineage against the WAL prefix, and
+    /// deterministically replays only the suffix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] for snapshot, path-alias, definition, prefix,
+    /// journal, matching, or reconstructed-state failure.
+    pub fn open_with_checkpoint(
+        path: impl AsRef<Path>,
+        checkpoint_path: impl AsRef<Path>,
+        definition: InstrumentDefinition,
+        options: JournalOptions,
+        snapshot_options: SnapshotOptions,
+    ) -> Result<Self, DurableError> {
+        Self::open_storage(
+            path.as_ref(),
+            definition,
+            StorageOptions::Single(options),
+            Some((checkpoint_path.as_ref(), snapshot_options)),
+        )
     }
 
     /// Opens a matching shard over an automatically rotating WAL directory.
@@ -227,6 +334,29 @@ impl DurableOrderBook {
             directory.as_ref(),
             definition,
             StorageOptions::Segmented(options),
+            None,
+        )
+    }
+
+    /// Opens a segmented matching WAL from a verified semantic checkpoint and
+    /// replays only command/report frames after its exact global sequence boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] for snapshot, managed-path, prefix, segmented
+    /// storage, matching, or reconstructed-state failure.
+    pub fn open_segmented_with_checkpoint(
+        directory: impl AsRef<Path>,
+        checkpoint_path: impl AsRef<Path>,
+        definition: InstrumentDefinition,
+        options: SegmentedJournalOptions,
+        snapshot_options: SnapshotOptions,
+    ) -> Result<Self, DurableError> {
+        Self::open_storage(
+            directory.as_ref(),
+            definition,
+            StorageOptions::Segmented(options),
+            Some((checkpoint_path.as_ref(), snapshot_options)),
         )
     }
 
@@ -234,77 +364,18 @@ impl DurableOrderBook {
         path: &Path,
         definition: InstrumentDefinition,
         options: StorageOptions,
+        checkpoint_source: Option<(&Path, SnapshotOptions)>,
     ) -> Result<Self, DurableError> {
-        let mut journal = StorageWriter::open(path, options)?;
-        let journal_recovery = journal.recovery();
-        if journal_recovery.last_sequence.is_none() {
-            journal.append(&definition)?;
-        }
-        let mut reader = StorageReader::open(path, options)?;
-        let Some(definition_frame) = reader.next().transpose()? else {
-            return Err(DurableError::DefinitionRecordMissing);
-        };
-        if definition_frame.kind() != RecordKind::InstrumentDefinition {
-            return Err(DurableError::DefinitionRecordRequired {
-                sequence: definition_frame.sequence(),
-                actual: definition_frame.kind(),
-            });
-        }
-        let persisted_definition: InstrumentDefinition = definition_frame.decode()?;
-        if persisted_definition != definition {
-            return Err(DurableError::DefinitionMismatch {
-                requested_instrument_id: definition.instrument_id(),
-                requested_version: definition.version(),
-                persisted_instrument_id: persisted_definition.instrument_id(),
-                persisted_version: persisted_definition.version(),
-            });
-        }
-        let mut book = OrderBook::new(definition);
-        let mut pending: Option<(u64, Command)> = None;
-        let mut replayed_commands = 0_u64;
-
-        for frame_result in reader {
-            let frame = frame_result?;
-            match frame.kind() {
-                RecordKind::Command => {
-                    if let Some((pending_sequence, _)) = pending {
-                        return Err(DurableError::ConsecutiveCommands {
-                            pending_sequence,
-                            next_sequence: frame.sequence(),
-                        });
-                    }
-                    pending = Some((frame.sequence(), frame.decode()?));
-                }
-                RecordKind::ExecutionReport => {
-                    let Some((command_sequence, command)) = pending.take() else {
-                        return Err(DurableError::ReportWithoutCommand {
-                            sequence: frame.sequence(),
-                        });
-                    };
-                    let persisted: ExecutionReport = frame.decode()?;
-                    let reproduced = book.submit(command)?;
-                    if reproduced != persisted {
-                        return Err(DurableError::ReplayDivergence {
-                            command_sequence,
-                            report_sequence: frame.sequence(),
-                        });
-                    }
-                    replayed_commands = replayed_commands
-                        .checked_add(1)
-                        .ok_or(MatchingError::SequenceExhausted)?;
-                }
-                RecordKind::LedgerEntry
-                | RecordKind::InstrumentDefinition
-                | RecordKind::AccountRiskDefinition => {
-                    return Err(DurableError::UnexpectedRecord {
-                        sequence: frame.sequence(),
-                        kind: frame.kind(),
-                    });
-                }
-            }
-        }
-
-        let completed_dangling_command = if let Some((_, command)) = pending {
+        let opened = open_matching_journal(path, definition, options, checkpoint_source)?;
+        let mut journal = opened.journal;
+        let replay = replay_matching_suffix(
+            opened.reader,
+            opened.checkpoint,
+            definition,
+            opened.wal_first_sequence,
+        )?;
+        let mut book = replay.book;
+        let completed_dangling_command = if let Some((_, command)) = replay.pending {
             let report = book.submit(command)?;
             journal.append(&report)?;
             true
@@ -316,8 +387,9 @@ impl DurableOrderBook {
             book,
             journal,
             recovery: DurableRecoveryReport {
-                journal: journal_recovery,
-                replayed_commands,
+                journal: opened.recovery,
+                checkpointed_commands: replay.checkpointed_commands,
+                replayed_commands: replay.replayed_commands,
                 completed_dangling_command,
             },
             poisoned: false,
@@ -372,6 +444,44 @@ impl DurableOrderBook {
         Ok(report)
     }
 
+    /// Synchronizes the matching WAL, audits direct state, and atomically
+    /// replaces a checksum-protected semantic checkpoint.
+    ///
+    /// Checkpoint output cannot alias the WAL, its lease/pending namespace, or
+    /// any path inside a managed segmented-journal directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] for poison, path conflict, WAL barrier,
+    /// matching invariant, checkpoint codec, snapshot ownership, or I/O failure.
+    pub fn write_checkpoint(
+        &mut self,
+        path: impl AsRef<Path>,
+        options: SnapshotOptions,
+    ) -> Result<SnapshotReceipt, DurableError> {
+        if self.poisoned {
+            return Err(DurableError::Poisoned);
+        }
+        validate_checkpoint_path(self.journal.path(), self.journal.layout(), path.as_ref())?;
+        self.sync_all()?;
+        let wal_sequence = self
+            .journal
+            .next_sequence()
+            .checked_sub(1)
+            .ok_or(MatchingError::SequenceExhausted)?;
+        let checkpoint = match self
+            .book
+            .checkpoint(self.journal.first_sequence(), wal_sequence)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                self.poisoned = true;
+                return Err(DurableError::Checkpoint(error));
+            }
+        };
+        SnapshotFile::write(path, &checkpoint, options).map_err(Into::into)
+    }
+
     /// Synchronizes journal data and metadata.
     ///
     /// # Errors
@@ -401,4 +511,280 @@ impl DurableOrderBook {
         }
         self.journal.close().map_err(Into::into)
     }
+}
+
+struct OpenedMatchingJournal {
+    journal: StorageWriter,
+    reader: StorageReader,
+    recovery: StorageRecoveryReport,
+    checkpoint: Option<OrderBookCheckpoint>,
+    wal_first_sequence: u64,
+}
+
+fn open_matching_journal(
+    path: &Path,
+    definition: InstrumentDefinition,
+    options: StorageOptions,
+    checkpoint_source: Option<(&Path, SnapshotOptions)>,
+) -> Result<OpenedMatchingJournal, DurableError> {
+    if let Some((checkpoint_path, _)) = checkpoint_source {
+        validate_checkpoint_path(path, storage_layout(options), checkpoint_path)?;
+    }
+    let mut journal = StorageWriter::open(path, options)?;
+    let recovery = journal.recovery();
+    if recovery.last_sequence.is_none() {
+        journal.append(&definition)?;
+    }
+    let checkpoint = checkpoint_source
+        .map(|(checkpoint_path, snapshot_options)| {
+            SnapshotFile::read::<OrderBookCheckpoint>(checkpoint_path, snapshot_options)
+        })
+        .transpose()?;
+    let mut reader = StorageReader::open(path, options)?;
+    let Some(definition_frame) = reader.next().transpose()? else {
+        return Err(DurableError::DefinitionRecordMissing);
+    };
+    validate_definition_frame(&definition_frame, definition)?;
+    if let Some(value) = &checkpoint {
+        if value.wal_metadata_sequence() != definition_frame.sequence() {
+            return Err(DurableError::CheckpointWalLineageMismatch {
+                checkpoint_first_sequence: value.wal_metadata_sequence(),
+                wal_first_sequence: definition_frame.sequence(),
+            });
+        }
+        if value.definition() != definition {
+            return Err(DurableError::CheckpointDefinitionMismatch);
+        }
+    }
+    Ok(OpenedMatchingJournal {
+        journal,
+        reader,
+        recovery,
+        checkpoint,
+        wal_first_sequence: definition_frame.sequence(),
+    })
+}
+
+fn validate_definition_frame(
+    frame: &JournalFrame,
+    definition: InstrumentDefinition,
+) -> Result<(), DurableError> {
+    if frame.kind() != RecordKind::InstrumentDefinition {
+        return Err(DurableError::DefinitionRecordRequired {
+            sequence: frame.sequence(),
+            actual: frame.kind(),
+        });
+    }
+    let persisted: InstrumentDefinition = frame.decode()?;
+    if persisted != definition {
+        return Err(DurableError::DefinitionMismatch {
+            requested_instrument_id: definition.instrument_id(),
+            requested_version: definition.version(),
+            persisted_instrument_id: persisted.instrument_id(),
+            persisted_version: persisted.version(),
+        });
+    }
+    Ok(())
+}
+
+struct MatchingReplay {
+    book: OrderBook,
+    pending: Option<(u64, Command)>,
+    checkpointed_commands: u64,
+    replayed_commands: u64,
+}
+
+fn replay_matching_suffix(
+    reader: StorageReader,
+    mut checkpoint: Option<OrderBookCheckpoint>,
+    definition: InstrumentDefinition,
+    wal_first_sequence: u64,
+) -> Result<MatchingReplay, DurableError> {
+    let checkpointed_commands = checkpoint
+        .as_ref()
+        .map(|value| u64::try_from(value.command_count()))
+        .transpose()
+        .map_err(|_| MatchingError::SequenceExhausted)?
+        .unwrap_or(0);
+    let mut book = checkpoint.is_none().then(|| OrderBook::new(definition));
+    let mut pending = None;
+    let mut replayed_commands = 0_u64;
+    let mut last_wal_sequence = wal_first_sequence;
+    for frame_result in reader {
+        let frame = frame_result?;
+        last_wal_sequence = frame.sequence();
+        if checkpoint
+            .as_ref()
+            .is_some_and(|value| frame.sequence() <= value.generation())
+        {
+            validate_checkpoint_prefix_frame(
+                checkpoint.as_ref().expect("checkpoint presence was tested"),
+                &frame,
+            )?;
+            continue;
+        }
+        if book.is_none() {
+            book = Some(OrderBook::from_checkpoint(
+                checkpoint
+                    .take()
+                    .expect("first suffix frame follows a checkpoint"),
+            )?);
+        }
+        if replay_matching_frame(
+            book.as_mut()
+                .expect("book is initialized before suffix replay"),
+            &mut pending,
+            &frame,
+        )? {
+            replayed_commands = replayed_commands
+                .checked_add(1)
+                .ok_or(MatchingError::SequenceExhausted)?;
+        }
+    }
+    if let Some(value) = checkpoint {
+        if last_wal_sequence < value.generation() {
+            return Err(DurableError::CheckpointAheadOfWal {
+                checkpoint_sequence: value.generation(),
+                wal_last_sequence: Some(last_wal_sequence),
+            });
+        }
+        book = Some(OrderBook::from_checkpoint(value)?);
+    }
+    Ok(MatchingReplay {
+        book: book.expect("book exists after WAL/checkpoint recovery"),
+        pending,
+        checkpointed_commands,
+        replayed_commands,
+    })
+}
+
+fn replay_matching_frame(
+    book: &mut OrderBook,
+    pending: &mut Option<(u64, Command)>,
+    frame: &JournalFrame,
+) -> Result<bool, DurableError> {
+    match frame.kind() {
+        RecordKind::Command => {
+            if let Some((pending_sequence, _)) = pending {
+                return Err(DurableError::ConsecutiveCommands {
+                    pending_sequence: *pending_sequence,
+                    next_sequence: frame.sequence(),
+                });
+            }
+            *pending = Some((frame.sequence(), frame.decode()?));
+            Ok(false)
+        }
+        RecordKind::ExecutionReport => {
+            let Some((command_sequence, command)) = pending.take() else {
+                return Err(DurableError::ReportWithoutCommand {
+                    sequence: frame.sequence(),
+                });
+            };
+            let persisted: ExecutionReport = frame.decode()?;
+            let reproduced = book.submit(command)?;
+            if reproduced != persisted {
+                return Err(DurableError::ReplayDivergence {
+                    command_sequence,
+                    report_sequence: frame.sequence(),
+                });
+            }
+            Ok(true)
+        }
+        RecordKind::LedgerEntry
+        | RecordKind::InstrumentDefinition
+        | RecordKind::AccountRiskDefinition
+        | RecordKind::LedgerCorrection => Err(DurableError::UnexpectedRecord {
+            sequence: frame.sequence(),
+            kind: frame.kind(),
+        }),
+    }
+}
+
+fn validate_checkpoint_prefix_frame(
+    checkpoint: &OrderBookCheckpoint,
+    frame: &JournalFrame,
+) -> Result<(), DurableError> {
+    let relative = frame
+        .sequence()
+        .checked_sub(checkpoint.wal_metadata_sequence())
+        .ok_or(DurableError::CheckpointPrefixDivergence {
+            wal_sequence: frame.sequence(),
+        })?;
+    if relative == 0 {
+        return Err(DurableError::CheckpointPrefixDivergence {
+            wal_sequence: frame.sequence(),
+        });
+    }
+    let history_index = usize::try_from((relative - 1) / 2).map_err(|_| {
+        DurableError::CheckpointPrefixDivergence {
+            wal_sequence: frame.sequence(),
+        }
+    })?;
+    let Some(expected) = checkpoint.history().get(history_index) else {
+        return Err(DurableError::CheckpointPrefixDivergence {
+            wal_sequence: frame.sequence(),
+        });
+    };
+    let equal = if relative % 2 == 1 {
+        frame.kind() == RecordKind::Command
+            && frame
+                .decode::<Command>()
+                .is_ok_and(|actual| actual == expected.command())
+    } else {
+        frame.kind() == RecordKind::ExecutionReport
+            && frame
+                .decode::<ExecutionReport>()
+                .is_ok_and(|actual| actual == *expected.report())
+    };
+    if !equal {
+        return Err(DurableError::CheckpointPrefixDivergence {
+            wal_sequence: frame.sequence(),
+        });
+    }
+    Ok(())
+}
+
+const fn storage_layout(options: StorageOptions) -> JournalLayout {
+    match options {
+        StorageOptions::Single(_) => JournalLayout::SingleFile,
+        StorageOptions::Segmented(_) => JournalLayout::Segmented,
+    }
+}
+
+fn validate_checkpoint_path(
+    storage_path: &Path,
+    layout: JournalLayout,
+    checkpoint_path: &Path,
+) -> Result<(), DurableError> {
+    let storage_path = normalize_journal_path(storage_path).map_err(JournalError::Io)?;
+    let checkpoint_path = normalize_journal_path(checkpoint_path).map_err(JournalError::Io)?;
+    let pending_path = normalize_journal_path(&SnapshotFile::pending_path(&checkpoint_path))
+        .map_err(JournalError::Io)?;
+    let checkpoint_lease = SnapshotFile::writer_lease_path(&checkpoint_path)?;
+    let snapshot_mutations = [&checkpoint_path, &pending_path, &checkpoint_lease];
+    match layout {
+        JournalLayout::Segmented => {
+            if let Some(conflict) = snapshot_mutations
+                .into_iter()
+                .find(|path| path.starts_with(&storage_path))
+            {
+                return Err(DurableError::CheckpointPathConflictsWithWal {
+                    path: conflict.clone(),
+                });
+            }
+        }
+        JournalLayout::SingleFile => {
+            let storage_lease = Journal::writer_lease_path(&storage_path)?;
+            let storage_paths = [&storage_path, &storage_lease];
+            if let Some(conflict) = snapshot_mutations
+                .into_iter()
+                .find(|snapshot| storage_paths.contains(snapshot))
+            {
+                return Err(DurableError::CheckpointPathConflictsWithWal {
+                    path: conflict.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }

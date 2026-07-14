@@ -172,10 +172,11 @@ The complete wire and decision contract is
 [Semantic snapshot format version 1](snapshot-v1.md).
 
 Direct users must dedicate the target and its two sidecars to snapshots.
-`DurableLedger` additionally checks that a checkpoint target, pending path, and
-lease cannot alias its single-file WAL/lease or reside anywhere inside its
-segmented directory. `write_checkpoint` synchronizes the WAL before publishing
-the independently audited ledger image.
+`DurableOrderBook`, `DurableRiskOrderBook`, and `DurableLedger` additionally
+check that a checkpoint target, pending path, and lease cannot alias their
+single-file WAL/lease or reside anywhere inside their segmented directory.
+`write_checkpoint` synchronizes the WAL before publishing an independently
+audited matching, coupled risk/matching, or ledger image.
 
 ## File and directory durability
 
@@ -230,6 +231,10 @@ loss and remount tests.
 | rename completed before parent barrier | namespace contains replacement if operation returned | power-loss persistence is filesystem/device conditional; reopen validates complete content |
 | stale, redundant, or divergent pending generation | current target remains authoritative until recovery | stale/redundant is synchronized away; divergence preserves both and fails closed |
 | checkpoint disagrees with WAL prefix or extends beyond WAL | durable open fails | no suffix is applied and no storage is mutated |
+| reversal target is absent, administrative, already reversed, or not the exact posting inverse | durable ledger post/open fails | balances and reversal index remain unchanged; no invalid suffix is accepted |
+| correction frame is torn | poisoned | strict open fails; repair removes the incomplete frame, so neither reversal nor replacement is recovered |
+| correction is complete but either member collides, is invalid, or was committed separately | durable ledger correction/open fails | balances, indexes, and event sequence remain unchanged; no one-member state is accepted |
+| financial effective date is closed, booking time regresses, or close/reopen progression is invalid | durable ledger post/open fails before commit | balances, period boundary, booking timestamp, and WAL remain unchanged for live validation failures; an invalid persisted suffix is rejected during recovery |
 
 Deterministic injected-fault tests exercise partial frame writes, complete writes
 with failed acknowledgement barriers, partial grouped writes, explicit sync
@@ -240,14 +245,20 @@ interrupted empty-file creation, and pre-rotation sequence exhaustion. A
 forced-process-termination test additionally proves recovery after an abandoned
 writer lease and a possible torn tail. Snapshot/checkpoint tests exercise stable
 framing, payload bounds, corrupt and incomplete pending files, current/pending
-generation forks, exact lineage, managed-directory rejection, WAL-path alias
-rejection, and single/segmented WAL-prefix proof.
+generation forks, exact matching-command/report and ledger-record lineage,
+matching FIFO/reserve/STP restoration, correction grouping, managed-directory
+rejection, WAL-path alias rejection, single/segmented WAL-prefix proof, suffix
+replay, coupled risk rejection/position/reservation restoration, immutable-
+profile binding, and reversal-index recovery.
+Ledger-period tests additionally exercise inclusive boundary dates, non-
+advancing closes, backward/full reopen, timestamp regression, administrative-
+reversal rejection, and checkpoint-plus-WAL suffix reconstruction.
 
 ## Unimplemented storage properties
 
 - automatic segment retention, archival, and deletion fencing;
-- matching/risk semantic state snapshots;
-- ledger checkpoint WAL cutover, compaction, and bounded restart;
+- matching/risk/ledger checkpoint WAL cutover, compaction, bounded idempotency
+  history, and bounded restart;
 - authenticated records against deliberate forgery;
 - kernel inode locks covering hard-link aliases;
 - remote replication, quorum acknowledgement, and failover;

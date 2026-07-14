@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use quotick::ledger::{JournalEntry, Ledger, LedgerCheckpoint, Posting};
 use quotick::snapshot::{PendingSnapshotRecovery, SnapshotError, SnapshotFile, SnapshotOptions};
-use quotick::{AccountId, AssetId, TransactionId};
+use quotick::{AccountId, AccountingDate, AssetId, TimestampNs, TransactionId};
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
 
@@ -40,6 +40,8 @@ fn checkpoint(transaction_id: u64, amount: i128) -> LedgerCheckpoint {
             JournalEntry::new(
                 TransactionId::new(transaction_id).expect("transaction ID"),
                 transaction_id,
+                AccountingDate::UNIX_EPOCH,
+                TimestampNs::from_unix_nanos(0),
                 vec![
                     Posting {
                         account_id: AccountId::new(1).expect("account ID"),
@@ -110,6 +112,8 @@ fn snapshot_replacement_is_atomic_at_the_file_namespace() {
             JournalEntry::new(
                 TransactionId::new(2).unwrap(),
                 2,
+                AccountingDate::UNIX_EPOCH,
+                TimestampNs::from_unix_nanos(0),
                 vec![
                     Posting {
                         account_id: AccountId::new(1).unwrap(),
@@ -159,6 +163,8 @@ fn complete_pending_snapshot_is_promoted_and_invalid_pending_is_discarded() {
             JournalEntry::new(
                 TransactionId::new(2).unwrap(),
                 2,
+                AccountingDate::UNIX_EPOCH,
+                TimestampNs::from_unix_nanos(0),
                 vec![
                     Posting {
                         account_id: AccountId::new(1).unwrap(),
@@ -209,6 +215,8 @@ fn stale_redundant_and_divergent_pending_generations_are_distinguished() {
             JournalEntry::new(
                 TransactionId::new(2).unwrap(),
                 2,
+                AccountingDate::UNIX_EPOCH,
+                TimestampNs::from_unix_nanos(0),
                 vec![
                     Posting {
                         account_id: AccountId::new(1).unwrap(),
@@ -267,6 +275,8 @@ fn normal_writes_reject_generation_regression_and_same_generation_forks() {
             JournalEntry::new(
                 TransactionId::new(2).unwrap(),
                 2,
+                AccountingDate::UNIX_EPOCH,
+                TimestampNs::from_unix_nanos(0),
                 vec![
                     Posting {
                         account_id: AccountId::new(1).unwrap(),
@@ -298,6 +308,8 @@ fn normal_writes_reject_generation_regression_and_same_generation_forks() {
         JournalEntry::new(
             TransactionId::new(11).unwrap(),
             11,
+            AccountingDate::UNIX_EPOCH,
+            TimestampNs::from_unix_nanos(0),
             vec![
                 Posting {
                     account_id: AccountId::new(1).unwrap(),
@@ -374,6 +386,8 @@ fn newer_generation_requires_a_proven_history_prefix() {
         JournalEntry::new(
             TransactionId::new(11).unwrap(),
             11,
+            AccountingDate::UNIX_EPOCH,
+            TimestampNs::from_unix_nanos(0),
             vec![
                 Posting {
                     account_id: AccountId::new(1).unwrap(),

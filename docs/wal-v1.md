@@ -10,7 +10,7 @@ or platform ABI is persisted.
 |---:|---:|---|
 | 0 | 4 | ASCII magic `QWAL` |
 | 4 | 2 | format version `1` |
-| 6 | 2 | record kind: command `1`, execution report `2`, ledger entry `3`, instrument definition `4`, account risk definition `5` |
+| 6 | 2 | record kind: command `1`, execution report `2`, ledger entry `3`, instrument definition `4`, account risk definition `5`, ledger correction `6` |
 | 8 | 4 | payload length |
 | 12 | 4 | CRC-32C |
 | 16 | 8 | contiguous journal sequence |
@@ -48,7 +48,7 @@ initialization recovery.
 
 ## Scalar notation
 
-- `u8`, `u32`, `u64`, `u128`, `i64`, `i128`: fixed-width integers.
+- `u8`, `u32`, `u64`, `u128`, `i32`, `i64`, `i128`: fixed-width integers.
 - `bool`: `u8`, where `0` is false and `1` is true.
 - Every identifier: validated non-zero `u64`.
 - `Price`: `i64` instrument quantum.
@@ -68,8 +68,9 @@ Fields occur in this exact order:
 7. price decimal scale `u8`, tick size `u64`, minimum price `i64`, maximum
    price `i64`;
 8. quantity increment `u64`, minimum quantity `u64`, maximum quantity `u64`;
-9. base units per lot `u64`, quote units per raw price unit `u64`;
-10. trading-state tag `u8`.
+9. maximum reserve replenishments `u32`; zero disables reserve orders;
+10. base units per lot `u64`, quote units per raw price unit `u64`;
+11. trading-state tag `u8`.
 
 Instrument-kind tags are equity `0`, spot `1`, future `2`, option `3`, bond
 `4`, swap `5`, index `6`, and synthetic `7`. Trading-state tags are open `0`,
@@ -99,19 +100,32 @@ these records in strictly increasing account-ID order.
 
 ## Command payload
 
-The first `u8` selects new `0`, cancel `1`, or replace `2`.
+The first `u8` selects new `0`, cancel `1`, replace `2`, or mass cancel `3`.
 
 - New: command ID, order ID, account ID, instrument ID, instrument version,
-  side, quantity, order type, time in force, self-trade policy, receive timestamp.
+  side, quantity, display policy, order type, time in force, self-trade policy,
+  receive timestamp.
 - Cancel: command ID, order ID, account ID, instrument ID, instrument version,
   receive timestamp.
 - Replace: command ID, order ID, account ID, instrument ID, instrument version,
-  new leaves quantity, new price, receive timestamp.
+  new leaves quantity, new price, new display policy, receive timestamp.
+- Mass cancel: command ID, account ID, instrument ID, instrument version,
+  selection scope, receive timestamp.
 
 Side tags are buy `0`, sell `1`. Order type tags are market `0`, limit `1`
 followed by price. Time-in-force tags are GTC `0`, IOC `1`, FOK `2`, post-only
 `3`. Self-trade tags are cancel aggressor `0`, cancel resting `1`, cancel both
 `2`, decrement-and-cancel `3`.
+
+Display-policy tags are fully displayed `0` and reserve `1` followed by peak
+quantity `u64`. A reserve peak is lot-grid aligned and strictly smaller than
+total quantity. The implied replenishment count
+`floor((total quantity - 1) / peak)` cannot exceed the definition's configured
+maximum. Reserve is admitted only on resting-capable limit orders.
+
+Mass-cancel scope tags are all owned orders `0`, or one side `1` followed by a
+side tag. The command applies only within its instrument-version shard and is
+admitted in every trading state after identity validation.
 
 Rejection-reason tags are wrong instrument `0`, duplicate order `1`, unknown
 order `2`, not owner `3`, market cannot rest `4`, market cannot post `5`,
@@ -122,8 +136,11 @@ quantity outside limits `14`, missing risk profile `15`, blocked risk account
 `16`, reduce-only violation `17`, risk order-quantity limit `18`, risk
 order-notional limit `19`, risk open-order-count limit `20`, risk open-quantity
 limit `21`, risk open-notional limit `22`, risk position limit `23`, and risk
-arithmetic overflow `24`. Cancellation-reason tags are user request `0`,
-unfilled remainder `1`, STP aggressor `2`, and STP resting `3`.
+arithmetic overflow `24`, reserve unsupported `25`, display quantity off grid
+`26`, display quantity not smaller than total `27`, reserve replenishment limit
+`28`, reserve cannot be immediate `29`, and display-mode conversion forbidden
+`30`. Cancellation-reason tags are user request `0`,
+unfilled remainder `1`, STP aggressor `2`, STP resting `3`, and mass cancel `4`.
 
 ## Execution-report payload
 
@@ -134,24 +151,108 @@ event-kind union:
 
 | Tag | Event |
 |---:|---|
-| 0 | order accepted: order ID, quantity |
-| 1 | order rested: order ID, price, leaves quantity |
+| 0 | order accepted: order ID, total quantity, display policy |
+| 1 | order rested: order ID, price, total leaves quantity, displayed quantity |
 | 2 | trade: trade ID, instrument ID, instrument version, price, quantity, buy/sell orders, buyer/seller accounts, maker/taker orders |
 | 3 | order cancelled: order ID, quantity, reason |
-| 4 | order replaced: order ID, old/new prices, old/new quantities, retained-priority boolean |
+| 4 | order replaced: order ID, old/new prices, old/new total quantities, old/new display policies, retained-priority boolean |
 | 5 | self-trade prevented: aggressor/resting orders, quantity, policy |
 | 6 | command rejected: reason |
+| 7 | reserve refreshed: order ID, price, displayed quantity, total leaves quantity |
+| 8 | mass cancel completed: account ID, scope, cancelled order count `u64`, total cancelled leaves `u128` |
 
 Decoding requires non-empty, contiguous events correlated to the report command.
 Accepted reports cannot contain rejection events; rejected reports contain
 exactly one matching rejection event.
 
+Reserve refresh keeps the same private order ID but records a new displayed
+slice after the prior slice has reached zero and the order has moved to the
+price-level FIFO tail. Total leaves are used for cancel, replacement, FOK, and
+risk state. Displayed leaves are used for aggregate public depth.
+
+A mass cancel emits one tag-`3` order-cancelled event per selected order in
+strictly ascending order ID, each carrying that order's total leaves, followed
+by exactly one tag-`8` completion. The completion count and `u128` quantity sum
+must equal those preceding cancellation events. An empty selection emits only
+the zero-valued completion.
+
+Under assumption A37, these display fields, mass-cancel command tag `3`, and
+event tags `7`–`8` are part of the first deployable version-1 matching schema.
+Pre-deployment development payloads that omit them are not backward-compatible
+and are not assigned inferred semantics.
+
 ## Ledger-entry payload
 
-Fields are transaction ID, source reference `u64`, posting count, then postings.
-Each posting is account ID, asset ID, and signed `i128` amount. Postings are
-strictly sorted by `(asset ID, account ID)`, contain no duplicate pair or zero
-amount, and balance independently to zero for every asset.
+Fields occur in this exact order:
+
+| Order | Width | Field |
+|---:|---:|---|
+| 1 | 8 B | transaction ID `u64` |
+| 2 | 8 B | source reference `u64` |
+| 3 | 1 B | effective-date-present `bool` |
+| 4 | 4 B | signed days from 1970-01-01 `i32`; zero when absent |
+| 5 | 8 B | recorded-at Unix timestamp in nanoseconds `u64` |
+| 6 | 4 B | posting count `u32` |
+| 7 | 32 B each | account ID `u64`, asset ID `u64`, signed amount `i128` |
+| 8 | 1 B | entry-kind tag `u8` |
+| 9 | 8 B | related transaction ID `u64`; zero when absent |
+| 10 | 1 B | period-boundary-present `bool` |
+| 11 | 4 B | signed boundary days from 1970-01-01 `i32`; zero when absent |
+
+The fixed payload portion is 47 B and each posting is 32 B. Financial entries
+require an effective date. Their postings are strictly sorted by `(asset ID,
+account ID)`, contain no duplicate pair or zero amount, contain at least two
+legs, and balance independently to zero for every asset. Administrative period
+controls have no effective date and exactly zero postings. `recorded_at` is
+nondecreasing over accepted journal sequence; equal timestamps are permitted.
+
+| Tag | Meaning | Related transaction | Period boundary |
+|---:|---|---|---|
+| 0 | standard financial entry | zero | absent |
+| 1 | reversal financial entry | non-zero target transaction | absent |
+| 2 | period close | zero | present inclusive `closed_through` date |
+| 3 | period reopen | zero | replacement boundary or absent to reopen all dates |
+
+Any other tag or contradictory shape is invalid. A close must strictly advance
+the current inclusive boundary. A reopen requires an existing boundary and
+must replace it with an earlier value or remove it. A financial effective date
+at or before the current boundary is rejected. Exact transaction retries are
+resolved before time or transition validation and return their original
+sequence without another effect.
+
+Framing validation alone cannot establish reversal semantics. Ledger replay
+requires the target to precede the reversal, requires that target not already
+have a committed reversal, and compares every reversal posting with the exact
+signed inverse of the target posting. Reversing a reversal is permitted once
+and is an explicit reinstatement; the lineage remains an append-only chain.
+Period controls have no financial posting effect and cannot be reversed.
+
+`AccountingDate` is a compact internal key. Calendar/service boundaries map it
+to an authoritative Gregorian date representation; ISO 8601 string parsing,
+business-day calendars, time zones, and close authorization are outside this
+payload codec.
+
+## Ledger-correction payload
+
+A ledger correction is one record-kind `6` payload containing, in order:
+
+1. reversal payload length `u32`, then one complete `JournalEntry` payload;
+2. replacement payload length `u32`, then one complete `JournalEntry` payload.
+
+Its encoded length is `102 B + 32 B × (Lᵣ + Lₚ)`, where `Lᵣ` and `Lₚ`
+are the reversal and replacement posting counts. The minimum is 230 B because
+both financial entries require at least two legs. The first entry must be an
+exact reversal and the second must be a standard entry. Their transaction IDs
+must be distinct and neither may equal the corrected target; the replacement
+timestamp cannot precede the reversal timestamp.
+
+Ledger admission additionally proves that the target precedes the correction,
+has no prior reversal, both effective dates are open, neither correction
+transaction was previously committed, and the exact final balances are
+representable. The two entries share one ledger-event sequence. Exact retries
+replay that event without a second effect. Because the complete pair occupies
+one CRC-protected frame, final-tail repair retains both entries or neither; it
+cannot retain only one correction member.
 
 ## Recovery
 
@@ -174,14 +275,18 @@ most one final command lacking a report. An empty journal is initialized by
 appending the requested definition; a nonempty journal without definition as
 its first frame is rejected. Recovery compares the complete persisted
 definition with the requested definition before replay. A ledger journal
-accepts only ledger-entry records.
+accepts ledger-entry and ledger-correction records only.
 
-A ledger semantic checkpoint is not a WAL frame and introduces no version-1
-record kind. It is a separate `QSNP` file described by
-[Semantic snapshot format version 1](snapshot-v1.md). Checkpoint-assisted open
-still scans every ledger-entry frame and requires the checkpoint's complete
-entry sequence to equal the exact WAL prefix before applying the remaining
-suffix. Version 1 does not truncate or retire that prefix.
+Semantic checkpoints are not WAL frames. Period controls use ledger-entry
+record kind `3`; indivisible reversal-plus-replacement events use ledger-
+correction kind `6`. Matching, coupled risk/matching, and ledger checkpoints
+are separate `QSNP` files described by
+[Semantic snapshot format version 1](snapshot-v1.md).
+Checkpoint-assisted open still scans every WAL frame and requires the
+checkpoint's complete command/report or ledger-record sequence to equal the
+exact WAL prefix before applying the remaining suffix. A matching checkpoint
+boundary is always a completed execution-report frame. Version 1 does not
+truncate or retire either prefix.
 
 A risk-managed matching journal inserts zero or more account-risk-definition
 records between the instrument definition and the first command. The complete
@@ -191,6 +296,12 @@ exact profile prefix; metadata drift or metadata after a command is rejected.
 Commands and reports then follow the same alternating grammar, but replay uses
 the coupled matching/risk state machine so risk rejections, positions, and
 reservations are reconstructed deterministically.
+The coupled risk checkpoint stores the true first sequence `F`, embeds matching
+state whose metadata boundary is `M = F + A` for `A` canonical profiles, and
+ends at `G = M + 2C` for `C` complete command/report pairs. Assisted recovery
+proves definition/profile metadata and every retained pair against the exact
+WAL before restoring positions and total-leaves reservations and applying the
+suffix.
 
 ## Writer ownership and acknowledgement
 
@@ -205,3 +316,17 @@ barrier returned successfully; it does not alter frame bytes. Any partial write
 or failed acknowledgement barrier poisons the in-process writer. Reopening
 verifies the physical log: an ambiguous complete frame is retained and replayed,
 while repair mode may truncate only an incomplete final frame.
+
+## Primary-source provenance
+
+- CRC-32C uses the Castagnoli procedure in
+  [IETF RFC 3720, section 12.1](https://www.rfc-editor.org/rfc/rfc3720#section-12.1).
+- Gregorian date strings at system boundaries are governed by
+  [ISO 8601-1:2019](https://www.iso.org/standard/70907.html); the ledger wire
+  value is its own signed epoch-day scalar rather than an ISO character string.
+- `DisplayQty`/maximum-show semantics and native-iceberg order identity are
+  grounded in the
+  [CME Globex Reference Guide](https://www.cmegroup.com/content/dam/cmegroup/globex/files/GlobexRefGd.pdf)
+  and [CME Market by Order FAQ](https://www.cmegroup.com/articles/faqs/market-by-order-mbo.html).
+  The precise FIFO-tail refresh rule remains Quotick's versioned internal
+  contract because reserve priority and feed behavior vary by venue.

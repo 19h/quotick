@@ -3,8 +3,8 @@ use quotick::ledger::{
 };
 use quotick::matching::Trade;
 use quotick::{
-    AccountId, AssetId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, TradeId,
-    TransactionId,
+    AccountId, AccountingDate, AssetId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity,
+    TimestampNs, TradeId, TransactionId,
 };
 
 fn account(value: u64) -> AccountId {
@@ -17,6 +17,14 @@ fn asset(value: u64) -> AssetId {
 
 fn transaction(value: u64) -> TransactionId {
     TransactionId::new(value).expect("non-zero transaction")
+}
+
+fn date() -> AccountingDate {
+    AccountingDate::UNIX_EPOCH
+}
+
+fn time() -> TimestampNs {
+    TimestampNs::from_unix_nanos(0)
 }
 
 fn trade(price: i64, quantity: u64) -> Trade {
@@ -40,6 +48,8 @@ fn unbalanced_entries_are_rejected_before_mutation() {
     let error = JournalEntry::new(
         transaction(1),
         1,
+        date(),
+        time(),
         vec![
             Posting {
                 account_id: account(1),
@@ -74,10 +84,10 @@ fn trade_settlement_is_atomic_balanced_and_idempotent() {
     };
     let execution = trade(25, 4);
     let receipt = ledger
-        .settle_trade(transaction(7), &execution, convention)
+        .settle_trade(transaction(7), date(), time(), &execution, convention)
         .expect("settlement succeeds");
     let replay = ledger
-        .settle_trade(transaction(7), &execution, convention)
+        .settle_trade(transaction(7), date(), time(), &execution, convention)
         .expect("settlement replay succeeds");
 
     assert_eq!(receipt.sequence, 1);
@@ -104,6 +114,8 @@ fn negative_execution_price_reverses_quote_cashflow_without_losing_balance() {
     ledger
         .settle_trade(
             transaction(7),
+            date(),
+            time(),
             &trade(-5, 2),
             SettlementConvention {
                 base_asset_id: asset(1),
@@ -126,6 +138,8 @@ fn zero_price_execution_delivers_base_without_zero_quote_legs() {
     ledger
         .settle_trade(
             transaction(7),
+            date(),
+            time(),
             &trade(0, 3),
             SettlementConvention {
                 base_asset_id: asset(1),
@@ -148,6 +162,8 @@ fn unrepresentable_opposite_notional_returns_error_without_panicking() {
     let extreme = trade(i64::MIN, 1_u64 << 63);
     let result = ledger.settle_trade(
         transaction(8),
+        date(),
+        time(),
         &extreme,
         SettlementConvention {
             base_asset_id: asset(1),
@@ -167,6 +183,8 @@ fn balance_overflow_aborts_all_legs() {
     let first = JournalEntry::new(
         transaction(1),
         1,
+        date(),
+        time(),
         vec![
             Posting {
                 account_id: account(1),
@@ -185,6 +203,8 @@ fn balance_overflow_aborts_all_legs() {
     let overflowing = JournalEntry::new(
         transaction(2),
         2,
+        date(),
+        time(),
         vec![
             Posting {
                 account_id: account(1),
@@ -216,6 +236,8 @@ fn transaction_id_collision_cannot_change_balances() {
         JournalEntry::new(
             transaction(1),
             1,
+            date(),
+            time(),
             vec![
                 Posting {
                     account_id: account(1),
@@ -248,6 +270,8 @@ fn prepared_posting_cannot_commit_after_ledger_generation_changes() {
             JournalEntry::new(
                 transaction(2),
                 2,
+                date(),
+                time(),
                 vec![
                     Posting {
                         account_id: account(1),
@@ -271,6 +295,8 @@ fn prepared_posting_cannot_commit_after_ledger_generation_changes() {
     let intervening = JournalEntry::new(
         transaction(1),
         1,
+        date(),
+        time(),
         vec![
             Posting {
                 account_id: account(1),

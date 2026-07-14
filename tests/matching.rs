@@ -35,6 +35,7 @@ fn definition() -> InstrumentDefinition {
         price: PriceRules::new(0, 1, Price::from_raw(i64::MIN), Price::from_raw(i64::MAX))
             .expect("price rules"),
         quantity: QuantityRules::new(1, 1, u64::MAX).expect("quantity rules"),
+        reserve: quotick::instrument::ReserveOrderRules::disabled(),
         base_units_per_lot: 1,
         quote_units_per_price_unit: 1,
         trading_state: TradingState::Open,
@@ -64,6 +65,7 @@ fn limit_order(
         instrument_version: version(),
         side,
         quantity: Quantity::new(quantity).expect("positive quantity"),
+        display: quotick::matching::OrderDisplay::FullyDisplayed,
         order_type: OrderType::Limit(Price::from_raw(price)),
         time_in_force,
         self_trade_prevention: stp,
@@ -91,6 +93,7 @@ fn replace(command: u64, order: u64, owner: u64, quantity: u64, price: i64) -> C
         instrument_version: version(),
         new_quantity: Quantity::new(quantity).expect("positive quantity"),
         new_price: Price::from_raw(price),
+        new_display: quotick::matching::OrderDisplay::FullyDisplayed,
         received_at: TimestampNs::from_unix_nanos(command),
     })
 }

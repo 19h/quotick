@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::codec::{BinaryCodec, CodecError};
 use crate::instrument::InstrumentDefinition;
-use crate::ledger::JournalEntry;
+use crate::ledger::{JournalEntry, LedgerCorrection};
 use crate::matching::{Command, ExecutionReport};
 use crate::risk::AccountRiskDefinition;
 
@@ -60,6 +60,8 @@ pub enum RecordKind {
     InstrumentDefinition,
     /// Immutable account risk profile bound to one risk-managed matching journal.
     AccountRiskDefinition,
+    /// One atomic ledger reversal-plus-replacement correction.
+    LedgerCorrection,
 }
 
 impl RecordKind {
@@ -70,6 +72,7 @@ impl RecordKind {
             Self::LedgerEntry => 3,
             Self::InstrumentDefinition => 4,
             Self::AccountRiskDefinition => 5,
+            Self::LedgerCorrection => 6,
         }
     }
 
@@ -80,6 +83,7 @@ impl RecordKind {
             3 => Ok(Self::LedgerEntry),
             4 => Ok(Self::InstrumentDefinition),
             5 => Ok(Self::AccountRiskDefinition),
+            6 => Ok(Self::LedgerCorrection),
             _ => Err(JournalError::UnknownRecordKind { offset, value }),
         }
     }
@@ -111,6 +115,10 @@ impl DurableRecord for AccountRiskDefinition {
     const KIND: RecordKind = RecordKind::AccountRiskDefinition;
 }
 
+impl DurableRecord for LedgerCorrection {
+    const KIND: RecordKind = RecordKind::LedgerCorrection;
+}
+
 /// A decoded known payload from a journal frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KnownRecord {
@@ -124,6 +132,8 @@ pub enum KnownRecord {
     InstrumentDefinition(InstrumentDefinition),
     /// Immutable account risk profile.
     AccountRiskDefinition(AccountRiskDefinition),
+    /// Atomic accounting correction.
+    LedgerCorrection(LedgerCorrection),
 }
 
 /// Acknowledgement policy for successful appends.
@@ -420,6 +430,7 @@ impl JournalFrame {
             RecordKind::AccountRiskDefinition => {
                 self.decode().map(KnownRecord::AccountRiskDefinition)
             }
+            RecordKind::LedgerCorrection => self.decode().map(KnownRecord::LedgerCorrection),
         }
     }
 }

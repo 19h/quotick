@@ -7,26 +7,30 @@
 use std::fmt;
 
 use crate::domain::{
-    AccountId, AssetId, CommandId, DomainError, InstrumentId, InstrumentVersion, OrderId, Price,
-    Quantity, Side, TimestampNs, TradeId, TransactionId,
+    AccountId, AccountingDate, AssetId, CommandId, DomainError, InstrumentId, InstrumentVersion,
+    OrderId, Price, Quantity, Side, TimestampNs, TradeId, TransactionId,
 };
 use crate::instrument::{
     InstrumentDefinition, InstrumentError, InstrumentKind, InstrumentSpec, InstrumentSymbol,
-    PriceRules, QuantityRules, TradingState,
+    PriceRules, QuantityRules, ReserveOrderRules, TradingState,
 };
 use crate::ledger::{
-    JournalEntry, LedgerBalance, LedgerCheckpoint, LedgerCheckpointError, LedgerError, Posting,
+    JournalEntry, LedgerBalance, LedgerCheckpoint, LedgerCheckpointError, LedgerCorrection,
+    LedgerEntryKind, LedgerError, LedgerRecord, Posting,
 };
 use crate::market_data::{
     MarketDataError, MarketDataKind, MarketDataLevel, MarketDataSnapshot, MarketDataUpdate,
     TradePrint,
 };
 use crate::matching::{
-    CancelOrder, CancelReason, Command, CommandOutcome, Event, EventKind, ExecutionReport,
-    NewOrder, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce, Trade,
+    CancelOrder, CancelReason, Command, CommandOutcome, CommandReportCheckpoint, Event, EventKind,
+    ExecutionReport, MassCancel, MassCancelScope, NewOrder, OrderBookCheckpoint,
+    OrderBookCheckpointError, OrderDisplay, OrderType, RejectReason, ReplaceOrder,
+    RestingOrderCheckpoint, SelfTradePrevention, TimeInForce, Trade,
 };
 use crate::risk::{
-    AccountRiskDefinition, AccountRiskState, RiskError, RiskLimitSpec, RiskLimits, RiskProfile,
+    AccountRiskDefinition, AccountRiskState, RiskAccountCheckpoint, RiskError, RiskLimitSpec,
+    RiskLimits, RiskManagedCheckpoint, RiskManagedCheckpointError, RiskProfile, RiskSnapshot,
 };
 
 /// A deterministic binary encoding or validation failure.
@@ -78,6 +82,10 @@ pub enum CodecError {
     InvalidRisk(RiskError),
     /// Decoded public market data violated sequence-independent invariants.
     InvalidMarketData(MarketDataError),
+    /// Decoded matching checkpoint violated semantic or structural invariants.
+    InvalidMatchingCheckpoint(OrderBookCheckpointError),
+    /// Decoded coupled risk/matching checkpoint violated semantic invariants.
+    InvalidRiskCheckpoint(RiskManagedCheckpointError),
 }
 
 impl fmt::Display for CodecError {
@@ -110,6 +118,8 @@ impl fmt::Display for CodecError {
             Self::InvalidInstrument(error) => error.fmt(formatter),
             Self::InvalidRisk(error) => error.fmt(formatter),
             Self::InvalidMarketData(error) => error.fmt(formatter),
+            Self::InvalidMatchingCheckpoint(error) => error.fmt(formatter),
+            Self::InvalidRiskCheckpoint(error) => error.fmt(formatter),
         }
     }
 }
@@ -123,6 +133,8 @@ impl std::error::Error for CodecError {
             Self::InvalidInstrument(error) => Some(error),
             Self::InvalidRisk(error) => Some(error),
             Self::InvalidMarketData(error) => Some(error),
+            Self::InvalidMatchingCheckpoint(error) => Some(error),
+            Self::InvalidRiskCheckpoint(error) => Some(error),
             _ => None,
         }
     }
@@ -155,6 +167,18 @@ impl From<MarketDataError> for CodecError {
 impl From<LedgerCheckpointError> for CodecError {
     fn from(error: LedgerCheckpointError) -> Self {
         Self::InvalidLedgerCheckpoint(error)
+    }
+}
+
+impl From<OrderBookCheckpointError> for CodecError {
+    fn from(error: OrderBookCheckpointError) -> Self {
+        Self::InvalidMatchingCheckpoint(error)
+    }
+}
+
+impl From<RiskManagedCheckpointError> for CodecError {
+    fn from(error: RiskManagedCheckpointError) -> Self {
+        Self::InvalidRiskCheckpoint(error)
     }
 }
 
@@ -192,6 +216,10 @@ impl Encoder {
     }
 
     fn u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn i32(&mut self, value: i32) {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
@@ -268,6 +296,10 @@ impl<'a> Decoder<'a> {
         Ok(u32::from_le_bytes(self.take()?))
     }
 
+    fn i32(&mut self) -> Result<i32, CodecError> {
+        Ok(i32::from_le_bytes(self.take()?))
+    }
+
     fn u64(&mut self) -> Result<u64, CodecError> {
         Ok(u64::from_le_bytes(self.take()?))
     }
@@ -295,6 +327,14 @@ impl<'a> Decoder<'a> {
         let start = self.position;
         self.position += length;
         Ok(&self.bytes[start..self.position])
+    }
+
+    fn sized_bytes(&mut self, field: &'static str) -> Result<&'a [u8], CodecError> {
+        let length = usize::try_from(self.u32()?).map_err(|_| CodecError::InvalidLength {
+            field,
+            length: usize::MAX,
+        })?;
+        self.bytes(length)
     }
 
     fn count(
@@ -360,6 +400,50 @@ fn decode_order_type(decoder: &mut Decoder<'_>) -> Result<OrderType, CodecError>
         1 => Ok(OrderType::Limit(Price::from_raw(decoder.i64()?))),
         tag => Err(CodecError::InvalidTag {
             type_name: "OrderType",
+            tag,
+        }),
+    }
+}
+
+fn encode_order_display(encoder: &mut Encoder, display: OrderDisplay) {
+    match display {
+        OrderDisplay::FullyDisplayed => encoder.u8(0),
+        OrderDisplay::Reserve { peak } => {
+            encoder.u8(1);
+            encoder.u64(peak.lots());
+        }
+    }
+}
+
+fn decode_order_display(decoder: &mut Decoder<'_>) -> Result<OrderDisplay, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(OrderDisplay::FullyDisplayed),
+        1 => Ok(OrderDisplay::Reserve {
+            peak: quantity(decoder)?,
+        }),
+        tag => Err(CodecError::InvalidTag {
+            type_name: "OrderDisplay",
+            tag,
+        }),
+    }
+}
+
+fn encode_mass_cancel_scope(encoder: &mut Encoder, scope: MassCancelScope) {
+    match scope {
+        MassCancelScope::All => encoder.u8(0),
+        MassCancelScope::Side(side) => {
+            encoder.u8(1);
+            encode_side(encoder, side);
+        }
+    }
+}
+
+fn decode_mass_cancel_scope(decoder: &mut Decoder<'_>) -> Result<MassCancelScope, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(MassCancelScope::All),
+        1 => Ok(MassCancelScope::Side(decode_side(decoder)?)),
+        tag => Err(CodecError::InvalidTag {
+            type_name: "MassCancelScope",
             tag,
         }),
     }
@@ -436,6 +520,12 @@ fn encode_reject_reason(encoder: &mut Encoder, value: RejectReason) {
         RejectReason::RiskOpenNotionalLimit => 22,
         RejectReason::RiskPositionLimit => 23,
         RejectReason::RiskArithmeticOverflow => 24,
+        RejectReason::ReserveOrderNotSupported => 25,
+        RejectReason::DisplayQuantityOffGrid => 26,
+        RejectReason::DisplayQuantityNotLessThanOrder => 27,
+        RejectReason::ReserveReplenishmentLimit => 28,
+        RejectReason::ReserveOrderCannotBeImmediate => 29,
+        RejectReason::OrderDisplayModeChangeNotAllowed => 30,
     });
 }
 
@@ -466,6 +556,12 @@ fn decode_reject_reason(decoder: &mut Decoder<'_>) -> Result<RejectReason, Codec
         22 => Ok(RejectReason::RiskOpenNotionalLimit),
         23 => Ok(RejectReason::RiskPositionLimit),
         24 => Ok(RejectReason::RiskArithmeticOverflow),
+        25 => Ok(RejectReason::ReserveOrderNotSupported),
+        26 => Ok(RejectReason::DisplayQuantityOffGrid),
+        27 => Ok(RejectReason::DisplayQuantityNotLessThanOrder),
+        28 => Ok(RejectReason::ReserveReplenishmentLimit),
+        29 => Ok(RejectReason::ReserveOrderCannotBeImmediate),
+        30 => Ok(RejectReason::OrderDisplayModeChangeNotAllowed),
         tag => Err(CodecError::InvalidTag {
             type_name: "RejectReason",
             tag,
@@ -479,6 +575,7 @@ fn encode_cancel_reason(encoder: &mut Encoder, value: CancelReason) {
         CancelReason::UnfilledRemainder => 1,
         CancelReason::SelfTradeAggressor => 2,
         CancelReason::SelfTradeResting => 3,
+        CancelReason::MassCancel => 4,
     });
 }
 
@@ -488,6 +585,7 @@ fn decode_cancel_reason(decoder: &mut Decoder<'_>) -> Result<CancelReason, Codec
         1 => Ok(CancelReason::UnfilledRemainder),
         2 => Ok(CancelReason::SelfTradeAggressor),
         3 => Ok(CancelReason::SelfTradeResting),
+        4 => Ok(CancelReason::MassCancel),
         tag => Err(CodecError::InvalidTag {
             type_name: "CancelReason",
             tag,
@@ -542,6 +640,7 @@ fn encode_command(encoder: &mut Encoder, command: Command) {
             encoder.u64(value.instrument_version.get());
             encode_side(encoder, value.side);
             encoder.u64(value.quantity.lots());
+            encode_order_display(encoder, value.display);
             encode_order_type(encoder, value.order_type);
             encode_time_in_force(encoder, value.time_in_force);
             encode_stp(encoder, value.self_trade_prevention);
@@ -565,6 +664,16 @@ fn encode_command(encoder: &mut Encoder, command: Command) {
             encoder.u64(value.instrument_version.get());
             encoder.u64(value.new_quantity.lots());
             encoder.i64(value.new_price.raw());
+            encode_order_display(encoder, value.new_display);
+            encoder.u64(value.received_at.as_unix_nanos());
+        }
+        Command::MassCancel(value) => {
+            encoder.u8(3);
+            encoder.u64(value.command_id.get());
+            encoder.u64(value.account_id.get());
+            encoder.u64(value.instrument_id.get());
+            encoder.u64(value.instrument_version.get());
+            encode_mass_cancel_scope(encoder, value.scope);
             encoder.u64(value.received_at.as_unix_nanos());
         }
     }
@@ -580,6 +689,7 @@ fn decode_command(decoder: &mut Decoder<'_>) -> Result<Command, CodecError> {
             instrument_version: instrument_version(decoder)?,
             side: decode_side(decoder)?,
             quantity: quantity(decoder)?,
+            display: decode_order_display(decoder)?,
             order_type: decode_order_type(decoder)?,
             time_in_force: decode_time_in_force(decoder)?,
             self_trade_prevention: decode_stp(decoder)?,
@@ -601,6 +711,15 @@ fn decode_command(decoder: &mut Decoder<'_>) -> Result<Command, CodecError> {
             instrument_version: instrument_version(decoder)?,
             new_quantity: quantity(decoder)?,
             new_price: Price::from_raw(decoder.i64()?),
+            new_display: decode_order_display(decoder)?,
+            received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
+        })),
+        3 => Ok(Command::MassCancel(MassCancel {
+            command_id: command_id(decoder)?,
+            account_id: account(decoder)?,
+            instrument_id: instrument(decoder)?,
+            instrument_version: instrument_version(decoder)?,
+            scope: decode_mass_cancel_scope(decoder)?,
             received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
         })),
         tag => Err(CodecError::InvalidTag {
@@ -704,6 +823,7 @@ impl BinaryCodec for InstrumentDefinition {
         encoder.u64(quantity.increment_lots());
         encoder.u64(quantity.minimum_lots());
         encoder.u64(quantity.maximum_lots());
+        encoder.u32(self.reserve_order_rules().maximum_replenishments());
         let settlement = self.settlement_convention();
         encoder.u64(settlement.base_units_per_lot);
         encoder.u64(settlement.quote_units_per_price_unit);
@@ -730,6 +850,12 @@ impl BinaryCodec for InstrumentDefinition {
             Price::from_raw(decoder.i64()?),
         )?;
         let quantity = QuantityRules::new(decoder.u64()?, decoder.u64()?, decoder.u64()?)?;
+        let maximum_replenishments = decoder.u32()?;
+        let reserve = if maximum_replenishments == 0 {
+            ReserveOrderRules::disabled()
+        } else {
+            ReserveOrderRules::new(maximum_replenishments)?
+        };
         let base_units_per_lot = decoder.u64()?;
         let quote_units_per_price_unit = decoder.u64()?;
         let trading_state = decode_trading_state(&mut decoder)?;
@@ -744,6 +870,7 @@ impl BinaryCodec for InstrumentDefinition {
             quote_asset_id,
             price,
             quantity,
+            reserve,
             base_units_per_lot,
             quote_units_per_price_unit,
             trading_state,
@@ -841,20 +968,27 @@ fn decode_trade(decoder: &mut Decoder<'_>) -> Result<Trade, CodecError> {
 
 fn encode_event_kind(encoder: &mut Encoder, kind: EventKind) {
     match kind {
-        EventKind::OrderAccepted { order_id, quantity } => {
+        EventKind::OrderAccepted {
+            order_id,
+            quantity,
+            display,
+        } => {
             encoder.u8(0);
             encoder.u64(order_id.get());
             encoder.u64(quantity.lots());
+            encode_order_display(encoder, display);
         }
         EventKind::OrderRested {
             order_id,
             price,
             leaves_quantity,
+            displayed_quantity,
         } => {
             encoder.u8(1);
             encoder.u64(order_id.get());
             encoder.i64(price.raw());
             encoder.u64(leaves_quantity.lots());
+            encoder.u64(displayed_quantity.lots());
         }
         EventKind::Trade(trade) => {
             encoder.u8(2);
@@ -876,6 +1010,8 @@ fn encode_event_kind(encoder: &mut Encoder, kind: EventKind) {
             new_price,
             old_quantity,
             new_quantity,
+            old_display,
+            new_display,
             priority_retained,
         } => {
             encoder.u8(4);
@@ -884,6 +1020,8 @@ fn encode_event_kind(encoder: &mut Encoder, kind: EventKind) {
             encoder.i64(new_price.raw());
             encoder.u64(old_quantity.lots());
             encoder.u64(new_quantity.lots());
+            encode_order_display(encoder, old_display);
+            encode_order_display(encoder, new_display);
             encoder.bool(priority_retained);
         }
         EventKind::SelfTradePrevented {
@@ -902,6 +1040,30 @@ fn encode_event_kind(encoder: &mut Encoder, kind: EventKind) {
             encoder.u8(6);
             encode_reject_reason(encoder, reason);
         }
+        EventKind::OrderRefreshed {
+            order_id,
+            price,
+            displayed_quantity,
+            leaves_quantity,
+        } => {
+            encoder.u8(7);
+            encoder.u64(order_id.get());
+            encoder.i64(price.raw());
+            encoder.u64(displayed_quantity.lots());
+            encoder.u64(leaves_quantity.lots());
+        }
+        EventKind::MassCancelCompleted {
+            account_id,
+            scope,
+            cancelled_order_count,
+            cancelled_quantity_lots,
+        } => {
+            encoder.u8(8);
+            encoder.u64(account_id.get());
+            encode_mass_cancel_scope(encoder, scope);
+            encoder.u64(cancelled_order_count);
+            encoder.u128(cancelled_quantity_lots);
+        }
     }
 }
 
@@ -910,11 +1072,13 @@ fn decode_event_kind(decoder: &mut Decoder<'_>) -> Result<EventKind, CodecError>
         0 => Ok(EventKind::OrderAccepted {
             order_id: order(decoder)?,
             quantity: quantity(decoder)?,
+            display: decode_order_display(decoder)?,
         }),
         1 => Ok(EventKind::OrderRested {
             order_id: order(decoder)?,
             price: Price::from_raw(decoder.i64()?),
             leaves_quantity: quantity(decoder)?,
+            displayed_quantity: quantity(decoder)?,
         }),
         2 => Ok(EventKind::Trade(decode_trade(decoder)?)),
         3 => Ok(EventKind::OrderCancelled {
@@ -928,6 +1092,8 @@ fn decode_event_kind(decoder: &mut Decoder<'_>) -> Result<EventKind, CodecError>
             new_price: Price::from_raw(decoder.i64()?),
             old_quantity: quantity(decoder)?,
             new_quantity: quantity(decoder)?,
+            old_display: decode_order_display(decoder)?,
+            new_display: decode_order_display(decoder)?,
             priority_retained: decoder.bool()?,
         }),
         5 => Ok(EventKind::SelfTradePrevented {
@@ -937,6 +1103,18 @@ fn decode_event_kind(decoder: &mut Decoder<'_>) -> Result<EventKind, CodecError>
             policy: decode_stp(decoder)?,
         }),
         6 => Ok(EventKind::CommandRejected(decode_reject_reason(decoder)?)),
+        7 => Ok(EventKind::OrderRefreshed {
+            order_id: order(decoder)?,
+            price: Price::from_raw(decoder.i64()?),
+            displayed_quantity: quantity(decoder)?,
+            leaves_quantity: quantity(decoder)?,
+        }),
+        8 => Ok(EventKind::MassCancelCompleted {
+            account_id: account(decoder)?,
+            scope: decode_mass_cancel_scope(decoder)?,
+            cancelled_order_count: decoder.u64()?,
+            cancelled_quantity_lots: decoder.u128()?,
+        }),
         tag => Err(CodecError::InvalidTag {
             type_name: "EventKind",
             tag,
@@ -1011,6 +1189,152 @@ impl BinaryCodec for ExecutionReport {
             events,
             replayed,
         })
+    }
+}
+
+fn encode_sized_bytes(
+    encoder: &mut Encoder,
+    field: &'static str,
+    bytes: &[u8],
+) -> Result<(), CodecError> {
+    encoder.length(field, bytes.len())?;
+    encoder.bytes(bytes);
+    Ok(())
+}
+
+impl BinaryCodec for OrderBookCheckpoint {
+    fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let mut encoder = Encoder::default();
+        encoder.u64(self.wal_metadata_sequence());
+        encoder.u64(self.generation());
+        encode_sized_bytes(
+            &mut encoder,
+            "matching checkpoint definition bytes",
+            &self.definition().encode()?,
+        )?;
+        encoder.length("matching checkpoint active orders", self.orders().len())?;
+        for order in self.orders() {
+            encoder.u64(order.order_id().get());
+            encoder.u64(order.account_id().get());
+            encode_side(&mut encoder, order.side());
+            encoder.i64(order.price().raw());
+            encoder.u64(order.leaves().lots());
+            encoder.u64(order.displayed().lots());
+            encode_order_display(&mut encoder, order.display());
+            encode_stp(&mut encoder, order.self_trade_prevention());
+        }
+        encoder.length("matching checkpoint command history", self.history().len())?;
+        for entry in self.history() {
+            encode_sized_bytes(
+                &mut encoder,
+                "matching checkpoint command bytes",
+                &entry.command().encode()?,
+            )?;
+            encode_sized_bytes(
+                &mut encoder,
+                "matching checkpoint report bytes",
+                &entry.report().encode()?,
+            )?;
+        }
+        Ok(encoder.finish())
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut decoder = Decoder::new(bytes);
+        let wal_metadata_sequence = decoder.u64()?;
+        let wal_sequence = decoder.u64()?;
+        let definition = InstrumentDefinition::decode(
+            decoder.sized_bytes("matching checkpoint definition bytes")?,
+        )?;
+        let order_count = decoder.count("matching checkpoint active orders", 43)?;
+        let mut orders = Vec::with_capacity(order_count);
+        for _ in 0..order_count {
+            orders.push(RestingOrderCheckpoint {
+                order_id: order(&mut decoder)?,
+                account_id: account(&mut decoder)?,
+                side: decode_side(&mut decoder)?,
+                price: Price::from_raw(decoder.i64()?),
+                leaves: quantity(&mut decoder)?,
+                displayed: quantity(&mut decoder)?,
+                display: decode_order_display(&mut decoder)?,
+                self_trade_prevention: decode_stp(&mut decoder)?,
+            });
+        }
+        let history_count = decoder.count("matching checkpoint command history", 8)?;
+        let mut history = Vec::with_capacity(history_count);
+        for _ in 0..history_count {
+            let command =
+                Command::decode(decoder.sized_bytes("matching checkpoint command bytes")?)?;
+            let report =
+                ExecutionReport::decode(decoder.sized_bytes("matching checkpoint report bytes")?)?;
+            history.push(CommandReportCheckpoint { command, report });
+        }
+        decoder.finish()?;
+        OrderBookCheckpoint::from_parts(
+            wal_metadata_sequence,
+            wal_sequence,
+            definition,
+            orders,
+            history,
+        )
+        .map_err(Into::into)
+    }
+}
+
+impl BinaryCodec for RiskManagedCheckpoint {
+    fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let mut encoder = Encoder::default();
+        encoder.u64(self.wal_first_sequence());
+        encode_sized_bytes(
+            &mut encoder,
+            "risk checkpoint matching bytes",
+            &self.matching().encode()?,
+        )?;
+        encoder.length("risk checkpoint accounts", self.accounts().len())?;
+        for account in self.accounts() {
+            let definition = AccountRiskDefinition::new(account.account_id(), account.profile());
+            encode_sized_bytes(
+                &mut encoder,
+                "risk checkpoint account definition bytes",
+                &definition.encode()?,
+            )?;
+            let exposure = account.exposure();
+            encoder.i128(exposure.position_lots());
+            encoder.u128(exposure.open_buy_lots());
+            encoder.u128(exposure.open_sell_lots());
+            encoder.u128(exposure.open_notional());
+            encoder.u64(exposure.open_orders());
+        }
+        Ok(encoder.finish())
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut decoder = Decoder::new(bytes);
+        let wal_first_sequence = decoder.u64()?;
+        let matching =
+            OrderBookCheckpoint::decode(decoder.sized_bytes("risk checkpoint matching bytes")?)?;
+        let account_count = decoder.count("risk checkpoint accounts", 76)?;
+        let mut accounts = Vec::with_capacity(account_count);
+        for _ in 0..account_count {
+            let definition = AccountRiskDefinition::decode(
+                decoder.sized_bytes("risk checkpoint account definition bytes")?,
+            )?;
+            let exposure = RiskSnapshot::from_parts(
+                decoder.i128()?,
+                decoder.u128()?,
+                decoder.u128()?,
+                decoder.u128()?,
+                decoder.u64()?,
+            );
+            accounts.push(RiskAccountCheckpoint::from_parts(
+                definition.account_id(),
+                definition.profile(),
+                exposure,
+            ));
+        }
+        decoder.finish()?;
+        RiskManagedCheckpoint::from_parts(wal_first_sequence, matching, accounts)
+            .map_err(Into::into)
     }
 }
 
@@ -1201,12 +1525,30 @@ impl BinaryCodec for JournalEntry {
         let mut encoder = Encoder::default();
         encoder.u64(self.transaction_id().get());
         encoder.u64(self.reference());
+        encoder.bool(self.effective_date().is_some());
+        encoder.i32(
+            self.effective_date()
+                .map_or(0, AccountingDate::days_since_unix_epoch),
+        );
+        encoder.u64(self.recorded_at().as_unix_nanos());
         encoder.length("journal entry postings", self.postings().len())?;
         for posting in self.postings() {
             encoder.u64(posting.account_id.get());
             encoder.u64(posting.asset_id.get());
             encoder.i128(posting.amount);
         }
+        let (kind_tag, related_transaction, period_boundary) = match self.kind() {
+            LedgerEntryKind::Standard => (0, 0, None),
+            LedgerEntryKind::Reversal {
+                reversed_transaction_id,
+            } => (1, reversed_transaction_id.get(), None),
+            LedgerEntryKind::PeriodClose { closed_through } => (2, 0, Some(closed_through)),
+            LedgerEntryKind::PeriodReopen { new_closed_through } => (3, 0, new_closed_through),
+        };
+        encoder.u8(kind_tag);
+        encoder.u64(related_transaction);
+        encoder.bool(period_boundary.is_some());
+        encoder.i32(period_boundary.map_or(0, AccountingDate::days_since_unix_epoch));
         Ok(encoder.finish())
     }
 
@@ -1214,6 +1556,16 @@ impl BinaryCodec for JournalEntry {
         let mut decoder = Decoder::new(bytes);
         let transaction_id = transaction(&mut decoder)?;
         let reference = decoder.u64()?;
+        let has_effective_date = decoder.bool()?;
+        let effective_date_days = decoder.i32()?;
+        if !has_effective_date && effective_date_days != 0 {
+            return Err(CodecError::InvalidValue(
+                "absent ledger effective date has a non-zero value",
+            ));
+        }
+        let effective_date = has_effective_date
+            .then(|| AccountingDate::from_days_since_unix_epoch(effective_date_days));
+        let recorded_at = TimestampNs::from_unix_nanos(decoder.u64()?);
         let count = decoder.count("journal entry postings", 32)?;
         let mut postings = Vec::with_capacity(count);
         for _ in 0..count {
@@ -1223,15 +1575,124 @@ impl BinaryCodec for JournalEntry {
                 amount: decoder.i128()?,
             });
         }
+        let kind_tag = decoder.u8()?;
+        let related_transaction = decoder.u64()?;
+        let has_period_boundary = decoder.bool()?;
+        let period_boundary_days = decoder.i32()?;
+        if !has_period_boundary && period_boundary_days != 0 {
+            return Err(CodecError::InvalidValue(
+                "absent ledger period boundary has a non-zero value",
+            ));
+        }
+        let period_boundary = has_period_boundary
+            .then(|| AccountingDate::from_days_since_unix_epoch(period_boundary_days));
+        let kind = match (kind_tag, related_transaction, period_boundary) {
+            (0, 0, None) => LedgerEntryKind::Standard,
+            (0, _, _) => {
+                return Err(CodecError::InvalidValue(
+                    "standard ledger entry has control metadata",
+                ));
+            }
+            (1, value, None) => LedgerEntryKind::Reversal {
+                reversed_transaction_id: TransactionId::new(value)?,
+            },
+            (1, _, Some(_)) => {
+                return Err(CodecError::InvalidValue(
+                    "reversal ledger entry has a period boundary",
+                ));
+            }
+            (2, 0, Some(closed_through)) => LedgerEntryKind::PeriodClose { closed_through },
+            (2, _, _) => {
+                return Err(CodecError::InvalidValue(
+                    "period-close ledger entry has invalid metadata",
+                ));
+            }
+            (3, 0, new_closed_through) => LedgerEntryKind::PeriodReopen { new_closed_through },
+            (3, _, _) => {
+                return Err(CodecError::InvalidValue(
+                    "period-reopen ledger entry has a related transaction",
+                ));
+            }
+            (tag, _, _) => {
+                return Err(CodecError::InvalidTag {
+                    type_name: "ledger entry kind",
+                    tag,
+                });
+            }
+        };
         decoder.finish()?;
-        let canonical = JournalEntry::new(transaction_id, reference, postings.clone())
-            .map_err(CodecError::InvalidJournalEntry)?;
+        let canonical = JournalEntry::with_kind(
+            transaction_id,
+            reference,
+            effective_date,
+            recorded_at,
+            postings.clone(),
+            kind,
+        )
+        .map_err(CodecError::InvalidJournalEntry)?;
         if canonical.postings() != postings {
             return Err(CodecError::InvalidValue(
                 "journal entry postings are not in canonical order",
             ));
         }
         Ok(canonical)
+    }
+}
+
+impl BinaryCodec for LedgerCorrection {
+    fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let reversal = self.reversal().encode()?;
+        let replacement = self.replacement().encode()?;
+        let mut encoder = Encoder::default();
+        encoder.length("ledger correction reversal", reversal.len())?;
+        encoder.bytes(&reversal);
+        encoder.length("ledger correction replacement", replacement.len())?;
+        encoder.bytes(&replacement);
+        Ok(encoder.finish())
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut decoder = Decoder::new(bytes);
+        let reversal_length = usize::try_from(decoder.u32()?)
+            .map_err(|_| CodecError::InvalidValue("ledger correction reversal exceeds usize"))?;
+        let reversal = JournalEntry::decode(decoder.bytes(reversal_length)?)?;
+        let replacement_length = usize::try_from(decoder.u32()?)
+            .map_err(|_| CodecError::InvalidValue("ledger correction replacement exceeds usize"))?;
+        let replacement = JournalEntry::decode(decoder.bytes(replacement_length)?)?;
+        decoder.finish()?;
+        LedgerCorrection::from_parts(reversal, replacement).map_err(CodecError::InvalidJournalEntry)
+    }
+}
+
+impl BinaryCodec for LedgerRecord {
+    fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let mut encoder = Encoder::default();
+        match self {
+            Self::Entry(entry) => {
+                encoder.u8(0);
+                encoder.bytes(&entry.encode()?);
+            }
+            Self::Correction(correction) => {
+                encoder.u8(1);
+                encoder.bytes(&correction.encode()?);
+            }
+        }
+        Ok(encoder.finish())
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let (tag, payload) = bytes.split_first().ok_or(CodecError::UnexpectedEnd {
+            needed: 1,
+            remaining: 0,
+        })?;
+        match tag {
+            0 => JournalEntry::decode(payload).map(Self::Entry),
+            1 => LedgerCorrection::decode(payload).map(Self::Correction),
+            tag => Err(CodecError::InvalidTag {
+                type_name: "ledger record",
+                tag: *tag,
+            }),
+        }
     }
 }
 
@@ -1245,10 +1706,10 @@ impl BinaryCodec for LedgerCheckpoint {
             encoder.u64(balance.asset_id().get());
             encoder.i128(balance.amount());
         }
-        encoder.length("ledger checkpoint entries", self.entries().len())?;
-        for entry in self.entries() {
-            let bytes = entry.encode()?;
-            encoder.length("ledger checkpoint entry payload", bytes.len())?;
+        encoder.length("ledger checkpoint records", self.records().len())?;
+        for record in self.records() {
+            let bytes = record.encode()?;
+            encoder.length("ledger checkpoint record payload", bytes.len())?;
             encoder.bytes(&bytes);
         }
         Ok(encoder.finish())
@@ -1266,18 +1727,17 @@ impl BinaryCodec for LedgerCheckpoint {
                 decoder.i128()?,
             ));
         }
-        // A valid entry is at least a 4-byte length prefix, a 20-byte fixed
-        // value, and two 32-byte postings. Reject impossible counts before a
-        // potentially large allocation.
-        let entry_count = decoder.count("ledger checkpoint entries", 88)?;
-        let mut entries = Vec::with_capacity(entry_count);
-        for _ in 0..entry_count {
+        // The smallest record is a one-byte tag plus a 47-byte period control.
+        // Include its four-byte length prefix before allocating the collection.
+        let record_count = decoder.count("ledger checkpoint records", 52)?;
+        let mut records = Vec::with_capacity(record_count);
+        for _ in 0..record_count {
             let length = usize::try_from(decoder.u32()?).map_err(|_| {
-                CodecError::InvalidValue("ledger checkpoint entry length exceeds usize")
+                CodecError::InvalidValue("ledger checkpoint record length exceeds usize")
             })?;
-            entries.push(JournalEntry::decode(decoder.bytes(length)?)?);
+            records.push(LedgerRecord::decode(decoder.bytes(length)?)?);
         }
         decoder.finish()?;
-        LedgerCheckpoint::from_parts(generation, balances, entries).map_err(Into::into)
+        LedgerCheckpoint::from_parts(generation, balances, records).map_err(Into::into)
     }
 }

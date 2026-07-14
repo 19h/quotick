@@ -14,7 +14,7 @@ use quotick::journal::{
     Durability, JournalLayout, JournalOptions, SegmentedJournal, SegmentedJournalOptions,
     SegmentedJournalReader,
 };
-use quotick::ledger::{JournalEntry, Posting};
+use quotick::ledger::{JournalEntry, LedgerCorrection, Posting};
 use quotick::matching::{
     Command, NewOrder, OrderBook, OrderType, SelfTradePrevention, TimeInForce,
 };
@@ -23,8 +23,8 @@ use quotick::risk::{
     RiskProfile,
 };
 use quotick::{
-    AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
-    TimestampNs, TransactionId,
+    AccountId, AccountingDate, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price,
+    Quantity, Side, TimestampNs, TransactionId,
 };
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
@@ -73,6 +73,7 @@ fn definition() -> InstrumentDefinition {
         price: PriceRules::new(0, 1, Price::from_raw(-1_000), Price::from_raw(1_000))
             .expect("price rules"),
         quantity: QuantityRules::new(1, 1, 1_000).expect("quantity rules"),
+        reserve: quotick::instrument::ReserveOrderRules::disabled(),
         base_units_per_lot: 1,
         quote_units_per_price_unit: 1,
         trading_state: TradingState::Open,
@@ -89,6 +90,7 @@ fn command(command_id: u64, order_id: u64) -> Command {
         instrument_version: InstrumentVersion::new(1).expect("instrument version"),
         side: Side::Buy,
         quantity: Quantity::new(5).expect("quantity"),
+        display: quotick::matching::OrderDisplay::FullyDisplayed,
         order_type: OrderType::Limit(Price::from_raw(100)),
         time_in_force: TimeInForce::GoodTilCancelled,
         self_trade_prevention: SelfTradePrevention::CancelAggressor,
@@ -115,6 +117,8 @@ fn entry(transaction_id: u64, amount: i128) -> JournalEntry {
     JournalEntry::new(
         TransactionId::new(transaction_id).expect("transaction ID"),
         transaction_id,
+        AccountingDate::UNIX_EPOCH,
+        TimestampNs::from_unix_nanos(0),
         vec![
             Posting {
                 account_id: account(11),
@@ -238,9 +242,41 @@ fn ledger_rotates_each_entry_and_reconstructs_balances() {
 
     let recovered = DurableLedger::open_segmented(directory.path(), options).expect("replays");
     assert_eq!(recovered.recovery().journal.segment_count, 3);
-    assert_eq!(recovered.recovery().replayed_entries, 3);
+    assert_eq!(recovered.recovery().replayed_records, 3);
     assert_eq!(recovered.ledger().balance(account(11), asset(1)), 250);
     assert_eq!(recovered.ledger().balance(account(12), asset(1)), -250);
+}
+
+#[test]
+fn ledger_correction_rotates_as_one_frame_and_recovers_as_one_event() {
+    let directory = TestDirectory::new("ledger-correction");
+    let original = entry(1, 100);
+    let correction = LedgerCorrection::new(
+        TransactionId::new(2).expect("reversal transaction ID"),
+        2,
+        AccountingDate::UNIX_EPOCH,
+        TimestampNs::from_unix_nanos(0),
+        entry(3, 70),
+        &original,
+    )
+    .expect("correction constructs");
+    let capacity = frame_length(&original).max(frame_length(&correction));
+    let options = options(capacity);
+    let mut ledger = DurableLedger::open_segmented(directory.path(), options).expect("opens");
+    ledger.post(original).expect("original posts");
+    ledger
+        .correct(correction.clone())
+        .expect("correction posts");
+    ledger.close().expect("closes");
+
+    let mut recovered = DurableLedger::open_segmented(directory.path(), options).expect("replays");
+    assert_eq!(recovered.recovery().journal.segment_count, 2);
+    assert_eq!(recovered.recovery().replayed_records, 2);
+    assert_eq!(recovered.ledger().record_count(), 2);
+    assert_eq!(recovered.ledger().entry_count(), 3);
+    assert_eq!(recovered.ledger().balance(account(11), asset(1)), 70);
+    assert!(recovered.correct(correction).expect("exact retry").replayed);
+    recovered.ledger().validate().expect("ledger validates");
 }
 
 #[test]

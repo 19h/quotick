@@ -1,6 +1,6 @@
 use quotick::codec::{BinaryCodec, CodecError};
 use quotick::ledger::{JournalEntry, Ledger, LedgerCheckpoint, LedgerCheckpointError, Posting};
-use quotick::{AccountId, AssetId, TransactionId};
+use quotick::{AccountId, AccountingDate, AssetId, TimestampNs, TransactionId};
 
 fn account(value: u64) -> AccountId {
     AccountId::new(value).expect("account ID")
@@ -24,6 +24,8 @@ fn entry(
     JournalEntry::new(
         transaction(transaction_id),
         transaction_id,
+        AccountingDate::UNIX_EPOCH,
+        TimestampNs::from_unix_nanos(0),
         vec![
             Posting {
                 account_id: account(debit_account),
@@ -64,7 +66,7 @@ fn trial_balance_and_checkpoint_are_canonical_and_independently_replayable() {
 
     let checkpoint = ledger.checkpoint().expect("checkpoint captures");
     assert_eq!(checkpoint.generation(), 3);
-    assert_eq!(checkpoint.entries().len(), 3);
+    assert_eq!(checkpoint.records().len(), 3);
     assert_eq!(checkpoint.balances().len(), 5);
     assert!(checkpoint.balances().windows(2).all(|pair| (
         pair[0].asset_id(),
@@ -75,7 +77,7 @@ fn trial_balance_and_checkpoint_are_canonical_and_independently_replayable() {
     )));
 
     let encoded = checkpoint.encode().expect("checkpoint encodes");
-    assert_eq!(encoded.len(), 440);
+    assert_eq!(encoded.len(), 524);
     let decoded = LedgerCheckpoint::decode(&encoded).expect("checkpoint decodes");
     assert_eq!(decoded, checkpoint);
     let mut restored = Ledger::from_checkpoint(decoded).expect("checkpoint restores");
@@ -112,14 +114,14 @@ fn checkpoint_decoder_rejects_generation_balance_and_order_corruption() {
     assert!(matches!(
         LedgerCheckpoint::decode(&impossible_entry_count),
         Err(CodecError::InvalidLength {
-            field: "ledger checkpoint entries",
+            field: "ledger checkpoint records",
             ..
         })
     ));
 
     let mut duplicate_transaction = encoded.clone();
-    let first_entry = duplicate_transaction[180..264].to_vec();
-    duplicate_transaction[268..352].copy_from_slice(&first_entry);
+    let first_entry = duplicate_transaction[180..292].to_vec();
+    duplicate_transaction[296..408].copy_from_slice(&first_entry);
     assert!(matches!(
         LedgerCheckpoint::decode(&duplicate_transaction),
         Err(CodecError::InvalidLedgerCheckpoint(
@@ -150,7 +152,7 @@ fn zero_balances_are_omitted_without_losing_idempotency_history() {
     ledger.post(second).expect("entry posts");
     let checkpoint = ledger.checkpoint().expect("checkpoint captures");
     assert!(checkpoint.balances().is_empty());
-    assert_eq!(checkpoint.entries().len(), 2);
+    assert_eq!(checkpoint.records().len(), 2);
     let mut restored = Ledger::from_checkpoint(checkpoint).expect("checkpoint restores");
     assert!(restored.post(first).expect("retry resolves").replayed);
     assert_eq!(restored.entry_count(), 2);

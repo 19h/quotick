@@ -11,7 +11,8 @@ use crate::domain::{AccountId, OrderId, Price, Side};
 use crate::instrument::InstrumentDefinition;
 use crate::matching::{
     Command, CommandOutcome, EventKind, ExecutionReport, MatchingError, NewOrder, OrderBook,
-    OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce, Trade,
+    OrderBookCheckpoint, OrderBookCheckpointError, OrderType, RejectReason, ReplaceOrder,
+    SelfTradePrevention, TimeInForce, Trade,
 };
 
 /// Account-level order-entry state.
@@ -239,6 +240,22 @@ pub struct RiskSnapshot {
 }
 
 impl RiskSnapshot {
+    pub(crate) const fn from_parts(
+        position_lots: i128,
+        open_buy_lots: u128,
+        open_sell_lots: u128,
+        open_notional: u128,
+        open_orders: u64,
+    ) -> Self {
+        Self {
+            position_lots,
+            open_buy_lots,
+            open_sell_lots,
+            open_notional,
+            open_orders,
+        }
+    }
+
     /// Returns the signed executed position.
     #[must_use]
     pub const fn position_lots(self) -> i128 {
@@ -267,6 +284,244 @@ impl RiskSnapshot {
     #[must_use]
     pub const fn open_orders(self) -> u64 {
         self.open_orders
+    }
+}
+
+/// Canonical profile and current exposure for one checkpointed account.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RiskAccountCheckpoint {
+    account_id: AccountId,
+    profile: RiskProfile,
+    exposure: RiskSnapshot,
+}
+
+impl RiskAccountCheckpoint {
+    /// Returns the account identifier.
+    #[must_use]
+    pub const fn account_id(self) -> AccountId {
+        self.account_id
+    }
+
+    /// Returns the immutable account profile.
+    #[must_use]
+    pub const fn profile(self) -> RiskProfile {
+        self.profile
+    }
+
+    /// Returns current signed position and aggregate open-order exposure.
+    #[must_use]
+    pub const fn exposure(self) -> RiskSnapshot {
+        self.exposure
+    }
+
+    pub(crate) const fn from_parts(
+        account_id: AccountId,
+        profile: RiskProfile,
+        exposure: RiskSnapshot,
+    ) -> Self {
+        Self {
+            account_id,
+            profile,
+            exposure,
+        }
+    }
+}
+
+/// Coupled matching/risk direct state at a completed risk-WAL report boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RiskManagedCheckpoint {
+    wal_first_sequence: u64,
+    matching: OrderBookCheckpoint,
+    accounts: Vec<RiskAccountCheckpoint>,
+}
+
+impl RiskManagedCheckpoint {
+    /// Returns the first WAL sequence, occupied by the instrument definition.
+    #[must_use]
+    pub const fn wal_first_sequence(&self) -> u64 {
+        self.wal_first_sequence
+    }
+
+    /// Returns the completed execution-report WAL boundary represented here.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.matching.generation()
+    }
+
+    /// Returns the embedded canonical matching state and complete report history.
+    #[must_use]
+    pub const fn matching(&self) -> &OrderBookCheckpoint {
+        &self.matching
+    }
+
+    /// Returns canonical account-sorted profiles and current exposures.
+    #[must_use]
+    pub fn accounts(&self) -> &[RiskAccountCheckpoint] {
+        &self.accounts
+    }
+
+    pub(crate) fn from_parts(
+        wal_first_sequence: u64,
+        matching: OrderBookCheckpoint,
+        accounts: Vec<RiskAccountCheckpoint>,
+    ) -> Result<Self, RiskManagedCheckpointError> {
+        let checkpoint = Self {
+            wal_first_sequence,
+            matching,
+            accounts,
+        };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
+    fn validate(&self) -> Result<(), RiskManagedCheckpointError> {
+        if self.wal_first_sequence == 0 {
+            return Err(RiskManagedCheckpointError::new(
+                "risk checkpoint WAL first sequence is zero",
+            ));
+        }
+        let profile_count = u64::try_from(self.accounts.len()).map_err(|_| {
+            RiskManagedCheckpointError::new("risk checkpoint account count exceeds u64")
+        })?;
+        let expected_metadata_sequence = self
+            .wal_first_sequence
+            .checked_add(profile_count)
+            .ok_or_else(|| {
+                RiskManagedCheckpointError::new("risk checkpoint metadata boundary overflow")
+            })?;
+        if self.matching.wal_metadata_sequence() != expected_metadata_sequence {
+            return Err(RiskManagedCheckpointError::new(
+                "risk checkpoint matching boundary does not follow its profile metadata",
+            ));
+        }
+        for pair in self.accounts.windows(2) {
+            if pair[0].account_id >= pair[1].account_id {
+                return Err(RiskManagedCheckpointError::new(
+                    "risk checkpoint accounts are not strictly canonical",
+                ));
+            }
+        }
+
+        let direct = self.restore_direct()?;
+        let mut replay = RiskManagedOrderBook::new(self.matching.definition());
+        for account in &self.accounts {
+            replay.register_account(account.account_id, account.profile)?;
+        }
+        for entry in self.matching.history() {
+            let reproduced = replay.submit(entry.command()).map_err(|error| {
+                RiskManagedCheckpointError::new(format!(
+                    "risk checkpoint history cannot be replayed: {error}"
+                ))
+            })?;
+            if reproduced != *entry.report() {
+                return Err(RiskManagedCheckpointError::new(
+                    "risk checkpoint history diverges under coupled deterministic replay",
+                ));
+            }
+        }
+        if replay != direct {
+            return Err(RiskManagedCheckpointError::new(
+                "risk checkpoint direct state differs from coupled history replay",
+            ));
+        }
+        Ok(())
+    }
+
+    fn restore_direct(&self) -> Result<RiskManagedOrderBook, RiskManagedCheckpointError> {
+        let book = OrderBook::from_checkpoint(self.matching.clone())?;
+        let mut risk = RiskEngine::new(self.matching.definition());
+        for account in &self.accounts {
+            risk.register_account(account.account_id, account.profile)?;
+            risk.accounts
+                .get_mut(&account.account_id)
+                .expect("registered checkpoint account exists")
+                .exposure
+                .position_lots = account.exposure.position_lots;
+        }
+        for order in self.matching.orders() {
+            if !risk.accounts.contains_key(&order.account_id()) {
+                return Err(RiskManagedCheckpointError::new(format!(
+                    "risk checkpoint active order {} has no account profile",
+                    order.order_id()
+                )));
+            }
+            risk.insert_reservation(
+                order.order_id(),
+                order.account_id(),
+                order.side(),
+                order.price(),
+                order.leaves().lots(),
+            );
+        }
+        for account in &self.accounts {
+            let restored = risk
+                .snapshot(account.account_id)
+                .expect("registered checkpoint account exists");
+            if restored != account.exposure {
+                return Err(RiskManagedCheckpointError::new(format!(
+                    "risk checkpoint account {} exposure differs from active reservations",
+                    account.account_id
+                )));
+            }
+        }
+        let managed = RiskManagedOrderBook { book, risk };
+        managed
+            .validate()
+            .map_err(|error| RiskManagedCheckpointError::new(error.detail()))?;
+        Ok(managed)
+    }
+
+    pub(crate) fn is_successor_of(&self, previous: &Self) -> bool {
+        self.wal_first_sequence == previous.wal_first_sequence
+            && self.accounts.len() == previous.accounts.len()
+            && self
+                .accounts
+                .iter()
+                .zip(&previous.accounts)
+                .all(|(current, old)| {
+                    current.account_id == old.account_id && current.profile == old.profile
+                })
+            && self.matching.is_successor_of(&previous.matching)
+    }
+}
+
+/// Semantic coupled risk/matching checkpoint construction or restoration failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RiskManagedCheckpointError {
+    detail: String,
+}
+
+impl RiskManagedCheckpointError {
+    fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+
+    /// Returns a stable diagnostic description.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl fmt::Display for RiskManagedCheckpointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.detail.fmt(formatter)
+    }
+}
+
+impl std::error::Error for RiskManagedCheckpointError {}
+
+impl From<OrderBookCheckpointError> for RiskManagedCheckpointError {
+    fn from(error: OrderBookCheckpointError) -> Self {
+        Self::new(error.detail())
+    }
+}
+
+impl From<RiskError> for RiskManagedCheckpointError {
+    fn from(error: RiskError) -> Self {
+        Self::new(error.to_string())
     }
 }
 
@@ -319,7 +574,7 @@ impl ReservationSnapshot {
 }
 
 /// Deterministic account profiles, positions, and resting-order reservations.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct RiskEngine {
     definition: InstrumentDefinition,
     accounts: HashMap<AccountId, RiskAccount>,
@@ -385,7 +640,7 @@ impl RiskEngine {
     fn authorize(&self, command: Command) -> Result<(), RejectReason> {
         match command {
             Command::New(order) => self.authorize_new(order),
-            Command::Cancel(_) => Ok(()),
+            Command::Cancel(_) | Command::MassCancel(_) => Ok(()),
             Command::Replace(order) => self.authorize_replace(order),
         }
     }
@@ -589,7 +844,7 @@ impl RiskEngine {
                     );
                 }
             }
-            Command::Cancel(_) => {}
+            Command::Cancel(_) | Command::MassCancel(_) => {}
             Command::Replace(order) => {
                 if replacement_retained_priority(report, order.order_id) {
                     self.insert_reservation(
@@ -806,7 +1061,7 @@ impl fmt::Display for RiskInvariantViolation {
 impl std::error::Error for RiskInvariantViolation {}
 
 /// One order book coupled to deterministic pre-trade risk and reservations.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct RiskManagedOrderBook {
     book: OrderBook,
     risk: RiskEngine,
@@ -867,6 +1122,56 @@ impl RiskManagedOrderBook {
     /// sequence capacity.
     pub fn preflight(&self, command: Command) -> Result<Option<ExecutionReport>, MatchingError> {
         self.book.preflight(command)
+    }
+
+    /// Captures and independently audits coupled matching, positions, and reservations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiskManagedCheckpointError`] when live state, physical WAL
+    /// boundaries, canonical account state, or coupled deterministic replay diverge.
+    pub fn checkpoint(
+        &self,
+        wal_first_sequence: u64,
+        wal_metadata_sequence: u64,
+        wal_sequence: u64,
+    ) -> Result<RiskManagedCheckpoint, RiskManagedCheckpointError> {
+        self.validate()
+            .map_err(|error| RiskManagedCheckpointError::new(error.detail()))?;
+        let matching = self
+            .book
+            .checkpoint_state(wal_metadata_sequence, wal_sequence)?;
+        let mut accounts: Vec<_> = self
+            .risk
+            .accounts
+            .iter()
+            .map(|(&account_id, account)| RiskAccountCheckpoint {
+                account_id,
+                profile: account.profile,
+                exposure: account.exposure,
+            })
+            .collect();
+        accounts.sort_unstable_by_key(|value| value.account_id);
+        let checkpoint = RiskManagedCheckpoint::from_parts(wal_first_sequence, matching, accounts)?;
+        let restored = checkpoint.restore_direct()?;
+        if restored != *self {
+            return Err(RiskManagedCheckpointError::new(
+                "risk checkpoint direct state differs from live coupled state",
+            ));
+        }
+        Ok(checkpoint)
+    }
+
+    /// Restores directly indexed matching/risk state from an audited checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiskManagedCheckpointError`] for invalid semantic state or
+    /// coupled deterministic replay divergence.
+    pub fn from_checkpoint(
+        checkpoint: &RiskManagedCheckpoint,
+    ) -> Result<Self, RiskManagedCheckpointError> {
+        checkpoint.restore_direct()
     }
 
     /// Returns the underlying read-only order book.
@@ -996,6 +1301,7 @@ fn rested_order(report: &ExecutionReport, order_id: OrderId) -> Option<(Price, u
             order_id: value,
             price,
             leaves_quantity,
+            ..
         } if value == order_id => Some((price, leaves_quantity.lots())),
         _ => None,
     })

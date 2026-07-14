@@ -50,6 +50,7 @@ fn command(command_id: u64, order_id: u64) -> Command {
         instrument_version: InstrumentVersion::new(1).expect("instrument version"),
         side: Side::Buy,
         quantity: Quantity::new(30).expect("positive quantity"),
+        display: quotick::matching::OrderDisplay::FullyDisplayed,
         order_type: OrderType::Limit(Price::from_raw(40)),
         time_in_force: TimeInForce::GoodTilCancelled,
         self_trade_prevention: SelfTradePrevention::CancelAggressor,

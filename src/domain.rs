@@ -64,8 +64,39 @@ identifier!(CommandId, "command identifier");
 identifier!(InstrumentId, "instrument identifier");
 identifier!(InstrumentVersion, "instrument version");
 identifier!(OrderId, "order identifier");
+identifier!(ReconciliationId, "reconciliation identifier");
 identifier!(TradeId, "trade identifier");
 identifier!(TransactionId, "transaction identifier");
+
+/// Accounting-date scalar represented as signed days from 1970-01-01.
+///
+/// Gregorian conversion, time-zone selection, and holiday/session membership
+/// belong to a versioned calendar service; this scalar provides deterministic
+/// ordering and a compact stable wire representation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct AccountingDate(i32);
+
+impl AccountingDate {
+    /// Smallest representable accounting date.
+    pub const MIN: Self = Self(i32::MIN);
+    /// Unix epoch date, 1970-01-01.
+    pub const UNIX_EPOCH: Self = Self(0);
+    /// Largest representable accounting date.
+    pub const MAX: Self = Self(i32::MAX);
+
+    /// Constructs a date from signed days relative to 1970-01-01.
+    #[must_use]
+    pub const fn from_days_since_unix_epoch(days: i32) -> Self {
+        Self(days)
+    }
+
+    /// Returns signed days relative to 1970-01-01.
+    #[must_use]
+    pub const fn days_since_unix_epoch(self) -> i32 {
+        self.0
+    }
+}
 
 /// A price expressed in an instrument-defined integer quantum.
 ///

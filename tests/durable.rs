@@ -71,6 +71,7 @@ fn definition_in_state(
         price: PriceRules::new(0, 1, Price::from_raw(i64::MIN), Price::from_raw(i64::MAX))
             .expect("price rules"),
         quantity: QuantityRules::new(1, 1, u64::MAX).expect("quantity rules"),
+        reserve: quotick::instrument::ReserveOrderRules::disabled(),
         base_units_per_lot: 1,
         quote_units_per_price_unit: 1,
         trading_state,
@@ -87,6 +88,7 @@ fn command(command_id: u64, order_id: u64, quantity: u64) -> Command {
         instrument_version: version(),
         side: Side::Buy,
         quantity: Quantity::new(quantity).expect("positive quantity"),
+        display: quotick::matching::OrderDisplay::FullyDisplayed,
         order_type: OrderType::Limit(Price::from_raw(100)),
         time_in_force: TimeInForce::GoodTilCancelled,
         self_trade_prevention: SelfTradePrevention::CancelAggressor,

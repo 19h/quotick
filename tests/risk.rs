@@ -37,6 +37,7 @@ fn definition() -> InstrumentDefinition {
         quote_asset_id: AssetId::new(2).unwrap(),
         price: PriceRules::new(0, 1, Price::from_raw(-1_000), Price::from_raw(1_000)).unwrap(),
         quantity: QuantityRules::new(1, 1, u64::MAX).unwrap(),
+        reserve: quotick::instrument::ReserveOrderRules::disabled(),
         base_units_per_lot: 1,
         quote_units_per_price_unit: 1,
         trading_state: TradingState::Open,
@@ -83,6 +84,7 @@ fn order(
         instrument_version: version(),
         side,
         quantity: Quantity::new(quantity).unwrap(),
+        display: quotick::matching::OrderDisplay::FullyDisplayed,
         order_type,
         time_in_force,
         self_trade_prevention: stp,
@@ -131,6 +133,7 @@ fn replace(command_id: u64, order_id: u64, owner: u64, quantity: u64, price: i64
         instrument_version: version(),
         new_quantity: Quantity::new(quantity).unwrap(),
         new_price: Price::from_raw(price),
+        new_display: quotick::matching::OrderDisplay::FullyDisplayed,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
@@ -771,6 +774,7 @@ fn instrument_spec(value: InstrumentDefinition) -> InstrumentSpec {
         quote_asset_id: value.quote_asset_id(),
         price: value.price_rules(),
         quantity: value.quantity_rules(),
+        reserve: value.reserve_order_rules(),
         base_units_per_lot: settlement.base_units_per_lot,
         quote_units_per_price_unit: settlement.quote_units_per_price_unit,
         trading_state: value.trading_state(),

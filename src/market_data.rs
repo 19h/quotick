@@ -9,12 +9,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use crate::domain::{
-    CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side, TimestampNs,
-    TradeId,
+    AccountId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
+    TimestampNs, TradeId,
 };
 use crate::matching::{
     CancelReason, Command, CommandOutcome, Event, EventKind, ExecutionReport, LevelSnapshot,
-    OrderBook, OrderType, SelfTradePrevention, Trade,
+    MassCancelScope, OrderBook, OrderDisplay, OrderType, SelfTradePrevention, Trade,
 };
 
 /// An absolute aggregate state for one publicly visible price level.
@@ -377,9 +377,20 @@ struct Aggregate {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TrackedOrder {
+    account_id: AccountId,
     side: Side,
     price: Price,
     leaves: u64,
+    displayed: u64,
+    display: OrderDisplay,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MassCancelProgress {
+    order_count: u64,
+    quantity_lots: u128,
+    last_order_id: Option<OrderId>,
+    completed: bool,
 }
 
 /// Stateful adapter from private matching traces to anonymized public depth.
@@ -417,9 +428,12 @@ impl MarketDataPublisher {
                 (
                     order.order_id,
                     TrackedOrder {
+                        account_id: order.account_id,
                         side: order.side,
                         price: order.price,
                         leaves: order.leaves_quantity.lots(),
+                        displayed: order.displayed_quantity.lots(),
+                        display: order.display,
                     },
                 )
             })
@@ -527,6 +541,7 @@ impl MarketDataPublisher {
 
         let mut updates = Vec::with_capacity(report.events.len());
         let mut replacement_side = None;
+        let mut mass_cancel_progress = MassCancelProgress::default();
         for event in &report.events {
             let expected = self
                 .last_sequence
@@ -542,7 +557,12 @@ impl MarketDataPublisher {
                     actual: event.sequence,
                 });
             }
-            let kind = match self.apply_event(command, *event, &mut replacement_side) {
+            let kind = match self.apply_event(
+                command,
+                *event,
+                &mut replacement_side,
+                &mut mass_cancel_progress,
+            ) {
                 Ok(kind) => kind,
                 Err(error) => return self.fail(error),
             };
@@ -554,6 +574,11 @@ impl MarketDataPublisher {
                 kind,
             });
             self.last_sequence = event.sequence;
+        }
+        if matches!(command, Command::MassCancel(_)) != mass_cancel_progress.completed {
+            return self.fail(MarketDataError::TraceMismatch(
+                "mass-cancel command and completion event disagree",
+            ));
         }
         if let Err(error) = self.validate_publication(&updates, book) {
             return self.fail(error);
@@ -598,9 +623,12 @@ impl MarketDataPublisher {
         })?;
         for order in active_orders {
             let expected = TrackedOrder {
+                account_id: order.account_id,
                 side: order.side,
                 price: order.price,
                 leaves: order.leaves_quantity.lots(),
+                displayed: order.displayed_quantity.lots(),
+                display: order.display,
             };
             if self.orders.get(&order.order_id) != Some(&expected) {
                 return Err(MarketDataError::SourceDivergence(
@@ -623,20 +651,31 @@ impl MarketDataPublisher {
         command: Command,
         event: Event,
         replacement_side: &mut Option<Side>,
+        mass_cancel_progress: &mut MassCancelProgress,
     ) -> Result<MarketDataKind, MarketDataError> {
         match event.kind {
-            EventKind::OrderAccepted { order_id, quantity } => {
-                Self::handle_order_accepted(command, order_id, quantity)
-            }
+            EventKind::OrderAccepted {
+                order_id,
+                quantity,
+                display,
+            } => Self::handle_order_accepted(command, order_id, quantity, display),
+            EventKind::OrderRefreshed {
+                order_id,
+                price,
+                displayed_quantity,
+                leaves_quantity,
+            } => self.handle_order_refreshed(order_id, price, displayed_quantity, leaves_quantity),
             EventKind::OrderRested {
                 order_id,
                 price,
                 leaves_quantity,
+                displayed_quantity,
             } => self.handle_order_rested(
                 command,
                 order_id,
                 price,
                 leaves_quantity,
+                displayed_quantity,
                 replacement_side,
             ),
             EventKind::Trade(trade) => self.handle_trade(command, trade),
@@ -644,13 +683,15 @@ impl MarketDataPublisher {
                 order_id,
                 quantity,
                 reason,
-            } => self.handle_cancel(command, order_id, quantity, reason),
+            } => self.handle_cancel(command, order_id, quantity, reason, mass_cancel_progress),
             EventKind::OrderReplaced {
                 order_id,
                 old_price,
                 new_price,
                 old_quantity,
                 new_quantity,
+                old_display,
+                new_display,
                 priority_retained,
             } => self.handle_replace(
                 command,
@@ -659,6 +700,8 @@ impl MarketDataPublisher {
                 new_price,
                 old_quantity,
                 new_quantity,
+                old_display,
+                new_display,
                 priority_retained,
                 replacement_side,
             ),
@@ -674,6 +717,19 @@ impl MarketDataPublisher {
                 quantity,
                 policy,
             ),
+            EventKind::MassCancelCompleted {
+                account_id,
+                scope,
+                cancelled_order_count,
+                cancelled_quantity_lots,
+            } => Self::handle_mass_cancel_completed(
+                command,
+                account_id,
+                scope,
+                cancelled_order_count,
+                cancelled_quantity_lots,
+                mass_cancel_progress,
+            ),
             EventKind::CommandRejected(_) => Ok(MarketDataKind::NoBookChange),
         }
     }
@@ -682,13 +738,17 @@ impl MarketDataPublisher {
         command: Command,
         order_id: OrderId,
         quantity: Quantity,
+        display: OrderDisplay,
     ) -> Result<MarketDataKind, MarketDataError> {
         let Command::New(new_order) = command else {
             return Err(MarketDataError::TraceMismatch(
                 "non-new command emitted OrderAccepted",
             ));
         };
-        if order_id != new_order.order_id || quantity != new_order.quantity {
+        if order_id != new_order.order_id
+            || quantity != new_order.quantity
+            || display != new_order.display
+        {
             return Err(MarketDataError::TraceMismatch(
                 "OrderAccepted differs from the new command",
             ));
@@ -702,16 +762,17 @@ impl MarketDataPublisher {
         order_id: OrderId,
         price: Price,
         leaves_quantity: Quantity,
+        displayed_quantity: Quantity,
         replacement_side: &mut Option<Side>,
     ) -> Result<MarketDataKind, MarketDataError> {
-        let side = match command {
+        let (account_id, side, display) = match command {
             Command::New(new_order) if new_order.order_id == order_id => {
                 if new_order.order_type != OrderType::Limit(price) {
                     return Err(MarketDataError::TraceMismatch(
                         "resting price differs from the new limit",
                     ));
                 }
-                new_order.side
+                (new_order.account_id, new_order.side, new_order.display)
             }
             Command::Replace(replace) if replace.order_id == order_id => {
                 if replace.new_price != price {
@@ -719,11 +780,15 @@ impl MarketDataPublisher {
                         "resting price differs from the replacement limit",
                     ));
                 }
-                replacement_side
-                    .take()
-                    .ok_or(MarketDataError::TraceMismatch(
-                        "replacement rested without losing its previous priority",
-                    ))?
+                (
+                    replace.account_id,
+                    replacement_side
+                        .take()
+                        .ok_or(MarketDataError::TraceMismatch(
+                            "replacement rested without losing its previous priority",
+                        ))?,
+                    replace.new_display,
+                )
             }
             _ => {
                 return Err(MarketDataError::TraceMismatch(
@@ -736,15 +801,55 @@ impl MarketDataPublisher {
                 "OrderRested duplicated an active order",
             ));
         }
+        if displayed_quantity.lots() != displayed_lots(display, leaves_quantity.lots()) {
+            return Err(MarketDataError::TraceMismatch(
+                "rested display differs from the order display policy",
+            ));
+        }
         self.orders.insert(
             order_id,
             TrackedOrder {
+                account_id,
                 side,
                 price,
                 leaves: leaves_quantity.lots(),
+                displayed: displayed_quantity.lots(),
+                display,
             },
         );
-        self.add_level(side, price, leaves_quantity.lots())
+        self.add_level(side, price, displayed_quantity.lots())
+            .map(MarketDataKind::Level)
+    }
+
+    fn handle_order_refreshed(
+        &mut self,
+        order_id: OrderId,
+        price: Price,
+        displayed_quantity: Quantity,
+        leaves_quantity: Quantity,
+    ) -> Result<MarketDataKind, MarketDataError> {
+        let order = self
+            .orders
+            .get(&order_id)
+            .copied()
+            .ok_or(MarketDataError::TraceMismatch(
+                "reserve refresh target is absent",
+            ))?;
+        if order.price != price
+            || order.displayed != 0
+            || order.leaves != leaves_quantity.lots()
+            || !order.display.is_reserve()
+            || displayed_quantity.lots() != displayed_lots(order.display, order.leaves)
+        {
+            return Err(MarketDataError::TraceMismatch(
+                "reserve refresh contradicts tracked hidden state",
+            ));
+        }
+        self.orders
+            .get_mut(&order_id)
+            .expect("checked refresh target exists")
+            .displayed = displayed_quantity.lots();
+        self.add_level(order.side, order.price, displayed_quantity.lots())
             .map(MarketDataKind::Level)
     }
 
@@ -759,7 +864,7 @@ impl MarketDataPublisher {
         if trade.instrument_version != self.instrument_version {
             return Err(MarketDataError::WrongInstrumentVersion);
         }
-        if trade.taker_order_id != command_order_id(command) {
+        if command_order_id(command) != Some(trade.taker_order_id) {
             return Err(MarketDataError::TraceMismatch(
                 "trade taker differs from the source command order",
             ));
@@ -771,9 +876,17 @@ impl MarketDataPublisher {
             Side::Buy => trade.buy_order_id,
             Side::Sell => trade.sell_order_id,
         };
-        if expected_maker != trade.maker_order_id || maker.price != trade.price {
+        let (maker_account, taker_account) = match maker.side {
+            Side::Buy => (trade.buyer_account_id, trade.seller_account_id),
+            Side::Sell => (trade.seller_account_id, trade.buyer_account_id),
+        };
+        if expected_maker != trade.maker_order_id
+            || maker.price != trade.price
+            || maker.account_id != maker_account
+            || command_account_id(command) != taker_account
+        {
             return Err(MarketDataError::TraceMismatch(
-                "trade maker side or price contradicts public state",
+                "trade identity, owner, side, or price contradicts tracked state",
             ));
         }
         self.advance_trade_id(trade.trade_id)?;
@@ -795,23 +908,71 @@ impl MarketDataPublisher {
         order_id: OrderId,
         quantity: Quantity,
         reason: CancelReason,
+        mass_cancel_progress: &mut MassCancelProgress,
     ) -> Result<MarketDataKind, MarketDataError> {
-        if self.orders.contains_key(&order_id) {
-            if !matches!(
-                reason,
-                CancelReason::UserRequested | CancelReason::SelfTradeResting
-            ) {
-                return Err(MarketDataError::TraceMismatch(
-                    "an incoming-only cancellation targeted a resting order",
-                ));
+        if let Some(order) = self.orders.get(&order_id).copied() {
+            match reason {
+                CancelReason::UserRequested => {
+                    let Command::Cancel(cancel) = command else {
+                        return Err(MarketDataError::TraceMismatch(
+                            "non-cancel command emitted a user cancellation",
+                        ));
+                    };
+                    if cancel.order_id != order_id || cancel.account_id != order.account_id {
+                        return Err(MarketDataError::TraceMismatch(
+                            "user cancellation differs from its source command",
+                        ));
+                    }
+                }
+                CancelReason::SelfTradeResting => {
+                    if command_order_id(command).is_none()
+                        || command_account_id(command) != order.account_id
+                    {
+                        return Err(MarketDataError::TraceMismatch(
+                            "self-trade cancellation targeted another account",
+                        ));
+                    }
+                }
+                CancelReason::MassCancel => {
+                    let Command::MassCancel(mass_cancel) = command else {
+                        return Err(MarketDataError::TraceMismatch(
+                            "non-mass-cancel command emitted a mass cancellation",
+                        ));
+                    };
+                    if mass_cancel_progress.completed
+                        || mass_cancel.account_id != order.account_id
+                        || !mass_cancel.scope.includes(order.side)
+                        || mass_cancel_progress
+                            .last_order_id
+                            .is_some_and(|previous| order_id <= previous)
+                    {
+                        return Err(MarketDataError::TraceMismatch(
+                            "mass cancellation targeted an order outside its scope",
+                        ));
+                    }
+                    mass_cancel_progress.order_count = mass_cancel_progress
+                        .order_count
+                        .checked_add(1)
+                        .ok_or(MarketDataError::ArithmeticOverflow)?;
+                    mass_cancel_progress.quantity_lots = mass_cancel_progress
+                        .quantity_lots
+                        .checked_add(u128::from(quantity.lots()))
+                        .ok_or(MarketDataError::ArithmeticOverflow)?;
+                    mass_cancel_progress.last_order_id = Some(order_id);
+                }
+                CancelReason::UnfilledRemainder | CancelReason::SelfTradeAggressor => {
+                    return Err(MarketDataError::TraceMismatch(
+                        "an incoming-only cancellation targeted a resting order",
+                    ));
+                }
             }
-            self.decrement_order(order_id, quantity.lots())
+            self.remove_tracked_order(order_id, quantity.lots())
                 .map(MarketDataKind::Level)
         } else {
             if !matches!(
                 reason,
                 CancelReason::UnfilledRemainder | CancelReason::SelfTradeAggressor
-            ) || order_id != command_order_id(command)
+            ) || command_order_id(command) != Some(order_id)
             {
                 return Err(MarketDataError::TraceMismatch(
                     "resting-order cancellation target is absent",
@@ -819,6 +980,33 @@ impl MarketDataPublisher {
             }
             Ok(MarketDataKind::NoBookChange)
         }
+    }
+
+    fn handle_mass_cancel_completed(
+        command: Command,
+        account_id: AccountId,
+        scope: MassCancelScope,
+        cancelled_order_count: u64,
+        cancelled_quantity_lots: u128,
+        progress: &mut MassCancelProgress,
+    ) -> Result<MarketDataKind, MarketDataError> {
+        let Command::MassCancel(mass_cancel) = command else {
+            return Err(MarketDataError::TraceMismatch(
+                "non-mass-cancel command emitted MassCancelCompleted",
+            ));
+        };
+        if progress.completed
+            || mass_cancel.account_id != account_id
+            || mass_cancel.scope != scope
+            || progress.order_count != cancelled_order_count
+            || progress.quantity_lots != cancelled_quantity_lots
+        {
+            return Err(MarketDataError::TraceMismatch(
+                "MassCancelCompleted contradicts its command or cancellations",
+            ));
+        }
+        progress.completed = true;
+        Ok(MarketDataKind::NoBookChange)
     }
 
     #[allow(
@@ -833,6 +1021,8 @@ impl MarketDataPublisher {
         new_price: Price,
         old_quantity: Quantity,
         new_quantity: Quantity,
+        old_display: OrderDisplay,
+        new_display: OrderDisplay,
         priority_retained: bool,
         replacement_side: &mut Option<Side>,
     ) -> Result<MarketDataKind, MarketDataError> {
@@ -844,6 +1034,7 @@ impl MarketDataPublisher {
         if replace.order_id != order_id
             || replace.new_price != new_price
             || replace.new_quantity != new_quantity
+            || replace.new_display != new_display
         {
             return Err(MarketDataError::TraceMismatch(
                 "OrderReplaced differs from its source command",
@@ -856,18 +1047,26 @@ impl MarketDataPublisher {
             .ok_or(MarketDataError::TraceMismatch(
                 "replacement target is absent",
             ))?;
-        if old.price != old_price || old.leaves != old_quantity.lots() {
+        if old.price != old_price
+            || old.leaves != old_quantity.lots()
+            || old.display != old_display
+            || old.account_id != replace.account_id
+        {
             return Err(MarketDataError::TraceMismatch(
                 "replacement old state differs from public state",
             ));
         }
         let level = if priority_retained {
-            if new_price != old.price || new_quantity.lots() > old.leaves {
+            if new_price != old.price
+                || new_quantity.lots() > old.leaves
+                || new_display != old.display
+            {
                 return Err(MarketDataError::TraceMismatch(
                     "priority-retaining replacement increased exposure",
                 ));
             }
-            let reduction = old.leaves - new_quantity.lots();
+            let new_displayed = old.displayed.min(new_quantity.lots());
+            let displayed_reduction = old.displayed - new_displayed;
             let tracked = self
                 .orders
                 .get_mut(&order_id)
@@ -875,10 +1074,11 @@ impl MarketDataPublisher {
                     "replacement target disappeared",
                 ))?;
             tracked.leaves = new_quantity.lots();
-            self.reduce_level_quantity(old.side, old.price, reduction)?
+            tracked.displayed = new_displayed;
+            self.reduce_level_quantity(old.side, old.price, displayed_reduction)?
         } else {
             *replacement_side = Some(old.side);
-            self.decrement_order(order_id, old.leaves)?
+            self.remove_tracked_order(order_id, old.leaves)?
         };
         Ok(MarketDataKind::Level(level))
     }
@@ -891,14 +1091,18 @@ impl MarketDataPublisher {
         quantity: Quantity,
         policy: SelfTradePrevention,
     ) -> Result<MarketDataKind, MarketDataError> {
-        if aggressor_order_id != command_order_id(command) {
+        if command_order_id(command) != Some(aggressor_order_id) {
             return Err(MarketDataError::TraceMismatch(
                 "self-trade aggressor differs from the source command",
             ));
         }
-        if !self.orders.contains_key(&resting_order_id) {
+        if self
+            .orders
+            .get(&resting_order_id)
+            .is_none_or(|resting| resting.account_id != command_account_id(command))
+        {
             return Err(MarketDataError::TraceMismatch(
-                "self-trade resting order is absent",
+                "self-trade resting order is absent or owned by another account",
             ));
         }
         if policy == SelfTradePrevention::DecrementAndCancel {
@@ -942,19 +1146,22 @@ impl MarketDataPublisher {
             .ok_or(MarketDataError::TraceMismatch(
                 "decremented order is absent from public state",
             ))?;
-        if quantity == 0 || quantity > order.leaves {
+        if quantity == 0 || quantity > order.displayed {
             return Err(MarketDataError::TraceMismatch(
-                "decremented quantity exceeds resting leaves",
+                "decremented quantity exceeds the displayed resting slice",
             ));
         }
         let removes_order = quantity == order.leaves;
+        let removes_display = quantity == order.displayed;
         if removes_order {
             self.orders.remove(&order_id);
         } else {
-            self.orders
+            let tracked = self
+                .orders
                 .get_mut(&order_id)
-                .expect("checked resting order exists")
-                .leaves -= quantity;
+                .expect("checked resting order exists");
+            tracked.leaves -= quantity;
+            tracked.displayed -= quantity;
         }
         let level = self.levels_mut(order.side).get_mut(&order.price).ok_or(
             MarketDataError::TraceMismatch("resting order references an absent public level"),
@@ -964,7 +1171,7 @@ impl MarketDataPublisher {
                 "public level quantity is smaller than its order decrement",
             ),
         )?;
-        if removes_order {
+        if removes_display {
             level.order_count =
                 level
                     .order_count
@@ -973,6 +1180,47 @@ impl MarketDataPublisher {
                         "public level order count underflowed",
                     ))?;
         }
+        let result =
+            MarketDataLevel::new(order.side, order.price, level.quantity, level.order_count)?;
+        if result.quantity == 0 {
+            self.levels_mut(order.side).remove(&order.price);
+        }
+        Ok(result)
+    }
+
+    fn remove_tracked_order(
+        &mut self,
+        order_id: OrderId,
+        total_quantity: u64,
+    ) -> Result<MarketDataLevel, MarketDataError> {
+        let order = self
+            .orders
+            .remove(&order_id)
+            .ok_or(MarketDataError::TraceMismatch(
+                "removed order is absent from public state",
+            ))?;
+        if total_quantity != order.leaves || order.displayed == 0 {
+            self.orders.insert(order_id, order);
+            return Err(MarketDataError::TraceMismatch(
+                "removed quantity differs from total resting leaves",
+            ));
+        }
+        let level = self.levels_mut(order.side).get_mut(&order.price).ok_or(
+            MarketDataError::TraceMismatch("resting order references an absent public level"),
+        )?;
+        level.quantity = level
+            .quantity
+            .checked_sub(u128::from(order.displayed))
+            .ok_or(MarketDataError::TraceMismatch(
+                "public level quantity is smaller than the removed display",
+            ))?;
+        level.order_count =
+            level
+                .order_count
+                .checked_sub(1)
+                .ok_or(MarketDataError::TraceMismatch(
+                    "public level order count underflowed",
+                ))?;
         let result =
             MarketDataLevel::new(order.side, order.price, level.quantity, level.order_count)?;
         if result.quantity == 0 {
@@ -1442,19 +1690,43 @@ fn levels_in_priority(side: Side, levels: &BTreeMap<Price, Aggregate>) -> Vec<Ma
     }
 }
 
+const fn displayed_lots(display: OrderDisplay, leaves: u64) -> u64 {
+    match display {
+        OrderDisplay::FullyDisplayed => leaves,
+        OrderDisplay::Reserve { peak } => {
+            if peak.lots() < leaves {
+                peak.lots()
+            } else {
+                leaves
+            }
+        }
+    }
+}
+
 const fn command_id(command: Command) -> CommandId {
     match command {
         Command::New(value) => value.command_id,
         Command::Cancel(value) => value.command_id,
         Command::Replace(value) => value.command_id,
+        Command::MassCancel(value) => value.command_id,
     }
 }
 
-const fn command_order_id(command: Command) -> OrderId {
+const fn command_order_id(command: Command) -> Option<OrderId> {
     match command {
-        Command::New(value) => value.order_id,
-        Command::Cancel(value) => value.order_id,
-        Command::Replace(value) => value.order_id,
+        Command::New(value) => Some(value.order_id),
+        Command::Cancel(value) => Some(value.order_id),
+        Command::Replace(value) => Some(value.order_id),
+        Command::MassCancel(_) => None,
+    }
+}
+
+const fn command_account_id(command: Command) -> AccountId {
+    match command {
+        Command::New(value) => value.account_id,
+        Command::Cancel(value) => value.account_id,
+        Command::Replace(value) => value.account_id,
+        Command::MassCancel(value) => value.account_id,
     }
 }
 
@@ -1463,6 +1735,7 @@ const fn command_instrument(command: Command) -> InstrumentId {
         Command::New(value) => value.instrument_id,
         Command::Cancel(value) => value.instrument_id,
         Command::Replace(value) => value.instrument_id,
+        Command::MassCancel(value) => value.instrument_id,
     }
 }
 
@@ -1471,6 +1744,7 @@ const fn command_version(command: Command) -> InstrumentVersion {
         Command::New(value) => value.instrument_version,
         Command::Cancel(value) => value.instrument_version,
         Command::Replace(value) => value.instrument_version,
+        Command::MassCancel(value) => value.instrument_version,
     }
 }
 
@@ -1479,6 +1753,7 @@ const fn command_time(command: Command) -> TimestampNs {
         Command::New(value) => value.received_at,
         Command::Cancel(value) => value.received_at,
         Command::Replace(value) => value.received_at,
+        Command::MassCancel(value) => value.received_at,
     }
 }
 

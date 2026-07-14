@@ -3,21 +3,23 @@ use quotick::instrument::{
     InstrumentDefinition, InstrumentError, InstrumentKind, InstrumentSpec, InstrumentSymbol,
     PriceRules, QuantityRules, TradingState,
 };
-use quotick::ledger::{JournalEntry, Posting};
+use quotick::ledger::{
+    JournalEntry, Ledger, LedgerCorrection, LedgerEntryKind, LedgerError, LedgerRecord, Posting,
+};
 use quotick::market_data::{
     MarketDataError, MarketDataPublisher, MarketDataReplica, MarketDataSnapshot, MarketDataUpdate,
 };
 use quotick::matching::{
     CancelOrder, CancelReason, Command, CommandOutcome, Event, EventKind, ExecutionReport,
-    NewOrder, OrderBook, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce,
-    Trade,
+    MassCancel, MassCancelScope, NewOrder, OrderBook, OrderDisplay, OrderType, RejectReason,
+    ReplaceOrder, SelfTradePrevention, TimeInForce, Trade,
 };
 use quotick::risk::{
     AccountRiskDefinition, AccountRiskState, RiskError, RiskLimitSpec, RiskLimits, RiskProfile,
 };
 use quotick::{
-    AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
-    TimestampNs, TradeId, TransactionId,
+    AccountId, AccountingDate, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price,
+    Quantity, Side, TimestampNs, TradeId, TransactionId,
 };
 
 fn id<T>(result: Result<T, quotick::domain::DomainError>) -> T {
@@ -40,6 +42,7 @@ fn definition() -> InstrumentDefinition {
         price: PriceRules::new(0, 1, Price::from_raw(i64::MIN), Price::from_raw(i64::MAX))
             .expect("price rules"),
         quantity: QuantityRules::new(1, 1, u64::MAX).expect("quantity rules"),
+        reserve: quotick::instrument::ReserveOrderRules::disabled(),
         base_units_per_lot: 1,
         quote_units_per_price_unit: 1,
         trading_state: TradingState::Open,
@@ -56,6 +59,7 @@ fn command(command_id: u64, order_id: u64, side: Side) -> Command {
         instrument_version: version(),
         side,
         quantity: Quantity::new(5).expect("positive quantity"),
+        display: quotick::matching::OrderDisplay::FullyDisplayed,
         order_type: OrderType::Limit(Price::from_raw(-7)),
         time_in_force: TimeInForce::ImmediateOrCancel,
         self_trade_prevention: SelfTradePrevention::CancelBoth,
@@ -74,6 +78,7 @@ fn command_codec_has_a_stable_little_endian_layout() {
     expected.extend_from_slice(&1_u64.to_le_bytes());
     expected.push(0);
     expected.extend_from_slice(&5_u64.to_le_bytes());
+    expected.push(0);
     expected.push(1);
     expected.extend_from_slice(&(-7_i64).to_le_bytes());
     expected.push(1);
@@ -85,6 +90,29 @@ fn command_codec_has_a_stable_little_endian_layout() {
         Command::decode(&encoded).expect("valid command"),
         command(1, 2, Side::Buy)
     );
+}
+
+#[test]
+fn mass_cancel_codec_has_a_stable_little_endian_layout() {
+    let value = Command::MassCancel(MassCancel {
+        command_id: id(CommandId::new(4)),
+        account_id: id(AccountId::new(5)),
+        instrument_id: id(InstrumentId::new(6)),
+        instrument_version: version(),
+        scope: MassCancelScope::Side(Side::Sell),
+        received_at: TimestampNs::from_unix_nanos(7),
+    });
+    let encoded = value.encode().unwrap();
+    let mut expected = vec![3];
+    expected.extend_from_slice(&4_u64.to_le_bytes());
+    expected.extend_from_slice(&5_u64.to_le_bytes());
+    expected.extend_from_slice(&6_u64.to_le_bytes());
+    expected.extend_from_slice(&1_u64.to_le_bytes());
+    expected.push(1);
+    expected.push(1);
+    expected.extend_from_slice(&7_u64.to_le_bytes());
+    assert_eq!(encoded, expected);
+    assert_eq!(Command::decode(&encoded).unwrap(), value);
 }
 
 #[test]
@@ -100,6 +128,7 @@ fn market_data_codecs_round_trip_stable_incrementals_and_full_depth_snapshots() 
         instrument_version: version(),
         side: Side::Buy,
         quantity: Quantity::new(5).expect("quantity"),
+        display: quotick::matching::OrderDisplay::FullyDisplayed,
         order_type: OrderType::Limit(Price::from_raw(-7)),
         time_in_force: TimeInForce::GoodTilCancelled,
         self_trade_prevention: SelfTradePrevention::CancelBoth,
@@ -189,13 +218,32 @@ fn codec_rejects_truncation_invalid_tags_and_trailing_bytes() {
         Command::decode(&trailing),
         Err(CodecError::TrailingBytes(1))
     );
+
+    let mut invalid_scope = Command::MassCancel(MassCancel {
+        command_id: id(CommandId::new(1)),
+        account_id: id(AccountId::new(2)),
+        instrument_id: id(InstrumentId::new(3)),
+        instrument_version: version(),
+        scope: MassCancelScope::All,
+        received_at: TimestampNs::from_unix_nanos(4),
+    })
+    .encode()
+    .unwrap();
+    invalid_scope[33] = u8::MAX;
+    assert_eq!(
+        Command::decode(&invalid_scope),
+        Err(CodecError::InvalidTag {
+            type_name: "MassCancelScope",
+            tag: u8::MAX,
+        })
+    );
 }
 
 #[test]
 fn instrument_definition_codec_round_trips_and_revalidates_rules() {
     let value = definition();
     let encoded = value.encode().expect("definition encodes");
-    assert_eq!(encoded.len(), 112);
+    assert_eq!(encoded.len(), 116);
     assert_eq!(
         InstrumentDefinition::decode(&encoded).expect("definition decodes"),
         value
@@ -302,7 +350,16 @@ fn every_command_variant_round_trips() {
             instrument_version: version(),
             new_quantity: Quantity::new(7).expect("positive quantity"),
             new_price: Price::from_raw(i64::MIN),
+            new_display: quotick::matching::OrderDisplay::FullyDisplayed,
             received_at: TimestampNs::from_unix_nanos(u64::MAX),
+        }),
+        Command::MassCancel(MassCancel {
+            command_id: id(CommandId::new(4)),
+            account_id: id(AccountId::new(5)),
+            instrument_id: id(InstrumentId::new(6)),
+            instrument_version: version(),
+            scope: MassCancelScope::Side(Side::Sell),
+            received_at: TimestampNs::from_unix_nanos(7),
         }),
     ];
 
@@ -324,6 +381,7 @@ fn execution_reports_round_trip_without_losing_trace_information() {
         instrument_version: version(),
         side: Side::Sell,
         quantity: Quantity::new(8).expect("positive quantity"),
+        display: quotick::matching::OrderDisplay::FullyDisplayed,
         order_type: OrderType::Limit(Price::from_raw(101)),
         time_in_force: TimeInForce::GoodTilCancelled,
         self_trade_prevention: SelfTradePrevention::CancelAggressor,
@@ -339,6 +397,7 @@ fn execution_reports_round_trip_without_losing_trace_information() {
             instrument_version: version(),
             side: Side::Buy,
             quantity: Quantity::new(5).expect("positive quantity"),
+            display: quotick::matching::OrderDisplay::FullyDisplayed,
             order_type: OrderType::Limit(Price::from_raw(101)),
             time_in_force: TimeInForce::ImmediateOrCancel,
             self_trade_prevention: SelfTradePrevention::CancelAggressor,
@@ -427,6 +486,10 @@ fn every_rejection_reason_has_a_stable_round_trip() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive fixture keeps every event discriminant visible together"
+)]
 fn every_event_variant_round_trips() {
     let command_id = id(CommandId::new(7));
     let order_id = id(OrderId::new(8));
@@ -436,11 +499,16 @@ fn every_event_variant_round_trips() {
     let instrument_id = id(InstrumentId::new(12));
     let quantity = Quantity::new(13).expect("positive quantity");
     let kinds = [
-        EventKind::OrderAccepted { order_id, quantity },
+        EventKind::OrderAccepted {
+            order_id,
+            quantity,
+            display: OrderDisplay::FullyDisplayed,
+        },
         EventKind::OrderRested {
             order_id,
             price: Price::from_raw(-14),
             leaves_quantity: quantity,
+            displayed_quantity: quantity,
         },
         EventKind::Trade(Trade {
             trade_id: id(TradeId::new(15)),
@@ -466,6 +534,10 @@ fn every_event_variant_round_trips() {
             new_price: Price::from_raw(16),
             old_quantity: quantity,
             new_quantity: Quantity::new(17).expect("positive quantity"),
+            old_display: OrderDisplay::FullyDisplayed,
+            new_display: OrderDisplay::Reserve {
+                peak: Quantity::new(3).expect("positive peak"),
+            },
             priority_retained: false,
         },
         EventKind::SelfTradePrevented {
@@ -473,6 +545,18 @@ fn every_event_variant_round_trips() {
             resting_order_id: other_order_id,
             quantity,
             policy: SelfTradePrevention::DecrementAndCancel,
+        },
+        EventKind::OrderRefreshed {
+            order_id,
+            price: Price::from_raw(-14),
+            displayed_quantity: Quantity::new(3).expect("positive displayed quantity"),
+            leaves_quantity: quantity,
+        },
+        EventKind::MassCancelCompleted {
+            account_id,
+            scope: MassCancelScope::Side(Side::Sell),
+            cancelled_order_count: 2,
+            cancelled_quantity_lots: 26,
         },
     ];
     let events = kinds
@@ -520,6 +604,8 @@ fn journal_entry_codec_preserves_canonical_posting_order() {
     let entry = JournalEntry::new(
         id(TransactionId::new(9)),
         77,
+        AccountingDate::from_days_since_unix_epoch(12),
+        TimestampNs::from_unix_nanos(34),
         vec![
             Posting {
                 account_id: id(AccountId::new(2)),
@@ -536,9 +622,78 @@ fn journal_entry_codec_preserves_canonical_posting_order() {
     .expect("balanced entry");
 
     let encoded = entry.encode().expect("entry encodes");
+    assert_eq!(encoded.len(), 111);
     let decoded = JournalEntry::decode(&encoded).expect("valid journal entry");
     assert_eq!(decoded, entry);
     assert_eq!(decoded.encode().expect("decoded entry re-encodes"), encoded);
+    assert_eq!(&encoded[encoded.len() - 14..], &[0; 14]);
+}
+
+#[test]
+fn journal_entry_codec_preserves_reversal_lineage_and_rejects_invalid_kind_metadata() {
+    let original = JournalEntry::new(
+        id(TransactionId::new(9)),
+        77,
+        AccountingDate::from_days_since_unix_epoch(12),
+        TimestampNs::from_unix_nanos(34),
+        vec![
+            Posting {
+                account_id: id(AccountId::new(1)),
+                asset_id: id(AssetId::new(8)),
+                amount: 50,
+            },
+            Posting {
+                account_id: id(AccountId::new(2)),
+                asset_id: id(AssetId::new(8)),
+                amount: -50,
+            },
+        ],
+    )
+    .unwrap();
+    let reversal = JournalEntry::reversal(
+        id(TransactionId::new(10)),
+        78,
+        AccountingDate::from_days_since_unix_epoch(13),
+        TimestampNs::from_unix_nanos(35),
+        &original,
+    )
+    .unwrap();
+    let encoded = reversal.encode().unwrap();
+    assert_eq!(encoded.len(), 111);
+    let metadata = encoded.len() - 14;
+    assert_eq!(encoded[metadata], 1);
+    assert_eq!(
+        u64::from_le_bytes(encoded[metadata + 1..metadata + 9].try_into().unwrap()),
+        9
+    );
+    let decoded = JournalEntry::decode(&encoded).unwrap();
+    assert_eq!(decoded, reversal);
+    assert_eq!(
+        decoded.kind(),
+        LedgerEntryKind::Reversal {
+            reversed_transaction_id: id(TransactionId::new(9))
+        }
+    );
+
+    let mut standard_with_relation = original.encode().unwrap();
+    let metadata = standard_with_relation.len() - 14;
+    standard_with_relation[metadata + 1..metadata + 9].copy_from_slice(&9_u64.to_le_bytes());
+    assert_eq!(
+        JournalEntry::decode(&standard_with_relation),
+        Err(CodecError::InvalidValue(
+            "standard ledger entry has control metadata"
+        ))
+    );
+    let mut unknown_kind = original.encode().unwrap();
+    let metadata = unknown_kind.len() - 14;
+    unknown_kind[metadata] = 255;
+    assert_eq!(
+        JournalEntry::decode(&unknown_kind),
+        Err(CodecError::InvalidTag {
+            type_name: "ledger entry kind",
+            tag: 255,
+        })
+    );
 }
 
 #[test]
@@ -546,6 +701,8 @@ fn journal_entry_decoder_rejects_noncanonical_wire_order() {
     let entry = JournalEntry::new(
         id(TransactionId::new(9)),
         77,
+        AccountingDate::from_days_since_unix_epoch(12),
+        TimestampNs::from_unix_nanos(34),
         vec![
             Posting {
                 account_id: id(AccountId::new(1)),
@@ -561,15 +718,197 @@ fn journal_entry_decoder_rejects_noncanonical_wire_order() {
     )
     .expect("balanced entry");
     let mut bytes = entry.encode().expect("entry encodes");
-    let first = bytes[20..52].to_vec();
-    let second = bytes[52..84].to_vec();
-    bytes[20..52].copy_from_slice(&second);
-    bytes[52..84].copy_from_slice(&first);
+    let first = bytes[33..65].to_vec();
+    let second = bytes[65..97].to_vec();
+    bytes[33..65].copy_from_slice(&second);
+    bytes[65..97].copy_from_slice(&first);
 
     assert_eq!(
         JournalEntry::decode(&bytes),
         Err(CodecError::InvalidValue(
             "journal entry postings are not in canonical order"
         ))
+    );
+}
+
+#[test]
+fn period_control_entry_codec_preserves_zero_posting_state_and_rejects_shape_confusion() {
+    let mut ledger = Ledger::new();
+    ledger
+        .close_period(
+            id(TransactionId::new(20)),
+            80,
+            TimestampNs::from_unix_nanos(40),
+            AccountingDate::from_days_since_unix_epoch(12),
+        )
+        .unwrap();
+    ledger
+        .reopen_period(
+            id(TransactionId::new(21)),
+            81,
+            TimestampNs::from_unix_nanos(41),
+            None,
+        )
+        .unwrap();
+
+    let close = ledger.transaction(id(TransactionId::new(20))).unwrap();
+    let encoded_close = close.encode().unwrap();
+    assert_eq!(encoded_close.len(), 47);
+    assert_eq!(JournalEntry::decode(&encoded_close).unwrap(), *close);
+    assert_eq!(close.effective_date(), None);
+    assert!(close.postings().is_empty());
+
+    let reopen = ledger.transaction(id(TransactionId::new(21))).unwrap();
+    let encoded_reopen = reopen.encode().unwrap();
+    assert_eq!(encoded_reopen.len(), 47);
+    assert_eq!(JournalEntry::decode(&encoded_reopen).unwrap(), *reopen);
+    assert_eq!(
+        reopen.kind(),
+        LedgerEntryKind::PeriodReopen {
+            new_closed_through: None
+        }
+    );
+
+    let mut financial_shape = encoded_close.clone();
+    financial_shape[16] = 1;
+    assert_eq!(
+        JournalEntry::decode(&financial_shape),
+        Err(CodecError::InvalidJournalEntry(
+            LedgerError::ControlEntryHasEffectiveDate
+        ))
+    );
+
+    let mut missing_close_boundary = encoded_close;
+    let metadata = missing_close_boundary.len() - 14;
+    missing_close_boundary[metadata + 9] = 0;
+    missing_close_boundary[metadata + 10..metadata + 14].copy_from_slice(&0_i32.to_le_bytes());
+    assert_eq!(
+        JournalEntry::decode(&missing_close_boundary),
+        Err(CodecError::InvalidValue(
+            "period-close ledger entry has invalid metadata"
+        ))
+    );
+
+    let mut missing_effective_date = JournalEntry::new(
+        id(TransactionId::new(22)),
+        82,
+        AccountingDate::UNIX_EPOCH,
+        TimestampNs::from_unix_nanos(42),
+        vec![
+            Posting {
+                account_id: id(AccountId::new(1)),
+                asset_id: id(AssetId::new(8)),
+                amount: 50,
+            },
+            Posting {
+                account_id: id(AccountId::new(2)),
+                asset_id: id(AssetId::new(8)),
+                amount: -50,
+            },
+        ],
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
+    let mut control_with_postings = missing_effective_date.clone();
+    control_with_postings[16] = 0;
+    let metadata = control_with_postings.len() - 14;
+    control_with_postings[metadata] = 2;
+    control_with_postings[metadata + 9] = 1;
+    control_with_postings[metadata + 10..metadata + 14].copy_from_slice(&12_i32.to_le_bytes());
+    assert_eq!(
+        JournalEntry::decode(&control_with_postings),
+        Err(CodecError::InvalidJournalEntry(
+            LedgerError::ControlEntryHasPostings
+        ))
+    );
+
+    missing_effective_date[16] = 0;
+    assert_eq!(
+        JournalEntry::decode(&missing_effective_date),
+        Err(CodecError::InvalidJournalEntry(
+            LedgerError::FinancialEntryMissingEffectiveDate
+        ))
+    );
+}
+
+#[test]
+fn ledger_correction_and_record_codecs_preserve_atomic_grouping() {
+    let original = JournalEntry::new(
+        id(TransactionId::new(30)),
+        30,
+        AccountingDate::from_days_since_unix_epoch(10),
+        TimestampNs::from_unix_nanos(100),
+        vec![
+            Posting {
+                account_id: id(AccountId::new(1)),
+                asset_id: id(AssetId::new(8)),
+                amount: 50,
+            },
+            Posting {
+                account_id: id(AccountId::new(2)),
+                asset_id: id(AssetId::new(8)),
+                amount: -50,
+            },
+        ],
+    )
+    .unwrap();
+    let replacement = JournalEntry::new(
+        id(TransactionId::new(32)),
+        32,
+        AccountingDate::from_days_since_unix_epoch(11),
+        TimestampNs::from_unix_nanos(102),
+        vec![
+            Posting {
+                account_id: id(AccountId::new(1)),
+                asset_id: id(AssetId::new(8)),
+                amount: 40,
+            },
+            Posting {
+                account_id: id(AccountId::new(2)),
+                asset_id: id(AssetId::new(8)),
+                amount: -40,
+            },
+        ],
+    )
+    .unwrap();
+    let correction = LedgerCorrection::new(
+        id(TransactionId::new(31)),
+        31,
+        AccountingDate::from_days_since_unix_epoch(11),
+        TimestampNs::from_unix_nanos(101),
+        replacement,
+        &original,
+    )
+    .unwrap();
+    let encoded = correction.encode().unwrap();
+    assert_eq!(encoded.len(), 230);
+    assert_eq!(LedgerCorrection::decode(&encoded).unwrap(), correction);
+
+    let record = LedgerRecord::Correction(correction.clone());
+    let encoded_record = record.encode().unwrap();
+    assert_eq!(encoded_record.len(), 231);
+    assert_eq!(LedgerRecord::decode(&encoded_record).unwrap(), record);
+
+    let mut nonstandard_replacement = encoded;
+    let replacement_metadata = nonstandard_replacement.len() - 14;
+    nonstandard_replacement[replacement_metadata] = 1;
+    nonstandard_replacement[replacement_metadata + 1..replacement_metadata + 9]
+        .copy_from_slice(&30_u64.to_le_bytes());
+    assert_eq!(
+        LedgerCorrection::decode(&nonstandard_replacement),
+        Err(CodecError::InvalidJournalEntry(
+            LedgerError::CorrectionReplacementNotStandard(id(TransactionId::new(32)))
+        ))
+    );
+
+    let mut unknown_record = encoded_record;
+    unknown_record[0] = 255;
+    assert_eq!(
+        LedgerRecord::decode(&unknown_record),
+        Err(CodecError::InvalidTag {
+            type_name: "ledger record",
+            tag: 255,
+        })
     );
 }

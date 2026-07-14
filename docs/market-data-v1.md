@@ -14,6 +14,14 @@ native Rust representation is serialized.
   renumbering or conflation in version 1.
 - `NoBookChange` preserves continuity for private lifecycle events that do not
   modify public depth or print a trade.
+- Reserve hidden leaves are never included in public quantity or order count.
+  A depleted visible slice can delete an order/level in its trade update; a
+  following source-sequenced level update publishes the replenished slice after
+  the private order has requeued at the FIFO tail.
+- Each order selected by a private mass cancel produces its normal absolute
+  level update. The private aggregate completion produces `NoBookChange`, so
+  account, scope, order identifiers, and hidden total leaves remain absent from
+  the public payload while sequence continuity is preserved.
 - A level update is absolute state after its source event. Quantity and order
   count are either both zero, meaning deletion, or both non-zero.
 - A trade update contains an anonymized print and the absolute maker-level state
@@ -74,6 +82,10 @@ For tag 2, trade price equals maker-level price, aggressor side opposes maker
 side, and trade ID cannot exceed the event sequence. A replica additionally
 requires the prior maker-level quantity minus printed quantity to equal the new
 absolute quantity; maker order count must remain constant or decrease by one.
+For a fully depleted reserve slice, the count decreases even though the private
+order retains hidden leaves. Its subsequent refresh is an ordinary absolute
+level update at the next matching-event sequence and increases visible order
+count again.
 
 ## Full-depth snapshot
 
@@ -95,6 +107,9 @@ The decoder rejects invalid tags, zero identifiers, truncated collections,
 trailing bytes, empty occupied levels, wrong-side levels, duplicate or
 non-priority-ordered prices, and crossed or locked snapshots.
 
+Snapshots contain displayed aggregate quantity only. Total hidden reserve
+leaves and private reserve order identifiers are intentionally absent.
+
 ## Gap recovery protocol
 
 For a transport that acquires snapshots independently of incrementals, the
@@ -111,3 +126,18 @@ race-free consumer procedure is:
 `MarketDataReplica` implements snapshot replacement, contiguous batch
 application, nonmutating gap detection, and fail-closed structural poisoning.
 Transport buffering and retry orchestration remain outside this payload layer.
+
+## Information boundary
+
+Although hidden total leaves are excluded, a refresh proves that additional
+quantity survived the preceding slice depletion, and a final partial slice can
+bound that surviving quantity. Version 1 performs no delay, conflation,
+randomized peak, or venue-specific obfuscation. Consumers must therefore treat
+the feed as displayed-depth data, not as proof that reserve size is
+non-inferable.
+
+The distinction between displayed peak and hidden total, and the possibility
+of changed priority on native-iceberg refresh, are documented by the
+[CME Market by Order FAQ](https://www.cmegroup.com/articles/faqs/market-by-order-mbo.html).
+This payload remains Quotick-specific and does not claim byte or behavioral
+compatibility with a CME market-data channel.
