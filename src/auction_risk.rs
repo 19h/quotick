@@ -4,9 +4,12 @@
 //! risk failures into ordinary idempotent auction reports, reserves every
 //! accepted market or limit order at its maximum reachable absolute collar
 //! price, and applies all uncross position deltas only after netting per account.
+//! Profile, reservation, and uncross-netting indexes own fixed-capacity dense
+//! storage before the coupled engine exists. Reservations additionally maintain
+//! allocation-free intrusive per-account membership for exact aggregate audit.
 
-use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::auction::AuctionOrderConstraint;
 use crate::auction_book::{
@@ -19,6 +22,7 @@ use crate::auction_engine::{
     CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionExecutionReport,
     CallAuctionRejectReason, PreparedCallAuctionCommand,
 };
+use crate::bounded_hash::BoundedHashMap;
 use crate::domain::{AccountId, OrderId, Side};
 use crate::instrument::InstrumentDefinition;
 use crate::risk::{
@@ -106,7 +110,7 @@ impl Default for CallAuctionRiskLimits {
 }
 
 /// Failure while constructing one coupled call-auction/risk shard.
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CallAuctionRiskConstructionError {
     /// The underlying auction engine could not be constructed.
     Auction(CallAuctionEngineConstructionError),
@@ -156,6 +160,8 @@ impl From<CallAuctionEngineConstructionError> for CallAuctionRiskConstructionErr
 struct CallAuctionRiskAccount {
     profile: RiskProfile,
     exposure: RiskSnapshot,
+    reservation_head: Option<OrderId>,
+    reservation_tail: Option<OrderId>,
 }
 
 /// Conservative reservation retained for one active call-auction order.
@@ -167,6 +173,13 @@ pub struct CallAuctionReservationSnapshot {
     valuation_per_lot: u64,
     quantity_lots: u64,
     notional: u128,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveCallAuctionReservation {
+    snapshot: CallAuctionReservationSnapshot,
+    previous: Option<OrderId>,
+    next: Option<OrderId>,
 }
 
 impl CallAuctionReservationSnapshot {
@@ -217,9 +230,9 @@ struct ExecutedLots {
 #[derive(Debug)]
 pub struct CallAuctionRiskEngine {
     definition: InstrumentDefinition,
-    accounts: HashMap<AccountId, CallAuctionRiskAccount>,
-    reservations: HashMap<OrderId, CallAuctionReservationSnapshot>,
-    position_scratch: HashMap<AccountId, ExecutedLots>,
+    accounts: BoundedHashMap<AccountId, CallAuctionRiskAccount>,
+    reservations: BoundedHashMap<OrderId, ActiveCallAuctionReservation>,
+    position_scratch: BoundedHashMap<AccountId, ExecutedLots>,
     maximum_accounts: usize,
     maximum_reservations: usize,
 }
@@ -229,18 +242,12 @@ impl CallAuctionRiskEngine {
         definition: InstrumentDefinition,
         limits: CallAuctionRiskLimits,
     ) -> Result<Self, CallAuctionRiskConstructionError> {
-        let mut accounts = HashMap::new();
-        accounts
-            .try_reserve(limits.max_registered_accounts())
+        let accounts = BoundedHashMap::try_new(limits.max_registered_accounts())
             .map_err(|_| CallAuctionRiskConstructionError::AccountReservationFailed)?;
         let maximum_reservations = limits.auction().book().max_active_orders();
-        let mut reservations = HashMap::new();
-        reservations
-            .try_reserve(maximum_reservations)
+        let reservations = BoundedHashMap::try_new(maximum_reservations)
             .map_err(|_| CallAuctionRiskConstructionError::OrderReservationFailed)?;
-        let mut position_scratch = HashMap::new();
-        position_scratch
-            .try_reserve(limits.max_registered_accounts())
+        let position_scratch = BoundedHashMap::try_new(limits.max_registered_accounts())
             .map_err(|_| CallAuctionRiskConstructionError::PositionScratchReservationFailed)?;
         Ok(Self {
             definition,
@@ -291,6 +298,8 @@ impl CallAuctionRiskEngine {
                             0,
                             0,
                         ),
+                        reservation_head: None,
+                        reservation_tail: None,
                     },
                 )
                 .is_none()
@@ -310,7 +319,9 @@ impl CallAuctionRiskEngine {
     /// Returns one active auction-order reservation.
     #[must_use]
     pub fn reservation(&self, order_id: OrderId) -> Option<CallAuctionReservationSnapshot> {
-        self.reservations.get(&order_id).copied()
+        self.reservations
+            .get(&order_id)
+            .map(|reservation| reservation.snapshot)
     }
 
     /// Returns active reservation count.
@@ -401,8 +412,6 @@ impl CallAuctionRiskEngine {
     }
 
     fn insert_reservation(&mut self, order: CallAuctionOrderSnapshot) {
-        let capacity = self.reservations.capacity();
-        assert!(self.reservations.len() < capacity);
         let constraint = risk_constraint(order.constraint);
         let valuation_per_lot =
             conservative_price_magnitude(self.definition, order.side, constraint);
@@ -417,11 +426,51 @@ impl CallAuctionRiskEngine {
             quantity_lots: order.quantity.lots(),
             notional,
         };
+        self.append_reservation(order.order_id, reservation);
+    }
+
+    fn append_reservation(
+        &mut self,
+        order_id: OrderId,
+        reservation: CallAuctionReservationSnapshot,
+    ) {
+        let capacity = self.reservations.capacity();
+        assert!(self.reservations.len() < capacity);
+        assert!(!self.reservations.contains_key(&order_id));
+        let previous = self
+            .accounts
+            .get(&reservation.account_id)
+            .expect("authorized auction account must have a risk profile")
+            .reservation_tail;
+        if let Some(previous_id) = previous {
+            let tail = self
+                .reservations
+                .get_mut(&previous_id)
+                .expect("auction risk account tail must reference a reservation");
+            assert!(tail.next.is_none());
+            tail.next = Some(order_id);
+        }
         assert!(
             self.reservations
-                .insert(order.order_id, reservation)
+                .insert(
+                    order_id,
+                    ActiveCallAuctionReservation {
+                        snapshot: reservation,
+                        previous,
+                        next: None,
+                    },
+                )
                 .is_none()
         );
+        let account = self
+            .accounts
+            .get_mut(&reservation.account_id)
+            .expect("authorized auction account must have a risk profile");
+        if account.reservation_head.is_none() {
+            assert!(previous.is_none());
+            account.reservation_head = Some(order_id);
+        }
+        account.reservation_tail = Some(order_id);
         debug_assert_eq!(self.reservations.capacity(), capacity);
         self.add_open_exposure(reservation);
     }
@@ -430,7 +479,7 @@ impl CallAuctionRiskEngine {
         let current = self
             .reservations
             .get(&order_id)
-            .copied()
+            .map(|reservation| reservation.snapshot)
             .expect("auction trade order must have a risk reservation");
         assert!(quantity_lots <= current.quantity_lots);
         self.remove_reservation(order_id);
@@ -447,20 +496,48 @@ impl CallAuctionRiskEngine {
             notional,
             ..current
         };
-        assert!(self.reservations.insert(order_id, replacement).is_none());
+        self.append_reservation(order_id, replacement);
         debug_assert_eq!(self.reservations.capacity(), capacity);
-        self.add_open_exposure(replacement);
     }
 
     fn remove_reservation(&mut self, order_id: OrderId) -> CallAuctionReservationSnapshot {
-        let reservation = self
+        let active = self
             .reservations
             .remove(&order_id)
             .expect("active auction order must have a risk reservation");
+        if let Some(previous_id) = active.previous {
+            let previous = self
+                .reservations
+                .get_mut(&previous_id)
+                .expect("auction risk reservation previous link must resolve");
+            assert_eq!(previous.next, Some(order_id));
+            previous.next = active.next;
+        }
+        if let Some(next_id) = active.next {
+            let next = self
+                .reservations
+                .get_mut(&next_id)
+                .expect("auction risk reservation next link must resolve");
+            assert_eq!(next.previous, Some(order_id));
+            next.previous = active.previous;
+        }
+        let reservation = active.snapshot;
         let account = self
             .accounts
             .get_mut(&reservation.account_id)
             .expect("reserved auction account must have a risk profile");
+        if active.previous.is_none() {
+            assert_eq!(account.reservation_head, Some(order_id));
+            account.reservation_head = active.next;
+        }
+        if active.next.is_none() {
+            assert_eq!(account.reservation_tail, Some(order_id));
+            account.reservation_tail = active.previous;
+        }
+        assert_eq!(
+            account.reservation_head.is_none(),
+            account.reservation_tail.is_none()
+        );
         let exposure = account.exposure;
         let quantity = u128::from(reservation.quantity_lots);
         let (open_buy_lots, open_sell_lots) = match reservation.side {
@@ -535,7 +612,18 @@ impl CallAuctionRiskEngine {
 
     fn add_execution(&mut self, account_id: AccountId, side: Side, quantity_lots: u64) {
         let capacity = self.position_scratch.capacity();
-        let delta = self.position_scratch.entry(account_id).or_default();
+        if !self.position_scratch.contains_key(&account_id) {
+            assert!(
+                self.position_scratch
+                    .insert(account_id, ExecutedLots::default())
+                    .is_none(),
+                "new auction position accumulator must be absent"
+            );
+        }
+        let delta = self
+            .position_scratch
+            .get_mut(&account_id)
+            .expect("auction position accumulator must exist after insertion");
         match side {
             Side::Buy => {
                 delta.buys = delta
@@ -554,7 +642,7 @@ impl CallAuctionRiskEngine {
     }
 
     fn apply_netted_positions(&mut self) {
-        for (&account_id, delta) in &self.position_scratch {
+        for (&account_id, delta) in self.position_scratch.iter() {
             let account = self
                 .accounts
                 .get_mut(&account_id)
@@ -587,11 +675,13 @@ impl CallAuctionRiskEngine {
 
     fn validate(&self) -> Result<(), CallAuctionRiskInvariantViolation> {
         self.validate_resource_bounds()?;
-        let mut aggregates: HashMap<AccountId, (u128, u128, u128, u64)> = HashMap::new();
-        aggregates.try_reserve(self.accounts.len()).map_err(|_| {
-            CallAuctionRiskInvariantViolation::new("auction risk audit allocation failed")
-        })?;
-        for (&order_id, reservation) in &self.reservations {
+        self.validate_reservation_economics()?;
+        self.validate_account_reservation_index()
+    }
+
+    fn validate_reservation_economics(&self) -> Result<(), CallAuctionRiskInvariantViolation> {
+        for (&order_id, active) in self.reservations.iter() {
+            let reservation = active.snapshot;
             let constraint = risk_constraint(reservation.constraint);
             let expected_valuation =
                 conservative_price_magnitude(self.definition, reservation.side, constraint);
@@ -611,11 +701,55 @@ impl CallAuctionRiskEngine {
                     "auction reservation {order_id} is invalid"
                 )));
             }
-            let aggregate = aggregates.entry(reservation.account_id).or_default();
+        }
+        Ok(())
+    }
+
+    fn validate_account_reservation_index(&self) -> Result<(), CallAuctionRiskInvariantViolation> {
+        let mut indexed_reservations = 0_usize;
+        for (&account_id, account) in self.accounts.iter() {
+            self.validate_account_reservations(account_id, account, &mut indexed_reservations)?;
+        }
+        if indexed_reservations != self.reservations.len() {
+            return Err(CallAuctionRiskInvariantViolation::new(
+                "active auction reservation is absent from its account index",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_account_reservations(
+        &self,
+        account_id: AccountId,
+        account: &CallAuctionRiskAccount,
+        indexed_reservations: &mut usize,
+    ) -> Result<(), CallAuctionRiskInvariantViolation> {
+        let mut current = account.reservation_head;
+        let mut previous = None;
+        let mut open_buy_lots = 0_u128;
+        let mut open_sell_lots = 0_u128;
+        let mut open_notional = 0_u128;
+        let mut open_orders = 0_u64;
+        while let Some(order_id) = current {
+            if *indexed_reservations >= self.reservations.len() {
+                return Err(CallAuctionRiskInvariantViolation::new(
+                    "auction reservation occurs more than once or participates in an account-index cycle",
+                ));
+            }
+            let active = self.reservations.get(&order_id).ok_or_else(|| {
+                CallAuctionRiskInvariantViolation::new(
+                    "auction account index references an absent reservation",
+                )
+            })?;
+            let reservation = active.snapshot;
+            if reservation.account_id != account_id || active.previous != previous {
+                return Err(CallAuctionRiskInvariantViolation::new(
+                    "auction reservation account membership or previous link is inconsistent",
+                ));
+            }
             match reservation.side {
                 Side::Buy => {
-                    aggregate.0 = aggregate
-                        .0
+                    open_buy_lots = open_buy_lots
                         .checked_add(u128::from(reservation.quantity_lots))
                         .ok_or_else(|| {
                             CallAuctionRiskInvariantViolation::new(
@@ -624,8 +758,7 @@ impl CallAuctionRiskEngine {
                         })?;
                 }
                 Side::Sell => {
-                    aggregate.1 = aggregate
-                        .1
+                    open_sell_lots = open_sell_lots
                         .checked_add(u128::from(reservation.quantity_lots))
                         .ok_or_else(|| {
                             CallAuctionRiskInvariantViolation::new(
@@ -634,46 +767,65 @@ impl CallAuctionRiskEngine {
                         })?;
                 }
             }
-            aggregate.2 = aggregate
-                .2
+            open_notional = open_notional
                 .checked_add(reservation.notional)
                 .ok_or_else(|| {
                     CallAuctionRiskInvariantViolation::new(
                         "auction reservation notional aggregate overflows",
                     )
                 })?;
-            aggregate.3 = aggregate.3.checked_add(1).ok_or_else(|| {
+            open_orders = open_orders.checked_add(1).ok_or_else(|| {
                 CallAuctionRiskInvariantViolation::new(
                     "auction reservation count aggregate overflows",
                 )
             })?;
+            *indexed_reservations = indexed_reservations.checked_add(1).ok_or_else(|| {
+                CallAuctionRiskInvariantViolation::new(
+                    "auction indexed-reservation count overflows",
+                )
+            })?;
+            previous = Some(order_id);
+            current = active.next;
         }
-        for (&account_id, account) in &self.accounts {
-            let expected = aggregates.get(&account_id).copied().unwrap_or_default();
-            let exposure = account.exposure;
-            if (
+        if previous != account.reservation_tail {
+            return Err(CallAuctionRiskInvariantViolation::new(
+                "auction risk account reservation tail is inconsistent",
+            ));
+        }
+        let exposure = account.exposure;
+        if (
+            exposure.open_buy_lots(),
+            exposure.open_sell_lots(),
+            exposure.open_notional(),
+            exposure.open_orders(),
+        ) != (open_buy_lots, open_sell_lots, open_notional, open_orders)
+            || !position_within_limits(exposure.position_lots(), account.profile.limits())
+            || !worst_case_position_within_limits(
+                exposure.position_lots(),
                 exposure.open_buy_lots(),
                 exposure.open_sell_lots(),
-                exposure.open_notional(),
-                exposure.open_orders(),
-            ) != expected
-                || !position_within_limits(exposure.position_lots(), account.profile.limits())
-                || !worst_case_position_within_limits(
-                    exposure.position_lots(),
-                    exposure.open_buy_lots(),
-                    exposure.open_sell_lots(),
-                    account.profile.limits(),
-                )
-            {
-                return Err(CallAuctionRiskInvariantViolation::new(format!(
-                    "auction risk account {account_id} exposure is invalid"
-                )));
-            }
+                account.profile.limits(),
+            )
+        {
+            return Err(CallAuctionRiskInvariantViolation::new(format!(
+                "auction risk account {account_id} exposure is invalid"
+            )));
         }
         Ok(())
     }
 
     fn validate_resource_bounds(&self) -> Result<(), CallAuctionRiskInvariantViolation> {
+        for (name, layout) in [
+            ("account", self.accounts.validate_layout()),
+            ("reservation", self.reservations.validate_layout()),
+            ("position-scratch", self.position_scratch.validate_layout()),
+        ] {
+            if let Err(detail) = layout {
+                return Err(CallAuctionRiskInvariantViolation::new(format!(
+                    "auction risk {name} hash layout is invalid: {detail}"
+                )));
+            }
+        }
         if self.accounts.capacity() < self.maximum_accounts
             || self.accounts.len() > self.maximum_accounts
         {
@@ -728,11 +880,15 @@ impl fmt::Display for CallAuctionRiskInvariantViolation {
 impl std::error::Error for CallAuctionRiskInvariantViolation {}
 
 /// Canonical coupled call-auction, risk-profile, position, and exposure state.
+///
+/// The canonical account image is immutable shared storage. The embedded
+/// auction image is shared independently, so cloning the complete coupled
+/// checkpoint is `O(1)` and copies no semantic rows or event values.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CallAuctionRiskCheckpoint {
     wal_first_sequence: u64,
     auction: CallAuctionCheckpoint,
-    accounts: Vec<RiskAccountCheckpoint>,
+    accounts: Arc<Vec<RiskAccountCheckpoint>>,
 }
 
 impl CallAuctionRiskCheckpoint {
@@ -757,7 +913,13 @@ impl CallAuctionRiskCheckpoint {
     /// Returns account-sorted immutable profiles and current exposures.
     #[must_use]
     pub fn accounts(&self) -> &[RiskAccountCheckpoint] {
-        &self.accounts
+        self.accounts.as_slice()
+    }
+
+    /// Returns whether two checkpoints share the identical immutable account image.
+    #[must_use]
+    pub fn shares_account_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.accounts, &other.accounts)
     }
 
     pub(crate) fn from_parts(
@@ -768,7 +930,7 @@ impl CallAuctionRiskCheckpoint {
         let checkpoint = Self {
             wal_first_sequence,
             auction,
-            accounts,
+            accounts: Arc::new(accounts),
         };
         checkpoint.validate()?;
         Ok(checkpoint)
@@ -810,12 +972,8 @@ impl CallAuctionRiskCheckpoint {
         let direct = self.restore_direct_with_limits(limits)?;
         let mut replay =
             CallAuctionRiskManagedEngine::try_with_limits(self.auction.definition(), limits)
-                .map_err(|error| {
-                    CallAuctionRiskCheckpointError::new(format!(
-                        "auction risk checkpoint replay construction failed: {error}"
-                    ))
-                })?;
-        for account in &self.accounts {
+                .map_err(CallAuctionRiskCheckpointError::Construction)?;
+        for account in self.accounts.iter() {
             replay.register_account(account.account_id(), account.profile())?;
         }
         for entry in self.auction.history() {
@@ -838,8 +996,8 @@ impl CallAuctionRiskCheckpoint {
             )
             .map_err(CallAuctionRiskCheckpointError::from)?;
         if replayed_auction != self.auction
-            || checkpoint_accounts(&replay.risk) != self.accounts
-            || checkpoint_accounts(&direct.risk) != self.accounts
+            || checkpoint_accounts(&replay.risk)?.as_slice() != self.accounts.as_slice()
+            || checkpoint_accounts(&direct.risk)?.as_slice() != self.accounts.as_slice()
         {
             return Err(CallAuctionRiskCheckpointError::new(
                 "auction risk checkpoint direct state differs from coupled history replay",
@@ -866,14 +1024,10 @@ impl CallAuctionRiskCheckpoint {
             )));
         }
         let engine =
-            CallAuctionEngine::from_checkpoint_with_limits(self.auction.clone(), limits.auction())?;
+            CallAuctionEngine::from_checkpoint_with_limits(&self.auction, limits.auction())?;
         let mut risk = CallAuctionRiskEngine::try_with_limits(self.auction.definition(), limits)
-            .map_err(|error| {
-                CallAuctionRiskCheckpointError::new(format!(
-                    "auction risk checkpoint capacity reservation failed: {error}"
-                ))
-            })?;
-        for account in &self.accounts {
+            .map_err(CallAuctionRiskCheckpointError::Construction)?;
+        for account in self.accounts.iter() {
             risk.register_account(account.account_id(), account.profile())?;
             let registered = risk
                 .accounts
@@ -891,7 +1045,7 @@ impl CallAuctionRiskCheckpoint {
             }
             risk.insert_reservation(order);
         }
-        for account in &self.accounts {
+        for account in self.accounts.iter() {
             let restored = risk
                 .snapshot(account.account_id())
                 .expect("registered checkpoint account exists");
@@ -922,7 +1076,7 @@ impl CallAuctionRiskCheckpoint {
             && self
                 .accounts
                 .iter()
-                .zip(&previous.accounts)
+                .zip(previous.accounts.iter())
                 .all(|(current, old)| {
                     current.account_id() == old.account_id() && current.profile() == old.profile()
                 })
@@ -930,43 +1084,166 @@ impl CallAuctionRiskCheckpoint {
     }
 }
 
+/// One fallibly reserved coupled call-auction/risk checkpoint resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallAuctionRiskCheckpointResource {
+    /// Canonical account/profile/exposure rows copied from live risk state.
+    CaptureAccounts,
+}
+
+impl fmt::Display for CallAuctionRiskCheckpointResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CaptureAccounts => formatter.write_str("capture accounts"),
+        }
+    }
+}
+
 /// Semantic coupled auction/risk checkpoint construction or restoration failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CallAuctionRiskCheckpointError {
-    detail: String,
+pub enum CallAuctionRiskCheckpointError {
+    /// Checkpoint content or coupled-state contradiction.
+    Invalid(String),
+    /// Direct call-auction checkpoint capture or restoration failed.
+    Auction(CallAuctionCheckpointError),
+    /// A temporary coupled risk engine could not be constructed.
+    Construction(CallAuctionRiskConstructionError),
+    /// Immutable profile registration or reconstruction failed.
+    Risk(RiskError),
+    /// A coupled checkpoint capture resource could not be reserved.
+    ResourceReservationFailed {
+        /// Resource whose construction failed.
+        resource: CallAuctionRiskCheckpointResource,
+        /// Requested semantic maximum entries.
+        maximum: usize,
+    },
 }
 
 impl CallAuctionRiskCheckpointError {
     fn new(detail: impl Into<String>) -> Self {
-        Self {
-            detail: detail.into(),
-        }
+        Self::Invalid(detail.into())
     }
 
     /// Returns a stable diagnostic description.
     #[must_use]
     pub fn detail(&self) -> &str {
-        &self.detail
+        match self {
+            Self::Invalid(detail) => detail,
+            Self::Auction(error) => error.detail(),
+            Self::Construction(_) => "auction risk checkpoint construction failed",
+            Self::Risk(_) => "auction risk checkpoint profile reconstruction failed",
+            Self::ResourceReservationFailed { .. } => {
+                "auction risk checkpoint account capture reservation failed"
+            }
+        }
+    }
+
+    /// Returns the failed coupled capture resource.
+    #[must_use]
+    pub const fn resource(&self) -> Option<CallAuctionRiskCheckpointResource> {
+        match self {
+            Self::ResourceReservationFailed { resource, .. } => Some(*resource),
+            Self::Invalid(_) | Self::Auction(_) | Self::Construction(_) | Self::Risk(_) => None,
+        }
+    }
+
+    /// Returns the preserved direct auction-checkpoint failure.
+    #[must_use]
+    pub const fn auction_error(&self) -> Option<&CallAuctionCheckpointError> {
+        match self {
+            Self::Auction(error) => Some(error),
+            Self::Invalid(_)
+            | Self::Construction(_)
+            | Self::Risk(_)
+            | Self::ResourceReservationFailed { .. } => None,
+        }
+    }
+
+    /// Returns the preserved coupled-engine construction failure.
+    #[must_use]
+    pub const fn construction_error(&self) -> Option<&CallAuctionRiskConstructionError> {
+        match self {
+            Self::Construction(error) => Some(error),
+            Self::Invalid(_)
+            | Self::Auction(_)
+            | Self::Risk(_)
+            | Self::ResourceReservationFailed { .. } => None,
+        }
+    }
+
+    /// Returns the preserved profile registration or reconstruction failure.
+    #[must_use]
+    pub const fn risk_error(&self) -> Option<&RiskError> {
+        match self {
+            Self::Risk(error) => Some(error),
+            Self::Invalid(_)
+            | Self::Auction(_)
+            | Self::Construction(_)
+            | Self::ResourceReservationFailed { .. } => None,
+        }
+    }
+
+    /// Returns whether this error or its direct-auction cause is resource exhaustion.
+    #[must_use]
+    pub const fn is_resource_exhaustion(&self) -> bool {
+        match self {
+            Self::Auction(error) => error.is_resource_exhaustion(),
+            Self::ResourceReservationFailed { .. } => true,
+            Self::Invalid(_) | Self::Construction(_) | Self::Risk(_) => false,
+        }
+    }
+
+    /// Returns whether retry under different resource availability can succeed.
+    #[must_use]
+    pub const fn is_operational_failure(&self) -> bool {
+        match self {
+            Self::Auction(error) => error.is_operational_failure(),
+            Self::Construction(_) | Self::ResourceReservationFailed { .. } => true,
+            Self::Invalid(_) | Self::Risk(_) => false,
+        }
     }
 }
 
 impl fmt::Display for CallAuctionRiskCheckpointError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.detail.fmt(formatter)
+        match self {
+            Self::Invalid(detail) => detail.fmt(formatter),
+            Self::Auction(error) => error.fmt(formatter),
+            Self::Construction(error) => {
+                write!(
+                    formatter,
+                    "failed to construct auction risk checkpoint shard: {error}"
+                )
+            }
+            Self::Risk(error) => error.fmt(formatter),
+            Self::ResourceReservationFailed { resource, maximum } => write!(
+                formatter,
+                "failed to reserve auction risk checkpoint {resource} through {maximum} entries"
+            ),
+        }
     }
 }
 
-impl std::error::Error for CallAuctionRiskCheckpointError {}
+impl std::error::Error for CallAuctionRiskCheckpointError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Auction(error) => Some(error),
+            Self::Construction(error) => Some(error),
+            Self::Risk(error) => Some(error),
+            Self::Invalid(_) | Self::ResourceReservationFailed { .. } => None,
+        }
+    }
+}
 
 impl From<CallAuctionCheckpointError> for CallAuctionRiskCheckpointError {
     fn from(error: CallAuctionCheckpointError) -> Self {
-        Self::new(error.detail())
+        Self::Auction(error)
     }
 }
 
 impl From<RiskError> for CallAuctionRiskCheckpointError {
     fn from(error: RiskError) -> Self {
-        Self::new(error.to_string())
+        Self::Risk(error)
     }
 }
 
@@ -1108,11 +1385,11 @@ impl CallAuctionRiskManagedEngine {
         let auction = self
             .engine
             .checkpoint(wal_metadata_sequence, wal_sequence)?;
-        let accounts = checkpoint_accounts(&self.risk);
+        let accounts = checkpoint_accounts(&self.risk)?;
         let checkpoint =
             CallAuctionRiskCheckpoint::from_parts(wal_first_sequence, auction, accounts)?;
         let restored = checkpoint.restore_direct_with_limits(self.limits)?;
-        if checkpoint_accounts(&restored.risk) != checkpoint.accounts
+        if checkpoint_accounts(&restored.risk)?.as_slice() != checkpoint.accounts.as_slice()
             || restored
                 .engine
                 .checkpoint(wal_metadata_sequence, wal_sequence)?
@@ -1170,6 +1447,14 @@ impl CallAuctionRiskManagedEngine {
 
     /// Cross-audits engine structure, reservations, positions, and aggregates.
     ///
+    /// Successful validation performs no heap allocation and uses `O(1)`
+    /// auxiliary space. The private risk audit traverses `A` accounts and `O`
+    /// reservations in expected `O(A + O)` time through constructor-owned hash
+    /// indexes and intrusive account lists. Active-order parity is another
+    /// expected `O(O)` pass; the embedded engine/book audits retain their own
+    /// A74/A75 bounds. Adversarial full hash collisions remain finite but can
+    /// make the risk passes quadratic. Failure-detail construction can allocate.
+    ///
     /// # Errors
     ///
     /// Returns [`CallAuctionRiskInvariantViolation`] at the first contradiction.
@@ -1183,19 +1468,26 @@ impl CallAuctionRiskManagedEngine {
                 "auction active-order count differs from risk reservation count",
             ));
         }
-        for (&order_id, reservation) in &self.risk.reservations {
-            let order = self.engine.book().order(order_id).ok_or_else(|| {
-                CallAuctionRiskInvariantViolation::new(format!(
-                    "auction reservation {order_id} has no active order"
-                ))
-            })?;
+        for order in self.engine.book().active_order_states() {
+            let reservation = self
+                .risk
+                .reservations
+                .get(&order.order_id)
+                .map(|active| active.snapshot)
+                .ok_or_else(|| {
+                    CallAuctionRiskInvariantViolation::new(format!(
+                        "auction active order {} has no risk reservation",
+                        order.order_id
+                    ))
+                })?;
             if order.account_id != reservation.account_id
                 || order.side != reservation.side
                 || order.constraint != reservation.constraint
                 || order.quantity.lots() != reservation.quantity_lots
             {
                 return Err(CallAuctionRiskInvariantViolation::new(format!(
-                    "auction reservation {order_id} differs from active order"
+                    "auction reservation {} differs from active order",
+                    order.order_id
                 )));
             }
         }
@@ -1203,16 +1495,81 @@ impl CallAuctionRiskManagedEngine {
     }
 }
 
-fn checkpoint_accounts(risk: &CallAuctionRiskEngine) -> Vec<RiskAccountCheckpoint> {
-    let mut accounts: Vec<_> = risk
-        .accounts
-        .iter()
-        .map(|(&account_id, account)| {
-            RiskAccountCheckpoint::from_parts(account_id, account.profile, account.exposure)
-        })
-        .collect();
+fn reserve_call_auction_risk_checkpoint_vec<T>(
+    maximum: usize,
+    resource: CallAuctionRiskCheckpointResource,
+) -> Result<Vec<T>, CallAuctionRiskCheckpointError> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(maximum).map_err(|_| {
+        CallAuctionRiskCheckpointError::ResourceReservationFailed { resource, maximum }
+    })?;
+    Ok(values)
+}
+
+fn checkpoint_accounts(
+    risk: &CallAuctionRiskEngine,
+) -> Result<Vec<RiskAccountCheckpoint>, CallAuctionRiskCheckpointError> {
+    let maximum = risk.accounts.len();
+    let mut accounts = reserve_call_auction_risk_checkpoint_vec(
+        maximum,
+        CallAuctionRiskCheckpointResource::CaptureAccounts,
+    )?;
+    for (&account_id, account) in risk.accounts.iter() {
+        accounts.push(RiskAccountCheckpoint::from_parts(
+            account_id,
+            account.profile,
+            account.exposure,
+        ));
+    }
     accounts.sort_unstable_by_key(|account| account.account_id());
-    accounts
+    Ok(accounts)
+}
+
+fn checkpoint_validation_event_capacity(
+    checkpoint: &CallAuctionRiskCheckpoint,
+    order_bound: usize,
+    max_report_events: usize,
+) -> Result<usize, CallAuctionRiskCheckpointError> {
+    let terminal_event_reserve = max_report_events.checked_add(1).ok_or_else(|| {
+        CallAuctionRiskCheckpointError::new(
+            "auction risk checkpoint terminal event capacity overflows",
+        )
+    })?;
+    let checkpoint_events =
+        checkpoint
+            .auction
+            .history()
+            .iter()
+            .try_fold(0_usize, |total, entry| {
+                total
+                    .checked_add(entry.report().events.len())
+                    .ok_or_else(|| {
+                        CallAuctionRiskCheckpointError::new(
+                            "auction risk checkpoint retained event count overflows",
+                        )
+                    })
+            })?;
+    let required_ordinary_events = order_bound.checked_add(1).ok_or_else(|| {
+        CallAuctionRiskCheckpointError::new(
+            "auction risk checkpoint ordinary event capacity overflows",
+        )
+    })?;
+    let minimum_retained_events = terminal_event_reserve
+        .checked_add(required_ordinary_events)
+        .ok_or_else(|| {
+            CallAuctionRiskCheckpointError::new(
+                "auction risk checkpoint minimum retained event capacity overflows",
+            )
+        })?;
+    checkpoint_events
+        .checked_add(terminal_event_reserve)
+        .and_then(|value| value.checked_add(1))
+        .map(|value| value.max(minimum_retained_events))
+        .ok_or_else(|| {
+            CallAuctionRiskCheckpointError::new(
+                "auction risk checkpoint event history capacity overflows",
+            )
+        })
 }
 
 fn checkpoint_validation_limits(
@@ -1231,6 +1588,7 @@ fn checkpoint_validation_limits(
         max_active_orders: order_bound,
         max_price_levels_per_side: order_bound,
         max_accepted_order_ids: order_bound,
+        max_prepared_uncrosses: CallAuctionBookLimits::DEFAULT_MAX_PREPARED_UNCROSSES,
     })
     .map_err(|error| {
         CallAuctionRiskCheckpointError::new(format!(
@@ -1258,10 +1616,13 @@ fn checkpoint_validation_limits(
         .ok_or_else(|| {
             CallAuctionRiskCheckpointError::new("auction risk checkpoint event capacity overflows")
         })?;
+    let max_retained_events =
+        checkpoint_validation_event_capacity(checkpoint, order_bound, max_report_events)?;
     let auction = CallAuctionEngineLimits::new(CallAuctionEngineLimitsSpec {
         book,
         max_retained_commands,
         terminal_command_reserve,
+        max_retained_events,
         max_report_events,
     })
     .map_err(|error| {
@@ -1298,5 +1659,178 @@ const fn call_auction_risk_rejection(reason: RiskRejectReason) -> CallAuctionRej
         RiskRejectReason::OpenNotionalLimit => CallAuctionRejectReason::RiskOpenNotionalLimit,
         RiskRejectReason::PositionLimit => CallAuctionRejectReason::RiskPositionLimit,
         RiskRejectReason::ArithmeticOverflow => CallAuctionRejectReason::RiskArithmeticOverflow,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CallAuctionRiskCheckpointError, CallAuctionRiskCheckpointResource, CallAuctionRiskEngine,
+        CallAuctionRiskLimits, CallAuctionRiskLimitsSpec, reserve_call_auction_risk_checkpoint_vec,
+    };
+    use crate::auction::AuctionOrderConstraint;
+    use crate::auction_book::{
+        CallAuctionBookLimits, CallAuctionBookLimitsSpec, CallAuctionOrderSnapshot,
+    };
+    use crate::auction_engine::{CallAuctionEngineLimits, CallAuctionEngineLimitsSpec};
+    use crate::domain::{
+        AccountId, AssetId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
+        TimestampNs,
+    };
+    use crate::instrument::{
+        InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
+        QuantityRules, ReserveOrderRules, TradingState,
+    };
+    use crate::risk::{AccountRiskState, RiskLimitSpec, RiskLimits, RiskProfile, RiskSnapshot};
+
+    fn definition() -> InstrumentDefinition {
+        InstrumentDefinition::new(InstrumentSpec {
+            instrument_id: InstrumentId::new(41).unwrap(),
+            version: InstrumentVersion::new(7).unwrap(),
+            effective_from: TimestampNs::from_unix_nanos(0),
+            symbol: InstrumentSymbol::new("AUCTION-RISK-AUDIT").unwrap(),
+            kind: InstrumentKind::Spot,
+            base_asset_id: AssetId::new(1).unwrap(),
+            quote_asset_id: AssetId::new(2).unwrap(),
+            price: PriceRules::new(0, 5, Price::from_raw(-100), Price::from_raw(200)).unwrap(),
+            quantity: QuantityRules::new(1, 1, 1_000).unwrap(),
+            reserve: ReserveOrderRules::disabled(),
+            base_units_per_lot: 1,
+            quote_units_per_price_unit: 1,
+            trading_state: TradingState::Halted,
+        })
+        .unwrap()
+    }
+
+    fn risk_engine() -> CallAuctionRiskEngine {
+        let book = CallAuctionBookLimits::new(CallAuctionBookLimitsSpec {
+            max_active_orders: 4,
+            max_price_levels_per_side: 4,
+            max_accepted_order_ids: 8,
+            max_prepared_uncrosses: 2,
+        })
+        .unwrap();
+        let auction = CallAuctionEngineLimits::new(CallAuctionEngineLimitsSpec {
+            book,
+            max_retained_commands: 16,
+            terminal_command_reserve: 6,
+            max_retained_events: 26,
+            max_report_events: 9,
+        })
+        .unwrap();
+        let limits = CallAuctionRiskLimits::new(CallAuctionRiskLimitsSpec {
+            auction,
+            max_registered_accounts: 2,
+        })
+        .unwrap();
+        let mut risk = CallAuctionRiskEngine::try_with_limits(definition(), limits).unwrap();
+        let profile = RiskProfile::new(
+            AccountRiskState::Active,
+            0,
+            RiskLimits::new(RiskLimitSpec {
+                max_order_quantity_lots: 1_000,
+                max_order_notional: 200_000,
+                max_open_orders: 4,
+                max_open_quantity_lots: 4_000,
+                max_open_notional: 800_000,
+                max_long_position_lots: i128::MAX.unsigned_abs(),
+                max_short_position_lots: i128::MAX.unsigned_abs(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        risk.register_account(AccountId::new(1).unwrap(), profile)
+            .unwrap();
+        for (priority_sequence, order_id) in [10_u64, 20].into_iter().enumerate() {
+            risk.insert_reservation(CallAuctionOrderSnapshot {
+                order_id: OrderId::new(order_id).unwrap(),
+                account_id: AccountId::new(1).unwrap(),
+                side: Side::Buy,
+                constraint: AuctionOrderConstraint::Market,
+                quantity: Quantity::new(1).unwrap(),
+                priority_sequence: u64::try_from(priority_sequence).unwrap() + 1,
+            });
+        }
+        risk.validate().unwrap();
+        risk
+    }
+
+    #[test]
+    fn allocation_free_risk_audit_rejects_cycles_and_unlinked_reservations() {
+        let head = OrderId::new(10).unwrap();
+        let tail = OrderId::new(20).unwrap();
+
+        let mut cycle = risk_engine();
+        cycle.reservations.get_mut(&tail).unwrap().next = Some(head);
+        assert!(
+            cycle
+                .validate()
+                .unwrap_err()
+                .detail()
+                .contains("account-index cycle")
+        );
+
+        let mut unlinked = risk_engine();
+        unlinked.reservations.get_mut(&head).unwrap().next = None;
+        let account = unlinked
+            .accounts
+            .get_mut(&AccountId::new(1).unwrap())
+            .unwrap();
+        account.reservation_tail = Some(head);
+        account.exposure = RiskSnapshot::from_parts(0, 1, 0, 200, 1);
+        assert!(
+            unlinked
+                .validate()
+                .unwrap_err()
+                .detail()
+                .contains("absent from its account index")
+        );
+    }
+
+    #[test]
+    fn unrepresentable_checkpoint_capture_is_typed_by_exact_resource() {
+        let error = reserve_call_auction_risk_checkpoint_vec::<RiskSnapshot>(
+            usize::MAX,
+            CallAuctionRiskCheckpointResource::CaptureAccounts,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            CallAuctionRiskCheckpointError::ResourceReservationFailed {
+                resource: CallAuctionRiskCheckpointResource::CaptureAccounts,
+                maximum: usize::MAX,
+            }
+        );
+        assert_eq!(
+            error.resource(),
+            Some(CallAuctionRiskCheckpointResource::CaptureAccounts)
+        );
+        assert!(error.is_resource_exhaustion());
+        assert!(error.is_operational_failure());
+    }
+
+    #[test]
+    fn reservation_links_survive_middle_partial_head_and_last_removal() {
+        let mut risk = risk_engine();
+        let third = OrderId::new(30).unwrap();
+        risk.insert_reservation(CallAuctionOrderSnapshot {
+            order_id: third,
+            account_id: AccountId::new(1).unwrap(),
+            side: Side::Buy,
+            constraint: AuctionOrderConstraint::Market,
+            quantity: Quantity::new(2).unwrap(),
+            priority_sequence: 3,
+        });
+        risk.validate().unwrap();
+
+        risk.remove_reservation(OrderId::new(20).unwrap());
+        risk.validate().unwrap();
+        risk.decrement_reservation(third, 1);
+        risk.validate().unwrap();
+        risk.remove_reservation(OrderId::new(10).unwrap());
+        risk.validate().unwrap();
+        risk.remove_reservation(third);
+        risk.validate().unwrap();
+        assert_eq!(risk.reservation_count(), 0);
     }
 }

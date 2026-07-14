@@ -12,8 +12,9 @@ use crate::journal::{
 };
 use crate::ledger::{
     BatchPreparation, BatchReceipt, CorrectionPreparation, CorrectionReceipt, JournalEntry, Ledger,
-    LedgerBatch, LedgerCheckpoint, LedgerCheckpointError, LedgerCorrection, LedgerError,
-    LedgerInvariantViolation, LedgerRecord, PostReceipt, PostingPreparation, SettlementConvention,
+    LedgerBatch, LedgerCheckpoint, LedgerCheckpointCaptureError, LedgerCheckpointError,
+    LedgerConstructionError, LedgerCorrection, LedgerError, LedgerInvariantViolation,
+    LedgerLimitsSpec, LedgerRecord, PostReceipt, PostingPreparation, SettlementConvention,
 };
 use crate::matching::Trade;
 use crate::snapshot::{
@@ -35,6 +36,8 @@ pub struct DurableLedgerRecoveryReport {
 /// Durable ledger orchestration or replay failure.
 #[derive(Debug)]
 pub enum DurableLedgerError {
+    /// Finite authoritative ledger storage could not be constructed.
+    Construction(LedgerConstructionError),
     /// Journal framing, codec, recovery, or I/O failure.
     Journal(JournalError),
     /// Segmented-journal inventory, rotation, framing, recovery, or I/O failure.
@@ -43,6 +46,8 @@ pub enum DurableLedgerError {
     Ledger(LedgerError),
     /// Semantic checkpoint construction or restoration failed.
     Checkpoint(LedgerCheckpointError),
+    /// Audited checkpoint capture failed before snapshot or cutover mutation.
+    CheckpointCapture(LedgerCheckpointCaptureError),
     /// Ledger state failed an independent structural/replay audit.
     Invariant(LedgerInvariantViolation),
     /// Snapshot framing, ownership, checksum, generation, or I/O failed.
@@ -106,10 +111,12 @@ pub enum DurableLedgerError {
 impl fmt::Display for DurableLedgerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Construction(error) => error.fmt(formatter),
             Self::Journal(error) => error.fmt(formatter),
             Self::SegmentedJournal(error) => error.fmt(formatter),
             Self::Ledger(error) => error.fmt(formatter),
             Self::Checkpoint(error) => error.fmt(formatter),
+            Self::CheckpointCapture(error) => error.fmt(formatter),
             Self::Invariant(error) => error.fmt(formatter),
             Self::Snapshot(error) => error.fmt(formatter),
             Self::UnexpectedRecord { sequence, kind } => {
@@ -169,14 +176,22 @@ impl fmt::Display for DurableLedgerError {
 impl std::error::Error for DurableLedgerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Construction(error) => Some(error),
             Self::Journal(error) => Some(error),
             Self::SegmentedJournal(error) => Some(error),
             Self::Ledger(error) => Some(error),
             Self::Checkpoint(error) => Some(error),
+            Self::CheckpointCapture(error) => Some(error),
             Self::Invariant(error) => Some(error),
             Self::Snapshot(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl From<LedgerConstructionError> for DurableLedgerError {
+    fn from(error: LedgerConstructionError) -> Self {
+        Self::Construction(error)
     }
 }
 
@@ -210,6 +225,12 @@ impl From<LedgerError> for DurableLedgerError {
 impl From<LedgerCheckpointError> for DurableLedgerError {
     fn from(error: LedgerCheckpointError) -> Self {
         Self::Checkpoint(error)
+    }
+}
+
+impl From<LedgerCheckpointCaptureError> for DurableLedgerError {
+    fn from(error: LedgerCheckpointCaptureError) -> Self {
+        Self::CheckpointCapture(error)
     }
 }
 
@@ -247,7 +268,22 @@ impl DurableLedger {
         path: impl AsRef<Path>,
         options: JournalOptions,
     ) -> Result<Self, DurableLedgerError> {
-        Self::open_storage(path.as_ref(), StorageOptions::Single(options), None)
+        Self::open_with_limits(path, options, LedgerLimitsSpec::default())
+    }
+
+    /// Opens and reconstructs a single-file ledger under explicit finite
+    /// authoritative resource limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableLedgerError`] for construction, storage, replay, or
+    /// invariant failure.
+    pub fn open_with_limits(
+        path: impl AsRef<Path>,
+        options: JournalOptions,
+        limits: LedgerLimitsSpec,
+    ) -> Result<Self, DurableLedgerError> {
+        Self::open_storage(path.as_ref(), StorageOptions::Single(options), None, limits)
     }
 
     /// Opens a single-file ledger WAL using a checksum-verified semantic
@@ -263,10 +299,34 @@ impl DurableLedger {
         options: JournalOptions,
         snapshot_options: SnapshotOptions,
     ) -> Result<Self, DurableLedgerError> {
+        Self::open_with_checkpoint_and_limits(
+            path,
+            checkpoint_path,
+            options,
+            snapshot_options,
+            LedgerLimitsSpec::default(),
+        )
+    }
+
+    /// Opens a single-file ledger from a verified checkpoint under explicit
+    /// finite authoritative resource limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableLedgerError`] for construction, snapshot, path, WAL,
+    /// replay, or invariant failure.
+    pub fn open_with_checkpoint_and_limits(
+        path: impl AsRef<Path>,
+        checkpoint_path: impl AsRef<Path>,
+        options: JournalOptions,
+        snapshot_options: SnapshotOptions,
+        limits: LedgerLimitsSpec,
+    ) -> Result<Self, DurableLedgerError> {
         Self::open_storage(
             path.as_ref(),
             StorageOptions::Single(options),
             Some((checkpoint_path.as_ref(), snapshot_options)),
+            limits,
         )
     }
 
@@ -280,7 +340,26 @@ impl DurableLedger {
         directory: impl AsRef<Path>,
         options: SegmentedJournalOptions,
     ) -> Result<Self, DurableLedgerError> {
-        Self::open_storage(directory.as_ref(), StorageOptions::Segmented(options), None)
+        Self::open_segmented_with_limits(directory, options, LedgerLimitsSpec::default())
+    }
+
+    /// Opens a segmented ledger under explicit finite authoritative limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableLedgerError`] for construction, storage, replay, or
+    /// invariant failure.
+    pub fn open_segmented_with_limits(
+        directory: impl AsRef<Path>,
+        options: SegmentedJournalOptions,
+        limits: LedgerLimitsSpec,
+    ) -> Result<Self, DurableLedgerError> {
+        Self::open_storage(
+            directory.as_ref(),
+            StorageOptions::Segmented(options),
+            None,
+            limits,
+        )
     }
 
     /// Opens a segmented ledger WAL using a checksum-verified semantic
@@ -296,10 +375,34 @@ impl DurableLedger {
         options: SegmentedJournalOptions,
         snapshot_options: SnapshotOptions,
     ) -> Result<Self, DurableLedgerError> {
+        Self::open_segmented_with_checkpoint_and_limits(
+            directory,
+            checkpoint_path,
+            options,
+            snapshot_options,
+            LedgerLimitsSpec::default(),
+        )
+    }
+
+    /// Opens a segmented ledger from a verified checkpoint under explicit
+    /// finite authoritative resource limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableLedgerError`] for construction, snapshot, storage,
+    /// replay, or invariant failure.
+    pub fn open_segmented_with_checkpoint_and_limits(
+        directory: impl AsRef<Path>,
+        checkpoint_path: impl AsRef<Path>,
+        options: SegmentedJournalOptions,
+        snapshot_options: SnapshotOptions,
+        limits: LedgerLimitsSpec,
+    ) -> Result<Self, DurableLedgerError> {
         Self::open_storage(
             directory.as_ref(),
             StorageOptions::Segmented(options),
             Some((checkpoint_path.as_ref(), snapshot_options)),
+            limits,
         )
     }
 
@@ -311,7 +414,9 @@ impl DurableLedger {
         path: &Path,
         options: StorageOptions,
         checkpoint_source: Option<(&Path, SnapshotOptions)>,
+        limits: LedgerLimitsSpec,
     ) -> Result<Self, DurableLedgerError> {
+        let empty_ledger = Ledger::try_with_limits(limits)?;
         if let Some((checkpoint_path, _)) = checkpoint_source {
             validate_checkpoint_path(path, storage_layout(options), checkpoint_path)?;
         }
@@ -372,10 +477,10 @@ impl DurableLedger {
             (checkpoint, None, None, false)
         };
         let checkpointed_records = checkpoint.as_ref().map_or(0, LedgerCheckpoint::generation);
-        let mut ledger = checkpoint
-            .map(Ledger::from_checkpoint)
-            .transpose()?
-            .unwrap_or_default();
+        let mut ledger = match checkpoint {
+            Some(checkpoint) => empty_ledger.restore_checkpoint(&checkpoint)?,
+            None => empty_ledger,
+        };
         let mut replayed_records = 0_u64;
         let mut wal_records = if compacted { checkpointed_records } else { 0 };
         loop {
@@ -681,7 +786,13 @@ impl DurableLedger {
         }
         validate_checkpoint_path(self.journal.path(), self.journal.layout(), path.as_ref())?;
         self.sync_all()?;
-        let checkpoint = self.ledger.checkpoint()?;
+        let checkpoint = match self.ledger.checkpoint() {
+            Ok(value) => value,
+            Err(error) => {
+                self.poisoned = checkpoint_capture_failure_requires_poison(&error);
+                return Err(DurableLedgerError::CheckpointCapture(error));
+            }
+        };
         SnapshotFile::write(path, &checkpoint, options).map_err(Into::into)
     }
 
@@ -715,7 +826,13 @@ impl DurableLedger {
             .next_sequence()
             .checked_sub(1)
             .ok_or(LedgerError::ArithmeticOverflow)?;
-        let checkpoint = self.ledger.checkpoint()?;
+        let checkpoint = match self.ledger.checkpoint() {
+            Ok(value) => value,
+            Err(error) => {
+                self.poisoned = checkpoint_capture_failure_requires_poison(&error);
+                return Err(DurableLedgerError::CheckpointCapture(error));
+            }
+        };
         let slot = self
             .checkpoint_slot
             .map_or(CheckpointSlot::A, CheckpointSlot::alternate);
@@ -782,6 +899,10 @@ const fn storage_layout(options: StorageOptions) -> JournalLayout {
     }
 }
 
+const fn checkpoint_capture_failure_requires_poison(error: &LedgerCheckpointCaptureError) -> bool {
+    !error.is_operational_failure()
+}
+
 fn validate_checkpoint_path(
     storage_path: &Path,
     layout: JournalLayout,
@@ -819,4 +940,34 @@ fn validate_checkpoint_path(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod checkpoint_capture_failure_tests {
+    use super::checkpoint_capture_failure_requires_poison;
+    use crate::ledger::{
+        LedgerCheckpointCaptureError, LedgerCheckpointCaptureResource, LedgerConstructionError,
+        LedgerInvariantViolation, LedgerResource,
+    };
+
+    #[test]
+    fn resource_pressure_is_retryable_but_semantic_failure_requires_poison() {
+        let resource = LedgerCheckpointCaptureError::ResourceReservationFailed {
+            resource: LedgerCheckpointCaptureResource::CaptureRecords,
+            maximum: usize::MAX,
+        };
+        let construction = LedgerCheckpointCaptureError::Construction(
+            LedgerConstructionError::ReservationFailed {
+                resource: LedgerResource::Records,
+                maximum: usize::MAX,
+            },
+        );
+        assert!(!checkpoint_capture_failure_requires_poison(&resource));
+        assert!(!checkpoint_capture_failure_requires_poison(&construction));
+        assert!(checkpoint_capture_failure_requires_poison(
+            &LedgerCheckpointCaptureError::Invalid(LedgerInvariantViolation::new(
+                "semantic contradiction"
+            ))
+        ));
+    }
 }

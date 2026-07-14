@@ -6,6 +6,8 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::domain::{InstrumentId, InstrumentVersion};
 use crate::durable_storage::{StorageError, StorageOptions, StorageReader, StorageWriter};
@@ -17,7 +19,8 @@ use crate::journal::{
 use crate::matching::{Command, CommandPreparation, ExecutionReport, MatchingError};
 use crate::risk::{
     AccountRiskDefinition, RiskError, RiskInvariantViolation, RiskManagedCheckpoint,
-    RiskManagedCheckpointError, RiskManagedLimits, RiskManagedOrderBook,
+    RiskManagedCheckpointCapture, RiskManagedCheckpointError, RiskManagedLimits,
+    RiskManagedOrderBook,
 };
 use crate::snapshot::{
     CheckpointAnchor, CheckpointCutoverReceipt, CheckpointSlot, SnapshotError, SnapshotFile,
@@ -37,6 +40,159 @@ pub struct DurableRiskRecoveryReport {
     pub completed_profile_records: u64,
     /// Whether one final command was completed with a reconstructed report.
     pub completed_dangling_command: bool,
+}
+
+/// A WAL-synchronized but not yet coupled-replay-verified durable risk capture.
+///
+/// This value is bound to one open [`DurableRiskOrderBook`] incarnation and
+/// its current physical WAL-prefix epoch. It has no codec or snapshot payload
+/// implementation. Cloning it shares all immutable rows and the same
+/// asynchronous poison/origin token in `O(1)`.
+#[derive(Clone)]
+pub struct DurableRiskManagedCheckpointCapture {
+    capture: RiskManagedCheckpointCapture,
+    origin: Arc<AtomicBool>,
+    cutover_epoch: u64,
+}
+
+impl DurableRiskManagedCheckpointCapture {
+    /// Returns the first physical WAL sequence occupied by the definition.
+    #[must_use]
+    pub const fn wal_first_sequence(&self) -> u64 {
+        self.capture.wal_first_sequence()
+    }
+
+    /// Returns the final immutable definition/profile metadata sequence.
+    #[must_use]
+    pub const fn wal_metadata_sequence(&self) -> u64 {
+        self.capture.wal_metadata_sequence()
+    }
+
+    /// Returns the completed durable report boundary represented here.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.capture.generation()
+    }
+
+    /// Returns the captured account/profile cardinality.
+    #[must_use]
+    pub fn account_count(&self) -> usize {
+        self.capture.account_count()
+    }
+
+    /// Returns the captured command/report cardinality.
+    #[must_use]
+    pub fn command_count(&self) -> usize {
+        self.capture.command_count()
+    }
+
+    /// Returns the captured active-order/reservation cardinality.
+    #[must_use]
+    pub fn active_order_count(&self) -> usize {
+        self.capture.active_order_count()
+    }
+
+    /// Returns whether two captures share every immutable checkpoint row image.
+    #[must_use]
+    pub fn shares_checkpoint_storage_with(&self, other: &Self) -> bool {
+        self.capture.shares_checkpoint_storage_with(&other.capture)
+    }
+
+    /// Consumes the capture and verifies deterministic coupled replay.
+    ///
+    /// Semantic failure atomically poisons the originating durable shard. A
+    /// typed reservation or temporary replay-shard construction failure leaves
+    /// that shard usable, and a cloned capture may be retried.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying coupled-risk checkpoint verification failure.
+    pub fn verify(
+        self,
+    ) -> Result<VerifiedDurableRiskManagedCheckpoint, RiskManagedCheckpointError> {
+        let Self {
+            capture,
+            origin,
+            cutover_epoch,
+        } = self;
+        match capture.verify() {
+            Ok(checkpoint) => Ok(VerifiedDurableRiskManagedCheckpoint {
+                checkpoint,
+                origin,
+                cutover_epoch,
+            }),
+            Err(error) => {
+                record_checkpoint_verification_failure(&origin, &error);
+                Err(error)
+            }
+        }
+    }
+}
+
+/// A coupled-replay-verified checkpoint bound to one durable shard incarnation.
+///
+/// Only this type is accepted by
+/// [`DurableRiskOrderBook::write_verified_checkpoint`]. Its private origin and
+/// cutover epoch prevent publication through another shard, a reopened shard,
+/// or the source shard after physical WAL-prefix retirement.
+#[derive(Clone)]
+pub struct VerifiedDurableRiskManagedCheckpoint {
+    checkpoint: RiskManagedCheckpoint,
+    origin: Arc<AtomicBool>,
+    cutover_epoch: u64,
+}
+
+impl VerifiedDurableRiskManagedCheckpoint {
+    /// Returns the first physical WAL sequence occupied by the definition.
+    #[must_use]
+    pub const fn wal_first_sequence(&self) -> u64 {
+        self.checkpoint.wal_first_sequence()
+    }
+
+    /// Returns the final immutable definition/profile metadata sequence.
+    #[must_use]
+    pub const fn wal_metadata_sequence(&self) -> u64 {
+        self.checkpoint.matching().wal_metadata_sequence()
+    }
+
+    /// Returns the completed report boundary represented here.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.checkpoint.generation()
+    }
+
+    /// Returns the verified account/profile cardinality.
+    #[must_use]
+    pub fn account_count(&self) -> usize {
+        self.checkpoint.accounts().len()
+    }
+
+    /// Returns the verified command/report cardinality.
+    #[must_use]
+    pub fn command_count(&self) -> usize {
+        self.checkpoint.matching().command_count()
+    }
+
+    /// Returns the verified active-order/reservation cardinality.
+    #[must_use]
+    pub fn active_order_count(&self) -> usize {
+        self.checkpoint.matching().active_order_count()
+    }
+
+    /// Returns whether two values share every immutable verified row image.
+    #[must_use]
+    pub fn shares_checkpoint_storage_with(&self, other: &Self) -> bool {
+        self.checkpoint
+            .shares_account_storage_with(&other.checkpoint)
+            && self
+                .checkpoint
+                .matching()
+                .shares_order_storage_with(other.checkpoint.matching())
+            && self
+                .checkpoint
+                .matching()
+                .shares_history_storage_with(other.checkpoint.matching())
+    }
 }
 
 /// Durable risk-managed matching failure.
@@ -135,6 +291,17 @@ pub enum DurableRiskError {
         /// Conflicting normalized path.
         path: PathBuf,
     },
+    /// A verified checkpoint belongs to another or previously reopened shard.
+    CheckpointCaptureOriginMismatch,
+    /// Physical WAL-prefix retirement occurred after the checkpoint was captured.
+    CheckpointCaptureStale {
+        /// Process-local cutover epoch retained by the capture.
+        captured_epoch: u64,
+        /// Current process-local cutover epoch of the source shard.
+        current_epoch: u64,
+    },
+    /// Process-local durable checkpoint cutover fencing cannot advance.
+    CheckpointCutoverEpochExhausted,
     /// A payload kind was not permitted in a risk-managed matching journal.
     UnexpectedRecord {
         /// Frame sequence.
@@ -249,6 +416,18 @@ impl fmt::Display for DurableRiskError {
                 "risk checkpoint path {} conflicts with WAL storage",
                 path.display()
             ),
+            Self::CheckpointCaptureOriginMismatch => formatter
+                .write_str("verified risk checkpoint belongs to another durable shard incarnation"),
+            Self::CheckpointCaptureStale {
+                captured_epoch,
+                current_epoch,
+            } => write!(
+                formatter,
+                "verified risk checkpoint was captured at WAL cutover epoch {captured_epoch}, but the shard is at epoch {current_epoch}"
+            ),
+            Self::CheckpointCutoverEpochExhausted => {
+                formatter.write_str("durable risk checkpoint cutover epoch is exhausted")
+            }
             Self::UnexpectedRecord { sequence, kind } => {
                 write!(
                     formatter,
@@ -347,6 +526,8 @@ pub struct DurableRiskOrderBook {
     wal_first_sequence: u64,
     wal_metadata_sequence: u64,
     checkpoint_slot: Option<CheckpointSlot>,
+    checkpoint_verification_origin: Arc<AtomicBool>,
+    cutover_epoch: u64,
     recovery: DurableRiskRecoveryReport,
     poisoned: bool,
 }
@@ -622,6 +803,8 @@ impl DurableRiskOrderBook {
             wal_first_sequence,
             wal_metadata_sequence,
             checkpoint_slot,
+            checkpoint_verification_origin: Arc::new(AtomicBool::new(false)),
+            cutover_epoch: 0,
             recovery: DurableRiskRecoveryReport {
                 journal: journal_recovery,
                 checkpointed_commands: replay.checkpointed_commands,
@@ -645,6 +828,13 @@ impl DurableRiskOrderBook {
         &self.managed
     }
 
+    /// Returns whether local failure or asynchronous checkpoint verification
+    /// has made this shard unusable until reopen/recovery.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned || self.checkpoint_verification_origin.load(Ordering::Acquire)
+    }
+
     /// Writes a command before applying matching/risk state and then persists its trace.
     ///
     /// # Errors
@@ -652,13 +842,21 @@ impl DurableRiskOrderBook {
     /// Returns [`DurableRiskError`] for preparation, journal, or matching failure.
     /// A failure after command acknowledgement poisons this instance.
     pub fn submit(&mut self, command: Command) -> Result<ExecutionReport, DurableRiskError> {
-        if self.poisoned {
+        if self.is_poisoned() {
             return Err(DurableRiskError::Poisoned);
         }
         let prepared = match self.managed.prepare(command)? {
-            CommandPreparation::Replay(report) => return Ok(report),
+            CommandPreparation::Replay(report) => {
+                if self.is_poisoned() {
+                    return Err(DurableRiskError::Poisoned);
+                }
+                return Ok(report);
+            }
             CommandPreparation::Ready(prepared) => prepared,
         };
+        if self.is_poisoned() {
+            return Err(DurableRiskError::Poisoned);
+        }
         if let Err(error) = self.journal.append(&prepared.command()) {
             self.poisoned = self.journal.is_poisoned();
             return Err(error.into());
@@ -677,6 +875,52 @@ impl DurableRiskOrderBook {
         Ok(report)
     }
 
+    /// Synchronizes the risk WAL and captures one immutable coupled checkpoint
+    /// candidate without deterministic history replay.
+    ///
+    /// The returned value is bound to this exact open shard incarnation and
+    /// current physical-prefix epoch. Ordinary command/report suffix growth is
+    /// permitted while verification runs; WAL-prefix cutover is not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableRiskError`] for poison, WAL synchronization failure, or
+    /// a typed live coupled-checkpoint capture/lineage failure. Operational
+    /// allocation/construction failures leave the shard usable; semantic
+    /// contradictions poison it.
+    pub fn capture_checkpoint_candidate(
+        &mut self,
+    ) -> Result<DurableRiskManagedCheckpointCapture, DurableRiskError> {
+        if self.is_poisoned() {
+            return Err(DurableRiskError::Poisoned);
+        }
+        self.sync_all()?;
+        if self.is_poisoned() {
+            return Err(DurableRiskError::Poisoned);
+        }
+        let wal_sequence = self
+            .journal
+            .next_sequence()
+            .checked_sub(1)
+            .ok_or(MatchingError::SequenceExhausted)?;
+        let capture = match self.managed.capture_checkpoint_candidate(
+            self.wal_first_sequence,
+            self.wal_metadata_sequence,
+            wal_sequence,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.poisoned = checkpoint_failure_requires_poison(&error);
+                return Err(DurableRiskError::Checkpoint(error));
+            }
+        };
+        Ok(DurableRiskManagedCheckpointCapture {
+            capture,
+            origin: Arc::clone(&self.checkpoint_verification_origin),
+            cutover_epoch: self.cutover_epoch,
+        })
+    }
+
     /// Synchronizes the risk WAL, audits coupled state, and atomically replaces
     /// a checksum-protected semantic checkpoint.
     ///
@@ -684,33 +928,90 @@ impl DurableRiskOrderBook {
     ///
     /// Returns [`DurableRiskError`] for poison, path conflict, WAL barrier,
     /// checkpoint audit/codec, snapshot ownership, or I/O failure.
+    /// Typed matching/risk checkpoint resource and temporary-construction
+    /// failures leave the shard unpoisoned; semantic contradictions poison it.
     pub fn write_checkpoint(
         &mut self,
         path: impl AsRef<Path>,
         options: SnapshotOptions,
     ) -> Result<SnapshotReceipt, DurableRiskError> {
-        if self.poisoned {
+        if self.is_poisoned() {
             return Err(DurableRiskError::Poisoned);
         }
         validate_checkpoint_path(self.journal.path(), self.journal.layout(), path.as_ref())?;
-        self.sync_all()?;
+        let capture = self.capture_checkpoint_candidate()?;
+        let verified = match capture.verify() {
+            Ok(value) => value,
+            Err(error) => {
+                self.poisoned = checkpoint_failure_requires_poison(&error);
+                return Err(DurableRiskError::Checkpoint(error));
+            }
+        };
+        self.write_verified_checkpoint(path, &verified, options)
+    }
+
+    /// Publishes a coupled-replay-verified capture through its originating shard.
+    ///
+    /// Ordinary suffix growth after capture is allowed because the checkpoint
+    /// remains an exact older WAL prefix. Publication rejects another/reopened
+    /// shard and any source shard whose physical prefix was compacted after
+    /// capture. This method writes a standalone checkpoint only; asynchronous
+    /// WAL cutover is deliberately not exposed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableRiskError`] for poison, origin/epoch or metadata
+    /// mismatch, path conflict, checkpoint-ahead contradiction, snapshot
+    /// ownership, codec, or I/O failure.
+    pub fn write_verified_checkpoint(
+        &mut self,
+        path: impl AsRef<Path>,
+        verified: &VerifiedDurableRiskManagedCheckpoint,
+        options: SnapshotOptions,
+    ) -> Result<SnapshotReceipt, DurableRiskError> {
+        if self.is_poisoned() {
+            return Err(DurableRiskError::Poisoned);
+        }
+        if !Arc::ptr_eq(&self.checkpoint_verification_origin, &verified.origin) {
+            return Err(DurableRiskError::CheckpointCaptureOriginMismatch);
+        }
+        if verified.cutover_epoch != self.cutover_epoch {
+            return Err(DurableRiskError::CheckpointCaptureStale {
+                captured_epoch: verified.cutover_epoch,
+                current_epoch: self.cutover_epoch,
+            });
+        }
+        validate_checkpoint_path(self.journal.path(), self.journal.layout(), path.as_ref())?;
+        if self.is_poisoned() {
+            return Err(DurableRiskError::Poisoned);
+        }
+        if verified.checkpoint.wal_first_sequence() != self.wal_first_sequence {
+            return Err(DurableRiskError::CheckpointWalLineageMismatch {
+                checkpoint_first_sequence: verified.checkpoint.wal_first_sequence(),
+                wal_first_sequence: self.wal_first_sequence,
+            });
+        }
+        if verified.checkpoint.matching().wal_metadata_sequence() != self.wal_metadata_sequence {
+            return Err(DurableRiskError::CheckpointMetadataBoundaryMismatch {
+                checkpoint_metadata_sequence: verified
+                    .checkpoint
+                    .matching()
+                    .wal_metadata_sequence(),
+                wal_metadata_sequence: self.wal_metadata_sequence,
+            });
+        }
         let wal_sequence = self
             .journal
             .next_sequence()
             .checked_sub(1)
             .ok_or(MatchingError::SequenceExhausted)?;
-        let checkpoint = match self.managed.checkpoint(
-            self.wal_first_sequence,
-            self.wal_metadata_sequence,
-            wal_sequence,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                self.poisoned = true;
-                return Err(DurableRiskError::Checkpoint(error));
-            }
-        };
-        SnapshotFile::write(path, &checkpoint, options).map_err(Into::into)
+        if verified.checkpoint.generation() > wal_sequence {
+            return Err(DurableRiskError::CheckpointAheadOfWal {
+                checkpoint_sequence: verified.checkpoint.generation(),
+                wal_last_sequence: Some(wal_sequence),
+            });
+        }
+        SnapshotFile::write(path, &verified.checkpoint, options).map_err(Into::into)
     }
 
     /// Writes the inactive coupled checkpoint slot and atomically retires the
@@ -720,14 +1021,20 @@ impl DurableRiskOrderBook {
     ///
     /// Returns [`DurableRiskError`] for poison, path conflicts, audit/encoding
     /// failure, snapshot persistence, or physical cutover failure.
+    /// Pre-semantic checkpoint resource/construction failure performs no cutover
+    /// mutation and leaves the shard unpoisoned.
     pub fn compact_to_checkpoint(
         &mut self,
         checkpoint_base: impl AsRef<Path>,
         options: SnapshotOptions,
     ) -> Result<CheckpointCutoverReceipt, DurableRiskError> {
-        if self.poisoned {
+        if self.is_poisoned() {
             return Err(DurableRiskError::Poisoned);
         }
+        let next_cutover_epoch = self
+            .cutover_epoch
+            .checked_add(1)
+            .ok_or(DurableRiskError::CheckpointCutoverEpochExhausted)?;
         validate_checkpoint_path(
             self.journal.path(),
             self.journal.layout(),
@@ -746,7 +1053,7 @@ impl DurableRiskOrderBook {
         ) {
             Ok(value) => value,
             Err(error) => {
-                self.poisoned = true;
+                self.poisoned = checkpoint_failure_requires_poison(&error);
                 return Err(DurableRiskError::Checkpoint(error));
             }
         };
@@ -767,6 +1074,7 @@ impl DurableRiskOrderBook {
             return Err(error.into());
         }
         self.checkpoint_slot = Some(slot);
+        self.cutover_epoch = next_cutover_epoch;
         Ok(CheckpointCutoverReceipt::new(snapshot, slot, wal_sequence))
     }
 
@@ -776,7 +1084,7 @@ impl DurableRiskOrderBook {
     ///
     /// Returns [`DurableRiskError`] and poisons the shard on synchronization failure.
     pub fn sync_all(&mut self) -> Result<(), DurableRiskError> {
-        if self.poisoned {
+        if self.is_poisoned() {
             return Err(DurableRiskError::Poisoned);
         }
         if let Err(error) = self.journal.sync_all() {
@@ -794,7 +1102,7 @@ impl DurableRiskOrderBook {
     /// Returns [`DurableRiskError`] if the shard is poisoned or final journal
     /// synchronization/lease release fails.
     pub fn close(self) -> Result<(), DurableRiskError> {
-        if self.poisoned {
+        if self.is_poisoned() {
             return Err(DurableRiskError::Poisoned);
         }
         self.journal.close().map_err(Into::into)
@@ -1240,4 +1548,113 @@ fn validate_checkpoint_path(
         }
     }
     Ok(())
+}
+
+const fn checkpoint_failure_requires_poison(error: &RiskManagedCheckpointError) -> bool {
+    !error.is_operational_failure()
+}
+
+fn record_checkpoint_verification_failure(poison: &AtomicBool, error: &RiskManagedCheckpointError) {
+    if checkpoint_failure_requires_poison(error) {
+        poison.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_failure_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::domain::{AssetId, InstrumentId, InstrumentVersion, Price, TimestampNs};
+    use crate::instrument::{
+        InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
+        QuantityRules, ReserveOrderRules, TradingState,
+    };
+    use crate::matching::{OrderBookCheckpointError, OrderBookCheckpointResource};
+    use crate::risk::{
+        RiskManagedCheckpointError, RiskManagedCheckpointResource, RiskManagedOrderBook,
+    };
+
+    use super::{
+        DurableRiskManagedCheckpointCapture, checkpoint_failure_requires_poison,
+        record_checkpoint_verification_failure,
+    };
+
+    fn definition() -> InstrumentDefinition {
+        InstrumentDefinition::new(InstrumentSpec {
+            instrument_id: InstrumentId::new(1).unwrap(),
+            version: InstrumentVersion::new(1).unwrap(),
+            effective_from: TimestampNs::from_unix_nanos(0),
+            symbol: InstrumentSymbol::new("DURABLE-RISK-STAGED-CHECKPOINT").unwrap(),
+            kind: InstrumentKind::Future,
+            base_asset_id: AssetId::new(1).unwrap(),
+            quote_asset_id: AssetId::new(2).unwrap(),
+            price: PriceRules::new(0, 1, Price::from_raw(1), Price::from_raw(1_000)).unwrap(),
+            quantity: QuantityRules::new(1, 1, 1_000).unwrap(),
+            reserve: ReserveOrderRules::new(100).unwrap(),
+            base_units_per_lot: 1,
+            quote_units_per_price_unit: 1,
+            trading_state: TradingState::Open,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn nested_and_direct_resource_pressure_are_retryable() {
+        let matching = RiskManagedCheckpointError::Matching(
+            OrderBookCheckpointError::ResourceReservationFailed {
+                resource: OrderBookCheckpointResource::CaptureActiveOrders,
+                maximum: 1,
+            },
+        );
+        let accounts = RiskManagedCheckpointError::ResourceReservationFailed {
+            resource: RiskManagedCheckpointResource::CaptureAccounts,
+            maximum: 1,
+        };
+        let construction = RiskManagedCheckpointError::ConstructionFailed(
+            crate::matching::MatchingError::CapacityReservationFailed(
+                crate::matching::MatchingCapacity::RiskAccounts,
+            ),
+        );
+        assert!(!checkpoint_failure_requires_poison(&matching));
+        assert!(!checkpoint_failure_requires_poison(&accounts));
+        assert!(!checkpoint_failure_requires_poison(&construction));
+        assert!(checkpoint_failure_requires_poison(
+            &RiskManagedCheckpointError::Invalid("corrupt coupled state".to_owned())
+        ));
+    }
+
+    #[test]
+    fn asynchronous_verification_latch_records_only_semantic_failure() {
+        let poison = AtomicBool::new(false);
+        let operational = RiskManagedCheckpointError::ResourceReservationFailed {
+            resource: RiskManagedCheckpointResource::CaptureAccounts,
+            maximum: 1,
+        };
+        record_checkpoint_verification_failure(&poison, &operational);
+        assert!(!poison.load(Ordering::Acquire));
+
+        let semantic = RiskManagedCheckpointError::Invalid("replay divergence".to_owned());
+        record_checkpoint_verification_failure(&poison, &semantic);
+        assert!(poison.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn durable_capture_semantic_verification_failure_trips_its_origin_latch() {
+        let managed = RiskManagedOrderBook::new(definition());
+        let mut capture = managed.capture_checkpoint_candidate(1, 1, 1).unwrap();
+        capture.corrupt_wal_lineage_for_test();
+        let origin = Arc::new(AtomicBool::new(false));
+        let durable = DurableRiskManagedCheckpointCapture {
+            capture,
+            origin: Arc::clone(&origin),
+            cutover_epoch: 0,
+        };
+
+        assert!(matches!(
+            durable.verify(),
+            Err(RiskManagedCheckpointError::Invalid(_))
+        ));
+        assert!(origin.load(Ordering::Acquire));
+    }
 }

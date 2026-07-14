@@ -6,8 +6,8 @@ use quotick::auction::{
 };
 use quotick::auction_book::{
     CallAuctionAdmissionError, CallAuctionBook, CallAuctionBookLimits, CallAuctionBookLimitsError,
-    CallAuctionBookLimitsSpec, CallAuctionCancelError, CallAuctionCapacity, CallAuctionIndicative,
-    CallAuctionOrder, CallAuctionPlanError,
+    CallAuctionBookLimitsSpec, CallAuctionCancelError, CallAuctionCapacity,
+    CallAuctionConstructionError, CallAuctionIndicative, CallAuctionOrder, CallAuctionPlanError,
 };
 use quotick::instrument::{
     AdmissionError, InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol,
@@ -54,6 +54,7 @@ fn limits(active: usize, levels: usize, accepted: usize) -> CallAuctionBookLimit
         max_active_orders: active,
         max_price_levels_per_side: levels,
         max_accepted_order_ids: accepted,
+        max_prepared_uncrosses: 2,
     })
     .unwrap()
 }
@@ -78,32 +79,54 @@ fn order(
 
 #[test]
 fn limits_reject_zero_and_incoherent_bounds() {
-    let make = |active, levels, accepted| {
+    let make = |active, levels, accepted, prepared| {
         CallAuctionBookLimits::new(CallAuctionBookLimitsSpec {
             max_active_orders: active,
             max_price_levels_per_side: levels,
             max_accepted_order_ids: accepted,
+            max_prepared_uncrosses: prepared,
         })
     };
     assert_eq!(
-        make(0, 1, 1),
+        make(0, 1, 1, 1),
         Err(CallAuctionBookLimitsError::ZeroActiveOrders)
     );
     assert_eq!(
-        make(1, 0, 1),
+        make(1, 0, 1, 1),
         Err(CallAuctionBookLimitsError::ZeroPriceLevels)
     );
     assert_eq!(
-        make(1, 1, 0),
+        make(1, 1, 0, 1),
         Err(CallAuctionBookLimitsError::ZeroAcceptedOrderIds)
     );
     assert_eq!(
-        make(1, 2, 2),
+        make(1, 2, 2, 1),
         Err(CallAuctionBookLimitsError::PriceLevelsExceedActiveOrders)
     );
     assert_eq!(
-        make(2, 1, 1),
+        make(2, 1, 1, 1),
         Err(CallAuctionBookLimitsError::ActiveOrdersExceedAcceptedOrderIds)
+    );
+    assert_eq!(
+        make(1, 1, 1, 0),
+        Err(CallAuctionBookLimitsError::ZeroPreparedUncrosses)
+    );
+}
+
+#[test]
+fn unrepresentable_uncross_pool_is_a_typed_constructor_failure() {
+    let limits = CallAuctionBookLimits::new(CallAuctionBookLimitsSpec {
+        max_active_orders: 1,
+        max_price_levels_per_side: 1,
+        max_accepted_order_ids: 1,
+        max_prepared_uncrosses: usize::MAX,
+    })
+    .unwrap();
+    assert_eq!(
+        CallAuctionBook::try_with_limits(definition(), limits).unwrap_err(),
+        CallAuctionConstructionError::CapacityReservationFailed(
+            CallAuctionCapacity::PreparedUncrosses
+        )
     );
 }
 

@@ -14,6 +14,7 @@ pub mod auction_book;
 pub mod auction_engine;
 pub mod auction_market_data;
 pub mod auction_risk;
+mod bounded_hash;
 pub mod codec;
 pub mod domain;
 pub mod durable;
@@ -31,6 +32,7 @@ pub mod matching;
 pub mod risk;
 mod segmented_journal;
 pub mod snapshot;
+mod trace_arena;
 
 pub use domain::{
     AccountId, AccountingDate, AssetId, AuctionId, CommandId, InstrumentId, InstrumentVersion,

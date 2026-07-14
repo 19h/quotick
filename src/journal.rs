@@ -14,6 +14,10 @@
 //! Recovery can repair only a physically incomplete final frame. A checksum
 //! mismatch, sequence discontinuity, invalid magic, unsupported version, or
 //! unknown record kind is always corruption and is never silently discarded.
+//! Complete frame, batch-byte, receipt, read-payload, and segment-inventory
+//! storage is fallibly reserved before the corresponding write, read, or
+//! rotation. A batch writes stack-built headers directly into one reserved byte
+//! buffer and never allocates an intermediate vector per frame.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -335,23 +339,44 @@ impl JournalBatch {
         }
     }
 
+    /// Creates an empty batch with fallibly reserved record headroom.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::CapacityReservationFailed`] when the requested
+    /// record layout is unrepresentable or unavailable.
+    pub fn try_with_capacity(maximum_records: usize) -> Result<Self, JournalError> {
+        Ok(Self {
+            records: reserve_journal_vec(JournalResource::BatchRecords, maximum_records)?,
+        })
+    }
+
     /// Encodes and adds one typed record.
     ///
     /// # Errors
     ///
-    /// Returns [`CodecError`] if the record cannot be represented by its stable
-    /// payload format.
-    pub fn push<T: DurableRecord>(&mut self, record: &T) -> Result<(), CodecError> {
+    /// Returns [`JournalError::Codec`] if the record cannot be represented by
+    /// its stable payload format, or [`JournalError::CapacityReservationFailed`]
+    /// if the next batch-record slot cannot be reserved.
+    pub fn push<T: DurableRecord>(&mut self, record: &T) -> Result<(), JournalError> {
+        reserve_journal_additional(&mut self.records, JournalResource::BatchRecords, 1)?;
         self.records.push(EncodedRecord {
             kind: T::KIND,
-            payload: record.encode()?,
+            payload: record.encode().map_err(JournalError::Codec)?,
         });
         Ok(())
     }
 
     /// Adds already encoded payload bytes.
-    pub fn push_raw(&mut self, kind: RecordKind, payload: Vec<u8>) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::CapacityReservationFailed`] if the next
+    /// batch-record slot cannot be reserved.
+    pub fn push_raw(&mut self, kind: RecordKind, payload: Vec<u8>) -> Result<(), JournalError> {
+        reserve_journal_additional(&mut self.records, JournalResource::BatchRecords, 1)?;
         self.records.push(EncodedRecord { kind, payload });
+        Ok(())
     }
 
     /// Returns the number of records in the batch.
@@ -398,6 +423,64 @@ impl JournalBatch {
         }
         Ok(total)
     }
+}
+
+/// One fallibly reserved journal-owned buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JournalResource {
+    /// Encoded records retained by a caller-owned [`JournalBatch`].
+    BatchRecords,
+    /// One complete header-plus-payload frame.
+    FrameBytes,
+    /// Concatenated header-plus-payload bytes for one append batch.
+    BatchFrameBytes,
+    /// Plain append receipts returned for one batch.
+    BatchReceipts,
+    /// Payload bytes read from one verified physical frame.
+    ReadPayloadBytes,
+    /// Segmented append receipts returned for one batch.
+    SegmentedBatchReceipts,
+    /// Physical segment descriptors retained by a segmented writer.
+    SegmentInventory,
+}
+
+impl fmt::Display for JournalResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::BatchRecords => "batch-record entries",
+            Self::FrameBytes => "frame bytes",
+            Self::BatchFrameBytes => "batch-frame bytes",
+            Self::BatchReceipts => "batch-receipt entries",
+            Self::ReadPayloadBytes => "read-payload bytes",
+            Self::SegmentedBatchReceipts => "segmented batch-receipt entries",
+            Self::SegmentInventory => "segment-inventory entries",
+        })
+    }
+}
+
+pub(crate) fn reserve_journal_vec<T>(
+    resource: JournalResource,
+    maximum: usize,
+) -> Result<Vec<T>, JournalError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(maximum)
+        .map_err(|_| JournalError::CapacityReservationFailed { resource, maximum })?;
+    Ok(values)
+}
+
+pub(crate) fn reserve_journal_additional<T>(
+    values: &mut Vec<T>,
+    resource: JournalResource,
+    additional: usize,
+) -> Result<(), JournalError> {
+    let maximum = values
+        .len()
+        .checked_add(additional)
+        .ok_or(JournalError::FrameLengthOverflow)?;
+    values
+        .try_reserve(additional)
+        .map_err(|_| JournalError::CapacityReservationFailed { resource, maximum })
 }
 
 /// A verified frame returned by [`JournalReader`].
@@ -524,6 +607,13 @@ pub enum JournalError {
     SequenceExhausted,
     /// Header-plus-payload or file offset arithmetic exceeded its representation.
     FrameLengthOverflow,
+    /// A complete journal-owned buffer could not be represented or reserved.
+    CapacityReservationFailed {
+        /// Exact logical buffer that failed.
+        resource: JournalResource,
+        /// Exact required byte or entry count, according to `resource`.
+        maximum: usize,
+    },
     /// A checkpoint anchor does not describe the current complete WAL boundary.
     CheckpointAnchorSequenceMismatch {
         /// Last sequence in the current WAL.
@@ -643,6 +733,9 @@ impl fmt::Display for JournalError {
             }
             Self::SequenceExhausted => formatter.write_str("journal sequence exhausted"),
             Self::FrameLengthOverflow => formatter.write_str("journal frame length overflow"),
+            Self::CapacityReservationFailed { resource, maximum } => {
+                format_reservation_failure(formatter, *resource, *maximum)
+            }
             Self::CheckpointAnchorSequenceMismatch { current, proposed } => write!(
                 formatter,
                 "checkpoint anchor sequence {proposed} does not equal current WAL boundary {current:?}"
@@ -658,10 +751,7 @@ impl fmt::Display for JournalError {
                 path.display()
             ),
             Self::PayloadTooLarge { length, maximum } => {
-                write!(
-                    formatter,
-                    "payload length {length} exceeds configured maximum {maximum}"
-                )
+                format_payload_too_large(formatter, *length, *maximum)
             }
             Self::TruncatedFrame {
                 offset,
@@ -707,6 +797,28 @@ impl fmt::Display for JournalError {
             }
         }
     }
+}
+
+fn format_reservation_failure(
+    formatter: &mut fmt::Formatter<'_>,
+    resource: JournalResource,
+    maximum: usize,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "failed to reserve journal {resource} through {maximum}"
+    )
+}
+
+fn format_payload_too_large(
+    formatter: &mut fmt::Formatter<'_>,
+    length: usize,
+    maximum: u32,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "payload length {length} exceeds configured maximum {maximum}"
+    )
 }
 
 impl std::error::Error for JournalError {
@@ -1205,7 +1317,7 @@ impl Journal {
                 u64::try_from(frame_length).map_err(|_| JournalError::FrameLengthOverflow)?,
             )
             .ok_or(JournalError::FrameLengthOverflow)?;
-        let frame = encode_frame(kind, sequence, payload_length, payload);
+        let frame = encode_frame(kind, sequence, payload_length, payload)?;
         let receipt = AppendReceipt {
             sequence,
             offset: self.offset,
@@ -1234,7 +1346,7 @@ impl Journal {
     ///
     /// # Errors
     ///
-    /// Returns [`JournalError`] for payload limits, length or sequence
+    /// Returns [`JournalError`] for payload limits, length, sequence, or buffer
     /// exhaustion, I/O failure, or use after an ambiguous I/O failure.
     pub fn append_batch(
         &mut self,
@@ -1265,21 +1377,31 @@ impl Journal {
             )
             .ok_or(JournalError::FrameLengthOverflow)?;
 
-        let mut bytes = Vec::with_capacity(total_length);
-        let mut receipts = Vec::with_capacity(batch.len());
+        let mut bytes = reserve_journal_vec(JournalResource::BatchFrameBytes, total_length)?;
+        let mut receipts = reserve_journal_vec(JournalResource::BatchReceipts, batch.len())?;
         let mut offset = self.offset;
         for (sequence, record) in (self.next_sequence..).zip(&batch.records) {
             let payload_length = u32::try_from(record.payload.len())
                 .map_err(|_| JournalError::FrameLengthOverflow)?;
-            let frame = encode_frame(record.kind, sequence, payload_length, &record.payload);
+            let frame_length = append_frame_reserved(
+                &mut bytes,
+                JournalResource::BatchFrameBytes,
+                record.kind,
+                sequence,
+                payload_length,
+                &record.payload,
+            )?;
             receipts.push(AppendReceipt {
                 sequence,
                 offset,
-                frame_length: frame.len(),
+                frame_length,
                 durability: self.options.durability,
             });
-            bytes.extend_from_slice(&frame);
-            offset += u64::try_from(frame.len()).map_err(|_| JournalError::FrameLengthOverflow)?;
+            offset = offset
+                .checked_add(
+                    u64::try_from(frame_length).map_err(|_| JournalError::FrameLengthOverflow)?,
+                )
+                .ok_or(JournalError::FrameLengthOverflow)?;
         }
 
         if let Err(error) = self.write_bytes(&bytes) {
@@ -1327,7 +1449,7 @@ impl Journal {
             anchor.wal_sequence(),
             payload_length,
             &payload,
-        );
+        )?;
         let frame_length =
             u64::try_from(frame.len()).map_err(|_| JournalError::FrameLengthOverflow)?;
         let next_sequence = anchor
@@ -1706,7 +1828,9 @@ fn read_frame_at(
             .try_into()
             .expect("eight-byte sequence field"),
     );
-    let mut payload = vec![0_u8; usize::try_from(payload_length).expect("u32 fits usize")];
+    let payload_length = usize::try_from(payload_length).expect("u32 fits usize");
+    let mut payload = reserve_journal_vec(JournalResource::ReadPayloadBytes, payload_length)?;
+    payload.resize(payload_length, 0);
     file.read_exact(&mut payload)?;
     let calculated_checksum = frame_checksum(&header, &payload);
     if stored_checksum != calculated_checksum {
@@ -1731,23 +1855,60 @@ fn read_frame_at(
     })
 }
 
-fn encode_frame(kind: RecordKind, sequence: u64, payload_length: u32, payload: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(HEADER_LENGTH + payload.len());
-    frame.extend_from_slice(&MAGIC);
-    frame.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    frame.extend_from_slice(&kind.wire().to_le_bytes());
-    frame.extend_from_slice(&payload_length.to_le_bytes());
-    frame.extend_from_slice(&0_u32.to_le_bytes());
-    frame.extend_from_slice(&sequence.to_le_bytes());
-    frame.extend_from_slice(payload);
-    let checksum = frame_checksum(
-        frame[..HEADER_LENGTH]
-            .try_into()
-            .expect("complete frame has a fixed header"),
+fn encode_frame(
+    kind: RecordKind,
+    sequence: u64,
+    payload_length: u32,
+    payload: &[u8],
+) -> Result<Vec<u8>, JournalError> {
+    let frame_length = HEADER_LENGTH
+        .checked_add(payload.len())
+        .ok_or(JournalError::FrameLengthOverflow)?;
+    let mut frame = reserve_journal_vec(JournalResource::FrameBytes, frame_length)?;
+    append_frame_reserved(
+        &mut frame,
+        JournalResource::FrameBytes,
+        kind,
+        sequence,
+        payload_length,
         payload,
-    );
-    frame[CHECKSUM_START..CHECKSUM_END].copy_from_slice(&checksum.to_le_bytes());
-    frame
+    )?;
+    Ok(frame)
+}
+
+fn append_frame_reserved(
+    output: &mut Vec<u8>,
+    resource: JournalResource,
+    kind: RecordKind,
+    sequence: u64,
+    payload_length: u32,
+    payload: &[u8],
+) -> Result<usize, JournalError> {
+    let frame_length = HEADER_LENGTH
+        .checked_add(payload.len())
+        .ok_or(JournalError::FrameLengthOverflow)?;
+    let final_length = output
+        .len()
+        .checked_add(frame_length)
+        .ok_or(JournalError::FrameLengthOverflow)?;
+    if final_length > output.capacity() {
+        return Err(JournalError::CapacityReservationFailed {
+            resource,
+            maximum: final_length,
+        });
+    }
+
+    let mut header = [0_u8; HEADER_LENGTH];
+    header[0..4].copy_from_slice(&MAGIC);
+    header[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    header[6..8].copy_from_slice(&kind.wire().to_le_bytes());
+    header[8..12].copy_from_slice(&payload_length.to_le_bytes());
+    header[16..24].copy_from_slice(&sequence.to_le_bytes());
+    let checksum = frame_checksum(&header, payload);
+    header[CHECKSUM_START..CHECKSUM_END].copy_from_slice(&checksum.to_le_bytes());
+    output.extend_from_slice(&header);
+    output.extend_from_slice(payload);
+    Ok(frame_length)
 }
 
 fn apply_durability(file: &mut File, durability: Durability) -> io::Result<()> {
@@ -1820,8 +1981,9 @@ mod tests {
 
     use super::{
         CRC32C_TABLE, Durability, HEADER_LENGTH, InjectedFault, Journal, JournalBatch,
-        JournalError, JournalOptions, JournalReader, RecordKind, RecoveryMode,
-        cutover_pending_path, update_crc32c,
+        JournalError, JournalOptions, JournalReader, JournalResource, RecordKind, RecoveryMode,
+        append_frame_reserved, cutover_pending_path, encode_frame, reserve_journal_vec,
+        update_crc32c,
     };
     use crate::codec::BinaryCodec;
     use crate::snapshot::{CheckpointAnchor, CheckpointSlot, SnapshotKind};
@@ -1841,6 +2003,60 @@ mod tests {
             durability: Durability::Buffered,
             ..JournalOptions::default()
         }
+    }
+
+    #[test]
+    fn unrepresentable_journal_buffers_are_typed_by_exact_resource() {
+        for resource in [
+            JournalResource::FrameBytes,
+            JournalResource::BatchFrameBytes,
+            JournalResource::BatchReceipts,
+            JournalResource::ReadPayloadBytes,
+            JournalResource::SegmentedBatchReceipts,
+            JournalResource::SegmentInventory,
+        ] {
+            assert!(matches!(
+                reserve_journal_vec::<u128>(resource, usize::MAX),
+                Err(JournalError::CapacityReservationFailed {
+                    resource: actual,
+                    maximum: usize::MAX,
+                }) if actual == resource
+            ));
+        }
+        assert!(matches!(
+            JournalBatch::try_with_capacity(usize::MAX),
+            Err(JournalError::CapacityReservationFailed {
+                resource: JournalResource::BatchRecords,
+                maximum: usize::MAX,
+            })
+        ));
+
+        let mut unreserved = Vec::new();
+        assert!(matches!(
+            append_frame_reserved(
+                &mut unreserved,
+                JournalResource::FrameBytes,
+                RecordKind::Command,
+                1,
+                0,
+                &[],
+            ),
+            Err(JournalError::CapacityReservationFailed {
+                resource: JournalResource::FrameBytes,
+                maximum: HEADER_LENGTH,
+            })
+        ));
+    }
+
+    #[test]
+    fn frame_encoding_has_stable_bytes_without_intermediate_allocation() {
+        assert_eq!(
+            encode_frame(RecordKind::Command, 1, 2, &[0xAA, 0xBB]).unwrap(),
+            [
+                0x51, 0x57, 0x41, 0x4C, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x35, 0xAC,
+                0x4E, 0xA8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAA, 0xBB,
+            ]
+        );
     }
 
     fn remove_test_files(path: &PathBuf) {
@@ -2046,8 +2262,12 @@ mod tests {
         let path = test_path("batch-partial");
         remove_test_files(&path);
         let mut batch = JournalBatch::new();
-        batch.push_raw(RecordKind::Command, vec![1; 8]);
-        batch.push_raw(RecordKind::Command, vec![2; 8]);
+        batch
+            .push_raw(RecordKind::Command, vec![1; 8])
+            .expect("first raw record reserves");
+        batch
+            .push_raw(RecordKind::Command, vec![2; 8])
+            .expect("second raw record reserves");
         let mut journal = Journal::open(&path, buffered_options()).expect("journal opens");
         journal.injected_fault = Some(InjectedFault::PartialWrite(HEADER_LENGTH + 8 + 5));
         assert!(matches!(

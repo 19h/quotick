@@ -1,14 +1,14 @@
 use quotick::auction::{AuctionOrderConstraint, AuctionPricePolicy};
 use quotick::auction_book::{
-    CallAuctionBookLimits, CallAuctionBookLimitsSpec, CallAuctionOrder, CallAuctionRemainderPolicy,
-    CallAuctionSelfTradePolicy, CallAuctionUncrossPolicy,
+    CallAuctionBookLimits, CallAuctionBookLimitsSpec, CallAuctionOrder, CallAuctionPrepareError,
+    CallAuctionRemainderPolicy, CallAuctionSelfTradePolicy, CallAuctionUncrossPolicy,
 };
 use quotick::auction_engine::{
     CallAuctionAction, CallAuctionCancelOrder, CallAuctionCommand, CallAuctionCommandOutcome,
-    CallAuctionEngine, CallAuctionEngineCapacity, CallAuctionEngineError, CallAuctionEngineLimits,
-    CallAuctionEngineLimitsError, CallAuctionEngineLimitsSpec, CallAuctionEventKind,
-    CallAuctionPhase, CallAuctionPhaseControl, CallAuctionRejectReason, CallAuctionSubmitOrder,
-    CallAuctionUncrossCommand,
+    CallAuctionEngine, CallAuctionEngineCapacity, CallAuctionEngineConstructionError,
+    CallAuctionEngineError, CallAuctionEngineLimits, CallAuctionEngineLimitsError,
+    CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionPhase, CallAuctionPhaseControl,
+    CallAuctionRejectReason, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use quotick::instrument::{
     InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -59,6 +59,7 @@ fn book_limits(active: usize, accepted: usize) -> CallAuctionBookLimits {
         max_active_orders: active,
         max_price_levels_per_side: active,
         max_accepted_order_ids: accepted,
+        max_prepared_uncrosses: 2,
     })
     .unwrap()
 }
@@ -69,6 +70,7 @@ fn engine_limits(active: usize, accepted: usize, retained: usize) -> CallAuction
         book,
         max_retained_commands: retained,
         terminal_command_reserve: active + 2,
+        max_retained_events: retained + active * 2 + 2,
         max_report_events: active * 2 + 1,
     })
     .unwrap()
@@ -431,25 +433,31 @@ fn prepared_commands_reject_foreign_and_stale_state_but_exact_races_replay() {
         quotick::auction_engine::CallAuctionCommandPreparation::Ready(value) => value,
         quotick::auction_engine::CallAuctionCommandPreparation::Replay(_) => unreachable!(),
     };
+    assert_eq!(first.resource_status().retained_events, 0);
     assert!(matches!(
         second.commit(prepared),
         Err(CallAuctionEngineError::ForeignPreparation)
     ));
+    assert_eq!(first.resource_status().retained_events, 0);
+    assert_eq!(second.resource_status().retained_events, 0);
 
     let prepared = match first.prepare(command).unwrap() {
         quotick::auction_engine::CallAuctionCommandPreparation::Ready(value) => value,
         quotick::auction_engine::CallAuctionCommandPreparation::Replay(_) => unreachable!(),
     };
+    assert_eq!(first.resource_status().retained_events, 0);
     first
         .submit(submit_command(
             2,
             order(1, 1, Side::Buy, AuctionOrderConstraint::Market, 1),
         ))
         .unwrap();
+    assert_eq!(first.resource_status().retained_events, 1);
     assert!(matches!(
         first.commit(prepared),
         Err(CallAuctionEngineError::StalePreparation)
     ));
+    assert_eq!(first.resource_status().retained_events, 1);
 
     let command = phase_command(3, 1, 0, CallAuctionPhase::Collecting);
     let prepared = match first.prepare(command).unwrap() {
@@ -461,7 +469,212 @@ fn prepared_commands_reject_foreign_and_stale_state_but_exact_races_replay() {
     assert!(replay.replayed);
     assert_eq!(replay.command_sequence, committed.command_sequence);
     assert!(replay.events.shares_storage_with(&committed.events));
+    assert_eq!(first.resource_status().retained_events, 2);
     first.validate().unwrap();
+}
+
+#[test]
+fn protected_event_history_admits_only_valid_terminal_actions() {
+    let book = book_limits(2, 4);
+    let limits = CallAuctionEngineLimits::new(CallAuctionEngineLimitsSpec {
+        book,
+        max_retained_commands: 12,
+        terminal_command_reserve: 4,
+        max_retained_events: 9,
+        max_report_events: 5,
+    })
+    .unwrap();
+    let mut engine = CallAuctionEngine::try_with_limits(definition(), limits).unwrap();
+    let allocated = engine.resource_status().allocated_retained_events;
+
+    engine
+        .submit(phase_command(1, 1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            2,
+            order(1, 1, Side::Buy, AuctionOrderConstraint::Market, 2),
+        ))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            3,
+            order(2, 2, Side::Sell, AuctionOrderConstraint::Market, 2),
+        ))
+        .unwrap();
+    let status = engine.resource_status();
+    assert_eq!(status.retained_events, 3);
+    assert_eq!(status.ordinary_event_capacity, 3);
+    assert_eq!(status.terminal_event_reserve, 6);
+
+    assert!(matches!(
+        engine.submit(cancel_command(4, 99, 1)),
+        Err(CallAuctionEngineError::CapacityExhausted(
+            CallAuctionEngineCapacity::AdmissionEventHistory
+        ))
+    ));
+    assert_eq!(engine.resource_status().retained_events, 3);
+
+    engine
+        .submit(phase_command(5, 1, 1, CallAuctionPhase::Frozen))
+        .unwrap();
+    let uncross = uncross_command(&engine, 6, 1, 2, CallAuctionRemainderPolicy::CancelAll);
+    let report = engine.submit(uncross).unwrap();
+    assert_eq!(report.events.len(), 2);
+    assert_eq!(engine.resource_status().retained_events, 6);
+    assert_eq!(
+        engine.resource_status().allocated_retained_events,
+        allocated
+    );
+
+    let replay = engine.submit(uncross).unwrap();
+    assert!(replay.replayed);
+    assert!(replay.events.shares_storage_with(&report.events));
+    assert_eq!(engine.resource_status().retained_events, 6);
+    engine.validate().unwrap();
+}
+
+#[test]
+fn total_event_exhaustion_preserves_exact_retry_after_checkpoint_rebinding() {
+    let source_limits = engine_limits(2, 2, 20);
+    let mut source = CallAuctionEngine::try_with_limits(definition(), source_limits).unwrap();
+    let first = submit_command_at(
+        1,
+        1,
+        0,
+        order(1, 1, Side::Buy, AuctionOrderConstraint::Market, 1),
+    );
+    for command_id in 1..=9 {
+        let command = submit_command_at(
+            command_id,
+            1,
+            0,
+            order(command_id, 1, Side::Buy, AuctionOrderConstraint::Market, 1),
+        );
+        source.submit(command).unwrap();
+    }
+    let checkpoint = source.checkpoint(1, 19).unwrap();
+    let book = book_limits(2, 2);
+    let selected = CallAuctionEngineLimits::new(CallAuctionEngineLimitsSpec {
+        book,
+        max_retained_commands: 14,
+        terminal_command_reserve: 4,
+        max_retained_events: 9,
+        max_report_events: 5,
+    })
+    .unwrap();
+    let mut restored =
+        CallAuctionEngine::from_checkpoint_with_limits(&checkpoint, selected).unwrap();
+    assert_eq!(restored.resource_status().retained_events, 9);
+    restored.validate().unwrap();
+
+    let replay = restored.submit(first).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(restored.resource_status().retained_events, 9);
+    assert!(matches!(
+        restored.submit(submit_command_at(
+            10,
+            1,
+            0,
+            order(10, 1, Side::Buy, AuctionOrderConstraint::Market, 1),
+        )),
+        Err(CallAuctionEngineError::CapacityExhausted(
+            CallAuctionEngineCapacity::RetainedEvents
+        ))
+    ));
+    assert_eq!(restored.resource_status().retained_events, 9);
+}
+
+#[test]
+fn uncross_pool_exhaustion_is_unsequenced_and_drop_releases_the_lease() {
+    let book = CallAuctionBookLimits::new(CallAuctionBookLimitsSpec {
+        max_active_orders: 2,
+        max_price_levels_per_side: 2,
+        max_accepted_order_ids: 4,
+        max_prepared_uncrosses: 1,
+    })
+    .unwrap();
+    let limits = CallAuctionEngineLimits::new(CallAuctionEngineLimitsSpec {
+        book,
+        max_retained_commands: 12,
+        terminal_command_reserve: 4,
+        max_retained_events: 18,
+        max_report_events: 5,
+    })
+    .unwrap();
+    let mut engine = CallAuctionEngine::try_with_limits(definition(), limits).unwrap();
+    engine
+        .submit(phase_command(1, 1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            2,
+            order(1, 1, Side::Buy, AuctionOrderConstraint::Market, 2),
+        ))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            3,
+            order(2, 2, Side::Sell, AuctionOrderConstraint::Market, 2),
+        ))
+        .unwrap();
+    engine
+        .submit(phase_command(4, 1, 1, CallAuctionPhase::Frozen))
+        .unwrap();
+
+    let first_command = uncross_command(&engine, 5, 1, 2, CallAuctionRemainderPolicy::CancelAll);
+    let quotick::auction_engine::CallAuctionCommandPreparation::Ready(first) =
+        engine.prepare(first_command).unwrap()
+    else {
+        unreachable!();
+    };
+    assert_eq!(
+        engine.book().resource_status().available_prepared_uncrosses,
+        0
+    );
+    let second_command = uncross_command(&engine, 6, 1, 2, CallAuctionRemainderPolicy::CancelAll);
+    assert!(matches!(
+        engine.prepare(second_command),
+        Err(CallAuctionEngineError::UncrossPreparation(
+            CallAuctionPrepareError::PreparationCapacityExhausted { maximum: 1 }
+        ))
+    ));
+    assert_eq!(engine.resource_status().retained_commands, 4);
+    assert_eq!(engine.resource_status().retained_events, 4);
+
+    drop(first);
+    assert_eq!(
+        engine.book().resource_status().available_prepared_uncrosses,
+        1
+    );
+    let quotick::auction_engine::CallAuctionCommandPreparation::Ready(second) =
+        engine.prepare(second_command).unwrap()
+    else {
+        unreachable!();
+    };
+    engine.commit(second).unwrap();
+    assert_eq!(
+        engine.book().resource_status().available_prepared_uncrosses,
+        1
+    );
+    engine.validate().unwrap();
+}
+
+#[test]
+fn unrepresentable_event_arena_is_a_typed_constructor_failure() {
+    let book = book_limits(1, 1);
+    let limits = CallAuctionEngineLimits::new(CallAuctionEngineLimitsSpec {
+        book,
+        max_retained_commands: 4,
+        terminal_command_reserve: 3,
+        max_retained_events: usize::MAX,
+        max_report_events: 3,
+    })
+    .unwrap();
+    assert!(matches!(
+        CallAuctionEngine::try_with_limits(definition(), limits),
+        Err(CallAuctionEngineConstructionError::EventArenaReservationFailed)
+    ));
 }
 
 #[test]
@@ -576,31 +789,43 @@ fn phase_controller_matches_literal_model_for_ten_thousand_commands() {
 #[test]
 fn engine_limits_derive_terminal_and_report_bounds() {
     let book = book_limits(2, 4);
-    let make = |retained, reserve, events| {
+    let make = |retained, reserve, retained_events, report_events| {
         CallAuctionEngineLimits::new(CallAuctionEngineLimitsSpec {
             book,
             max_retained_commands: retained,
             terminal_command_reserve: reserve,
-            max_report_events: events,
+            max_retained_events: retained_events,
+            max_report_events: report_events,
         })
     };
     assert_eq!(
-        make(7, 3, 5),
+        make(7, 3, 9, 5),
         Err(CallAuctionEngineLimitsError::TerminalReserveBelowRequired {
             configured: 3,
             required: 4,
         })
     );
     assert_eq!(
-        make(4, 4, 5),
+        make(4, 4, 9, 5),
         Err(CallAuctionEngineLimitsError::TerminalReserveExhaustsHistory)
     );
     assert_eq!(
-        make(7, 4, 4),
+        make(7, 4, 9, 4),
         Err(CallAuctionEngineLimitsError::ReportEventsBelowRequired {
             configured: 4,
             required: 5,
         })
     );
-    assert!(make(7, 4, 5).is_ok());
+    assert_eq!(
+        make(7, 4, 0, 5),
+        Err(CallAuctionEngineLimitsError::ZeroRetainedEvents)
+    );
+    assert_eq!(
+        make(7, 4, 8, 5),
+        Err(CallAuctionEngineLimitsError::RetainedEventsBelowRequired {
+            configured: 8,
+            required: 9,
+        })
+    );
+    assert!(make(7, 4, 9, 5).is_ok());
 }

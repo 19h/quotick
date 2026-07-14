@@ -22,13 +22,21 @@ enum Slot<K, V> {
     Vacant { next: Option<usize> },
 }
 
+/// Process-local stable address of one occupied AVL slot.
+///
+/// Rotations and removal of a different key preserve this address. Callers
+/// must pair it with the expected key: removal invalidates the handle, and a
+/// later insertion may reuse the numeric slot for another key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IndexedAvlHandle(usize);
+
 /// A finitely bounded ordered map backed by a stable-slot AVL arena.
 ///
 /// Construction fallibly reserves the complete slot allocation. Insertion and
 /// deletion subsequently perform no heap allocation: removed slots form an
 /// intrusive free list and are reused before the arena's initialized prefix can
-/// grow. Keys and values move between slots during two-child deletion, so slot
-/// indices are deliberately not exposed.
+/// grow. Rotations and two-child deletion relink nodes without moving any
+/// surviving key/value pair, allowing key-checked stable handles on hot paths.
 #[derive(Debug)]
 pub(crate) struct IndexedAvlMap<K, V> {
     root: Option<usize>,
@@ -55,6 +63,10 @@ impl<K, V> IndexedAvlMap<K, V> {
         self.len
     }
 
+    pub(crate) const fn maximum(&self) -> usize {
+        self.max_entries
+    }
+
     pub(crate) fn has_insertion_capacity(&self) -> bool {
         self.free_head.is_some()
             || (self.slots.len() < self.max_entries && self.slots.len() < self.slots.capacity())
@@ -66,6 +78,23 @@ impl<K, V> IndexedAvlMap<K, V> {
 
     pub(crate) fn storage_len(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Removes every entry while retaining the complete arena allocation.
+    pub(crate) fn clear(&mut self) {
+        let mut next = None;
+        for (index, slot) in self.slots.iter_mut().enumerate().rev() {
+            *slot = Slot::Vacant { next };
+            next = Some(index);
+        }
+        self.root = None;
+        self.free_head = next;
+        self.len = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.slots.shrink_to_fit();
     }
 }
 
@@ -79,9 +108,36 @@ impl<K: Ord + Copy, V: Copy> IndexedAvlMap<K, V> {
         Some(&mut self.node_mut(index).value)
     }
 
+    pub(crate) fn get_handle(&self, key: &K) -> Option<IndexedAvlHandle> {
+        self.find_index(key).map(IndexedAvlHandle)
+    }
+
+    pub(crate) fn get_by_handle(&self, handle: IndexedAvlHandle, expected_key: &K) -> Option<&V> {
+        let Slot::Occupied(node) = self.slots.get(handle.0)? else {
+            return None;
+        };
+        (node.key == *expected_key).then_some(&node.value)
+    }
+
+    pub(crate) fn get_mut_by_handle(
+        &mut self,
+        handle: IndexedAvlHandle,
+        expected_key: &K,
+    ) -> Option<&mut V> {
+        let Slot::Occupied(node) = self.slots.get_mut(handle.0)? else {
+            return None;
+        };
+        (node.key == *expected_key).then_some(&mut node.value)
+    }
+
     pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
+        self.insert_with_handle(key, value).1
+    }
+
+    pub(crate) fn insert_with_handle(&mut self, key: K, value: V) -> (IndexedAvlHandle, Option<V>) {
         if let Some(index) = self.find_index(&key) {
-            return Some(std::mem::replace(&mut self.node_mut(index).value, value));
+            let replaced = std::mem::replace(&mut self.node_mut(index).value, value);
+            return (IndexedAvlHandle(index), Some(replaced));
         }
         assert!(
             self.has_insertion_capacity(),
@@ -90,30 +146,52 @@ impl<K: Ord + Copy, V: Copy> IndexedAvlMap<K, V> {
         let index = self.allocate_slot(key, value);
         self.root = Some(self.insert_index(self.root, index, key));
         self.len += 1;
-        None
+        (IndexedAvlHandle(index), None)
     }
 
     pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
-        let original_index = self.find_index(key)?;
-        let original_value = self.node(original_index).value;
+        let handle = self.get_handle(key)?;
+        self.remove_by_handle(handle, key)
+    }
+
+    pub(crate) fn remove_by_handle(
+        &mut self,
+        handle: IndexedAvlHandle,
+        expected_key: &K,
+    ) -> Option<V> {
+        let original_value = *self.get_by_handle(handle, expected_key)?;
         let mut removed_index = None;
-        self.root = self.delete_index(self.root, key, &mut removed_index);
+        self.root = self.delete_index(self.root, expected_key, &mut removed_index);
         let removed_index = removed_index.expect("found AVL key must remove one occupied slot");
+        assert_eq!(
+            removed_index, handle.0,
+            "stable AVL deletion must release the addressed key slot"
+        );
         self.release_slot(removed_index);
         self.len -= 1;
         Some(original_value)
     }
 
     pub(crate) fn first_key_value(&self) -> Option<(&K, &V)> {
-        let index = self.minimum_index(self.root?);
-        let node = self.node(index);
-        Some((&node.key, &node.value))
+        self.first_key_value_with_handle()
+            .map(|(_, key, value)| (key, value))
     }
 
     pub(crate) fn last_key_value(&self) -> Option<(&K, &V)> {
+        self.last_key_value_with_handle()
+            .map(|(_, key, value)| (key, value))
+    }
+
+    pub(crate) fn first_key_value_with_handle(&self) -> Option<(IndexedAvlHandle, &K, &V)> {
+        let index = self.minimum_index(self.root?);
+        let node = self.node(index);
+        Some((IndexedAvlHandle(index), &node.key, &node.value))
+    }
+
+    pub(crate) fn last_key_value_with_handle(&self) -> Option<(IndexedAvlHandle, &K, &V)> {
         let index = self.maximum_index(self.root?);
         let node = self.node(index);
-        Some((&node.key, &node.value))
+        Some((IndexedAvlHandle(index), &node.key, &node.value))
     }
 
     pub(crate) fn predecessor_key(&self, key: &K) -> Option<&K> {
@@ -150,64 +228,124 @@ impl<K: Ord + Copy, V: Copy> IndexedAvlMap<K, V> {
         Iter::new(self)
     }
 
-    pub(crate) fn validate(&self) -> Result<(), String> {
+    /// Audits the complete tree/arena/free-list structure without allocation.
+    ///
+    /// Every child reference is checked once, the tree must have exactly one
+    /// fewer edge than occupied slots, and each occupied key must resolve from
+    /// the root to its exact stable slot. A valid tree therefore audits in
+    /// `O(S log S)` for `S` initialized slots and `O(1)` auxiliary space while
+    /// detecting shared children, disconnected components, and cycles without
+    /// transient state.
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
         if self.len > self.max_entries {
-            return Err("indexed AVL cardinality exceeds its finite bound".to_owned());
+            return Err("indexed AVL cardinality exceeds its finite bound");
         }
         if self.slots.len() > self.max_entries || self.slots.capacity() < self.max_entries {
-            return Err("indexed AVL arena capacity contradicts its finite bound".to_owned());
+            return Err("indexed AVL arena capacity contradicts its finite bound");
         }
         if self.root.is_none() != (self.len == 0) {
-            return Err("indexed AVL root/length state is inconsistent".to_owned());
+            return Err("indexed AVL root/length state is inconsistent");
         }
 
-        let mut states = vec![0_u8; self.slots.len()];
+        let mut occupied = 0_usize;
+        let mut vacant = 0_usize;
+        let mut child_references = 0_usize;
+        for slot in self.slots.iter().copied() {
+            match slot {
+                Slot::Occupied(node) => {
+                    occupied = occupied
+                        .checked_add(1)
+                        .ok_or("indexed AVL occupied count is exhausted")?;
+                    for child in [node.left, node.right].into_iter().flatten() {
+                        let child_slot = self
+                            .slots
+                            .get(child)
+                            .ok_or("indexed AVL child references an absent slot")?;
+                        if matches!(child_slot, Slot::Vacant { .. }) {
+                            return Err("indexed AVL child references a vacant slot");
+                        }
+                        child_references = child_references
+                            .checked_add(1)
+                            .ok_or("indexed AVL child-reference count is exhausted")?;
+                    }
+                }
+                Slot::Vacant { .. } => {
+                    vacant = vacant
+                        .checked_add(1)
+                        .ok_or("indexed AVL vacant count is exhausted")?;
+                }
+            }
+        }
+        if occupied != self.len {
+            return Err("indexed AVL occupied-slot count differs from length");
+        }
+        let expected_child_references = occupied.saturating_sub(1);
+        if child_references != expected_child_references {
+            return Err("indexed AVL contains a cycle or duplicate child");
+        }
+        for (index, slot) in self.slots.iter().copied().enumerate() {
+            let Slot::Occupied(node) = slot else {
+                continue;
+            };
+            if self.audit_find_index(&node.key)? != Some(index) {
+                return Err("indexed AVL contains an unreachable occupied slot or duplicate key");
+            }
+        }
+
         let reachable = match self.root {
-            Some(root) => self.validate_subtree(root, None, None, 0, &mut states)?.0,
+            Some(root) => self.validate_subtree(root, None, None, 0)?.0,
             None => 0,
         };
         if reachable != self.len {
-            return Err("indexed AVL reachable cardinality differs from length".to_owned());
+            return Err("indexed AVL reachable cardinality differs from length");
         }
 
-        let mut free_seen = vec![false; self.slots.len()];
+        let mut free_count = 0_usize;
         let mut current = self.free_head;
         while let Some(index) = current {
+            if free_count >= vacant {
+                return Err("indexed AVL free list contains a cycle");
+            }
             let slot = self
                 .slots
                 .get(index)
                 .copied()
-                .ok_or_else(|| "indexed AVL free list references an absent slot".to_owned())?;
-            if std::mem::replace(&mut free_seen[index], true) {
-                return Err("indexed AVL free list contains a cycle".to_owned());
-            }
+                .ok_or("indexed AVL free list references an absent slot")?;
+            free_count += 1;
             current = match slot {
                 Slot::Vacant { next } => next,
                 Slot::Occupied(_) => {
-                    return Err("indexed AVL free list references an occupied slot".to_owned());
+                    return Err("indexed AVL free list references an occupied slot");
                 }
             };
         }
-
-        let mut occupied = 0_usize;
-        for (index, slot) in self.slots.iter().enumerate() {
-            match slot {
-                Slot::Occupied(_) => {
-                    occupied += 1;
-                    if states[index] != 2 {
-                        return Err("indexed AVL contains an unreachable occupied slot".to_owned());
-                    }
-                }
-                Slot::Vacant { .. } if !free_seen[index] => {
-                    return Err("indexed AVL contains an unlinked vacant slot".to_owned());
-                }
-                Slot::Vacant { .. } => {}
-            }
-        }
-        if occupied != self.len {
-            return Err("indexed AVL occupied-slot count differs from length".to_owned());
+        if free_count != vacant {
+            return Err("indexed AVL contains an unlinked vacant slot");
         }
         Ok(())
+    }
+
+    fn audit_find_index(&self, key: &K) -> Result<Option<usize>, &'static str> {
+        let mut current = self.root;
+        for _ in 0..MAX_AVL_HEIGHT {
+            let Some(index) = current else {
+                return Ok(None);
+            };
+            let slot = self
+                .slots
+                .get(index)
+                .copied()
+                .ok_or("indexed AVL child references an absent slot")?;
+            let Slot::Occupied(node) = slot else {
+                return Err("indexed AVL child references a vacant slot");
+            };
+            match key.cmp(&node.key) {
+                Ordering::Less => current = node.left,
+                Ordering::Greater => current = node.right,
+                Ordering::Equal => return Ok(Some(index)),
+            }
+        }
+        Err("indexed AVL search exceeds the addressable height bound or contains a cycle")
     }
 
     fn validate_subtree(
@@ -216,56 +354,48 @@ impl<K: Ord + Copy, V: Copy> IndexedAvlMap<K, V> {
         lower: Option<K>,
         upper: Option<K>,
         depth: usize,
-        states: &mut [u8],
-    ) -> Result<(usize, u16), String> {
+    ) -> Result<(usize, u16), &'static str> {
         if depth >= MAX_AVL_HEIGHT {
-            return Err("indexed AVL exceeds the addressable height bound".to_owned());
+            return Err("indexed AVL exceeds the addressable height bound");
         }
         let slot = self
             .slots
             .get(index)
             .copied()
-            .ok_or_else(|| "indexed AVL child references an absent slot".to_owned())?;
-        if states[index] != 0 {
-            return Err("indexed AVL contains a cycle or duplicate child".to_owned());
-        }
-        states[index] = 1;
+            .ok_or("indexed AVL child references an absent slot")?;
         let node = match slot {
             Slot::Occupied(node) => node,
             Slot::Vacant { .. } => {
-                return Err("indexed AVL child references a vacant slot".to_owned());
+                return Err("indexed AVL child references a vacant slot");
             }
         };
         if lower.is_some_and(|bound| node.key <= bound)
             || upper.is_some_and(|bound| node.key >= bound)
         {
-            return Err("indexed AVL violates strict key ordering".to_owned());
+            return Err("indexed AVL violates strict key ordering");
         }
         let (left_count, left_height) = match node.left {
-            Some(left) => self.validate_subtree(left, lower, Some(node.key), depth + 1, states)?,
+            Some(left) => self.validate_subtree(left, lower, Some(node.key), depth + 1)?,
             None => (0, 0),
         };
         let (right_count, right_height) = match node.right {
-            Some(right) => {
-                self.validate_subtree(right, Some(node.key), upper, depth + 1, states)?
-            }
+            Some(right) => self.validate_subtree(right, Some(node.key), upper, depth + 1)?,
             None => (0, 0),
         };
         if left_height.abs_diff(right_height) > 1 {
-            return Err("indexed AVL balance factor exceeds one".to_owned());
+            return Err("indexed AVL balance factor exceeds one");
         }
         let expected_height = left_height
             .max(right_height)
             .checked_add(1)
             .expect("valid AVL height must fit u16");
         if node.height != expected_height {
-            return Err("indexed AVL cached height is inconsistent".to_owned());
+            return Err("indexed AVL cached height is inconsistent");
         }
-        states[index] = 2;
         let count = left_count
             .checked_add(right_count)
             .and_then(|value| value.checked_add(1))
-            .ok_or_else(|| "indexed AVL reachable count is exhausted".to_owned())?;
+            .ok_or("indexed AVL reachable count is exhausted")?;
         Ok((count, expected_height))
     }
 
@@ -327,23 +457,28 @@ impl<K: Ord + Copy, V: Copy> IndexedAvlMap<K, V> {
                         return child;
                     }
                     (Some(_), Some(right)) => {
-                        let successor = self.minimum_index(right);
-                        let (successor_key, successor_value) = {
-                            let node = self.node(successor);
-                            (node.key, node.value)
-                        };
+                        let (right, successor) = self.detach_minimum(right);
                         {
-                            let node = self.node_mut(root);
-                            node.key = successor_key;
-                            node.value = successor_value;
+                            let successor_node = self.node_mut(successor);
+                            successor_node.left = left;
+                            successor_node.right = right;
                         }
-                        let child = self.delete_index(Some(right), &successor_key, removed);
-                        self.node_mut(root).right = child;
+                        *removed = Some(root);
+                        return Some(self.rebalance(successor));
                     }
                 }
             }
         }
         Some(self.rebalance(root))
+    }
+
+    fn detach_minimum(&mut self, root: usize) -> (Option<usize>, usize) {
+        let Some(left) = self.node(root).left else {
+            return (self.node(root).right, root);
+        };
+        let (left, minimum) = self.detach_minimum(left);
+        self.node_mut(root).left = left;
+        (Some(self.rebalance(root)), minimum)
     }
 
     fn rebalance(&mut self, index: usize) -> usize {
@@ -597,9 +732,87 @@ impl<K: Ord + Copy, V: Copy> ExactSizeIterator for Iter<'_, K, V> {}
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::cmp::Ordering;
     use std::collections::BTreeMap;
 
     use super::{IndexedAvlMap, Slot};
+
+    thread_local! {
+        static ORDER_COMPARISONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct ComparisonKey(i64);
+
+    impl Ord for ComparisonKey {
+        fn cmp(&self, other: &Self) -> Ordering {
+            ORDER_COMPARISONS.set(ORDER_COMPARISONS.get() + 1);
+            self.0.cmp(&other.0)
+        }
+    }
+
+    impl PartialOrd for ComparisonKey {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    #[test]
+    fn direct_handle_access_performs_no_ordered_key_search() {
+        let mut map = IndexedAvlMap::try_with_capacity(7).unwrap();
+        let mut selected = None;
+        for key in [4_i64, 2, 6, 1, 3, 5, 7] {
+            let key = ComparisonKey(key);
+            let (handle, replaced) = map.insert_with_handle(key, key.0 * 10);
+            assert_eq!(replaced, None);
+            if key.0 == 4 {
+                selected = Some((key, handle));
+            }
+        }
+        let (key, handle) = selected.unwrap();
+
+        ORDER_COMPARISONS.set(0);
+        *map.get_mut_by_handle(handle, &key).unwrap() = 4_000;
+        assert_eq!(map.get_by_handle(handle, &key), Some(&4_000));
+        assert_eq!(ORDER_COMPARISONS.get(), 0);
+    }
+
+    #[test]
+    fn keyed_handles_survive_rotations_and_two_child_deletion() {
+        let mut map = IndexedAvlMap::try_with_capacity(8).unwrap();
+        let (handle_40, replaced) = map.insert_with_handle(40_i64, 400_i64);
+        assert_eq!(replaced, None);
+        let mut retained = Vec::new();
+        for key in [20_i64, 60, 10, 30, 50, 70, 25] {
+            let (handle, replaced) = map.insert_with_handle(key, key * 10);
+            assert_eq!(replaced, None);
+            retained.push((key, handle));
+        }
+
+        *map.get_mut_by_handle(retained[6].1, &25).unwrap() = 2_500;
+        assert_eq!(map.remove_by_handle(handle_40, &40), Some(400));
+        assert_eq!(map.get_by_handle(handle_40, &40), None);
+        for (key, handle) in retained {
+            let expected = if key == 25 { 2_500 } else { key * 10 };
+            assert_eq!(map.get_by_handle(handle, &key), Some(&expected));
+        }
+        map.validate().unwrap();
+    }
+
+    #[test]
+    fn keyed_handle_rejects_a_differently_keyed_reused_slot() {
+        let mut map = IndexedAvlMap::try_with_capacity(1).unwrap();
+        let (old_handle, replaced) = map.insert_with_handle(1_i64, 10_i64);
+        assert_eq!(replaced, None);
+        assert_eq!(map.remove(&1), Some(10));
+        let (new_handle, replaced) = map.insert_with_handle(2, 20);
+        assert_eq!(replaced, None);
+
+        assert_eq!(old_handle, new_handle);
+        assert_eq!(map.get_by_handle(old_handle, &1), None);
+        assert_eq!(map.get_by_handle(new_handle, &2), Some(&20));
+    }
 
     #[test]
     fn all_rotation_shapes_preserve_total_order_and_reverse_iteration() {
@@ -739,6 +952,33 @@ mod tests {
     }
 
     #[test]
+    fn clear_retains_and_reuses_the_complete_initialized_arena() {
+        let mut map = IndexedAvlMap::try_with_capacity(4).unwrap();
+        for key in [4_i64, 2, 6, 1] {
+            map.insert(key, key * 10);
+        }
+        let capacity = map.allocation_capacity();
+        let storage_len = map.storage_len();
+        map.clear();
+        assert_eq!(map.len(), 0);
+        assert_eq!(map.maximum(), 4);
+        assert_eq!(map.allocation_capacity(), capacity);
+        assert_eq!(map.storage_len(), storage_len);
+        map.validate().unwrap();
+
+        for key in [3_i64, 5, 7, 9] {
+            map.insert(key, key * 10);
+        }
+        assert_eq!(map.allocation_capacity(), capacity);
+        assert_eq!(map.storage_len(), storage_len);
+        assert_eq!(
+            map.iter().map(|(&key, _)| key).collect::<Vec<_>>(),
+            [3, 5, 7, 9]
+        );
+        map.validate().unwrap();
+    }
+
+    #[test]
     fn invariant_audit_rejects_tree_and_free_list_corruption() {
         let mut map = IndexedAvlMap::try_with_capacity(4).unwrap();
         for key in [2_i64, 1, 3] {
@@ -768,5 +1008,47 @@ mod tests {
                 .unwrap_err()
                 .contains("free list contains a cycle")
         );
+    }
+
+    #[test]
+    fn allocation_free_audit_rejects_shared_disconnected_and_unlinked_slots() {
+        let mut map = IndexedAvlMap::try_with_capacity(4).unwrap();
+        for key in [2_i64, 1, 3] {
+            map.insert(key, key);
+        }
+        let root = map.root.unwrap();
+        let left = map.node(root).left.unwrap();
+
+        let mut shared = map.clone();
+        let Slot::Occupied(node) = &mut shared.slots[root] else {
+            unreachable!();
+        };
+        node.right = Some(left);
+        assert!(
+            shared
+                .validate()
+                .unwrap_err()
+                .contains("unreachable occupied slot")
+        );
+
+        let mut disconnected_cycle = map.clone();
+        let Slot::Occupied(node) = &mut disconnected_cycle.slots[root] else {
+            unreachable!();
+        };
+        node.left = None;
+        let Slot::Occupied(node) = &mut disconnected_cycle.slots[left] else {
+            unreachable!();
+        };
+        node.left = Some(left);
+        assert!(
+            disconnected_cycle
+                .validate()
+                .unwrap_err()
+                .contains("unreachable occupied slot")
+        );
+
+        map.remove(&1);
+        map.free_head = None;
+        assert!(map.validate().unwrap_err().contains("unlinked vacant slot"));
     }
 }

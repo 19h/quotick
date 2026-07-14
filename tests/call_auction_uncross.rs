@@ -1,8 +1,8 @@
 use quotick::auction::{AuctionOrderConstraint, AuctionPricePolicy};
 use quotick::auction_book::{
     CallAuctionBook, CallAuctionBookLimits, CallAuctionBookLimitsSpec, CallAuctionCommitError,
-    CallAuctionOrder, CallAuctionRemainderPolicy, CallAuctionSelfTradePolicy,
-    CallAuctionUncrossPolicy,
+    CallAuctionOrder, CallAuctionPrepareError, CallAuctionRemainderPolicy,
+    CallAuctionSelfTradePolicy, CallAuctionUncrossPolicy,
 };
 use quotick::instrument::{
     InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -49,10 +49,15 @@ fn definition() -> InstrumentDefinition {
 }
 
 fn limits(active: usize, accepted: usize) -> CallAuctionBookLimits {
+    limits_with_prepared(active, accepted, 2)
+}
+
+fn limits_with_prepared(active: usize, accepted: usize, prepared: usize) -> CallAuctionBookLimits {
     CallAuctionBookLimits::new(CallAuctionBookLimitsSpec {
         max_active_orders: active,
         max_price_levels_per_side: active,
         max_accepted_order_ids: accepted,
+        max_prepared_uncrosses: prepared,
     })
     .unwrap()
 }
@@ -318,6 +323,87 @@ fn balanced_market_book() -> CallAuctionBook {
     book.admit(order(2, 2, Side::Sell, AuctionOrderConstraint::Market, 5))
         .unwrap();
     book
+}
+
+#[test]
+fn constructor_owned_uncross_pool_is_bounded_reusable_and_drop_released() {
+    let mut book =
+        CallAuctionBook::try_with_limits(definition(), limits_with_prepared(8, 16, 1)).unwrap();
+    book.admit(order(1, 1, Side::Buy, AuctionOrderConstraint::Market, 5))
+        .unwrap();
+    book.admit(order(2, 2, Side::Sell, AuctionOrderConstraint::Market, 5))
+        .unwrap();
+    let initial = book.resource_status();
+    assert_eq!(initial.configured_prepared_uncrosses, 1);
+    assert_eq!(initial.available_prepared_uncrosses, 1);
+    assert!(initial.uncross_fill_capacity_per_side >= 8);
+    assert!(initial.uncross_trade_capacity >= 8);
+    assert!(initial.uncross_cancellation_capacity >= 8);
+
+    let clearing = indicative(&mut book, 0);
+    let prepared = book
+        .prepare_uncross(clearing, policy(CallAuctionRemainderPolicy::RetainAll))
+        .unwrap();
+    assert_eq!(book.resource_status().available_prepared_uncrosses, 0);
+    assert!(matches!(
+        book.prepare_uncross(clearing, policy(CallAuctionRemainderPolicy::RetainAll)),
+        Err(CallAuctionPrepareError::PreparationCapacityExhausted { maximum: 1 })
+    ));
+    drop(prepared);
+    assert_eq!(book.resource_status().available_prepared_uncrosses, 1);
+
+    let prepared = book
+        .prepare_uncross(clearing, policy(CallAuctionRemainderPolicy::RetainAll))
+        .unwrap();
+    let result = book.commit_uncross(prepared).unwrap();
+    assert_eq!(book.resource_status().available_prepared_uncrosses, 0);
+    assert_eq!(result.trades().len(), 1);
+    book.validate().unwrap();
+    drop(result);
+    let final_status = book.resource_status();
+    assert_eq!(final_status.available_prepared_uncrosses, 1);
+    assert_eq!(
+        final_status.uncross_fill_capacity_per_side,
+        initial.uncross_fill_capacity_per_side
+    );
+    assert_eq!(
+        final_status.uncross_trade_capacity,
+        initial.uncross_trade_capacity
+    );
+    assert_eq!(
+        final_status.uncross_cancellation_capacity,
+        initial.uncross_cancellation_capacity
+    );
+    book.validate().unwrap();
+}
+
+#[test]
+fn concurrent_uncross_leases_are_isolated_and_returned_after_stale_commit() {
+    let mut book = remainder_book();
+    let clearing = indicative(&mut book, 150);
+    let retain = book
+        .prepare_uncross(clearing, policy(CallAuctionRemainderPolicy::RetainAll))
+        .unwrap();
+    let cancel = book
+        .prepare_uncross(clearing, policy(CallAuctionRemainderPolicy::CancelAll))
+        .unwrap();
+    assert_eq!(book.resource_status().available_prepared_uncrosses, 0);
+    assert!(retain.cancellations().is_empty());
+    assert_eq!(cancel.cancellations().len(), 2);
+
+    let retained_result = book.commit_uncross(retain).unwrap();
+    assert_eq!(book.resource_status().available_prepared_uncrosses, 0);
+    assert!(matches!(
+        book.commit_uncross(cancel),
+        Err(CallAuctionCommitError::StalePreparation {
+            observed: 3,
+            current: 4,
+        })
+    ));
+    assert_eq!(book.resource_status().available_prepared_uncrosses, 1);
+    drop(retained_result);
+    assert_eq!(book.resource_status().available_prepared_uncrosses, 2);
+    book.validate().unwrap();
 }
 
 #[test]

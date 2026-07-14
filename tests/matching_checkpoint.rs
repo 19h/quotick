@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use quotick::codec::{BinaryCodec, CodecError};
-use quotick::durable::{DurableError, DurableOrderBook};
+use quotick::durable::{
+    DurableError, DurableOrderBook, DurableOrderBookCheckpointCapture,
+    VerifiedDurableOrderBookCheckpoint,
+};
 use quotick::instrument::{
     InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
     QuantityRules, ReserveOrderRules, TradingState,
@@ -14,8 +17,8 @@ use quotick::journal::{
 };
 use quotick::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelReason, Command, EventKind,
-    NewOrder, OrderBook, OrderBookCheckpoint, OrderDisplay, OrderType, ReplaceOrder,
-    SelfTradePrevention, TimeInForce,
+    NewOrder, OrderBook, OrderBookCheckpoint, OrderBookCheckpointCapture, OrderDisplay, OrderType,
+    ReplaceOrder, SelfTradePrevention, TimeInForce,
 };
 use quotick::snapshot::{CheckpointSlot, SnapshotFile, SnapshotOptions};
 use quotick::{
@@ -131,6 +134,222 @@ fn account_control(
     })
 }
 
+#[test]
+fn immutable_matching_checkpoint_clones_share_row_and_event_storage() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<OrderBookCheckpoint>();
+
+    let command = resting(1, 1, 5);
+    let mut book = OrderBook::new(definition());
+    let report = book.submit(command).unwrap();
+    let checkpoint = book.checkpoint(1, 3).unwrap();
+
+    assert_eq!(checkpoint.active_order_count(), 1);
+    assert_eq!(checkpoint.command_count(), 1);
+    assert!(
+        checkpoint.history()[0]
+            .report()
+            .events
+            .shares_storage_with(&report.events)
+    );
+
+    let clone = checkpoint.clone();
+    assert!(clone.shares_order_storage_with(&checkpoint));
+    assert!(clone.shares_history_storage_with(&checkpoint));
+    assert!(
+        clone.history()[0]
+            .report()
+            .events
+            .shares_storage_with(&checkpoint.history()[0].report().events)
+    );
+
+    drop(checkpoint);
+    drop(report);
+    drop(book);
+    let mut restored = OrderBook::from_checkpoint(&clone).unwrap();
+    let retry = restored.submit(command).unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.events, clone.history()[0].report().events);
+}
+
+#[test]
+fn staged_matching_capture_verifies_off_thread_at_its_exact_boundary() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<OrderBookCheckpointCapture>();
+
+    let ask = order(
+        1,
+        1,
+        11,
+        Side::Sell,
+        5,
+        OrderDisplay::FullyDisplayed,
+        OrderType::Limit(Price::from_raw(100)),
+        TimeInForce::GoodTilCancelled,
+        SelfTradePrevention::CancelAggressor,
+    );
+    let take = order(
+        2,
+        2,
+        12,
+        Side::Buy,
+        5,
+        OrderDisplay::FullyDisplayed,
+        OrderType::Limit(Price::from_raw(100)),
+        TimeInForce::ImmediateOrCancel,
+        SelfTradePrevention::CancelAggressor,
+    );
+    let block = account_control(4, 103, 0, AccountControlAction::BlockAndCancel);
+    let suffix = resting(6, 6, 9);
+    let mut book = OrderBook::new(definition());
+    for command in [ask, take, resting(3, 3, 7), block, resting(5, 5, 8)] {
+        book.submit(command).unwrap();
+    }
+
+    let capture = book.capture_checkpoint_candidate(1, 11).unwrap();
+    let shared_capture = capture.clone();
+    assert_eq!(capture.wal_metadata_sequence(), 1);
+    assert_eq!(capture.generation(), 11);
+    assert_eq!(capture.definition(), definition());
+    assert_eq!(capture.limits(), book.limits());
+    assert_eq!(capture.command_count(), 5);
+    assert_eq!(capture.active_order_count(), 1);
+    assert!(capture.shares_checkpoint_storage_with(&shared_capture));
+
+    let synchronous = book.checkpoint(1, 11).unwrap();
+    let expected_suffix = book.submit(suffix).unwrap();
+    let verified = std::thread::spawn(move || shared_capture.verify().unwrap())
+        .join()
+        .unwrap();
+    let independently_verified = capture.verify().unwrap();
+
+    assert_eq!(verified, synchronous);
+    assert_eq!(verified.encode().unwrap(), synchronous.encode().unwrap());
+    assert!(verified.shares_order_storage_with(&independently_verified));
+    assert!(verified.shares_history_storage_with(&independently_verified));
+    let mut restored = OrderBook::from_checkpoint(&verified).unwrap();
+    assert_eq!(restored.submit(suffix).unwrap(), expected_suffix);
+}
+
+#[test]
+fn durable_staged_checkpoint_publishes_an_exact_prefix_after_suffix_growth() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<DurableOrderBookCheckpointCapture>();
+    assert_send_sync::<VerifiedDurableOrderBookCheckpoint>();
+
+    let area = TestArea::new("durable-staged-prefix");
+    let wal = area.join("matching.wal");
+    let snapshot = area.join("matching.qsnp");
+    let first = resting(1, 1, 5);
+    let second = resting(2, 2, 6);
+    let suffix = resting(3, 3, 7);
+    let mut durable = DurableOrderBook::open(&wal, definition(), journal_options()).unwrap();
+    durable.submit(first).unwrap();
+    durable.submit(second).unwrap();
+
+    let capture = durable.capture_checkpoint_candidate().unwrap();
+    let shared_capture = capture.clone();
+    assert_eq!(capture.generation(), 5);
+    assert_eq!(capture.wal_metadata_sequence(), 1);
+    assert_eq!(capture.command_count(), 2);
+    assert_eq!(capture.active_order_count(), 2);
+    assert!(capture.shares_checkpoint_storage_with(&shared_capture));
+
+    let expected_suffix = durable.submit(suffix).unwrap();
+    let verified = std::thread::spawn(move || shared_capture.verify().unwrap())
+        .join()
+        .unwrap();
+    let independently_verified = capture.verify().unwrap();
+    assert!(verified.shares_checkpoint_storage_with(&independently_verified));
+    assert_eq!(verified.generation(), 5);
+    assert_eq!(verified.command_count(), 2);
+    assert_eq!(verified.active_order_count(), 2);
+    let receipt = durable
+        .write_verified_checkpoint(&snapshot, &verified, SnapshotOptions::default())
+        .unwrap();
+    assert_eq!(receipt.generation(), 5);
+    durable.close().unwrap();
+
+    let mut recovered = DurableOrderBook::open_with_checkpoint(
+        &wal,
+        &snapshot,
+        definition(),
+        journal_options(),
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().checkpointed_commands, 2);
+    assert_eq!(recovered.recovery().replayed_commands, 1);
+    assert_eq!(recovered.book().active_order_count(), 3);
+    let retry = recovered.submit(suffix).unwrap();
+    assert!(retry.replayed);
+    let mut expected_retry = expected_suffix;
+    expected_retry.replayed = true;
+    assert_eq!(retry, expected_retry);
+    recovered.close().unwrap();
+}
+
+#[test]
+fn durable_verified_checkpoint_rejects_another_reopen_or_cutover_epoch() {
+    let area = TestArea::new("durable-staged-fences");
+    let wal = area.join("matching.wal");
+    let other_wal = area.join("other.wal");
+    let snapshot = area.join("matching.qsnp");
+    let other_snapshot = area.join("other.qsnp");
+    let checkpoint_base = area.join("cutover.qsnp");
+    let stale_snapshot = area.join("stale.qsnp");
+
+    let mut source = DurableOrderBook::open(&wal, definition(), journal_options()).unwrap();
+    source.submit(resting(1, 1, 5)).unwrap();
+    let verified = source
+        .capture_checkpoint_candidate()
+        .unwrap()
+        .verify()
+        .unwrap();
+
+    let mut other = DurableOrderBook::open(&other_wal, definition(), journal_options()).unwrap();
+    assert!(matches!(
+        other.write_verified_checkpoint(&other_snapshot, &verified, SnapshotOptions::default()),
+        Err(DurableError::CheckpointCaptureOriginMismatch)
+    ));
+    assert!(!other.is_poisoned());
+    assert!(!other_snapshot.exists());
+    other.submit(resting(2, 2, 6)).unwrap();
+    other.close().unwrap();
+
+    source.close().unwrap();
+    let mut reopened = DurableOrderBook::open(&wal, definition(), journal_options()).unwrap();
+    assert!(matches!(
+        reopened.write_verified_checkpoint(&snapshot, &verified, SnapshotOptions::default()),
+        Err(DurableError::CheckpointCaptureOriginMismatch)
+    ));
+    assert!(!reopened.is_poisoned());
+    assert!(!snapshot.exists());
+
+    let stale = reopened
+        .capture_checkpoint_candidate()
+        .unwrap()
+        .verify()
+        .unwrap();
+    reopened
+        .compact_to_checkpoint(&checkpoint_base, SnapshotOptions::default())
+        .unwrap();
+    assert!(matches!(
+        reopened.write_verified_checkpoint(&stale_snapshot, &stale, SnapshotOptions::default()),
+        Err(DurableError::CheckpointCaptureStale {
+            captured_epoch: 0,
+            current_epoch: 1
+        })
+    ));
+    assert!(!reopened.is_poisoned());
+    assert!(!stale_snapshot.exists());
+    reopened.submit(resting(3, 3, 7)).unwrap();
+    reopened.close().unwrap();
+}
+
 fn journal_options() -> JournalOptions {
     JournalOptions {
         durability: Durability::Buffered,
@@ -169,7 +388,7 @@ fn checkpoint_restores_account_fence_revision_and_atomic_cancellation() {
 
     let checkpoint: OrderBookCheckpoint =
         SnapshotFile::read(&snapshot, SnapshotOptions::default()).unwrap();
-    let direct = OrderBook::from_checkpoint(checkpoint).unwrap();
+    let direct = OrderBook::from_checkpoint(&checkpoint).unwrap();
     assert_eq!(direct.active_order_count(), 0);
     assert_eq!(
         direct.account_control(AccountId::new(101).unwrap()).state(),
@@ -304,7 +523,7 @@ fn matching_checkpoint_preserves_fifo_reserve_stp_idempotency_and_replays_only_s
             .collect::<Vec<_>>(),
         vec![OrderId::new(2).unwrap(), OrderId::new(1).unwrap()]
     );
-    let mut directly_restored = OrderBook::from_checkpoint(checkpoint).unwrap();
+    let mut directly_restored = OrderBook::from_checkpoint(&checkpoint).unwrap();
     assert_eq!(directly_restored.submit(suffix).unwrap(), expected_suffix);
 
     let mut recovered = DurableOrderBook::open_with_checkpoint(
@@ -496,6 +715,41 @@ fn segmented_matching_checkpoint_recovers_across_physical_boundaries() {
         .write_checkpoint(&snapshot, SnapshotOptions::default())
         .unwrap();
     durable.submit(resting(2, 2, 7)).unwrap();
+    durable.close().unwrap();
+
+    let recovered = DurableOrderBook::open_segmented_with_checkpoint(
+        &segments,
+        &snapshot,
+        definition(),
+        options,
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().checkpointed_commands, 1);
+    assert_eq!(recovered.recovery().replayed_commands, 1);
+    assert!(recovered.recovery().journal.segment_count >= 2);
+    assert_eq!(recovered.book().active_order_count(), 2);
+}
+
+#[test]
+fn segmented_durable_staged_checkpoint_replays_only_the_post_capture_suffix() {
+    let area = TestArea::new("segmented-staged");
+    let segments = area.join("segments");
+    let snapshot = area.join("matching.qsnp");
+    let options = SegmentedJournalOptions {
+        maximum_segment_bytes: 512,
+        journal: journal_options(),
+    };
+    let mut durable = DurableOrderBook::open_segmented(&segments, definition(), options).unwrap();
+    durable.submit(resting(1, 1, 5)).unwrap();
+    let capture = durable.capture_checkpoint_candidate().unwrap();
+    durable.submit(resting(2, 2, 7)).unwrap();
+    let verified = std::thread::spawn(move || capture.verify().unwrap())
+        .join()
+        .unwrap();
+    durable
+        .write_verified_checkpoint(&snapshot, &verified, SnapshotOptions::default())
+        .unwrap();
     durable.close().unwrap();
 
     let recovered = DurableOrderBook::open_segmented_with_checkpoint(

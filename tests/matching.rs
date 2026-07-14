@@ -146,7 +146,7 @@ fn event_trace_from_vec_retains_the_event_buffer() {
     });
     let original_buffer = events.as_ptr();
     let trace = EventTrace::from(events);
-    assert_eq!(trace.as_ptr(), original_buffer);
+    assert_eq!(std::ptr::from_ref(&trace[0]), original_buffer);
 }
 
 #[test]
@@ -185,7 +185,7 @@ fn account_block_is_revision_checked_atomic_and_exactly_replayable() {
         AccountAdmissionState::Blocked
     );
     assert_eq!(book.account_control(account(11)).revision(), 1);
-    assert!(report.events[..2].iter().all(|event| matches!(
+    assert!(report.events.iter().take(2).all(|event| matches!(
         event.kind,
         EventKind::OrderCancelled {
             reason: CancelReason::AccountControl,
@@ -588,7 +588,7 @@ fn exact_command_retries_are_idempotent_and_collisions_are_detected() {
         EventKind::CommandRejected(RejectReason::UnknownOrder);
     assert!(!locally_corrupted.events.shares_storage_with(&replay.events));
     let replay_after_copy_on_write = book.submit(command).expect("second exact replay");
-    assert_eq!(replay_after_copy_on_write.events.as_slice(), cached_events);
+    assert_eq!(replay_after_copy_on_write.events.to_vec(), cached_events);
     assert!(
         replay_after_copy_on_write
             .events
@@ -853,7 +853,7 @@ fn best_level_survives_creation_non_best_removal_reprice_fill_stp_and_restore() 
     let checkpoint = book
         .checkpoint(1, 23)
         .expect("eleven commands terminate at the declared WAL boundary");
-    let restored = OrderBook::from_checkpoint(checkpoint).expect("checkpoint restores");
+    let restored = OrderBook::from_checkpoint(&checkpoint).expect("checkpoint restores");
     assert_eq!(restored.best_bid(), book.best_bid());
     assert_eq!(restored.best_ask(), book.best_ask());
     restored.validate().expect("restored extrema are valid");

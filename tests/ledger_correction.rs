@@ -97,7 +97,7 @@ fn correction_is_one_idempotent_event_with_exact_reversal_and_replacement() {
     assert_eq!(checkpoint.generation(), 2);
     assert_eq!(checkpoint.records().len(), 2);
     let decoded = quotick::ledger::LedgerCheckpoint::decode(&checkpoint.encode().unwrap()).unwrap();
-    let mut restored = Ledger::from_checkpoint(decoded).unwrap();
+    let mut restored = Ledger::from_checkpoint(&decoded).unwrap();
     assert!(
         restored
             .correct(correction(2, 3, 70, &entry(1, 100, 10, 100)))

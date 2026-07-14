@@ -99,7 +99,7 @@ fn one_balanced_entry_can_exceed_u128_side_totals_without_false_overflow() {
 
     let checkpoint = ledger.checkpoint().unwrap();
     let decoded = LedgerCheckpoint::decode(&checkpoint.encode().unwrap()).unwrap();
-    let restored = Ledger::from_checkpoint(decoded).unwrap();
+    let restored = Ledger::from_checkpoint(&decoded).unwrap();
     restored.validate().unwrap();
     assert_eq!(restored.trial_balance(), trial);
 }

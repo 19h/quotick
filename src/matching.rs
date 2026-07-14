@@ -1,32 +1,36 @@
 //! A deterministic, single-instrument, price-time-priority matching engine.
 //!
 //! One [`OrderBook`] is intended to be owned by one execution shard.  It uses
-//! an order hash index, intrusive per-account/per-side indexes, and intrusive
-//! FIFO links inside ordered price levels. New resting orders and cancellations
+//! fixed-capacity dense hash indexes, intrusive per-account/per-side indexes,
+//! and intrusive FIFO links inside ordered price levels. New resting orders and cancellations
 //! avoid scans of an entire price level or book. A redundant complete best-level
-//! cache makes market-extremum discovery `O(1)`; ordered level insertion,
-//! deletion, and next-worse traversal remain `O(log P)`, where `P` is the number
-//! of occupied price levels. A command consuming `E` displayed maker slices is
-//! `O((E + 1) log P)`. A reserve maker can contribute multiple slices. Account
+//! cache makes market-extremum discovery `O(1)`. Its key-checked stable-slot
+//! handle makes non-empty maker-level aggregate mutation and reserve FIFO-tail
+//! refresh `O(1)`; ordered level insertion, empty-level deletion, and next-worse
+//! traversal remain `O(log(P + 1))`, where `P` is the number of occupied price
+//! levels. A command consuming `E` displayed maker slices and exhausting `L`
+//! price levels is `O(E + (L + 1) log(P + 1))`. A reserve maker can contribute
+//! multiple slices. Account
 //! mass-cancel and block-and-cancel selection visit `K` selected orders;
 //! instrument transition-and-cancel visits all `O` active orders. Both
 //! canonically sort in `O(K log K)` or `O(O log O)`. FOK inspection uses `O(1)` auxiliary space and visits each
 //! active order in crossed levels at most once; it never materializes reserve
 //! replenishment slices.
 
-use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::ops::Deref;
-use std::slice;
-use std::sync::Arc;
+use std::hash::Hash;
+use std::ops::Index;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::bounded_hash::{BoundedHashMap, BoundedHashSet};
 use crate::domain::{
     AccountId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
     TimestampNs, TradeId,
 };
-use crate::indexed_avl::IndexedAvlMap;
+use crate::indexed_avl::{IndexedAvlHandle, IndexedAvlMap};
 use crate::instrument::{AdmissionError, InstrumentDefinition, TradingState};
+use crate::trace_arena::AppendOnlyTraceArena;
 
 static NEXT_ORDER_BOOK_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -687,124 +691,314 @@ pub struct Event {
     pub kind: EventKind,
 }
 
+/// Constructor-owned append-only storage for committed matching events.
+type EventArena = AppendOnlyTraceArena<Event>;
+
+fn try_event_arena(maximum_events: usize) -> Result<Arc<EventArena>, MatchingError> {
+    EventArena::try_with_capacity(maximum_events)
+        .map_err(|_| MatchingError::CapacityReservationFailed(MatchingCapacity::RetainedEvents))
+}
+
+#[derive(Clone)]
+enum EventTraceBacking {
+    Arena(Arc<EventArena>),
+    Owned(Arc<Vec<Event>>),
+}
+
 /// Immutable shared event sequence for one execution report.
 ///
-/// Cloning a trace is `O(1)` and shares the same control block and event buffer.
-/// Ordinary consumers receive slice semantics through [`Deref`].
-/// [`Self::make_mut`] performs explicit copy-on-write for diagnostic mutation
-/// without corrupting the idempotency cache. Conversion from `Vec<Event>` keeps
-/// that vector's event buffer and allocates only the shared-owner control block.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EventTrace(Arc<Vec<Event>>);
+/// Live matching reports reference a range of one constructor-owned append-only
+/// arena, so trace creation and cloning allocate no event storage or control
+/// block. Decoded and caller-constructed traces retain an owned fallback.
+/// [`Self::make_mut`] detaches into owned copy-on-write storage for diagnostic
+/// mutation without corrupting the idempotency cache.
+#[derive(Clone)]
+pub struct EventTrace {
+    backing: EventTraceBacking,
+    start: usize,
+    length: usize,
+}
 
 impl EventTrace {
-    /// Returns the complete immutable event slice.
+    /// Returns the number of events in this trace.
     #[must_use]
-    pub fn as_slice(&self) -> &[Event] {
-        self.0.as_slice()
+    pub const fn len(&self) -> usize {
+        self.length
     }
 
-    /// Returns a mutable event slice, copying first when storage is shared.
+    /// Returns whether this trace contains no events.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// Iterates over events in deterministic sequence order.
+    #[must_use]
+    pub fn iter(&self) -> EventTraceIter<'_> {
+        EventTraceIter {
+            trace: self,
+            front: 0,
+            back: self.length,
+        }
+    }
+
+    /// Returns the event at `index`, if present.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&Event> {
+        (index < self.length).then(|| self.event_at(index))
+    }
+
+    /// Returns the first event, if present.
+    #[must_use]
+    pub fn first(&self) -> Option<&Event> {
+        self.get(0)
+    }
+
+    /// Returns the last event, if present.
+    #[must_use]
+    pub fn last(&self) -> Option<&Event> {
+        self.length.checked_sub(1).and_then(|index| self.get(index))
+    }
+
+    /// Copies this trace into independent contiguous storage.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<Event> {
+        self.iter().copied().collect()
+    }
+
+    fn event_at(&self, index: usize) -> &Event {
+        assert!(index < self.length, "event-trace index out of bounds");
+        let absolute = self
+            .start
+            .checked_add(index)
+            .expect("published event index must be representable");
+        match &self.backing {
+            EventTraceBacking::Arena(arena) => arena.get(absolute),
+            EventTraceBacking::Owned(events) => &events[absolute],
+        }
+    }
+
+    /// Returns a mutable event slice, detaching from arena or shared storage.
     pub fn make_mut(&mut self) -> &mut [Event] {
-        Arc::make_mut(&mut self.0).as_mut_slice()
+        let detach = match &self.backing {
+            EventTraceBacking::Arena(_) => true,
+            EventTraceBacking::Owned(events) => self.start != 0 || self.length != events.len(),
+        };
+        if detach {
+            let owned = self.to_vec();
+            *self = owned.into();
+        }
+        let EventTraceBacking::Owned(events) = &mut self.backing else {
+            unreachable!("detached trace must own its storage")
+        };
+        Arc::make_mut(events).as_mut_slice()
     }
 
     /// Returns whether two traces reference the identical immutable owner and buffer.
     #[must_use]
     pub fn shares_storage_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        if self.start != other.start || self.length != other.length {
+            return false;
+        }
+        match (&self.backing, &other.backing) {
+            (EventTraceBacking::Arena(left), EventTraceBacking::Arena(right)) => {
+                Arc::ptr_eq(left, right)
+            }
+            (EventTraceBacking::Owned(left), EventTraceBacking::Owned(right)) => {
+                Arc::ptr_eq(left, right)
+            }
+            (EventTraceBacking::Arena(_), EventTraceBacking::Owned(_))
+            | (EventTraceBacking::Owned(_), EventTraceBacking::Arena(_)) => false,
+        }
+    }
+
+    fn from_arena(arena: Arc<EventArena>, start: usize, length: usize) -> Self {
+        debug_assert!(
+            start
+                .checked_add(length)
+                .is_some_and(|end| end <= arena.capacity())
+        );
+        Self {
+            backing: EventTraceBacking::Arena(arena),
+            start,
+            length,
+        }
+    }
+
+    fn arena_range_for(&self, arena: &Arc<EventArena>) -> Option<(usize, usize)> {
+        match &self.backing {
+            EventTraceBacking::Arena(current) if Arc::ptr_eq(current, arena) => {
+                Some((self.start, self.length))
+            }
+            EventTraceBacking::Arena(_) | EventTraceBacking::Owned(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn rebind_arena(&self, source: &Arc<EventArena>, target: Arc<EventArena>) -> Self {
+        let EventTraceBacking::Arena(current) = &self.backing else {
+            panic!("live order-book reports must use arena storage")
+        };
+        assert!(Arc::ptr_eq(current, source));
+        Self::from_arena(target, self.start, self.length)
     }
 }
 
 impl From<Vec<Event>> for EventTrace {
     fn from(events: Vec<Event>) -> Self {
-        Self(Arc::new(events))
+        let length = events.len();
+        Self {
+            backing: EventTraceBacking::Owned(Arc::new(events)),
+            start: 0,
+            length,
+        }
+    }
+}
+
+impl fmt::Debug for EventTrace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl PartialEq for EventTrace {
+    fn eq(&self, other: &Self) -> bool {
+        self.length == other.length && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for EventTrace {}
+
+/// Immutable iterator over one possibly arena-backed event trace.
+#[derive(Clone, Debug)]
+pub struct EventTraceIter<'a> {
+    trace: &'a EventTrace,
+    front: usize,
+    back: usize,
+}
+
+impl<'a> Iterator for EventTraceIter<'a> {
+    type Item = &'a Event;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        let index = self.front;
+        self.front += 1;
+        Some(self.trace.event_at(index))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.back - self.front;
+        (remaining, Some(remaining))
+    }
+}
+
+impl DoubleEndedIterator for EventTraceIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        self.back -= 1;
+        Some(self.trace.event_at(self.back))
+    }
+}
+
+impl ExactSizeIterator for EventTraceIter<'_> {}
+impl std::iter::FusedIterator for EventTraceIter<'_> {}
+
+impl Index<usize> for EventTrace {
+    type Output = Event;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.event_at(index)
     }
 }
 
 #[derive(Debug)]
 struct EventTraceBuilder {
-    events: Arc<Vec<Event>>,
+    arena: Arc<EventArena>,
+    start: usize,
+    length: usize,
     maximum_events: usize,
 }
 
 impl EventTraceBuilder {
-    fn try_with_capacity(maximum_events: usize) -> Result<Self, MatchingError> {
-        let mut events = Vec::new();
-        events.try_reserve_exact(maximum_events).map_err(|_| {
-            MatchingError::CapacityReservationFailed(MatchingCapacity::ReportEvents)
-        })?;
-        Ok(Self {
-            events: Arc::new(events),
+    fn new(arena: Arc<EventArena>, start: usize, maximum_events: usize) -> Self {
+        assert!(
+            start
+                .checked_add(maximum_events)
+                .is_some_and(|end| end <= arena.capacity()),
+            "prepared report bound must fit retained-event arena"
+        );
+        Self {
+            arena,
+            start,
+            length: 0,
             maximum_events,
-        })
+        }
     }
 
     fn push(&mut self, event: Event) {
         assert!(
-            self.events.len() < self.maximum_events,
+            self.length < self.maximum_events,
             "prepared event bound must cover the complete execution report"
         );
-        Arc::get_mut(&mut self.events)
-            .expect("event builder must have unique storage")
-            .push(event);
+        let index = self
+            .start
+            .checked_add(self.length)
+            .expect("prepared event index must be representable");
+        self.arena.write_once(index, event);
+        self.length += 1;
     }
 
     fn finish(self) -> EventTrace {
-        EventTrace(self.events)
+        EventTrace::from_arena(self.arena, self.start, self.length)
     }
 }
 
 #[cfg(test)]
 mod event_trace_builder_tests {
+    use std::sync::Arc;
+
     use super::{
         Event, EventKind, EventTraceBuilder, MatchingCapacity, MatchingError, RejectReason,
+        try_event_arena,
     };
     use crate::{CommandId, TimestampNs};
 
     #[test]
-    fn finalization_retains_the_builder_event_buffer() {
+    fn finalization_publishes_the_exact_preallocated_arena_range() {
         let command_id = CommandId::new(1).expect("non-zero command");
-        let mut builder = EventTraceBuilder::try_with_capacity(8).unwrap();
+        let arena = try_event_arena(8).unwrap();
+        let mut builder = EventTraceBuilder::new(Arc::clone(&arena), 3, 2);
         builder.push(Event {
             sequence: 1,
             command_id,
             occurred_at: TimestampNs::from_unix_nanos(1),
             kind: EventKind::CommandRejected(RejectReason::UnknownOrder),
         });
-        let original_buffer = builder.events.as_ptr();
         let trace = builder.finish();
-        assert_eq!(trace.as_ptr(), original_buffer);
+        assert_eq!(std::ptr::from_ref(&trace[0]), arena.slot_pointer(3));
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].command_id, command_id);
     }
 
     #[test]
-    fn unrepresentable_event_capacity_is_a_typed_preparation_failure() {
+    fn unrepresentable_event_arena_is_a_typed_constructor_failure() {
         assert!(matches!(
-            EventTraceBuilder::try_with_capacity(usize::MAX),
+            try_event_arena(usize::MAX),
             Err(MatchingError::CapacityReservationFailed(
-                MatchingCapacity::ReportEvents
+                MatchingCapacity::RetainedEvents
             ))
         ));
     }
 }
 
-impl Deref for EventTrace {
-    type Target = [Event];
-
-    fn deref(&self) -> &Self::Target {
-        self.as_slice()
-    }
-}
-
-impl AsRef<[Event]> for EventTrace {
-    fn as_ref(&self) -> &[Event] {
-        self.as_slice()
-    }
-}
-
 impl<'a> IntoIterator for &'a EventTrace {
     type Item = &'a Event;
-    type IntoIter = slice::Iter<'a, Event>;
+    type IntoIter = EventTraceIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -827,7 +1021,7 @@ pub struct ExecutionReport {
     pub command_id: CommandId,
     /// Accepted or rejected disposition.
     pub outcome: CommandOutcome,
-    /// Contiguous events caused by this command.
+    /// Ordered events caused by this command.
     pub events: EventTrace,
     /// True when this report came from the exact-command idempotency cache.
     pub replayed: bool,
@@ -845,11 +1039,13 @@ pub enum CommandPreparation {
 /// Opaque single-use command validated against one retained-history generation.
 ///
 /// A prepared command contains no borrowed book state and can be written to a
-/// WAL before commit. It owns the empty Arc-backed event vector and, for mass
-/// cancellation or transition-and-cancel, the empty order-selection vector whose complete command-specific
-/// capacities were fallibly reserved during preparation. All matching hash-table
-/// headroom was reserved when the book was constructed, so preparation borrows the
-/// book immutably and cannot change either allocator or semantic book state.
+/// WAL before commit. For mass cancellation, block-and-cancel, or
+/// transition-and-cancel it holds one isolated constructor-owned order-selection
+/// lease. Event storage belongs to the book and is not consumed until a
+/// non-stale token commits. All matching hash-table and selection headroom was
+/// reserved when the book was constructed, so preparation borrows the book
+/// immutably and cannot allocate or change semantic book state; acquiring a
+/// non-empty selection changes only process-local pool occupancy.
 /// [`OrderBook::commit`] rejects it if an unrelated command changes the book
 /// generation after preparation.
 #[derive(Debug)]
@@ -858,8 +1054,8 @@ pub struct PreparedCommand {
     book_instance_id: u64,
     expected_retained_commands: usize,
     core_rejection: Option<RejectReason>,
-    events: EventTraceBuilder,
-    selected_order_ids: Option<Vec<OrderId>>,
+    maximum_events: usize,
+    selected_order_ids: Option<PooledOrderSelection>,
 }
 
 impl PreparedCommand {
@@ -873,6 +1069,118 @@ impl PreparedCommand {
     #[must_use]
     pub const fn core_rejection(&self) -> Option<RejectReason> {
         self.core_rejection
+    }
+}
+
+#[derive(Debug)]
+struct OrderSelectionPool {
+    available: Mutex<Vec<Vec<OrderId>>>,
+    capacity: usize,
+    order_capacity: usize,
+}
+
+impl OrderSelectionPool {
+    fn try_new(capacity: usize, maximum_orders: usize) -> Result<Arc<Self>, MatchingError> {
+        let mut available = Vec::new();
+        available.try_reserve_exact(capacity).map_err(|_| {
+            MatchingError::CapacityReservationFailed(MatchingCapacity::PreparedOrderSelections)
+        })?;
+        for _ in 0..capacity {
+            let mut selected = Vec::new();
+            selected.try_reserve_exact(maximum_orders).map_err(|_| {
+                MatchingError::CapacityReservationFailed(MatchingCapacity::OrderSelectionBuffers)
+            })?;
+            available.push(selected);
+        }
+        let order_capacity = available.iter().map(Vec::capacity).min().unwrap_or(0);
+        Ok(Arc::new(Self {
+            available: Mutex::new(available),
+            capacity,
+            order_capacity,
+        }))
+    }
+
+    fn lock_available(&self) -> MutexGuard<'_, Vec<Vec<OrderId>>> {
+        self.available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn acquire(self: &Arc<Self>) -> Option<PooledOrderSelection> {
+        let selected = self.lock_available().pop()?;
+        Some(PooledOrderSelection {
+            pool: Some(Arc::clone(self)),
+            selected: Some(selected),
+        })
+    }
+
+    fn release(&self, mut selected: Vec<OrderId>) {
+        selected.clear();
+        let mut available = self.lock_available();
+        assert!(
+            available.len() < self.capacity,
+            "matching order-selection buffer must be returned exactly once"
+        );
+        available.push(selected);
+    }
+
+    fn available(&self) -> usize {
+        self.lock_available().len()
+    }
+}
+
+struct PooledOrderSelection {
+    pool: Option<Arc<OrderSelectionPool>>,
+    selected: Option<Vec<OrderId>>,
+}
+
+impl PooledOrderSelection {
+    fn empty() -> Self {
+        Self {
+            pool: None,
+            selected: Some(Vec::new()),
+        }
+    }
+
+    fn values(&self) -> &[OrderId] {
+        self.selected
+            .as_deref()
+            .expect("live matching order-selection lease must contain its buffer")
+    }
+
+    fn values_mut(&mut self) -> &mut Vec<OrderId> {
+        self.selected
+            .as_mut()
+            .expect("live matching order-selection lease must contain its buffer")
+    }
+
+    fn capacity(&self) -> usize {
+        self.selected
+            .as_ref()
+            .expect("live matching order-selection lease must contain its buffer")
+            .capacity()
+    }
+}
+
+impl fmt::Debug for PooledOrderSelection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PooledOrderSelection")
+            .field("length", &self.values().len())
+            .field("capacity", &self.capacity())
+            .finish()
+    }
+}
+
+impl Drop for PooledOrderSelection {
+    fn drop(&mut self) {
+        if let Some(selected) = self.selected.take() {
+            if let Some(pool) = &self.pool {
+                pool.release(selected);
+            } else {
+                debug_assert!(selected.is_empty());
+            }
+        }
     }
 }
 
@@ -903,6 +1211,28 @@ pub struct PriceLevelArenaStatus {
     pub occupied_slots: usize,
     /// Initialized vacant slots linked into the reuse list.
     pub reusable_slots: usize,
+}
+
+/// Process-local allocation state of the append-only retained-event arena.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventArenaStatus {
+    /// Configured total event-slot bound.
+    pub configured_events: usize,
+    /// Event-slot capacity returned by the allocator during construction.
+    pub allocated_events: usize,
+    /// Events published by committed reports.
+    pub retained_events: usize,
+}
+
+/// Process-local allocation state of constructor-owned order-selection storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OrderSelectionPoolStatus {
+    /// Configured simultaneous prepared selection leases.
+    pub configured_leases: usize,
+    /// Buffer sets not currently held by a preparation or commit.
+    pub available_leases: usize,
+    /// Minimum order-identifier capacity granted to every buffer set.
+    pub allocated_order_ids_per_lease: usize,
 }
 
 /// One constructor-reserved matching hash index.
@@ -1042,13 +1372,27 @@ impl CommandReportCheckpoint {
 }
 
 /// Canonical direct state plus complete idempotency lineage for one order book.
+///
+/// Active-order and history vectors are immutable shared values, so cloning a
+/// checkpoint is `O(1)` and allocates no row storage. Construction and decoding
+/// still create one shared-owner control block per vector.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OrderBookCheckpoint {
     wal_metadata_sequence: u64,
     wal_sequence: u64,
     definition: InstrumentDefinition,
-    orders: Vec<RestingOrderCheckpoint>,
-    history: Vec<CommandReportCheckpoint>,
+    orders: Arc<Vec<RestingOrderCheckpoint>>,
+    history: Arc<Vec<CommandReportCheckpoint>>,
+}
+
+#[derive(Debug)]
+struct OrderBookCheckpointLineage {
+    seen_order_ids: BoundedHashSet<OrderId>,
+    account_controls: BoundedHashMap<AccountId, AccountControlSnapshot>,
+    trading_state: TradingStateSnapshot,
+    retained_event_count: usize,
+    next_sequence: u64,
+    next_trade_id: u64,
 }
 
 impl OrderBookCheckpoint {
@@ -1094,13 +1438,25 @@ impl OrderBookCheckpoint {
     /// Returns canonical private active-order state.
     #[must_use]
     pub fn orders(&self) -> &[RestingOrderCheckpoint] {
-        &self.orders
+        self.orders.as_slice()
     }
 
     /// Returns chronological command/report idempotency state.
     #[must_use]
     pub fn history(&self) -> &[CommandReportCheckpoint] {
-        &self.history
+        self.history.as_slice()
+    }
+
+    /// Returns whether two checkpoints share the identical immutable active-order image.
+    #[must_use]
+    pub fn shares_order_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.orders, &other.orders)
+    }
+
+    /// Returns whether two checkpoints share the identical immutable history image.
+    #[must_use]
+    pub fn shares_history_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.history, &other.history)
     }
 
     pub(crate) fn from_parts(
@@ -1110,22 +1466,43 @@ impl OrderBookCheckpoint {
         orders: Vec<RestingOrderCheckpoint>,
         history: Vec<CommandReportCheckpoint>,
     ) -> Result<Self, OrderBookCheckpointError> {
-        let checkpoint = Self {
+        Self::from_parts_with_lineage(
             wal_metadata_sequence,
             wal_sequence,
             definition,
             orders,
             history,
+        )
+        .map(|(checkpoint, _)| checkpoint)
+    }
+
+    fn from_parts_with_lineage(
+        wal_metadata_sequence: u64,
+        wal_sequence: u64,
+        definition: InstrumentDefinition,
+        orders: Vec<RestingOrderCheckpoint>,
+        history: Vec<CommandReportCheckpoint>,
+    ) -> Result<(Self, OrderBookCheckpointLineage), OrderBookCheckpointError> {
+        let checkpoint = Self {
+            wal_metadata_sequence,
+            wal_sequence,
+            definition,
+            orders: Arc::new(orders),
+            history: Arc::new(history),
         };
-        checkpoint.validate()?;
-        Ok(checkpoint)
+        let lineage = checkpoint.validate_lineage()?;
+        Ok((checkpoint, lineage))
+    }
+
+    fn validate(&self) -> Result<(), OrderBookCheckpointError> {
+        self.validate_lineage().map(drop)
     }
 
     #[allow(
         clippy::too_many_lines,
         reason = "one chronological audit keeps command, event, trade, identity, and control lineage coupled"
     )]
-    fn validate(&self) -> Result<(), OrderBookCheckpointError> {
+    fn validate_lineage(&self) -> Result<OrderBookCheckpointLineage, OrderBookCheckpointError> {
         if self.wal_metadata_sequence == 0 {
             return Err(OrderBookCheckpointError::new(
                 "checkpoint WAL metadata sequence is zero",
@@ -1145,14 +1522,25 @@ impl OrderBookCheckpoint {
             ));
         }
 
-        let mut command_ids = HashSet::with_capacity(self.history.len());
-        let mut seen_order_ids = HashSet::new();
-        let mut account_controls: HashMap<AccountId, AccountControlSnapshot> = HashMap::new();
+        let mut command_ids = reserve_checkpoint_set(
+            self.history.len(),
+            OrderBookCheckpointResource::HistoryCommandIdentifiers,
+        )?;
+        let mut seen_order_ids = reserve_checkpoint_set(
+            self.history.len(),
+            OrderBookCheckpointResource::HistoryAcceptedOrderIdentifiers,
+        )?;
+        let mut account_controls: BoundedHashMap<AccountId, AccountControlSnapshot> =
+            reserve_checkpoint_map(
+                self.history.len(),
+                OrderBookCheckpointResource::HistoryAccountControls,
+            )?;
         let mut trading_state =
             TradingStateSnapshot::from_parts(self.definition.trading_state(), 0);
+        let mut retained_event_count = 0_usize;
         let mut expected_event_sequence = 1_u64;
         let mut expected_trade_id = 1_u64;
-        for entry in &self.history {
+        for entry in self.history.iter() {
             let command_id = entry.command.command_id();
             if !command_ids.insert(command_id) {
                 return Err(OrderBookCheckpointError::new(
@@ -1169,6 +1557,13 @@ impl OrderBookCheckpoint {
                     "checkpoint execution report has no event",
                 ));
             }
+            retained_event_count = retained_event_count
+                .checked_add(entry.report.events.len())
+                .ok_or_else(|| {
+                    OrderBookCheckpointError::new(
+                        "checkpoint retained event count is not representable",
+                    )
+                })?;
             for event in &entry.report.events {
                 if event.sequence != expected_event_sequence
                     || event.command_id != command_id
@@ -1225,7 +1620,12 @@ impl OrderBookCheckpoint {
                 let current_state = control.action.resulting_state();
                 let mut cancelled_order_count = 0_u64;
                 let mut cancelled_quantity_lots = 0_u128;
-                for event in &entry.report.events[..entry.report.events.len() - 1] {
+                for event in entry
+                    .report
+                    .events
+                    .iter()
+                    .take(entry.report.events.len() - 1)
+                {
                     let EventKind::OrderCancelled {
                         quantity,
                         reason: CancelReason::AccountControl,
@@ -1305,7 +1705,12 @@ impl OrderBookCheckpoint {
                 let mut cancelled_order_count = 0_u64;
                 let mut cancelled_quantity_lots = 0_u128;
                 let mut previous_order_id = None;
-                for event in &entry.report.events[..entry.report.events.len() - 1] {
+                for event in entry
+                    .report
+                    .events
+                    .iter()
+                    .take(entry.report.events.len() - 1)
+                {
                     let EventKind::OrderCancelled {
                         order_id,
                         quantity,
@@ -1361,9 +1766,12 @@ impl OrderBookCheckpoint {
             }
         }
 
-        let mut active_ids = HashSet::with_capacity(self.orders.len());
+        let mut active_ids = reserve_checkpoint_set(
+            self.orders.len(),
+            OrderBookCheckpointResource::ActiveOrderIdentifiers,
+        )?;
         let mut previous_key = None;
-        for order in &self.orders {
+        for order in self.orders.iter() {
             if !active_ids.insert(order.order_id) || !seen_order_ids.contains(&order.order_id) {
                 return Err(OrderBookCheckpointError::new(
                     "checkpoint active-order identity is duplicated or absent from accepted history",
@@ -1386,44 +1794,474 @@ impl OrderBookCheckpoint {
                 ));
             }
         }
-        Ok(())
+        Ok(OrderBookCheckpointLineage {
+            seen_order_ids,
+            account_controls,
+            trading_state,
+            retained_event_count,
+            next_sequence: expected_event_sequence,
+            next_trade_id: expected_trade_id,
+        })
     }
 
     pub(crate) fn is_successor_of(&self, previous: &Self) -> bool {
         self.wal_metadata_sequence == previous.wal_metadata_sequence
             && self.definition == previous.definition
             && self.wal_sequence >= previous.wal_sequence
-            && self.history.starts_with(&previous.history)
+            && self
+                .history
+                .as_slice()
+                .starts_with(previous.history.as_slice())
+    }
+}
+
+/// An immutable but not yet replay-verified continuous-order-book capture.
+///
+/// Capture performs live structural and lineage audits but deliberately defers
+/// deterministic command replay. This type has no stable codec or snapshot
+/// payload implementation; call [`Self::verify`] to obtain the only persistable
+/// [`OrderBookCheckpoint`] form. Clones share all candidate row and event
+/// storage and are therefore `O(1)`.
+#[derive(Clone)]
+pub struct OrderBookCheckpointCapture {
+    checkpoint: OrderBookCheckpoint,
+    limits: OrderBookLimits,
+}
+
+impl OrderBookCheckpointCapture {
+    /// Returns the completed execution-report WAL boundary represented here.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.checkpoint.generation()
+    }
+
+    /// Returns the final immutable-metadata sequence before command history.
+    #[must_use]
+    pub const fn wal_metadata_sequence(&self) -> u64 {
+        self.checkpoint.wal_metadata_sequence()
+    }
+
+    /// Returns the immutable captured instrument definition.
+    #[must_use]
+    pub const fn definition(&self) -> InstrumentDefinition {
+        self.checkpoint.definition()
+    }
+
+    /// Returns the finite policy under which replay verification will run.
+    #[must_use]
+    pub const fn limits(&self) -> OrderBookLimits {
+        self.limits
+    }
+
+    /// Returns the captured active-order cardinality without exposing rows.
+    #[must_use]
+    pub fn active_order_count(&self) -> usize {
+        self.checkpoint.active_order_count()
+    }
+
+    /// Returns the captured command/report cardinality without exposing rows.
+    #[must_use]
+    pub fn command_count(&self) -> usize {
+        self.checkpoint.command_count()
+    }
+
+    /// Returns whether two captures share every immutable candidate row image.
+    #[must_use]
+    pub fn shares_checkpoint_storage_with(&self, other: &Self) -> bool {
+        self.checkpoint.shares_order_storage_with(&other.checkpoint)
+            && self
+                .checkpoint
+                .shares_history_storage_with(&other.checkpoint)
+    }
+
+    /// Consumes the unverified capture and proves deterministic history replay.
+    ///
+    /// Verification constructs an isolated book under the captured finite
+    /// policy, requires exact command/report reproduction, and compares a fresh
+    /// canonical projection of the replayed state with the captured candidate.
+    /// It may therefore run on another thread while the source writer advances.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrderBookCheckpointError::BookConstructionFailed`] if the
+    /// replay book cannot be reserved, a typed checkpoint resource error if the
+    /// replay projection cannot be reserved, or `Invalid` for any semantic
+    /// replay or direct-state divergence.
+    pub fn verify(self) -> Result<OrderBookCheckpoint, OrderBookCheckpointError> {
+        let Self { checkpoint, limits } = self;
+        let mut replay = OrderBook::try_with_limits(checkpoint.definition, limits)
+            .map_err(OrderBookCheckpointError::BookConstructionFailed)?;
+        for entry in checkpoint.history.iter() {
+            let reproduced = replay.submit(entry.command).map_err(|error| {
+                OrderBookCheckpointError::new(format!(
+                    "checkpoint history cannot be replayed: {error}"
+                ))
+            })?;
+            if reproduced != entry.report {
+                return Err(OrderBookCheckpointError::new(
+                    "checkpoint live state history diverges under deterministic replay",
+                ));
+            }
+        }
+        let replayed =
+            replay.checkpoint_state(checkpoint.wal_metadata_sequence, checkpoint.wal_sequence)?;
+        if replayed != checkpoint {
+            return Err(OrderBookCheckpointError::new(
+                "checkpoint direct state differs from deterministic history replay",
+            ));
+        }
+        Ok(checkpoint)
+    }
+}
+
+#[cfg(test)]
+impl OrderBookCheckpointCapture {
+    pub(crate) fn corrupt_generation_for_test(&mut self) {
+        self.checkpoint.wal_sequence = self.checkpoint.wal_sequence.saturating_add(1);
+    }
+}
+
+/// One fallibly reserved matching-checkpoint capture or validation resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderBookCheckpointResource {
+    /// Chronological command/report rows owned by a newly captured checkpoint.
+    CaptureHistory,
+    /// Canonical active-order rows owned by a newly captured checkpoint.
+    CaptureActiveOrders,
+    /// Unique command identifiers in retained history.
+    HistoryCommandIdentifiers,
+    /// Never-reused accepted order identifiers reconstructed from history.
+    HistoryAcceptedOrderIdentifiers,
+    /// Latest accepted account-control state reconstructed from history.
+    HistoryAccountControls,
+    /// Unique active-order identities in the direct checkpoint image.
+    ActiveOrderIdentifiers,
+    /// Unique controlled accounts counted against restoration limits.
+    CapacityControlledAccounts,
+    /// Unique active accounts counted against restoration limits.
+    CapacityActiveAccounts,
+    /// Unique active bid prices counted against restoration limits.
+    CapacityBidPrices,
+    /// Unique active ask prices counted against restoration limits.
+    CapacityAskPrices,
+}
+
+impl OrderBookCheckpointResource {
+    const fn failure_detail(self) -> &'static str {
+        match self {
+            Self::CaptureHistory => "checkpoint history capture reservation failed",
+            Self::CaptureActiveOrders => "checkpoint active-order capture reservation failed",
+            Self::HistoryCommandIdentifiers => {
+                "checkpoint command-identifier scratch reservation failed"
+            }
+            Self::HistoryAcceptedOrderIdentifiers => {
+                "checkpoint accepted-order-identifier scratch reservation failed"
+            }
+            Self::HistoryAccountControls => "checkpoint account-control scratch reservation failed",
+            Self::ActiveOrderIdentifiers => {
+                "checkpoint active-order-identifier scratch reservation failed"
+            }
+            Self::CapacityControlledAccounts => {
+                "checkpoint controlled-account capacity scratch reservation failed"
+            }
+            Self::CapacityActiveAccounts => {
+                "checkpoint active-account capacity scratch reservation failed"
+            }
+            Self::CapacityBidPrices => "checkpoint bid-price capacity scratch reservation failed",
+            Self::CapacityAskPrices => "checkpoint ask-price capacity scratch reservation failed",
+        }
+    }
+}
+
+impl fmt::Display for OrderBookCheckpointResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::CaptureHistory => "captured history rows",
+            Self::CaptureActiveOrders => "captured active-order rows",
+            Self::HistoryCommandIdentifiers => "history command identifiers",
+            Self::HistoryAcceptedOrderIdentifiers => "history accepted order identifiers",
+            Self::HistoryAccountControls => "history account controls",
+            Self::ActiveOrderIdentifiers => "active order identifiers",
+            Self::CapacityControlledAccounts => "capacity controlled accounts",
+            Self::CapacityActiveAccounts => "capacity active accounts",
+            Self::CapacityBidPrices => "capacity bid prices",
+            Self::CapacityAskPrices => "capacity ask prices",
+        })
     }
 }
 
 /// Semantic matching-checkpoint construction or restoration failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OrderBookCheckpointError {
-    detail: String,
+pub enum OrderBookCheckpointError {
+    /// Checkpoint content or selected-limit contradiction.
+    Invalid(String),
+    /// A temporary book required for validation or restoration could not be constructed.
+    BookConstructionFailed(MatchingError),
+    /// A complete capture or validation resource could not be represented or reserved.
+    ResourceReservationFailed {
+        /// Capture vector or validation index whose construction failed.
+        resource: OrderBookCheckpointResource,
+        /// Requested semantic maximum entries.
+        maximum: usize,
+    },
 }
 
 impl OrderBookCheckpointError {
     fn new(detail: impl Into<String>) -> Self {
-        Self {
-            detail: detail.into(),
-        }
+        Self::Invalid(detail.into())
     }
 
     /// Returns a stable diagnostic description.
     #[must_use]
     pub fn detail(&self) -> &str {
-        &self.detail
+        match self {
+            Self::Invalid(detail) => detail,
+            Self::BookConstructionFailed(_) => "matching checkpoint book construction failed",
+            Self::ResourceReservationFailed { resource, .. } => resource.failure_detail(),
+        }
+    }
+
+    /// Returns the failed capture or validation resource, if reservation failed.
+    #[must_use]
+    pub const fn resource(&self) -> Option<OrderBookCheckpointResource> {
+        match self {
+            Self::ResourceReservationFailed { resource, .. } => Some(*resource),
+            Self::Invalid(_) | Self::BookConstructionFailed(_) => None,
+        }
+    }
+
+    /// Returns the underlying temporary-book construction failure, if present.
+    #[must_use]
+    pub const fn construction_error(&self) -> Option<MatchingError> {
+        match self {
+            Self::BookConstructionFailed(error) => Some(*error),
+            Self::Invalid(_) | Self::ResourceReservationFailed { .. } => None,
+        }
+    }
+
+    /// Returns whether this failure is an explicitly typed reservation result.
+    #[must_use]
+    pub const fn is_resource_exhaustion(&self) -> bool {
+        matches!(self, Self::ResourceReservationFailed { .. })
+    }
+
+    /// Returns whether failure occurred before semantic validation could mutate state.
+    #[must_use]
+    pub const fn is_operational_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::BookConstructionFailed(_) | Self::ResourceReservationFailed { .. }
+        )
     }
 }
 
 impl fmt::Display for OrderBookCheckpointError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.detail.fmt(formatter)
+        match self {
+            Self::Invalid(detail) => detail.fmt(formatter),
+            Self::BookConstructionFailed(error) => {
+                write!(
+                    formatter,
+                    "matching checkpoint book construction failed: {error}"
+                )
+            }
+            Self::ResourceReservationFailed { resource, maximum } => write!(
+                formatter,
+                "failed to reserve matching-checkpoint {resource} through {maximum} entries"
+            ),
+        }
     }
 }
 
-impl std::error::Error for OrderBookCheckpointError {}
+impl std::error::Error for OrderBookCheckpointError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BookConstructionFailed(error) => Some(error),
+            Self::Invalid(_) | Self::ResourceReservationFailed { .. } => None,
+        }
+    }
+}
+
+fn reserve_checkpoint_set<K>(
+    maximum: usize,
+    resource: OrderBookCheckpointResource,
+) -> Result<BoundedHashSet<K>, OrderBookCheckpointError>
+where
+    K: Eq + Hash,
+{
+    BoundedHashSet::try_new(maximum)
+        .map_err(|_| OrderBookCheckpointError::ResourceReservationFailed { resource, maximum })
+}
+
+fn reserve_checkpoint_map<K, V>(
+    maximum: usize,
+    resource: OrderBookCheckpointResource,
+) -> Result<BoundedHashMap<K, V>, OrderBookCheckpointError>
+where
+    K: Eq + Hash,
+{
+    BoundedHashMap::try_new(maximum)
+        .map_err(|_| OrderBookCheckpointError::ResourceReservationFailed { resource, maximum })
+}
+
+fn reserve_checkpoint_vec<T>(
+    maximum: usize,
+    resource: OrderBookCheckpointResource,
+) -> Result<Vec<T>, OrderBookCheckpointError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(maximum)
+        .map_err(|_| OrderBookCheckpointError::ResourceReservationFailed { resource, maximum })?;
+    Ok(values)
+}
+
+#[cfg(test)]
+mod checkpoint_resource_tests {
+    use super::{
+        AccountControlSnapshot, AccountId, CommandId, CommandReportCheckpoint,
+        OrderBookCheckpointError, OrderBookCheckpointResource, RestingOrderCheckpoint,
+        reserve_checkpoint_map, reserve_checkpoint_set, reserve_checkpoint_vec,
+    };
+
+    #[test]
+    fn unrepresentable_checkpoint_storage_is_typed_by_exact_resource() {
+        for resource in [
+            OrderBookCheckpointResource::HistoryCommandIdentifiers,
+            OrderBookCheckpointResource::HistoryAcceptedOrderIdentifiers,
+            OrderBookCheckpointResource::ActiveOrderIdentifiers,
+            OrderBookCheckpointResource::CapacityControlledAccounts,
+            OrderBookCheckpointResource::CapacityActiveAccounts,
+            OrderBookCheckpointResource::CapacityBidPrices,
+            OrderBookCheckpointResource::CapacityAskPrices,
+        ] {
+            assert_eq!(
+                reserve_checkpoint_set::<CommandId>(usize::MAX, resource).unwrap_err(),
+                OrderBookCheckpointError::ResourceReservationFailed {
+                    resource,
+                    maximum: usize::MAX,
+                }
+            );
+        }
+        assert_eq!(
+            reserve_checkpoint_map::<AccountId, AccountControlSnapshot>(
+                usize::MAX,
+                OrderBookCheckpointResource::HistoryAccountControls,
+            )
+            .unwrap_err(),
+            OrderBookCheckpointError::ResourceReservationFailed {
+                resource: OrderBookCheckpointResource::HistoryAccountControls,
+                maximum: usize::MAX,
+            }
+        );
+        for resource in [
+            OrderBookCheckpointResource::CaptureHistory,
+            OrderBookCheckpointResource::CaptureActiveOrders,
+        ] {
+            let error = match resource {
+                OrderBookCheckpointResource::CaptureHistory => {
+                    reserve_checkpoint_vec::<CommandReportCheckpoint>(usize::MAX, resource)
+                        .unwrap_err()
+                }
+                OrderBookCheckpointResource::CaptureActiveOrders => {
+                    reserve_checkpoint_vec::<RestingOrderCheckpoint>(usize::MAX, resource)
+                        .unwrap_err()
+                }
+                _ => unreachable!("capture resource set is exhaustive"),
+            };
+            assert_eq!(
+                error,
+                OrderBookCheckpointError::ResourceReservationFailed {
+                    resource,
+                    maximum: usize::MAX,
+                }
+            );
+            assert!(error.is_resource_exhaustion());
+            assert_eq!(error.resource(), Some(resource));
+        }
+    }
+}
+
+#[cfg(test)]
+mod staged_checkpoint_capture_tests {
+    use std::sync::Arc;
+
+    use crate::domain::AssetId;
+    use crate::instrument::{
+        InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules, QuantityRules,
+        ReserveOrderRules,
+    };
+
+    use super::{
+        AccountId, InstrumentDefinition, InstrumentId, InstrumentVersion, OrderBook,
+        OrderBookCheckpointError, OrderDisplay, OrderId, Price, Quantity, RestingOrderCheckpoint,
+        SelfTradePrevention, Side, TimestampNs, TradingState,
+    };
+
+    fn definition() -> InstrumentDefinition {
+        InstrumentDefinition::new(InstrumentSpec {
+            instrument_id: InstrumentId::new(1).unwrap(),
+            version: InstrumentVersion::new(1).unwrap(),
+            effective_from: TimestampNs::from_unix_nanos(0),
+            symbol: InstrumentSymbol::new("STAGED-CHECKPOINT").unwrap(),
+            kind: InstrumentKind::Future,
+            base_asset_id: AssetId::new(1).unwrap(),
+            quote_asset_id: AssetId::new(2).unwrap(),
+            price: PriceRules::new(0, 1, Price::from_raw(1), Price::from_raw(1_000)).unwrap(),
+            quantity: QuantityRules::new(1, 1, 1_000).unwrap(),
+            reserve: ReserveOrderRules::new(100).unwrap(),
+            base_units_per_lot: 1,
+            quote_units_per_price_unit: 1,
+            trading_state: TradingState::Open,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn staged_capture_rejects_live_lineage_and_post_capture_corruption() {
+        let mut corrupted_live = OrderBook::new(definition());
+        corrupted_live.next_sequence = 2;
+        let Err(error) = corrupted_live.capture_checkpoint_candidate(1, 1) else {
+            panic!("corrupt live lineage must not produce a capture");
+        };
+        assert_eq!(
+            error,
+            OrderBookCheckpointError::Invalid(
+                "live next event sequence differs from command history".into()
+            )
+        );
+
+        let book = OrderBook::new(definition());
+        let mut capture = book.capture_checkpoint_candidate(1, 1).unwrap();
+        capture.checkpoint.wal_sequence = 2;
+        let error = capture.verify().unwrap_err();
+        assert_eq!(
+            error,
+            OrderBookCheckpointError::Invalid(
+                "checkpoint WAL boundary does not terminate its command/report history".into()
+            )
+        );
+
+        let book = OrderBook::new(definition());
+        let mut capture = book.capture_checkpoint_candidate(1, 1).unwrap();
+        Arc::make_mut(&mut capture.checkpoint.orders).push(RestingOrderCheckpoint {
+            order_id: OrderId::new(1).unwrap(),
+            account_id: AccountId::new(1).unwrap(),
+            side: Side::Buy,
+            price: Price::from_raw(100),
+            leaves: Quantity::new(1).unwrap(),
+            displayed: Quantity::new(1).unwrap(),
+            display: OrderDisplay::FullyDisplayed,
+            self_trade_prevention: SelfTradePrevention::CancelAggressor,
+        });
+        let error = capture.verify().unwrap_err();
+        assert_eq!(
+            error,
+            OrderBookCheckpointError::Invalid(
+                "checkpoint direct state differs from deterministic history replay".into()
+            )
+        );
+    }
+}
 
 const fn side_wire_order(side: Side) -> u8 {
     match side {
@@ -1484,6 +2322,14 @@ fn validate_checkpoint_capacity(
             "checkpoint report exceeds selected event capacity",
         ));
     }
+    let retained_events = checkpoint.history.iter().try_fold(0_usize, |total, entry| {
+        total.checked_add(entry.report.events.len())
+    });
+    if retained_events.is_none_or(|count| count > limits.max_retained_events()) {
+        return Err(OrderBookCheckpointError::new(
+            "checkpoint retained events exceed selected capacity",
+        ));
+    }
     let accepted_order_ids = checkpoint
         .history
         .iter()
@@ -1499,18 +2345,18 @@ fn validate_checkpoint_capacity(
             "checkpoint accepted-order identifiers exceed selected capacity",
         ));
     }
-    let controlled_accounts = checkpoint
-        .history
-        .iter()
-        .filter_map(|entry| match (entry.command, entry.report.outcome) {
-            (Command::AccountControl(control), CommandOutcome::Accepted) => {
-                Some(control.account_id)
-            }
-            _ => None,
-        })
-        .collect::<HashSet<_>>()
-        .len();
-    if controlled_accounts > limits.max_account_controls() {
+    let mut controlled_accounts = reserve_checkpoint_set(
+        checkpoint.history.len(),
+        OrderBookCheckpointResource::CapacityControlledAccounts,
+    )?;
+    for entry in checkpoint.history.iter() {
+        if let (Command::AccountControl(control), CommandOutcome::Accepted) =
+            (entry.command, entry.report.outcome)
+        {
+            controlled_accounts.insert(control.account_id);
+        }
+    }
+    if controlled_accounts.len() > limits.max_account_controls() {
         return Err(OrderBookCheckpointError::new(
             "checkpoint account-control capacity is insufficient",
         ));
@@ -1520,10 +2366,19 @@ fn validate_checkpoint_capacity(
             "checkpoint active-order capacity is insufficient",
         ));
     }
-    let mut accounts = HashSet::with_capacity(checkpoint.orders.len());
-    let mut bids = HashSet::new();
-    let mut asks = HashSet::new();
-    for order in &checkpoint.orders {
+    let mut accounts = reserve_checkpoint_set(
+        checkpoint.orders.len(),
+        OrderBookCheckpointResource::CapacityActiveAccounts,
+    )?;
+    let mut bids = reserve_checkpoint_set(
+        checkpoint.orders.len(),
+        OrderBookCheckpointResource::CapacityBidPrices,
+    )?;
+    let mut asks = reserve_checkpoint_set(
+        checkpoint.orders.len(),
+        OrderBookCheckpointResource::CapacityAskPrices,
+    )?;
+    for order in checkpoint.orders.iter() {
         accounts.insert(order.account_id);
         match order.side {
             Side::Buy => bids.insert(order.price),
@@ -1550,8 +2405,12 @@ fn validate_checkpoint_capacity(
 pub enum MatchingCapacity {
     /// Ordinary new/replace history reached the cancellation-reserve boundary.
     AdmissionCommandHistory,
+    /// Ordinary command events reached the protected cancellation-event boundary.
+    AdmissionEventHistory,
     /// Total retained command history, including the cancellation reserve.
     CommandHistory,
+    /// Total retained events, including the protected cancellation reserve.
+    RetainedEvents,
     /// Never-reusable accepted order identifiers.
     AcceptedOrderIds,
     /// Never-evicted account admission-control revisions.
@@ -1566,10 +2425,10 @@ pub enum MatchingCapacity {
     AskPriceLevels,
     /// Events retained in one execution report.
     ReportEvents,
-    /// Active-order identifiers selected by one mass cancellation.
-    MassCancelSelection,
-    /// All active-order identifiers selected by an instrument state control.
-    TradingStateSelection,
+    /// Constructor-owned active-order identifier buffers used by selection commands.
+    OrderSelectionBuffers,
+    /// Fixed pool of simultaneously leased order-selection buffers.
+    PreparedOrderSelections,
     /// Coupled pre-trade risk reservations for active orders.
     RiskReservations,
     /// Immutable account profiles registered in a coupled risk shard.
@@ -1580,7 +2439,9 @@ impl fmt::Display for MatchingCapacity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::AdmissionCommandHistory => "ordinary command history",
+            Self::AdmissionEventHistory => "ordinary event history",
             Self::CommandHistory => "total command history",
+            Self::RetainedEvents => "total retained events",
             Self::AcceptedOrderIds => "accepted order identifiers",
             Self::AccountControls => "account admission controls",
             Self::ActiveOrders => "active orders",
@@ -1588,8 +2449,8 @@ impl fmt::Display for MatchingCapacity {
             Self::BidPriceLevels => "bid price levels",
             Self::AskPriceLevels => "ask price levels",
             Self::ReportEvents => "execution-report events",
-            Self::MassCancelSelection => "mass-cancel order selection",
-            Self::TradingStateSelection => "trading-state order selection",
+            Self::OrderSelectionBuffers => "prepared order-selection buffers",
+            Self::PreparedOrderSelections => "prepared order-selection pool",
             Self::RiskReservations => "risk reservations",
             Self::RiskAccounts => "registered risk accounts",
         })
@@ -1609,12 +2470,19 @@ pub enum MatchingError {
     CapacityExhausted(MatchingCapacity),
     /// A fallible configured-resource memory reservation failed.
     CapacityReservationFailed(MatchingCapacity),
+    /// Every constructor-owned order-selection buffer is currently leased.
+    PreparationCapacityExhausted {
+        /// Configured simultaneous selection-lease maximum.
+        maximum: usize,
+    },
     /// The book generation changed after a command was prepared.
     StalePreparation,
     /// A prepared command belongs to another order-book instance.
     ForeignPreparation,
     /// Process-local order-book identity exhausted its `u64` representation.
     BookInstanceIdExhausted,
+    /// Private matching state contradicted its constructor reservation or preflight.
+    InternalInvariantViolation,
 }
 
 impl fmt::Display for MatchingError {
@@ -1637,12 +2505,19 @@ impl fmt::Display for MatchingError {
                     "matching capacity reservation failed: {resource}"
                 )
             }
+            Self::PreparationCapacityExhausted { maximum } => write!(
+                formatter,
+                "matching prepared order-selection capacity {maximum} is exhausted"
+            ),
             Self::StalePreparation => formatter.write_str("prepared matching command is stale"),
             Self::ForeignPreparation => {
                 formatter.write_str("prepared matching command belongs to another order book")
             }
             Self::BookInstanceIdExhausted => {
                 formatter.write_str("order-book instance identifier exhausted")
+            }
+            Self::InternalInvariantViolation => {
+                formatter.write_str("private matching state contradicts its preparation")
             }
         }
     }
@@ -1669,6 +2544,10 @@ pub struct OrderBookLimitsSpec {
     pub cancellation_reserve: usize,
     /// Maximum events retained by one execution report.
     pub max_report_events: usize,
+    /// Maximum events retained across all execution reports.
+    pub max_retained_events: usize,
+    /// Maximum simultaneous prepared commands retaining order-selection storage.
+    pub max_prepared_order_selections: usize,
 }
 
 /// Invalid bounded order-book resource policy.
@@ -1688,6 +2567,10 @@ pub enum OrderBookLimitsError {
     ZeroRetainedCommands,
     /// Per-report event maximum is zero.
     ZeroReportEvents,
+    /// Total retained-event maximum is zero.
+    ZeroRetainedEvents,
+    /// Prepared order-selection lease maximum is zero.
+    ZeroPreparedOrderSelections,
     /// More active accounts than active orders were configured.
     ActiveAccountsExceedActiveOrders,
     /// More price levels per side than total active orders were configured.
@@ -1702,6 +2585,14 @@ pub enum OrderBookLimitsError {
     NoOrdinaryCommandCapacity,
     /// Ordinary history cannot admit the configured maximum active population.
     ActiveOrdersExceedOrdinaryCommandCapacity,
+    /// The protected cancellation-event reserve is not representable.
+    RetainedEventReserveOverflow,
+    /// The protected cancellation-event reserve consumes the complete arena.
+    NoOrdinaryEventCapacity,
+    /// One maximum-size report cannot fit outside the protected event reserve.
+    ReportEventsExceedOrdinaryEventCapacity,
+    /// Ordinary event capacity cannot admit the maximum active population.
+    ActiveOrdersExceedOrdinaryEventCapacity,
 }
 
 impl fmt::Display for OrderBookLimitsError {
@@ -1714,6 +2605,8 @@ impl fmt::Display for OrderBookLimitsError {
             Self::ZeroAccountControls => "account-control limit is zero",
             Self::ZeroRetainedCommands => "retained-command limit is zero",
             Self::ZeroReportEvents => "execution-report event limit is zero",
+            Self::ZeroRetainedEvents => "retained-event limit is zero",
+            Self::ZeroPreparedOrderSelections => "prepared order-selection lease limit is zero",
             Self::ActiveAccountsExceedActiveOrders => {
                 "active-account limit exceeds active-order limit"
             }
@@ -1735,6 +2628,18 @@ impl fmt::Display for OrderBookLimitsError {
             Self::ActiveOrdersExceedOrdinaryCommandCapacity => {
                 "active-order limit exceeds ordinary command capacity"
             }
+            Self::RetainedEventReserveOverflow => {
+                "protected cancellation-event reserve is not representable"
+            }
+            Self::NoOrdinaryEventCapacity => {
+                "protected cancellation-event reserve leaves no ordinary event capacity"
+            }
+            Self::ReportEventsExceedOrdinaryEventCapacity => {
+                "per-report event limit exceeds ordinary event capacity"
+            }
+            Self::ActiveOrdersExceedOrdinaryEventCapacity => {
+                "maximum active population cannot fit in ordinary event capacity"
+            }
         })
     }
 }
@@ -1752,6 +2657,8 @@ pub struct OrderBookLimits {
     max_retained_commands: usize,
     cancellation_reserve: usize,
     max_report_events: usize,
+    max_retained_events: usize,
+    max_prepared_order_selections: usize,
 }
 
 impl OrderBookLimits {
@@ -1771,6 +2678,10 @@ impl OrderBookLimits {
     pub const DEFAULT_CANCELLATION_RESERVE: usize = 4_096;
     /// Default maximum events retained by one execution report.
     pub const DEFAULT_MAX_REPORT_EVENTS: usize = 65_536;
+    /// Default maximum events retained across all reports.
+    pub const DEFAULT_MAX_RETAINED_EVENTS: usize = 262_144;
+    /// Default maximum simultaneous prepared order-selection commands.
+    pub const DEFAULT_MAX_PREPARED_ORDER_SELECTIONS: usize = 2;
 
     /// Validates a finite matching-resource policy.
     ///
@@ -1799,6 +2710,12 @@ impl OrderBookLimits {
         if spec.max_report_events == 0 {
             return Err(OrderBookLimitsError::ZeroReportEvents);
         }
+        if spec.max_retained_events == 0 {
+            return Err(OrderBookLimitsError::ZeroRetainedEvents);
+        }
+        if spec.max_prepared_order_selections == 0 {
+            return Err(OrderBookLimitsError::ZeroPreparedOrderSelections);
+        }
         if spec.max_active_accounts > spec.max_active_orders {
             return Err(OrderBookLimitsError::ActiveAccountsExceedActiveOrders);
         }
@@ -1812,7 +2729,7 @@ impl OrderBookLimits {
             return Err(OrderBookLimitsError::CancellationReserveBelowActiveOrders);
         }
         let Some(maximum_mass_cancel_events) = spec.max_active_orders.checked_add(1) else {
-            return Err(OrderBookLimitsError::ReportEventsBelowMassCancelMaximum);
+            return Err(OrderBookLimitsError::RetainedEventReserveOverflow);
         };
         if spec.max_report_events < maximum_mass_cancel_events {
             return Err(OrderBookLimitsError::ReportEventsBelowMassCancelMaximum);
@@ -1823,6 +2740,20 @@ impl OrderBookLimits {
         if spec.max_active_orders > spec.max_retained_commands - spec.cancellation_reserve {
             return Err(OrderBookLimitsError::ActiveOrdersExceedOrdinaryCommandCapacity);
         }
+        let cancellation_event_reserve = maximum_mass_cancel_events;
+        if cancellation_event_reserve >= spec.max_retained_events {
+            return Err(OrderBookLimitsError::NoOrdinaryEventCapacity);
+        }
+        let ordinary_event_capacity = spec.max_retained_events - cancellation_event_reserve;
+        if spec.max_report_events > ordinary_event_capacity {
+            return Err(OrderBookLimitsError::ReportEventsExceedOrdinaryEventCapacity);
+        }
+        let Some(active_population_events) = spec.max_active_orders.checked_mul(2) else {
+            return Err(OrderBookLimitsError::ActiveOrdersExceedOrdinaryEventCapacity);
+        };
+        if active_population_events > ordinary_event_capacity {
+            return Err(OrderBookLimitsError::ActiveOrdersExceedOrdinaryEventCapacity);
+        }
         Ok(Self {
             max_active_orders: spec.max_active_orders,
             max_active_accounts: spec.max_active_accounts,
@@ -1832,6 +2763,8 @@ impl OrderBookLimits {
             max_retained_commands: spec.max_retained_commands,
             cancellation_reserve: spec.cancellation_reserve,
             max_report_events: spec.max_report_events,
+            max_retained_events: spec.max_retained_events,
+            max_prepared_order_selections: spec.max_prepared_order_selections,
         })
     }
 
@@ -1883,6 +2816,30 @@ impl OrderBookLimits {
         self.max_report_events
     }
 
+    /// Maximum events retained across all execution reports.
+    #[must_use]
+    pub const fn max_retained_events(self) -> usize {
+        self.max_retained_events
+    }
+
+    /// Maximum simultaneous prepared commands retaining order-selection storage.
+    #[must_use]
+    pub const fn max_prepared_order_selections(self) -> usize {
+        self.max_prepared_order_selections
+    }
+
+    /// Event slots protected for business-valid cancellation-capable commands.
+    #[must_use]
+    pub const fn cancellation_event_reserve(self) -> usize {
+        self.max_active_orders + 1
+    }
+
+    /// Maximum ordinary retained events before the cancellation lane begins.
+    #[must_use]
+    pub const fn ordinary_event_capacity(self) -> usize {
+        self.max_retained_events - self.cancellation_event_reserve()
+    }
+
     /// Maximum new/replace command history before the cancellation lane begins.
     #[must_use]
     pub const fn ordinary_command_capacity(self) -> usize {
@@ -1901,6 +2858,8 @@ impl Default for OrderBookLimits {
             max_retained_commands: Self::DEFAULT_MAX_RETAINED_COMMANDS,
             cancellation_reserve: Self::DEFAULT_CANCELLATION_RESERVE,
             max_report_events: Self::DEFAULT_MAX_REPORT_EVENTS,
+            max_retained_events: Self::DEFAULT_MAX_RETAINED_EVENTS,
+            max_prepared_order_selections: Self::DEFAULT_MAX_PREPARED_ORDER_SELECTIONS,
         })
         .expect("built-in order-book limits are valid")
     }
@@ -1993,22 +2952,41 @@ struct PriceLevel {
     event_units: u128,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PriceLevelHandle {
+    price: Price,
+    slot: IndexedAvlHandle,
+}
+
 /// Bounded occupied prices for one side with a mutation-maintained market
-/// extremum.
+/// extremum and its key-checked stable-slot handle.
 ///
 /// The preallocated indexed AVL map remains the authoritative ordered
 /// enumeration/index structure. The cached best price is redundant derived
-/// state, updated only by `insert` and `remove` and independently checked by
-/// `validate_extremum`. Read-only best-price discovery therefore does not
-/// traverse the tree, and level mutation performs no allocation.
+/// state, updated by every applicable mutation and independently checked by
+/// `validate_extremum`. Read-only best-price discovery and handle-addressed
+/// maker-level mutation therefore do not traverse the tree, and level mutation
+/// performs no allocation.
 #[cfg_attr(test, derive(Clone))]
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct PriceLevels {
     side: Side,
     by_price: IndexedAvlMap<Price, PriceLevel>,
     best: Option<(Price, PriceLevel)>,
+    best_handle: Option<PriceLevelHandle>,
     event_units: u128,
 }
+
+impl PartialEq for PriceLevels {
+    fn eq(&self, other: &Self) -> bool {
+        self.side == other.side
+            && self.by_price == other.by_price
+            && self.best == other.best
+            && self.event_units == other.event_units
+    }
+}
+
+impl Eq for PriceLevels {}
 
 impl PriceLevels {
     fn try_new(
@@ -2019,6 +2997,7 @@ impl PriceLevels {
             side,
             by_price: IndexedAvlMap::try_with_capacity(maximum_levels)?,
             best: None,
+            best_handle: None,
             event_units: 0,
         })
     }
@@ -2027,7 +3006,7 @@ impl PriceLevels {
         self.by_price.get(&price)
     }
 
-    fn iter(&self) -> impl DoubleEndedIterator<Item = (&Price, &PriceLevel)> {
+    fn iter(&self) -> impl DoubleEndedIterator<Item = (&Price, &PriceLevel)> + ExactSizeIterator {
         self.by_price.iter()
     }
 
@@ -2059,8 +3038,25 @@ impl PriceLevels {
         self.best
     }
 
+    fn best_level_with_handle(&self) -> Option<(PriceLevelHandle, PriceLevel)> {
+        let handle = self.best_handle?;
+        let (price, level) = self.best?;
+        debug_assert_eq!(handle.price, price);
+        Some((handle, level))
+    }
+
+    fn handle(&self, price: Price) -> Option<PriceLevelHandle> {
+        self.by_price
+            .get_handle(&price)
+            .map(|slot| PriceLevelHandle { price, slot })
+    }
+
+    fn get_by_handle(&self, handle: PriceLevelHandle) -> Option<&PriceLevel> {
+        self.by_price.get_by_handle(handle.slot, &handle.price)
+    }
+
     fn insert(&mut self, price: Price, level: PriceLevel) -> Option<PriceLevel> {
-        let replaced = self.by_price.insert(price, level);
+        let (slot, replaced) = self.by_price.insert_with_handle(price, level);
         self.event_units = self
             .event_units
             .checked_sub(replaced.map_or(0, |value| value.event_units))
@@ -2071,13 +3067,25 @@ impl PriceLevels {
             .is_none_or(|(current, _)| current == price || self.is_better(price, current))
         {
             self.best = Some((price, level));
+            self.best_handle = Some(PriceLevelHandle { price, slot });
         }
         replaced
     }
 
     fn update<R>(&mut self, price: Price, update: impl FnOnce(&mut PriceLevel) -> R) -> Option<R> {
+        let handle = self.handle(price)?;
+        self.update_by_handle(handle, update)
+    }
+
+    fn update_by_handle<R>(
+        &mut self,
+        handle: PriceLevelHandle,
+        update: impl FnOnce(&mut PriceLevel) -> R,
+    ) -> Option<R> {
         let (result, snapshot, previous_event_units) = {
-            let level = self.by_price.get_mut(&price)?;
+            let level = self
+                .by_price
+                .get_mut_by_handle(handle.slot, &handle.price)?;
             let previous_event_units = level.event_units;
             let result = update(level);
             (result, *level, previous_event_units)
@@ -2087,22 +3095,30 @@ impl PriceLevels {
             .checked_sub(previous_event_units)
             .and_then(|value| value.checked_add(snapshot.event_units))
             .expect("active-order event work must fit u128");
-        if self.best.is_some_and(|(best_price, _)| best_price == price) {
-            self.best = Some((price, snapshot));
+        if self.best_handle == Some(handle) {
+            self.best = Some((handle.price, snapshot));
         }
         Some(result)
     }
 
+    #[cfg(test)]
     fn remove(&mut self, price: Price) -> Option<PriceLevel> {
-        let removed = self.by_price.remove(&price);
+        let handle = self.handle(price)?;
+        self.remove_by_handle(handle)
+    }
+
+    fn remove_by_handle(&mut self, handle: PriceLevelHandle) -> Option<PriceLevel> {
+        let removed = self.by_price.remove_by_handle(handle.slot, &handle.price);
         if let Some(level) = removed {
             self.event_units = self
                 .event_units
                 .checked_sub(level.event_units)
                 .expect("removed level event work must be indexed");
         }
-        if removed.is_some() && self.best.is_some_and(|(best_price, _)| best_price == price) {
-            self.best = self.map_extremum();
+        if self.best_handle == Some(handle) {
+            let extremum = self.map_extremum();
+            self.best = extremum.map(|(_, price, level)| (price, level));
+            self.best_handle = extremum.map(|(handle, _, _)| handle);
         }
         removed
     }
@@ -2119,10 +3135,12 @@ impl PriceLevels {
             InvariantViolation::new(format!("{:?} price index: {detail}", self.side))
         })?;
         let actual = self.map_extremum();
-        if self.best != actual {
+        let actual_best = actual.map(|(_, price, level)| (price, level));
+        let actual_handle = actual.map(|(handle, _, _)| handle);
+        if self.best != actual_best || self.best_handle != actual_handle {
             return Err(InvariantViolation::new(format!(
-                "{:?} cached best level {:?} differs from indexed-AVL extremum {:?}",
-                self.side, self.best, actual
+                "{:?} cached best level {:?}/{:?} differs from indexed-AVL extremum {:?}/{:?}",
+                self.side, self.best, self.best_handle, actual_best, actual_handle
             )));
         }
         let actual_event_units = self
@@ -2146,17 +3164,12 @@ impl PriceLevels {
         }
     }
 
-    fn map_extremum(&self) -> Option<(Price, PriceLevel)> {
-        match self.side {
-            Side::Buy => self
-                .by_price
-                .last_key_value()
-                .map(|(&price, &level)| (price, level)),
-            Side::Sell => self
-                .by_price
-                .first_key_value()
-                .map(|(&price, &level)| (price, level)),
-        }
+    fn map_extremum(&self) -> Option<(PriceLevelHandle, Price, PriceLevel)> {
+        let (slot, &price, &level) = match self.side {
+            Side::Buy => self.by_price.last_key_value_with_handle(),
+            Side::Sell => self.by_price.first_key_value_with_handle(),
+        }?;
+        Some((PriceLevelHandle { price, slot }, price, level))
     }
 }
 
@@ -2342,7 +3355,6 @@ enum LevelLiquidity {
 }
 
 /// A deterministic single-instrument central limit order book.
-#[cfg_attr(test, derive(Clone))]
 #[derive(Debug)]
 pub struct OrderBook {
     instance_id: u64,
@@ -2351,11 +3363,14 @@ pub struct OrderBook {
     limits: OrderBookLimits,
     bids: PriceLevels,
     asks: PriceLevels,
-    orders: HashMap<OrderId, RestingOrder>,
-    account_orders: HashMap<AccountId, AccountOrderIndex>,
-    seen_order_ids: HashSet<OrderId>,
-    account_controls: HashMap<AccountId, AccountControlSnapshot>,
-    reports: HashMap<CommandId, CachedReport>,
+    orders: BoundedHashMap<OrderId, RestingOrder>,
+    account_orders: BoundedHashMap<AccountId, AccountOrderIndex>,
+    seen_order_ids: BoundedHashSet<OrderId>,
+    account_controls: BoundedHashMap<AccountId, AccountControlSnapshot>,
+    reports: BoundedHashMap<CommandId, CachedReport>,
+    event_arena: Arc<EventArena>,
+    order_selection_pool: Arc<OrderSelectionPool>,
+    retained_event_count: usize,
     next_sequence: u64,
     next_trade_id: u64,
 }
@@ -2372,12 +3387,53 @@ impl PartialEq for OrderBook {
             && self.seen_order_ids == other.seen_order_ids
             && self.account_controls == other.account_controls
             && self.reports == other.reports
+            && self.retained_event_count == other.retained_event_count
             && self.next_sequence == other.next_sequence
             && self.next_trade_id == other.next_trade_id
     }
 }
 
 impl Eq for OrderBook {}
+
+#[cfg(test)]
+impl Clone for OrderBook {
+    fn clone(&self) -> Self {
+        let event_arena = try_event_arena(self.event_arena.capacity())
+            .expect("test clone must reserve the validated event-arena capacity");
+        let order_selection_pool = OrderSelectionPool::try_new(
+            self.limits.max_prepared_order_selections(),
+            self.limits.max_active_orders(),
+        )
+        .expect("test clone must reserve the validated order-selection pool");
+        self.event_arena
+            .copy_prefix_to(&event_arena, self.retained_event_count);
+        let mut reports = self.reports.clone();
+        for cached in reports.values_mut() {
+            cached.report.events = cached
+                .report
+                .events
+                .rebind_arena(&self.event_arena, Arc::clone(&event_arena));
+        }
+        Self {
+            instance_id: self.instance_id,
+            definition: self.definition,
+            trading_state: self.trading_state,
+            limits: self.limits,
+            bids: self.bids.clone(),
+            asks: self.asks.clone(),
+            orders: self.orders.clone(),
+            account_orders: self.account_orders.clone(),
+            seen_order_ids: self.seen_order_ids.clone(),
+            account_controls: self.account_controls.clone(),
+            reports,
+            event_arena,
+            order_selection_pool,
+            retained_event_count: self.retained_event_count,
+            next_sequence: self.next_sequence,
+            next_trade_id: self.next_trade_id,
+        }
+    }
+}
 
 impl OrderBook {
     /// Creates an empty finitely bounded order book using [`OrderBookLimits::default`].
@@ -2394,23 +3450,25 @@ impl OrderBook {
     ///
     /// # Panics
     ///
-    /// Panics when constructor-time price-arena/hash reservation or process-local
-    /// instance identity allocation fails.
+    /// Panics when constructor-time price/event/selection arena or hash
+    /// reservation or process-local instance identity allocation fails.
     #[must_use]
     pub fn with_limits(definition: InstrumentDefinition, limits: OrderBookLimits) -> Self {
         Self::try_with_limits(definition, limits)
             .expect("order-book capacity reservation must succeed under A12")
     }
 
-    /// Creates an empty bounded order book and fallibly reserves both complete
-    /// price-level arenas plus any configured hash maxima.
+    /// Creates an empty bounded order book and fallibly reserves the complete
+    /// price-level, retained-event, and order-selection arenas plus all
+    /// configured hash maxima.
     ///
     /// # Errors
     ///
     /// Returns [`MatchingError::CapacityReservationFailed`] naming the first
-    /// price arena or hash index whose requested reservation cannot be represented
-    /// or allocated, or [`MatchingError::BookInstanceIdExhausted`] if
-    /// process-local book identity is exhausted.
+    /// price/event/selection arena or hash index whose requested reservation
+    /// cannot be represented or allocated, or
+    /// [`MatchingError::BookInstanceIdExhausted`] if process-local book identity
+    /// is exhausted.
     pub fn try_with_limits(
         definition: InstrumentDefinition,
         limits: OrderBookLimits,
@@ -2423,36 +3481,29 @@ impl OrderBook {
             PriceLevels::try_new(Side::Sell, limits.max_price_levels_per_side()).map_err(|_| {
                 MatchingError::CapacityReservationFailed(MatchingCapacity::AskPriceLevels)
             })?;
-        let mut orders = HashMap::new();
-        let mut account_orders = HashMap::new();
-        let mut seen_order_ids = HashSet::new();
-        let mut account_controls = HashMap::new();
-        let mut reports = HashMap::new();
-        orders
-            .try_reserve(limits.max_active_orders())
-            .map_err(|_| {
-                MatchingError::CapacityReservationFailed(MatchingCapacity::ActiveOrders)
-            })?;
-        account_orders
-            .try_reserve(limits.max_active_accounts())
-            .map_err(|_| {
+        let orders = BoundedHashMap::try_new(limits.max_active_orders()).map_err(|_| {
+            MatchingError::CapacityReservationFailed(MatchingCapacity::ActiveOrders)
+        })?;
+        let account_orders =
+            BoundedHashMap::try_new(limits.max_active_accounts()).map_err(|_| {
                 MatchingError::CapacityReservationFailed(MatchingCapacity::ActiveAccounts)
             })?;
-        seen_order_ids
-            .try_reserve(limits.max_accepted_order_ids())
-            .map_err(|_| {
+        let seen_order_ids =
+            BoundedHashSet::try_new(limits.max_accepted_order_ids()).map_err(|_| {
                 MatchingError::CapacityReservationFailed(MatchingCapacity::AcceptedOrderIds)
             })?;
-        account_controls
-            .try_reserve(limits.max_account_controls())
-            .map_err(|_| {
+        let account_controls =
+            BoundedHashMap::try_new(limits.max_account_controls()).map_err(|_| {
                 MatchingError::CapacityReservationFailed(MatchingCapacity::AccountControls)
             })?;
-        reports
-            .try_reserve(limits.max_retained_commands())
-            .map_err(|_| {
-                MatchingError::CapacityReservationFailed(MatchingCapacity::CommandHistory)
-            })?;
+        let reports = BoundedHashMap::try_new(limits.max_retained_commands()).map_err(|_| {
+            MatchingError::CapacityReservationFailed(MatchingCapacity::CommandHistory)
+        })?;
+        let event_arena = try_event_arena(limits.max_retained_events())?;
+        let order_selection_pool = OrderSelectionPool::try_new(
+            limits.max_prepared_order_selections(),
+            limits.max_active_orders(),
+        )?;
         let instance_id = next_order_book_instance_id()?;
         let trading_state = TradingStateSnapshot::from_parts(definition.trading_state(), 0);
         Ok(Self {
@@ -2467,48 +3518,60 @@ impl OrderBook {
             seen_order_ids,
             account_controls,
             reports,
+            event_arena,
+            order_selection_pool,
+            retained_event_count: 0,
             next_sequence: 1,
             next_trade_id: 1,
         })
     }
 
-    /// Captures canonical direct state at one completed WAL report boundary.
+    /// Captures and synchronously verifies canonical state at one completed WAL
+    /// report boundary.
     ///
     /// The checkpoint retains complete command/report history because exact
     /// retries and never-reusable order identifiers are part of matching state.
-    /// Active orders are emitted in buy-then-sell, ascending-price, FIFO order.
+    /// This convenience path uses the same replay transition as
+    /// [`Self::capture_checkpoint_candidate`] followed by
+    /// [`OrderBookCheckpointCapture::verify`].
     ///
     /// # Errors
     ///
-    /// Returns [`OrderBookCheckpointError`] when the live structure is invalid,
-    /// the WAL boundary is not consistent with the retained command count, or
-    /// canonical checkpoint validation fails.
+    /// Returns [`OrderBookCheckpointError::ResourceReservationFailed`] when the
+    /// complete history or active-order capture cannot be reserved, preserves a
+    /// typed temporary-book construction failure, or reports an invalid live
+    /// structure, WAL boundary, or canonical checkpoint.
     pub fn checkpoint(
         &self,
         wal_metadata_sequence: u64,
         wal_sequence: u64,
     ) -> Result<OrderBookCheckpoint, OrderBookCheckpointError> {
-        let checkpoint = self.checkpoint_state(wal_metadata_sequence, wal_sequence)?;
-        let mut replay = Self::try_with_limits(self.definition, self.limits)
-            .map_err(|error| OrderBookCheckpointError::new(error.to_string()))?;
-        for entry in checkpoint.history() {
-            let reproduced = replay.submit(entry.command).map_err(|error| {
-                OrderBookCheckpointError::new(format!(
-                    "checkpoint history cannot be replayed: {error}"
-                ))
-            })?;
-            if reproduced != entry.report {
-                return Err(OrderBookCheckpointError::new(
-                    "checkpoint live state history diverges under deterministic replay",
-                ));
-            }
-        }
-        if replay != *self {
-            return Err(OrderBookCheckpointError::new(
-                "checkpoint direct state differs from deterministic history replay",
-            ));
-        }
-        Ok(checkpoint)
+        self.capture_checkpoint_candidate(wal_metadata_sequence, wal_sequence)?
+            .verify()
+    }
+
+    /// Captures an immutable candidate without deterministic full-history replay.
+    ///
+    /// The writer-side phase audits live topology, event-arena layout, complete
+    /// command-derived lineage, and the WAL boundary, then copies `C`
+    /// command/report handles and `O` canonical active-order rows. Active orders
+    /// are emitted in buy-then-sell, ascending-price, FIFO order. The returned
+    /// value is not encodable or persistable until consumed by
+    /// [`OrderBookCheckpointCapture::verify`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed capture/validation reservation failure or `Invalid` for
+    /// a live structural, lineage, WAL-boundary, or canonical-state contradiction.
+    pub fn capture_checkpoint_candidate(
+        &self,
+        wal_metadata_sequence: u64,
+        wal_sequence: u64,
+    ) -> Result<OrderBookCheckpointCapture, OrderBookCheckpointError> {
+        Ok(OrderBookCheckpointCapture {
+            checkpoint: self.checkpoint_state(wal_metadata_sequence, wal_sequence)?,
+            limits: self.limits,
+        })
     }
 
     pub(crate) fn checkpoint_state(
@@ -2518,23 +3581,26 @@ impl OrderBook {
     ) -> Result<OrderBookCheckpoint, OrderBookCheckpointError> {
         self.validate()
             .map_err(|error| OrderBookCheckpointError::new(error.detail()))?;
-        let mut history: Vec<_> = self
-            .reports
-            .values()
-            .map(|cached| CommandReportCheckpoint {
+        let mut history = reserve_checkpoint_vec(
+            self.reports.len(),
+            OrderBookCheckpointResource::CaptureHistory,
+        )?;
+        let mut orders = reserve_checkpoint_vec(
+            self.orders.len(),
+            OrderBookCheckpointResource::CaptureActiveOrders,
+        )?;
+        for (command_id, cached) in self.reports.iter() {
+            if *command_id != cached.command.command_id() {
+                return Err(OrderBookCheckpointError::new(
+                    "live command-history key differs from its cached command",
+                ));
+            }
+            history.push(CommandReportCheckpoint {
                 command: cached.command,
                 report: cached.report.clone(),
-            })
-            .collect();
-        history.sort_unstable_by_key(|entry| {
-            entry
-                .report
-                .events
-                .first()
-                .map_or(u64::MAX, |event| event.sequence)
-        });
+            });
+        }
 
-        let mut orders = Vec::with_capacity(self.orders.len());
         for side in [Side::Buy, Side::Sell] {
             for level in self.levels(side).values() {
                 let mut current = Some(level.head);
@@ -2566,13 +3632,44 @@ impl OrderBook {
                 }
             }
         }
-        OrderBookCheckpoint::from_parts(
+        let (checkpoint, lineage) = OrderBookCheckpoint::from_parts_with_lineage(
             wal_metadata_sequence,
             wal_sequence,
             self.definition,
             orders,
             history,
-        )
+        )?;
+        if lineage.seen_order_ids != self.seen_order_ids {
+            return Err(OrderBookCheckpointError::new(
+                "live accepted-order identity state differs from command history",
+            ));
+        }
+        if lineage.account_controls != self.account_controls {
+            return Err(OrderBookCheckpointError::new(
+                "live account-control state differs from command history",
+            ));
+        }
+        if lineage.trading_state != self.trading_state {
+            return Err(OrderBookCheckpointError::new(
+                "live trading-state control state differs from command history",
+            ));
+        }
+        if lineage.retained_event_count != self.retained_event_count {
+            return Err(OrderBookCheckpointError::new(
+                "live retained-event count differs from command history",
+            ));
+        }
+        if lineage.next_sequence != self.next_sequence {
+            return Err(OrderBookCheckpointError::new(
+                "live next event sequence differs from command history",
+            ));
+        }
+        if lineage.next_trade_id != self.next_trade_id {
+            return Err(OrderBookCheckpointError::new(
+                "live next trade identifier differs from command history",
+            ));
+        }
+        Ok(checkpoint)
     }
 
     /// Restores a directly indexed order book from a validated semantic checkpoint.
@@ -2582,7 +3679,7 @@ impl OrderBook {
     /// Returns [`OrderBookCheckpointError`] when semantic or reconstructed
     /// structural invariants fail.
     pub fn from_checkpoint(
-        checkpoint: OrderBookCheckpoint,
+        checkpoint: &OrderBookCheckpoint,
     ) -> Result<Self, OrderBookCheckpointError> {
         Self::from_checkpoint_with_limits(checkpoint, OrderBookLimits::default())
     }
@@ -2594,17 +3691,19 @@ impl OrderBook {
     ///
     /// # Errors
     ///
-    /// Returns [`OrderBookCheckpointError`] when the checkpoint is invalid or
-    /// its current state exceeds any selected limit.
+    /// Returns [`OrderBookCheckpointError`] when the checkpoint is invalid, its
+    /// current state exceeds a selected limit, a validation resource cannot be
+    /// reserved, or temporary book construction fails.
     pub fn from_checkpoint_with_limits(
-        checkpoint: OrderBookCheckpoint,
+        checkpoint: &OrderBookCheckpoint,
         limits: OrderBookLimits,
     ) -> Result<Self, OrderBookCheckpointError> {
         checkpoint.validate()?;
-        validate_checkpoint_capacity(&checkpoint, limits)?;
+        validate_checkpoint_capacity(checkpoint, limits)?;
         let mut book = Self::try_with_limits(checkpoint.definition, limits)
-            .map_err(|error| OrderBookCheckpointError::new(error.to_string()))?;
-        for entry in checkpoint.history {
+            .map_err(OrderBookCheckpointError::BookConstructionFailed)?;
+        for source in checkpoint.history.iter() {
+            let mut entry = source.clone();
             if let (Command::New(order), CommandOutcome::Accepted) =
                 (entry.command, entry.report.outcome)
             {
@@ -2647,6 +3746,24 @@ impl OrderBook {
                     })?;
                 }
             }
+            let event_count = entry.report.events.len();
+            let mut events = EventTraceBuilder::new(
+                Arc::clone(&book.event_arena),
+                book.retained_event_count,
+                event_count,
+            );
+            for event in entry.report.events.iter().copied() {
+                events.push(event);
+            }
+            entry.report.events = events.finish();
+            book.retained_event_count = book
+                .retained_event_count
+                .checked_add(event_count)
+                .ok_or_else(|| {
+                    OrderBookCheckpointError::new(
+                        "checkpoint retained event count is not representable",
+                    )
+                })?;
             book.reports.insert(
                 entry.command.command_id(),
                 CachedReport {
@@ -2655,7 +3772,7 @@ impl OrderBook {
                 },
             );
         }
-        for state in checkpoint.orders {
+        for &state in checkpoint.orders.iter() {
             book.append_order(RestingOrder {
                 order_id: state.order_id,
                 account_id: state.account_id,
@@ -2874,11 +3991,12 @@ impl OrderBook {
     /// Prepares a command against the current matching generation.
     ///
     /// Preparation checks idempotency, all operational capacity and identifier
-    /// bounds, and core matching business rules exactly once. It also fallibly
-    /// reserves the complete report event buffer and any mass-cancel or
-    /// block-and-cancel or instrument transition-and-cancel selection buffer.
+    /// bounds, and core matching business rules exactly once. It also proves the
+    /// complete report event bound against constructor-owned arena headroom and
+    /// leases any non-empty mass-cancel, block-and-cancel, or instrument
+    /// transition-and-cancel selection buffer.
     /// Every matching hash index already owns its complete configured headroom,
-    /// so preparation is read-only with respect to the book. A ready token can be durably written
+    /// so preparation changes no semantic book state. A ready token can be durably written
     /// through [`PreparedCommand::command`] and then applied with
     /// [`OrderBook::commit`] without event/scratch growth or hash-table rehashing.
     ///
@@ -2905,6 +4023,7 @@ impl OrderBook {
                 MatchingCapacity::ReportEvents,
             ));
         }
+        self.check_event_capacity(command, core_rejection, maximum_events)?;
         let maximum_events_u64 =
             u64::try_from(maximum_events).map_err(|_| MatchingError::SequenceExhausted)?;
         self.next_sequence
@@ -2913,16 +4032,11 @@ impl OrderBook {
         self.next_trade_id
             .checked_add(maximum_trades)
             .ok_or(MatchingError::TradeIdExhausted)?;
-        let events = EventTraceBuilder::try_with_capacity(maximum_events)?;
         let selected_order_ids = match (core_rejection, command) {
             (None, Command::MassCancel(command)) => {
                 let selected_count =
                     self.account_active_order_count(command.account_id, command.scope);
-                let mut selected = Vec::new();
-                selected.try_reserve_exact(selected_count).map_err(|_| {
-                    MatchingError::CapacityReservationFailed(MatchingCapacity::MassCancelSelection)
-                })?;
-                Some(selected)
+                Some(self.acquire_order_selection(selected_count)?)
             }
             (
                 None,
@@ -2934,11 +4048,7 @@ impl OrderBook {
             ) => {
                 let selected_count =
                     self.account_active_order_count(account_id, MassCancelScope::All);
-                let mut selected = Vec::new();
-                selected.try_reserve_exact(selected_count).map_err(|_| {
-                    MatchingError::CapacityReservationFailed(MatchingCapacity::MassCancelSelection)
-                })?;
-                Some(selected)
+                Some(self.acquire_order_selection(selected_count)?)
             }
             (
                 None,
@@ -2946,15 +4056,7 @@ impl OrderBook {
                     action: TradingStateControlAction::TransitionAndCancel,
                     ..
                 }),
-            ) => {
-                let mut selected = Vec::new();
-                selected.try_reserve_exact(self.orders.len()).map_err(|_| {
-                    MatchingError::CapacityReservationFailed(
-                        MatchingCapacity::TradingStateSelection,
-                    )
-                })?;
-                Some(selected)
-            }
+            ) => Some(self.acquire_order_selection(self.orders.len())?),
             _ => None,
         };
         Ok(CommandPreparation::Ready(PreparedCommand {
@@ -2962,9 +4064,27 @@ impl OrderBook {
             book_instance_id: self.instance_id,
             expected_retained_commands: self.reports.len(),
             core_rejection,
-            events,
+            maximum_events,
             selected_order_ids,
         }))
+    }
+
+    fn acquire_order_selection(
+        &self,
+        required: usize,
+    ) -> Result<PooledOrderSelection, MatchingError> {
+        if required == 0 {
+            return Ok(PooledOrderSelection::empty());
+        }
+        let selected = self.order_selection_pool.acquire().ok_or(
+            MatchingError::PreparationCapacityExhausted {
+                maximum: self.limits.max_prepared_order_selections(),
+            },
+        )?;
+        if selected.capacity() < required {
+            return Err(MatchingError::InternalInvariantViolation);
+        }
+        Ok(selected)
     }
 
     /// Computes a safe command-specific report/trade bound in `O(1)` from
@@ -3129,7 +4249,7 @@ impl OrderBook {
             book_instance_id,
             expected_retained_commands,
             core_rejection,
-            events,
+            maximum_events,
             selected_order_ids,
         } = prepared;
         if self.instance_id != book_instance_id {
@@ -3147,6 +4267,11 @@ impl OrderBook {
         if self.reports.len() != expected_retained_commands {
             return Err(MatchingError::StalePreparation);
         }
+        let events = EventTraceBuilder::new(
+            Arc::clone(&self.event_arena),
+            self.retained_event_count,
+            maximum_events,
+        );
 
         let report = if let Some(reason) = core_rejection.or(gate_reason) {
             self.rejected(command_id, command.received_at(), reason, events)?
@@ -3183,22 +4308,7 @@ impl OrderBook {
             ));
         }
         if self.reports.len() >= self.limits.ordinary_command_capacity() {
-            if !matches!(
-                command,
-                Command::Cancel(_)
-                    | Command::MassCancel(_)
-                    | Command::AccountControl(AccountControl {
-                        action: AccountControlAction::BlockAndCancel,
-                        ..
-                    })
-                    | Command::TradingStateControl(TradingStateControl {
-                        action: TradingStateControlAction::TransitionAndCancel,
-                        target_state: TradingState::CancelOnly
-                            | TradingState::Halted
-                            | TradingState::Closed,
-                        ..
-                    })
-            ) {
+            if !Self::is_protected_cancellation_command(command) {
                 return Err(MatchingError::CapacityExhausted(
                     MatchingCapacity::AdmissionCommandHistory,
                 ));
@@ -3212,6 +4322,52 @@ impl OrderBook {
             return Ok(None);
         }
         Ok(self.check_business_rules(command).err())
+    }
+
+    fn is_protected_cancellation_command(command: Command) -> bool {
+        matches!(
+            command,
+            Command::Cancel(_)
+                | Command::MassCancel(_)
+                | Command::AccountControl(AccountControl {
+                    action: AccountControlAction::BlockAndCancel,
+                    ..
+                })
+                | Command::TradingStateControl(TradingStateControl {
+                    action: TradingStateControlAction::TransitionAndCancel,
+                    target_state: TradingState::CancelOnly
+                        | TradingState::Halted
+                        | TradingState::Closed,
+                    ..
+                })
+        )
+    }
+
+    fn check_event_capacity(
+        &self,
+        command: Command,
+        core_rejection: Option<RejectReason>,
+        maximum_events: usize,
+    ) -> Result<(), MatchingError> {
+        let final_count = self
+            .retained_event_count
+            .checked_add(maximum_events)
+            .ok_or(MatchingError::CapacityExhausted(
+                MatchingCapacity::RetainedEvents,
+            ))?;
+        if final_count > self.limits.max_retained_events() {
+            return Err(MatchingError::CapacityExhausted(
+                MatchingCapacity::RetainedEvents,
+            ));
+        }
+        if final_count > self.limits.ordinary_event_capacity()
+            && (core_rejection.is_some() || !Self::is_protected_cancellation_command(command))
+        {
+            return Err(MatchingError::CapacityExhausted(
+                MatchingCapacity::AdmissionEventHistory,
+            ));
+        }
+        Ok(())
     }
 
     fn check_command_capacity(
@@ -3380,6 +4536,26 @@ impl OrderBook {
         }
     }
 
+    /// Returns process-local allocation telemetry for retained event storage.
+    #[must_use]
+    pub fn event_arena_status(&self) -> EventArenaStatus {
+        EventArenaStatus {
+            configured_events: self.limits.max_retained_events(),
+            allocated_events: self.event_arena.allocated_capacity(),
+            retained_events: self.retained_event_count,
+        }
+    }
+
+    /// Returns constructor allocation and current availability for order-selection storage.
+    #[must_use]
+    pub fn order_selection_pool_status(&self) -> OrderSelectionPoolStatus {
+        OrderSelectionPoolStatus {
+            configured_leases: self.limits.max_prepared_order_selections(),
+            available_leases: self.order_selection_pool.available(),
+            allocated_order_ids_per_lease: self.order_selection_pool.order_capacity,
+        }
+    }
+
     /// Returns process-local allocation telemetry for one bounded hash index.
     ///
     /// Construction reserves at least the complete configured entry bound.
@@ -3421,20 +4597,19 @@ impl OrderBook {
     #[must_use]
     pub fn depth(&self, side: Side, limit: usize) -> Vec<LevelSnapshot> {
         match side {
-            Side::Buy => self
-                .bids
-                .iter()
-                .rev()
-                .take(limit)
-                .map(|(&price, level)| Self::level_snapshot(price, level))
-                .collect(),
-            Side::Sell => self
-                .asks
-                .iter()
-                .take(limit)
-                .map(|(&price, level)| Self::level_snapshot(price, level))
-                .collect(),
+            Side::Buy => self.depth_levels(side).rev().take(limit).collect(),
+            Side::Sell => self.depth_levels(side).take(limit).collect(),
         }
+    }
+
+    /// Iterates aggregate levels in ascending price order without allocating.
+    pub(crate) fn depth_levels(
+        &self,
+        side: Side,
+    ) -> impl DoubleEndedIterator<Item = LevelSnapshot> + ExactSizeIterator + '_ {
+        self.levels(side)
+            .iter()
+            .map(|(&price, level)| Self::level_snapshot(price, level))
     }
 
     /// Returns one aggregate level, or `None` when the price is unoccupied.
@@ -3479,7 +4654,18 @@ impl OrderBook {
     /// zero total or displayed leaves quantity.
     pub fn active_orders(&self) -> Result<Vec<OrderSnapshot>, InvariantViolation> {
         let mut orders = Vec::with_capacity(self.orders.len());
-        for order in self.orders.values() {
+        for order in self.active_order_states() {
+            orders.push(order?);
+        }
+        orders.sort_unstable_by_key(|order| order.order_id);
+        Ok(orders)
+    }
+
+    /// Iterates active-order state in dense process-local order without allocating.
+    pub(crate) fn active_order_states(
+        &self,
+    ) -> impl ExactSizeIterator<Item = Result<OrderSnapshot, InvariantViolation>> + '_ {
+        self.orders.values().map(|order| {
             let leaves_quantity = Quantity::new(order.leaves).map_err(|_| {
                 InvariantViolation::new(format!(
                     "active order {} has zero leaves quantity",
@@ -3492,7 +4678,7 @@ impl OrderBook {
                     order.order_id
                 ))
             })?;
-            orders.push(OrderSnapshot {
+            Ok(OrderSnapshot {
                 order_id: order.order_id,
                 account_id: order.account_id,
                 side: order.side,
@@ -3500,10 +4686,8 @@ impl OrderBook {
                 leaves_quantity,
                 displayed_quantity,
                 display: order.display,
-            });
-        }
-        orders.sort_unstable_by_key(|order| order.order_id);
-        Ok(orders)
+            })
+        })
     }
 
     /// Returns the most recently allocated event sequence, or zero at genesis.
@@ -3630,24 +4814,32 @@ impl OrderBook {
 
     /// Audits all index, FIFO-link, aggregate, and spread invariants.
     ///
-    /// This is `O(O + P)` and allocates `O(O)` temporary memory, so it is
-    /// intended for tests, snapshots, diagnostics, and replay verification—not
-    /// the matching hot path.
+    /// Successful validation uses `O(1)` auxiliary space and performs no heap
+    /// allocation. FIFO/account traversal is `O(O)` for `O` active orders; the
+    /// two allocation-free indexed-AVL audits are `O(P log(P + 1))` for at most `P`
+    /// initialized slots per side. Failure-detail formatting can allocate, so
+    /// this remains an offline audit rather than a matching-hot-path operation.
     ///
     /// # Errors
     ///
     /// Returns [`InvariantViolation`] at the first detected corruption.
     pub fn validate(&self) -> Result<(), InvariantViolation> {
         self.validate_capacity()?;
-        let mut visited = HashSet::with_capacity(self.orders.len());
         self.bids.validate_extremum()?;
         self.asks.validate_extremum()?;
-        self.validate_side(Side::Buy, &mut visited)?;
-        self.validate_side(Side::Sell, &mut visited)?;
-        if visited.len() != self.orders.len() {
+        let indexed_by_price = self
+            .validate_side(Side::Buy)?
+            .checked_add(self.validate_side(Side::Sell)?)
+            .ok_or_else(|| InvariantViolation::new("price-index order count is exhausted"))?;
+        if indexed_by_price > self.orders.len() {
+            return Err(InvariantViolation::new(
+                "price levels reference an active order more than once",
+            ));
+        }
+        if indexed_by_price != self.orders.len() {
             return Err(InvariantViolation::new(format!(
                 "{} active orders are absent from price levels",
-                self.orders.len() - visited.len()
+                self.orders.len() - indexed_by_price
             )));
         }
         if self
@@ -3714,6 +4906,16 @@ impl OrderBook {
                 )));
             }
         }
+        let selection_status = self.order_selection_pool_status();
+        if selection_status.configured_leases != self.limits.max_prepared_order_selections()
+            || selection_status.available_leases > selection_status.configured_leases
+            || selection_status.allocated_order_ids_per_lease < self.limits.max_active_orders()
+        {
+            return Err(InvariantViolation::new(
+                "order-selection pool reservation is below its configured maximum",
+            ));
+        }
+        self.validate_hash_layouts()?;
         let checks = [
             (
                 self.orders.len(),
@@ -3758,15 +4960,7 @@ impl OrderBook {
                 )));
             }
         }
-        if self
-            .reports
-            .values()
-            .any(|cached| cached.report.events.len() > self.limits.max_report_events())
-        {
-            return Err(InvariantViolation::new(
-                "retained report exceeds configured event capacity",
-            ));
-        }
+        self.validate_event_capacity()?;
         if self
             .account_controls
             .values()
@@ -3779,9 +4973,79 @@ impl OrderBook {
         Ok(())
     }
 
+    fn validate_event_capacity(&self) -> Result<(), InvariantViolation> {
+        if self.event_arena.capacity() != self.limits.max_retained_events()
+            || self.event_arena.allocated_capacity() < self.limits.max_retained_events()
+        {
+            return Err(InvariantViolation::new(format!(
+                "retained-event arena capacity {}/{} differs from configured capacity {}",
+                self.event_arena.capacity(),
+                self.event_arena.allocated_capacity(),
+                self.limits.max_retained_events()
+            )));
+        }
+        if self
+            .reports
+            .values()
+            .any(|cached| cached.report.events.len() > self.limits.max_report_events())
+        {
+            return Err(InvariantViolation::new(
+                "retained report exceeds configured event capacity",
+            ));
+        }
+        let mut expected_event_start = 0_usize;
+        for cached in self.reports.values() {
+            let Some((start, length)) = cached.report.events.arena_range_for(&self.event_arena)
+            else {
+                return Err(InvariantViolation::new(
+                    "retained report does not reference this book's event arena",
+                ));
+            };
+            if start != expected_event_start {
+                return Err(InvariantViolation::new(format!(
+                    "retained report event range starts at {start}, expected {expected_event_start}"
+                )));
+            }
+            expected_event_start = expected_event_start.checked_add(length).ok_or_else(|| {
+                InvariantViolation::new("retained report event count is not representable")
+            })?;
+        }
+        if expected_event_start != self.retained_event_count
+            || self.retained_event_count > self.limits.max_retained_events()
+        {
+            return Err(InvariantViolation::new(format!(
+                "retained event count {} differs from canonical report coverage {} or exceeds {}",
+                self.retained_event_count,
+                expected_event_start,
+                self.limits.max_retained_events()
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_hash_layouts(&self) -> Result<(), InvariantViolation> {
+        for (name, layout) in [
+            ("active-order", self.orders.validate_layout()),
+            ("active-account", self.account_orders.validate_layout()),
+            (
+                "accepted-order-identifier",
+                self.seen_order_ids.validate_layout(),
+            ),
+            ("account-control", self.account_controls.validate_layout()),
+            ("command-history", self.reports.validate_layout()),
+        ] {
+            if let Err(detail) = layout {
+                return Err(InvariantViolation::new(format!(
+                    "{name} hash layout is invalid: {detail}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_account_order_index(&self) -> Result<(), InvariantViolation> {
-        let mut indexed = HashSet::with_capacity(self.orders.len());
-        for (&account_id, index) in &self.account_orders {
+        let mut indexed = 0_usize;
+        for (&account_id, index) in self.account_orders.iter() {
             if index.is_empty() {
                 return Err(InvariantViolation::new(format!(
                     "account {account_id} has an empty active-order index"
@@ -3806,7 +5070,7 @@ impl OrderBook {
                 let mut previous = None;
                 let mut order_count = 0_usize;
                 while let Some(order_id) = current {
-                    if !indexed.insert(order_id) {
+                    if indexed >= self.orders.len() {
                         return Err(InvariantViolation::new(format!(
                             "order {order_id} occurs more than once or participates in an account-index cycle"
                         )));
@@ -3828,6 +5092,9 @@ impl OrderBook {
                     }
                     order_count = order_count.checked_add(1).ok_or_else(|| {
                         InvariantViolation::new("account-index order count is exhausted")
+                    })?;
+                    indexed = indexed.checked_add(1).ok_or_else(|| {
+                        InvariantViolation::new("account-index total order count is exhausted")
                     })?;
                     event_units = event_units
                         .checked_add(order.remaining_event_units())
@@ -3855,10 +5122,10 @@ impl OrderBook {
                 }
             }
         }
-        if indexed.len() != self.orders.len() {
+        if indexed != self.orders.len() {
             return Err(InvariantViolation::new(format!(
                 "{} active orders are absent from account indexes",
-                self.orders.len() - indexed.len()
+                self.orders.len() - indexed
             )));
         }
         Ok(())
@@ -3872,11 +5139,8 @@ impl OrderBook {
         }
     }
 
-    fn validate_side(
-        &self,
-        side: Side,
-        visited: &mut HashSet<OrderId>,
-    ) -> Result<(), InvariantViolation> {
+    fn validate_side(&self, side: Side) -> Result<usize, InvariantViolation> {
+        let mut indexed_orders = 0_usize;
         for (&price, level) in self.levels(side).iter() {
             if level.order_count == 0 || level.total_quantity == 0 {
                 return Err(InvariantViolation::new(format!(
@@ -3890,7 +5154,7 @@ impl OrderBook {
             let mut total = 0_u128;
             let mut event_units = 0_u128;
             while let Some(order_id) = current {
-                if !visited.insert(order_id) {
+                if indexed_orders >= self.orders.len() {
                     return Err(InvariantViolation::new(format!(
                         "order {order_id} is duplicated or participates in a FIFO cycle"
                     )));
@@ -3927,6 +5191,9 @@ impl OrderBook {
                     _ => {}
                 }
                 count += 1;
+                indexed_orders = indexed_orders.checked_add(1).ok_or_else(|| {
+                    InvariantViolation::new("price-index total order count is exhausted")
+                })?;
                 total += u128::from(order.displayed);
                 event_units = event_units
                     .checked_add(order.remaining_event_units())
@@ -3950,7 +5217,7 @@ impl OrderBook {
                 )));
             }
         }
-        Ok(())
+        Ok(indexed_orders)
     }
 
     fn apply_new(
@@ -4031,20 +5298,23 @@ impl OrderBook {
         &mut self,
         command: MassCancel,
         mut events: EventTraceBuilder,
-        mut selected: Vec<OrderId>,
+        mut selected: PooledOrderSelection,
     ) -> Result<ExecutionReport, MatchingError> {
         let selected_count = self.account_active_order_count(command.account_id, command.scope);
         debug_assert_eq!(events.maximum_events, selected_count + 1);
-        debug_assert!(selected.capacity() >= selected_count);
+        if selected.capacity() < selected_count {
+            return Err(MatchingError::InternalInvariantViolation);
+        }
         let cancelled_order_count =
             u64::try_from(selected_count).map_err(|_| MatchingError::SequenceExhausted)?;
-        let selected_buffer = selected.as_ptr();
-        self.take_account_orders_into(command.account_id, command.scope, &mut selected);
-        debug_assert_eq!(selected.len(), selected_count);
-        debug_assert_eq!(selected.as_ptr(), selected_buffer);
+        let selected_values = selected.values_mut();
+        let selected_buffer = selected_values.as_ptr();
+        self.take_account_orders_into(command.account_id, command.scope, selected_values);
+        debug_assert_eq!(selected_values.len(), selected_count);
+        debug_assert_eq!(selected_values.as_ptr(), selected_buffer);
 
         let mut cancelled_quantity_lots = 0_u128;
-        for order_id in selected {
+        for order_id in selected_values.drain(..) {
             let removed = self.remove_order_preserving_account_index(order_id);
             cancelled_quantity_lots = cancelled_quantity_lots
                 .checked_add(u128::from(removed.leaves))
@@ -4081,7 +5351,7 @@ impl OrderBook {
         &mut self,
         command: AccountControl,
         mut events: EventTraceBuilder,
-        selected: Option<Vec<OrderId>>,
+        selected: Option<PooledOrderSelection>,
     ) -> Result<ExecutionReport, MatchingError> {
         let previous = self.account_control(command.account_id);
         assert_eq!(
@@ -4100,20 +5370,23 @@ impl OrderBook {
                 let selected_count =
                     self.account_active_order_count(command.account_id, MassCancelScope::All);
                 debug_assert_eq!(events.maximum_events, selected_count + 1);
-                debug_assert!(selected.capacity() >= selected_count);
+                if selected.capacity() < selected_count {
+                    return Err(MatchingError::InternalInvariantViolation);
+                }
                 let cancelled_order_count =
                     u64::try_from(selected_count).map_err(|_| MatchingError::SequenceExhausted)?;
-                let selected_buffer = selected.as_ptr();
+                let selected_values = selected.values_mut();
+                let selected_buffer = selected_values.as_ptr();
                 self.take_account_orders_into(
                     command.account_id,
                     MassCancelScope::All,
-                    &mut selected,
+                    selected_values,
                 );
-                debug_assert_eq!(selected.len(), selected_count);
-                debug_assert_eq!(selected.as_ptr(), selected_buffer);
+                debug_assert_eq!(selected_values.len(), selected_count);
+                debug_assert_eq!(selected_values.as_ptr(), selected_buffer);
 
                 let mut cancelled_quantity_lots = 0_u128;
-                for order_id in selected {
+                for order_id in selected_values.drain(..) {
                     let removed = self.remove_order_preserving_account_index(order_id);
                     cancelled_quantity_lots = cancelled_quantity_lots
                         .checked_add(u128::from(removed.leaves))
@@ -4188,7 +5461,7 @@ impl OrderBook {
         &mut self,
         command: TradingStateControl,
         mut events: EventTraceBuilder,
-        selected: Option<Vec<OrderId>>,
+        selected: Option<PooledOrderSelection>,
     ) -> Result<ExecutionReport, MatchingError> {
         let previous = self.trading_state;
         assert_eq!(
@@ -4213,17 +5486,20 @@ impl OrderBook {
                     selected.expect("transition-and-cancel preparation owns selection storage");
                 let selected_count = self.orders.len();
                 debug_assert_eq!(events.maximum_events, selected_count + 1);
-                debug_assert!(selected.capacity() >= selected_count);
-                let selected_buffer = selected.as_ptr();
-                selected.extend(self.orders.keys().copied());
-                selected.sort_unstable();
-                debug_assert_eq!(selected.len(), selected_count);
-                debug_assert_eq!(selected.as_ptr(), selected_buffer);
+                if selected.capacity() < selected_count {
+                    return Err(MatchingError::InternalInvariantViolation);
+                }
+                let selected_values = selected.values_mut();
+                let selected_buffer = selected_values.as_ptr();
+                selected_values.extend(self.orders.keys().copied());
+                selected_values.sort_unstable();
+                debug_assert_eq!(selected_values.len(), selected_count);
+                debug_assert_eq!(selected_values.as_ptr(), selected_buffer);
 
                 let cancelled_order_count =
                     u64::try_from(selected_count).map_err(|_| MatchingError::SequenceExhausted)?;
                 let mut cancelled_quantity_lots = 0_u128;
-                for order_id in selected {
+                for order_id in selected_values.drain(..) {
                     let removed = self.remove_order(order_id);
                     cancelled_quantity_lots = cancelled_quantity_lots
                         .checked_add(u128::from(removed.leaves))
@@ -4377,6 +5653,19 @@ impl OrderBook {
             "command preflight must reserve retained-history capacity"
         );
         assert!(
+            report.events.arena_range_for(&self.event_arena)
+                == Some((self.retained_event_count, report.events.len())),
+            "committed report must publish the next canonical event-arena range"
+        );
+        let retained_event_count = self
+            .retained_event_count
+            .checked_add(report.events.len())
+            .expect("prepared retained-event count must be representable");
+        assert!(
+            retained_event_count <= self.limits.max_retained_events(),
+            "event preflight must reserve retained-event capacity"
+        );
+        assert!(
             self.reports
                 .insert(
                     command.command_id(),
@@ -4388,6 +5677,7 @@ impl OrderBook {
                 .is_none(),
             "command preflight must reject cached identifiers"
         );
+        self.retained_event_count = retained_event_count;
     }
 
     fn execute_incoming(
@@ -4399,7 +5689,8 @@ impl OrderBook {
         events: &mut EventTraceBuilder,
     ) -> Result<(), MatchingError> {
         while incoming.leaves > 0 {
-            let Some(resting_id) = self.best_opposite_order(incoming.side, incoming.order_type)
+            let Some((resting_id, level_handle)) =
+                self.best_opposite_order(incoming.side, incoming.order_type)
             else {
                 break;
             };
@@ -4409,7 +5700,14 @@ impl OrderBook {
                 .expect("price-level head must reference an active order");
 
             if resting.account_id == incoming.account_id {
-                self.prevent_self_trade(&mut incoming, resting, command_id, occurred_at, events)?;
+                self.prevent_self_trade(
+                    &mut incoming,
+                    resting,
+                    level_handle,
+                    command_id,
+                    occurred_at,
+                    events,
+                )?;
                 continue;
             }
 
@@ -4417,7 +5715,7 @@ impl OrderBook {
             let trade = self.make_trade(&incoming, &resting, executed)?;
             self.push_event(events, command_id, occurred_at, EventKind::Trade(trade))?;
             incoming.leaves -= executed;
-            if let Some(refresh) = self.decrement_resting(resting_id, executed) {
+            if let Some(refresh) = self.decrement_resting(resting_id, executed, level_handle) {
                 self.push_refresh(events, command_id, occurred_at, refresh)?;
             }
         }
@@ -4474,6 +5772,7 @@ impl OrderBook {
         &mut self,
         incoming: &mut IncomingOrder,
         resting: RestingOrder,
+        level_handle: PriceLevelHandle,
         command_id: CommandId,
         occurred_at: TimestampNs,
         events: &mut EventTraceBuilder,
@@ -4499,7 +5798,7 @@ impl OrderBook {
                 events,
             )?,
             SelfTradePrevention::CancelResting => {
-                let removed = self.remove_order(resting.order_id);
+                let removed = self.remove_order_at_level(resting.order_id, level_handle);
                 self.push_cancelled(
                     events,
                     command_id,
@@ -4510,7 +5809,7 @@ impl OrderBook {
                 )?;
             }
             SelfTradePrevention::CancelBoth => {
-                let removed = self.remove_order(resting.order_id);
+                let removed = self.remove_order_at_level(resting.order_id, level_handle);
                 self.push_cancelled(
                     events,
                     command_id,
@@ -4529,7 +5828,9 @@ impl OrderBook {
             }
             SelfTradePrevention::DecrementAndCancel => {
                 incoming.leaves -= prevented;
-                if let Some(refresh) = self.decrement_resting(resting.order_id, prevented) {
+                if let Some(refresh) =
+                    self.decrement_resting(resting.order_id, prevented, level_handle)
+                {
                     self.push_refresh(events, command_id, occurred_at, refresh)?;
                 }
             }
@@ -4676,15 +5977,20 @@ impl OrderBook {
         }
     }
 
-    fn best_opposite_order(&self, side: Side, order_type: OrderType) -> Option<OrderId> {
+    fn best_opposite_order(
+        &self,
+        side: Side,
+        order_type: OrderType,
+    ) -> Option<(OrderId, PriceLevelHandle)> {
         let opposite = side.opposite();
-        let (price, level) = self.levels(opposite).best_level()?;
+        let (handle, level) = self.levels(opposite).best_level_with_handle()?;
+        let price = handle.price;
         let crosses = match (side, order_type) {
             (_, OrderType::Market) => true,
             (Side::Buy, OrderType::Limit(limit)) => limit >= price,
             (Side::Sell, OrderType::Limit(limit)) => limit <= price,
         };
-        crosses.then_some(level.head)
+        crosses.then_some((level.head, handle))
     }
 
     /// Returns the number of makers removed before a non-zero residual rests.
@@ -5026,10 +6332,18 @@ impl OrderBook {
             assert!(previous_order.account_next.is_none());
             previous_order.account_next = Some(order.order_id);
         }
+        if !self.account_orders.contains_key(&order.account_id) {
+            assert!(
+                self.account_orders
+                    .insert(order.account_id, AccountOrderIndex::default())
+                    .is_none(),
+                "new active account index must be absent"
+            );
+        }
         let indexed_previous = self
             .account_orders
-            .entry(order.account_id)
-            .or_default()
+            .get_mut(&order.account_id)
+            .expect("active account index must exist after insertion")
             .append(order.side, order.order_id, event_units);
         assert_eq!(indexed_previous, previous);
         self.append_order_preserving_account_index(order);
@@ -5037,19 +6351,23 @@ impl OrderBook {
 
     fn append_order_preserving_account_index(&mut self, mut order: RestingOrder) {
         let event_units = order.remaining_event_units();
-        let existing_tail = self
-            .levels(order.side)
-            .get(order.price)
-            .map(|level| level.tail);
-        order.previous = existing_tail;
+        let existing_level = self.levels(order.side).handle(order.price).map(|handle| {
+            let tail = self
+                .levels(order.side)
+                .get_by_handle(handle)
+                .expect("fresh price-level handle must resolve")
+                .tail;
+            (handle, tail)
+        });
+        order.previous = existing_level.map(|(_, tail)| tail);
 
-        if let Some(tail) = existing_tail {
+        if let Some((handle, tail)) = existing_level {
             self.orders
                 .get_mut(&tail)
                 .expect("price-level tail must exist")
                 .next = Some(order.order_id);
             self.levels_mut(order.side)
-                .update(order.price, |level| {
+                .update_by_handle(handle, |level| {
                     level.tail = order.order_id;
                     level.total_quantity += u128::from(order.displayed);
                     level.order_count += 1;
@@ -5074,14 +6392,20 @@ impl OrderBook {
         );
     }
 
-    fn decrement_resting(&mut self, order_id: OrderId, quantity: u64) -> Option<ReserveRefresh> {
+    fn decrement_resting(
+        &mut self,
+        order_id: OrderId,
+        quantity: u64,
+        level_handle: PriceLevelHandle,
+    ) -> Option<ReserveRefresh> {
         let order = *self
             .orders
             .get(&order_id)
             .expect("decremented order must exist");
         debug_assert!(quantity <= order.displayed);
+        debug_assert_eq!(level_handle.price, order.price);
         if quantity == order.leaves {
-            self.remove_order(order_id);
+            self.remove_order_at_level(order_id, level_handle);
             None
         } else if quantity < order.displayed {
             let updated = self
@@ -5091,36 +6415,113 @@ impl OrderBook {
             updated.leaves -= quantity;
             updated.displayed -= quantity;
             self.levels_mut(order.side)
-                .update(order.price, |level| {
+                .update_by_handle(level_handle, |level| {
                     level.total_quantity -= u128::from(quantity);
                 })
                 .expect("resting order must reference a level");
             None
         } else {
-            let mut refreshed = self.remove_order_preserving_account_index(order_id);
-            let old_event_units = refreshed.remaining_event_units();
-            refreshed.leaves -= quantity;
-            refreshed.displayed = refreshed.display.displayed_lots(refreshed.leaves);
-            refreshed.previous = None;
+            Some(self.refresh_resting(order, quantity, level_handle))
+        }
+    }
+
+    fn refresh_resting(
+        &mut self,
+        order: RestingOrder,
+        quantity: u64,
+        level_handle: PriceLevelHandle,
+    ) -> ReserveRefresh {
+        debug_assert_eq!(quantity, order.displayed);
+        debug_assert!(quantity < order.leaves);
+        debug_assert_eq!(level_handle.price, order.price);
+        let old_event_units = order.remaining_event_units();
+        let mut refreshed = RestingOrder {
+            leaves: order.leaves - quantity,
+            ..order
+        };
+        refreshed.displayed = refreshed.display.displayed_lots(refreshed.leaves);
+        let new_event_units = refreshed.remaining_event_units();
+
+        if let Some(next) = order.next {
+            if let Some(previous) = order.previous {
+                self.orders
+                    .get_mut(&previous)
+                    .expect("previous FIFO link must exist")
+                    .next = Some(next);
+            }
+            self.orders
+                .get_mut(&next)
+                .expect("next FIFO link must exist")
+                .previous = order.previous;
+            let tail = self
+                .levels(order.side)
+                .get_by_handle(level_handle)
+                .expect("resting order handle must reference its level")
+                .tail;
+            debug_assert_ne!(tail, order.order_id);
+            self.orders
+                .get_mut(&tail)
+                .expect("price-level tail must exist")
+                .next = Some(order.order_id);
+            refreshed.previous = Some(tail);
             refreshed.next = None;
-            let result = ReserveRefresh {
-                order_id,
-                price: refreshed.price,
-                displayed: refreshed.displayed,
-                leaves: refreshed.leaves,
-            };
-            let new_event_units = refreshed.remaining_event_units();
-            self.account_orders
-                .get_mut(&refreshed.account_id)
-                .expect("refreshed order account index must exist")
-                .replace_event_units(refreshed.side, old_event_units, new_event_units);
-            self.append_order_preserving_account_index(refreshed);
-            Some(result)
+        }
+
+        self.levels_mut(order.side)
+            .update_by_handle(level_handle, |level| {
+                level.total_quantity = level
+                    .total_quantity
+                    .checked_sub(u128::from(order.displayed))
+                    .and_then(|total| total.checked_add(u128::from(refreshed.displayed)))
+                    .expect("reserve refresh quantity must fit level aggregate");
+                level.event_units = level
+                    .event_units
+                    .checked_sub(old_event_units)
+                    .and_then(|total| total.checked_add(new_event_units))
+                    .expect("reserve refresh work must fit level aggregate");
+                if let Some(next) = order.next {
+                    if order.previous.is_none() {
+                        level.head = next;
+                    }
+                    level.tail = order.order_id;
+                }
+            })
+            .expect("resting order handle must reference its level");
+        self.account_orders
+            .get_mut(&order.account_id)
+            .expect("refreshed order account index must exist")
+            .replace_event_units(order.side, old_event_units, new_event_units);
+        *self
+            .orders
+            .get_mut(&order.order_id)
+            .expect("refreshed order must remain active") = refreshed;
+
+        ReserveRefresh {
+            order_id: refreshed.order_id,
+            price: refreshed.price,
+            displayed: refreshed.displayed,
+            leaves: refreshed.leaves,
         }
     }
 
     fn remove_order(&mut self, order_id: OrderId) -> RestingOrder {
-        let order = self.remove_order_preserving_account_index(order_id);
+        let order = *self
+            .orders
+            .get(&order_id)
+            .expect("validated removal target must exist");
+        let level_handle = self
+            .levels(order.side)
+            .handle(order.price)
+            .expect("resting order must reference a level");
+        self.remove_order_at_level(order_id, level_handle)
+    }
+
+    fn remove_order_at_level(
+        &mut self,
+        order_id: OrderId,
+        level_handle: PriceLevelHandle,
+    ) -> RestingOrder {
+        let order = self.remove_order_preserving_account_index_at(order_id, level_handle);
         if let Some(previous) = order.account_previous {
             self.orders
                 .get_mut(&previous)
@@ -5151,10 +6552,27 @@ impl OrderBook {
     }
 
     fn remove_order_preserving_account_index(&mut self, order_id: OrderId) -> RestingOrder {
+        let order = *self
+            .orders
+            .get(&order_id)
+            .expect("validated removal target must exist");
+        let level_handle = self
+            .levels(order.side)
+            .handle(order.price)
+            .expect("resting order must reference a level");
+        self.remove_order_preserving_account_index_at(order_id, level_handle)
+    }
+
+    fn remove_order_preserving_account_index_at(
+        &mut self,
+        order_id: OrderId,
+        level_handle: PriceLevelHandle,
+    ) -> RestingOrder {
         let order = self
             .orders
             .remove(&order_id)
             .expect("validated removal target must exist");
+        debug_assert_eq!(level_handle.price, order.price);
         if let Some(previous) = order.previous {
             self.orders
                 .get_mut(&previous)
@@ -5170,7 +6588,7 @@ impl OrderBook {
 
         let level_is_empty = self
             .levels_mut(order.side)
-            .update(order.price, |level| {
+            .update_by_handle(level_handle, |level| {
                 level.total_quantity -= u128::from(order.displayed);
                 level.order_count -= 1;
                 level.event_units -= order.remaining_event_units();
@@ -5188,7 +6606,9 @@ impl OrderBook {
             })
             .expect("resting order must reference a level");
         if level_is_empty {
-            self.levels_mut(order.side).remove(order.price);
+            self.levels_mut(order.side)
+                .remove_by_handle(level_handle)
+                .expect("empty resting level handle must remain valid");
         }
         order
     }
@@ -5196,12 +6616,15 @@ impl OrderBook {
 
 #[cfg(test)]
 mod price_level_index_tests {
+    use std::sync::Arc;
+
     use super::{
         AccountAdmissionState, AccountControl, AccountControlAction, AccountControlSnapshot,
         Command, CommandOutcome, CommandPreparation, EventTraceBuilder, IncomingPreview,
-        InvariantViolation, MassCancel, MassCancelScope, NewOrder, OrderBook, OrderBookLimits,
-        OrderBookLimitsSpec, OrderDisplay, OrderType, PriceLevel, PriceLevels, RejectReason,
-        ReplaceOrder, RestingOrder, SelfTradePrevention, TimeInForce,
+        InvariantViolation, MassCancel, MassCancelScope, MatchingCapacity, MatchingError, NewOrder,
+        OrderBook, OrderBookLimits, OrderBookLimitsSpec, OrderDisplay, OrderSelectionPool,
+        OrderType, PriceLevel, PriceLevels, RejectReason, ReplaceOrder, RestingOrder,
+        SelfTradePrevention, TimeInForce, try_event_arena,
     };
     use crate::instrument::{
         InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -5245,6 +6668,67 @@ mod price_level_index_tests {
             trading_state: TradingState::Open,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn unrepresentable_order_selection_storage_is_typed_by_exact_resource() {
+        assert!(matches!(
+            OrderSelectionPool::try_new(1, usize::MAX),
+            Err(MatchingError::CapacityReservationFailed(
+                MatchingCapacity::OrderSelectionBuffers
+            ))
+        ));
+        assert!(matches!(
+            OrderSelectionPool::try_new(usize::MAX, 1),
+            Err(MatchingError::CapacityReservationFailed(
+                MatchingCapacity::PreparedOrderSelections
+            ))
+        ));
+    }
+
+    #[test]
+    fn order_selection_leases_are_isolated_and_returned_after_drop() {
+        let pool = OrderSelectionPool::try_new(2, 4).unwrap();
+        let mut first = pool.acquire().unwrap();
+        let mut second = pool.acquire().unwrap();
+        assert_eq!(pool.available(), 0);
+        assert_ne!(first.values().as_ptr(), second.values().as_ptr());
+        first.values_mut().push(OrderId::new(1).unwrap());
+        second.values_mut().push(OrderId::new(2).unwrap());
+        assert_eq!(first.values(), [OrderId::new(1).unwrap()]);
+        assert_eq!(second.values(), [OrderId::new(2).unwrap()]);
+        drop(first);
+        assert_eq!(pool.available(), 1);
+        assert_eq!(second.values(), [OrderId::new(2).unwrap()]);
+        drop(second);
+        assert_eq!(pool.available(), 2);
+    }
+
+    #[test]
+    fn audit_rejects_reordered_dense_history_before_checkpoint_capture() {
+        let mut book = OrderBook::new(reserve_definition());
+        for (command_id, account_id) in [(1_u64, 11_u64), (2, 12)] {
+            book.submit(Command::AccountControl(AccountControl {
+                command_id: CommandId::new(command_id).unwrap(),
+                account_id: AccountId::new(account_id).unwrap(),
+                instrument_id: InstrumentId::new(1).unwrap(),
+                instrument_version: InstrumentVersion::new(1).unwrap(),
+                expected_revision: 0,
+                action: AccountControlAction::Enable,
+                received_at: TimestampNs::from_unix_nanos(command_id),
+            }))
+            .unwrap();
+        }
+        let first_id = CommandId::new(1).unwrap();
+        let first = book.reports.remove(&first_id).unwrap();
+        assert!(book.reports.insert(first_id, first).is_none());
+        let error = book.validate().unwrap_err();
+        assert!(
+            error
+                .detail()
+                .contains("retained report event range starts")
+        );
+        assert!(book.checkpoint_state(1, 5).is_err());
     }
 
     fn reference_can_fill(book: &OrderBook, incoming: &NewOrder) -> bool {
@@ -5298,7 +6782,20 @@ mod price_level_index_tests {
     }
 
     fn generated_book_and_fok(generator: &mut Generator) -> (OrderBook, NewOrder) {
-        let mut book = OrderBook::new(reserve_definition());
+        let limits = OrderBookLimits::new(OrderBookLimitsSpec {
+            max_active_orders: 32,
+            max_active_accounts: 32,
+            max_price_levels_per_side: 4,
+            max_accepted_order_ids: 64,
+            max_account_controls: 64,
+            max_retained_commands: 64,
+            cancellation_reserve: 32,
+            max_report_events: 256,
+            max_retained_events: 1_024,
+            max_prepared_order_selections: 2,
+        })
+        .unwrap();
+        let mut book = OrderBook::with_limits(reserve_definition(), limits);
         let incoming_side = if generator.bounded(2) == 0 {
             Side::Buy
         } else {
@@ -5452,6 +6949,8 @@ mod price_level_index_tests {
             max_retained_commands: 64,
             cancellation_reserve: 32,
             max_report_events: 256,
+            max_retained_events: 1_024,
+            max_prepared_order_selections: 2,
         })
         .unwrap();
         old
@@ -5487,6 +6986,130 @@ mod price_level_index_tests {
     }
 
     #[test]
+    fn best_level_handle_updates_survive_unrelated_two_child_deletion() {
+        let mut levels = PriceLevels::try_new(Side::Sell, 8).unwrap();
+        for (order_id, price) in [40_i64, 20, 60, 10, 30, 50, 70, 25].into_iter().enumerate() {
+            levels.insert(
+                Price::from_raw(price),
+                level(u64::try_from(order_id).unwrap() + 1),
+            );
+        }
+        let (best_handle, best) = levels.best_level_with_handle().unwrap();
+        assert_eq!(best_handle.price, Price::from_raw(10));
+        let original_quantity = best.total_quantity;
+
+        levels
+            .update_by_handle(best_handle, |level| level.total_quantity += 7)
+            .unwrap();
+        assert_eq!(
+            levels.best_level().unwrap().1.total_quantity,
+            original_quantity + 7
+        );
+        assert!(levels.remove(Price::from_raw(40)).is_some());
+        levels
+            .update_by_handle(best_handle, |level| level.total_quantity += 11)
+            .unwrap();
+        assert_eq!(
+            levels.best_level().unwrap().1.total_quantity,
+            original_quantity + 18
+        );
+        levels.validate_extremum().unwrap();
+    }
+
+    #[test]
+    fn maker_handle_covers_partial_fill_refresh_and_level_removal() {
+        let mut book = OrderBook::new(reserve_definition());
+        let price = Price::from_raw(100);
+        for order in [
+            RestingOrder {
+                order_id: OrderId::new(1).unwrap(),
+                account_id: AccountId::new(11).unwrap(),
+                side: Side::Sell,
+                price,
+                leaves: 5,
+                displayed: 2,
+                display: OrderDisplay::Reserve {
+                    peak: Quantity::new(2).unwrap(),
+                },
+                self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                previous: None,
+                next: None,
+                account_previous: None,
+                account_next: None,
+            },
+            RestingOrder {
+                order_id: OrderId::new(2).unwrap(),
+                account_id: AccountId::new(12).unwrap(),
+                side: Side::Sell,
+                price,
+                leaves: 3,
+                displayed: 3,
+                display: OrderDisplay::FullyDisplayed,
+                self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                previous: None,
+                next: None,
+                account_previous: None,
+                account_next: None,
+            },
+            RestingOrder {
+                order_id: OrderId::new(3).unwrap(),
+                account_id: AccountId::new(13).unwrap(),
+                side: Side::Sell,
+                price: Price::from_raw(200),
+                leaves: 1,
+                displayed: 1,
+                display: OrderDisplay::FullyDisplayed,
+                self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                previous: None,
+                next: None,
+                account_previous: None,
+                account_next: None,
+            },
+        ] {
+            assert!(book.seen_order_ids.insert(order.order_id));
+            book.append_order(order);
+        }
+        let (handle, level) = book.asks.best_level_with_handle().unwrap();
+        assert_eq!(
+            (handle.price, level.head, level.tail),
+            (price, OrderId::new(1).unwrap(), OrderId::new(2).unwrap())
+        );
+
+        assert!(
+            book.decrement_resting(OrderId::new(1).unwrap(), 2, handle)
+                .is_some()
+        );
+        let level = book.asks.best_level().unwrap().1;
+        assert_eq!(
+            (level.head, level.tail, level.total_quantity),
+            (OrderId::new(2).unwrap(), OrderId::new(1).unwrap(), 5)
+        );
+        assert!(
+            book.decrement_resting(OrderId::new(2).unwrap(), 1, handle)
+                .is_none()
+        );
+        assert!(
+            book.decrement_resting(OrderId::new(2).unwrap(), 2, handle)
+                .is_none()
+        );
+        assert!(
+            book.decrement_resting(OrderId::new(1).unwrap(), 2, handle)
+                .is_some()
+        );
+        let level = book.asks.best_level().unwrap().1;
+        assert_eq!(
+            (level.head, level.tail, level.total_quantity),
+            (OrderId::new(1).unwrap(), OrderId::new(1).unwrap(), 1)
+        );
+        assert!(
+            book.decrement_resting(OrderId::new(1).unwrap(), 1, handle)
+                .is_none()
+        );
+        assert_eq!(book.best_ask().unwrap().price, Price::from_raw(200));
+        book.validate().unwrap();
+    }
+
+    #[test]
     fn deleting_best_recomputes_until_the_side_is_empty() {
         for (side, ordered_prices) in [(Side::Buy, [110, 100, 90]), (Side::Sell, [90, 100, 110])] {
             let mut levels = PriceLevels::try_new(side, 3).unwrap();
@@ -5511,6 +7134,7 @@ mod price_level_index_tests {
         let mut levels = PriceLevels::try_new(Side::Buy, 3).unwrap();
         levels.insert(Price::from_raw(100), level(1));
         levels.insert(Price::from_raw(110), level(2));
+        let inferior_handle = levels.handle(Price::from_raw(100)).unwrap();
 
         for corrupted in [
             None,
@@ -5522,6 +7146,11 @@ mod price_level_index_tests {
             let error: InvariantViolation = levels.validate_extremum().unwrap_err();
             assert!(error.detail().contains("cached best"));
         }
+
+        levels.best = Some((Price::from_raw(110), level(2)));
+        levels.best_handle = Some(inferior_handle);
+        let error: InvariantViolation = levels.validate_extremum().unwrap_err();
+        assert!(error.detail().contains("cached best"));
     }
 
     #[test]
@@ -5584,6 +7213,50 @@ mod price_level_index_tests {
         assert_eq!(book, semantic_clone);
         let error = book.validate().unwrap_err();
         assert!(error.detail().contains("broken previous account link"));
+    }
+
+    #[test]
+    fn allocation_free_validation_rejects_price_and_account_cycles() {
+        let mut book = OrderBook::new(reserve_definition());
+        for order_id in [10_u64, 20] {
+            let order_id = OrderId::new(order_id).unwrap();
+            book.append_order(RestingOrder {
+                order_id,
+                account_id: AccountId::new(1).unwrap(),
+                side: Side::Buy,
+                price: Price::from_raw(100),
+                leaves: 1,
+                displayed: 1,
+                display: OrderDisplay::FullyDisplayed,
+                self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                previous: None,
+                next: None,
+                account_previous: None,
+                account_next: None,
+            });
+            book.seen_order_ids.insert(order_id);
+        }
+        book.validate().unwrap();
+
+        let head = OrderId::new(10).unwrap();
+        let tail = OrderId::new(20).unwrap();
+        let mut price_cycle = book.clone();
+        price_cycle.orders.get_mut(&tail).unwrap().next = Some(head);
+        assert!(
+            price_cycle
+                .validate()
+                .unwrap_err()
+                .detail()
+                .contains("FIFO cycle")
+        );
+
+        book.orders.get_mut(&tail).unwrap().account_next = Some(head);
+        assert!(
+            book.validate()
+                .unwrap_err()
+                .detail()
+                .contains("account-index cycle")
+        );
     }
 
     #[test]
@@ -5666,7 +7339,7 @@ mod price_level_index_tests {
             [30_u64, 10, 20].map(|order_id| OrderId::new(order_id).unwrap())
         );
 
-        let restored = OrderBook::from_checkpoint(book.checkpoint(1, 7).unwrap()).unwrap();
+        let restored = OrderBook::from_checkpoint(&book.checkpoint(1, 7).unwrap()).unwrap();
         let mut restored_topology = Vec::new();
         restored.append_account_side_ids(
             restored.account_orders.get(&account_id).unwrap(),
@@ -5716,12 +7389,16 @@ mod price_level_index_tests {
         else {
             panic!("new command cannot be a replay")
         };
-        let prepared_buffer = prepared.events.events.as_ptr();
+        let event_slot = book.retained_event_count;
+        assert!(book.event_arena.slot_pointer(event_slot).is_null());
         let report = book
             .commit(prepared)
             .expect("two-event report fits before sequence exhaustion");
         assert_eq!(report.events.len(), 2);
-        assert_eq!(report.events.as_ptr(), prepared_buffer);
+        assert_eq!(
+            std::ptr::from_ref(&report.events[0]),
+            book.event_arena.slot_pointer(event_slot)
+        );
         assert_eq!(report.events[0].sequence, u64::MAX - 2);
         assert_eq!(report.events[1].sequence, u64::MAX - 1);
         assert_eq!(book.next_sequence, u64::MAX);
@@ -5730,9 +7407,9 @@ mod price_level_index_tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one allocator invariant fixture compares every constructor-owned index and prepared buffer"
+        reason = "one allocator invariant fixture compares every constructor-owned index, arena, and pool"
     )]
-    fn construction_owns_hash_headroom_and_preparation_owns_selection_storage() {
+    fn construction_owns_hash_and_selection_headroom() {
         let mut book = OrderBook::new(reserve_definition());
         let new = NewOrder {
             command_id: CommandId::new(1).unwrap(),
@@ -5753,6 +7430,16 @@ mod price_level_index_tests {
         assert!(book.seen_order_ids.capacity() >= book.limits.max_accepted_order_ids());
         assert!(book.account_controls.capacity() >= book.limits.max_account_controls());
         assert!(book.reports.capacity() >= book.limits.max_retained_commands());
+        let initial_selection = book.order_selection_pool_status();
+        assert_eq!(
+            initial_selection.configured_leases,
+            book.limits.max_prepared_order_selections()
+        );
+        assert_eq!(
+            initial_selection.available_leases,
+            initial_selection.configured_leases
+        );
+        assert!(initial_selection.allocated_order_ids_per_lease >= book.limits.max_active_orders());
         assert_eq!(book.bids.storage_len(), 0);
         assert!(book.bids.allocation_capacity() >= book.limits.max_price_levels_per_side());
         assert_eq!(
@@ -5807,9 +7494,14 @@ mod price_level_index_tests {
             .selected_order_ids
             .as_ref()
             .expect("mass cancellation owns selection storage");
-        assert!(selected.is_empty());
-        assert!(selected.capacity() >= 1);
+        assert!(selected.values().is_empty());
+        assert!(selected.capacity() >= book.limits.max_active_orders());
+        assert_eq!(
+            book.order_selection_pool_status().available_leases,
+            initial_selection.available_leases - 1
+        );
         book.commit(prepared).unwrap();
+        assert_eq!(book.order_selection_pool_status(), initial_selection);
         assert_eq!(book.active_order_count(), 0);
         assert_eq!(book.bids.storage_len(), 1);
         assert_eq!(book.price_level_arena_status(Side::Buy).occupied_slots, 0);
@@ -5841,24 +7533,29 @@ mod price_level_index_tests {
         let CommandPreparation::Ready(prepared) = book.prepare(control).unwrap() else {
             panic!("account control cannot be a replay")
         };
-        let event_buffer = prepared.events.events.as_ptr();
+        let retained_events = book.retained_event_count;
+        assert!(book.event_arena.slot_pointer(retained_events).is_null());
         let selected = prepared
             .selected_order_ids
             .as_ref()
             .expect("block-and-cancel owns selection storage");
-        assert!(selected.is_empty());
-        assert!(selected.capacity() >= 1);
+        assert!(selected.values().is_empty());
+        assert!(selected.capacity() >= book.limits.max_active_orders());
         assert_eq!(book.active_order_count(), 1);
         assert_eq!(book.account_control(new.account_id).revision(), 0);
         let report = book.commit(prepared).unwrap();
-        assert_eq!(report.events.as_ptr(), event_buffer);
+        assert_eq!(book.order_selection_pool_status(), initial_selection);
+        assert_eq!(
+            std::ptr::from_ref(&report.events[0]),
+            book.event_arena.slot_pointer(retained_events)
+        );
         assert_eq!(book.active_order_count(), 0);
         assert_eq!(book.account_control(new.account_id).revision(), 1);
         assert_eq!(book.account_controls.capacity(), control_capacity);
     }
 
     #[test]
-    fn invariant_validation_rejects_lost_constructor_hash_headroom() {
+    fn invariant_validation_rejects_lost_constructor_headroom() {
         let mut book = OrderBook::new(reserve_definition());
         book.orders.shrink_to_fit();
         let error = book
@@ -5872,6 +7569,15 @@ mod price_level_index_tests {
             .validate()
             .expect_err("lost control headroom is invalid");
         assert!(error.detail().contains("account-control hash capacity"));
+
+        let mut book = OrderBook::new(reserve_definition());
+        Arc::get_mut(&mut book.order_selection_pool)
+            .expect("unleased pool has one owner")
+            .order_capacity = 0;
+        let error = book
+            .validate()
+            .expect_err("lost order-selection headroom is invalid");
+        assert!(error.detail().contains("order-selection pool reservation"));
     }
 
     #[test]
@@ -5942,8 +7648,8 @@ mod price_level_index_tests {
                 report.events.len()
             );
             assert!(
-                report.events.0.capacity() >= maximum_events,
-                "prepared allocation was smaller than its bound in generated case {case}"
+                book.event_arena_status().allocated_events >= book.limits().max_retained_events(),
+                "constructor event arena was smaller than its limit in generated case {case}"
             );
             assert!(
                 u64::try_from(actual_trades).unwrap() <= maximum_trades,
@@ -6064,8 +7770,12 @@ mod price_level_index_tests {
             let (maximum_events, maximum_trades) = book
                 .maximum_report_work(Command::Replace(replacement), None)
                 .expect("generated replacement work is representable");
-            let events = EventTraceBuilder::try_with_capacity(maximum_events)
-                .expect("generated replacement trace allocation must succeed");
+            let events = EventTraceBuilder::new(
+                try_event_arena(maximum_events)
+                    .expect("generated replacement trace allocation must succeed"),
+                0,
+                maximum_events,
+            );
             let report = book
                 .apply_replace(replacement, events)
                 .expect("generated replacement execution cannot exhaust identifiers");

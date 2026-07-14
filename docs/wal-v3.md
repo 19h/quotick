@@ -180,26 +180,31 @@ append. Commit rejects foreign or stale tokens before mutation; recovery never
 serializes a token and instead prepares the persisted command against recovered
 state. Both stable-slot price-level AVL arenas, all five matching hash indexes,
 and the complete coupled-risk profile and reservation indexes are fallibly
-reserved to their configured maxima when the shard is constructed. Preparation therefore borrows
-matching/risk state immutably and fallibly reserves only the complete report
-vector and the exact identifier selection for mass-cancel, block-and-cancel, or
-instrument transition-and-cancel. These structures
-cannot grow during commit; level insertion/deletion and account membership
-allocate no node. Standard-library active-order/account and risk-reservation
-hashes can nevertheless rehash after deletion/different-key insertion churn;
-allocator failure on that path is outside the recoverable protocol under A12.
-Arc control blocks and unrelated codec/checkpoint buffers are likewise outside
-this operational guarantee. AVL topology, vacant-slot links,
+reserved to their configured maxima when the shard is constructed. Preparation
+therefore borrows matching/risk state immutably, proves the safe report bound
+against the constructor-owned retained-event arena, and fallibly reserves only
+the exact identifier selection for mass-cancel, block-and-cancel, or instrument
+transition-and-cancel. These structures cannot grow during commit;
+level insertion/deletion and account membership allocate no node.
+Active-order/account, identity, control, history, profile, and risk-reservation
+indexes use fixed-capacity dense values with open-addressed lookup buckets and
+backward-shift deletion, so different-key churn cannot rehash or allocate after
+construction.
+The one arena `Arc` control block and unrelated codec/checkpoint buffers are
+outside this operational guarantee. AVL topology, vacant-slot links,
 and account/side membership links are derived in-memory state: they are absent
 from WAL/checkpoint bytes and are rebuilt and independently audited during
 recovery.
 
-`EventTrace` is an in-memory immutable shared representation only. WAL report
-encoding still serializes the same event count and ordered event values; `Arc`
-identity, ownership count, and copy-on-write state are absent from version-3
+`EventTrace` is an in-memory immutable shared representation only. Live reports
+reference exact ranges in one constructor-owned append-only arena; decoded
+reports use an owned vector fallback. WAL report encoding still serializes the
+same event count and ordered event values; backing kind, range, `Arc` identity,
+ownership count, and copy-on-write state are absent from version-3 payload
 bytes. Decoding constructs a new vector event buffer plus shared-owner control
-block, retains that vector buffer without a final event copy, and applies the
-same semantic report validation.
+block, retains that vector without a final event copy, and applies the same
+semantic report validation. Checkpoint restoration copies validated values into
+the new live arena before exposing the restored book.
 
 When a resting bound is full, the same pre-WAL preparation performs an
 allocation-free GTC/post-only residual preview. A command proved to be fully
@@ -441,6 +446,25 @@ checkpoint's complete command/report or ledger-record sequence to equal the
 exact WAL prefix, then applies the remaining suffix. A matching checkpoint
 boundary is always a completed execution-report frame.
 
+`DurableOrderBook::capture_checkpoint_candidate` completes a full WAL barrier
+at that boundary before returning a nonencodable capture. Deterministic replay
+may proceed off-thread while later command/report pairs append. Standalone
+publication accepts only the verified typestate through the same open shard and
+unchanged process-local cutover epoch. This permits an older exact prefix but
+rejects reopen or physical-prefix retirement. The staged handle cannot drive
+record-kind-`8` cutover; prefix retirement remains a synchronous current-head
+operation so no suffix can be discarded.
+
+`DurableRiskOrderBook::capture_checkpoint_candidate` applies the same staged
+barrier and origin/epoch fence to the coupled grammar. Its capture also binds
+the original first sequence `F`, final immutable profile boundary `M`, and
+canonical profile/account image. Direct reconstruction proves live positions,
+exposures, and total-leaves reservations before handoff; complete coupled
+command/report replay occurs only in the consuming verifier. A verified older
+generation may be written as a standalone kind-`3` snapshot after ordinary
+suffix growth. Another shard, reopen, metadata drift, an ahead-of-head value,
+or successful prefix cutover rejects publication before output creation.
+
 ### Checkpoint-anchor payload and WAL cutover
 
 Record kind `8` is exactly 30 bytes:
@@ -540,6 +564,11 @@ ends at `G = M + 2C` for `C` complete command/report pairs. Assisted recovery
 proves definition/profile metadata and every retained pair against the exact
 WAL before restoring positions and total-leaves reservations and applying the
 suffix.
+
+The staged durable-risk path synchronizes through `G` before capture, may verify
+that exact prefix off-thread while later pairs append, and publishes only a
+same-origin, same-cutover-epoch verified typestate. Record-kind-`8` cutover
+remains a synchronous current-head operation.
 
 ## Writer ownership and acknowledgement
 

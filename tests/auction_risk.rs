@@ -64,12 +64,14 @@ fn engine_limits(active: usize, accepted: usize, retained: usize) -> CallAuction
         max_active_orders: active,
         max_price_levels_per_side: active,
         max_accepted_order_ids: accepted,
+        max_prepared_uncrosses: 2,
     })
     .unwrap();
     CallAuctionEngineLimits::new(CallAuctionEngineLimitsSpec {
         book,
         max_retained_commands: retained,
         terminal_command_reserve: active + 2,
+        max_retained_events: retained + active * 2 + 2,
         max_report_events: active * 2 + 1,
     })
     .unwrap()
@@ -589,7 +591,14 @@ fn fixed_hash_headroom_and_prepared_command_boundaries_remain_stable() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one coupled checkpoint case keeps sharing, replay, exposure, suffix, and corruption evidence contiguous"
+)]
 fn checkpoint_reconstructs_reservations_positions_rejections_and_suffix_state() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<quotick::auction_risk::CallAuctionRiskCheckpoint>();
     let mut engine = managed(2);
     for owner in 1..=2 {
         engine
@@ -636,12 +645,46 @@ fn checkpoint_reconstructs_reservations_positions_rejections_and_suffix_state() 
     assert_eq!(checkpoint.auction().wal_metadata_sequence(), 3);
     assert_eq!(checkpoint.generation(), 15);
     assert_eq!(checkpoint.accounts().len(), 2);
-    let encoded = checkpoint.encode().unwrap();
+    let shared = checkpoint.clone();
+    assert!(shared.shares_account_storage_with(&checkpoint));
+    assert!(
+        shared
+            .auction()
+            .shares_accepted_order_storage_with(checkpoint.auction())
+    );
+    assert!(
+        shared
+            .auction()
+            .shares_active_order_storage_with(checkpoint.auction())
+    );
+    assert!(
+        shared
+            .auction()
+            .shares_history_storage_with(checkpoint.auction())
+    );
+    drop(checkpoint);
+    let encoded = shared.encode().unwrap();
     let decoded = quotick::auction_risk::CallAuctionRiskCheckpoint::decode(&encoded).unwrap();
-    assert_eq!(decoded, checkpoint);
-    assert!(checkpoint.is_successor_of(&checkpoint));
+    assert_eq!(decoded, shared);
+    assert!(!decoded.shares_account_storage_with(&shared));
+    assert!(
+        !decoded
+            .auction()
+            .shares_accepted_order_storage_with(shared.auction())
+    );
+    assert!(
+        !decoded
+            .auction()
+            .shares_active_order_storage_with(shared.auction())
+    );
+    assert!(
+        !decoded
+            .auction()
+            .shares_history_storage_with(shared.auction())
+    );
+    assert!(shared.is_successor_of(&shared));
 
-    let mut restored = CallAuctionRiskManagedEngine::from_checkpoint(&checkpoint).unwrap();
+    let mut restored = CallAuctionRiskManagedEngine::from_checkpoint(&shared).unwrap();
     assert_eq!(
         restored
             .risk()
@@ -689,7 +732,7 @@ fn checkpoint_reconstructs_reservations_positions_rejections_and_suffix_state() 
     })
     .unwrap();
     assert!(
-        CallAuctionRiskManagedEngine::from_checkpoint_with_limits(&checkpoint, insufficient_limits)
+        CallAuctionRiskManagedEngine::from_checkpoint_with_limits(&shared, insufficient_limits)
             .is_err()
     );
 }

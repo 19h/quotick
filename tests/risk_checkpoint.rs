@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use quotick::codec::{BinaryCodec, CodecError};
-use quotick::durable_risk::{DurableRiskError, DurableRiskOrderBook};
+use quotick::durable_risk::{
+    DurableRiskError, DurableRiskManagedCheckpointCapture, DurableRiskOrderBook,
+    VerifiedDurableRiskManagedCheckpoint,
+};
 use quotick::instrument::{
     InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
     QuantityRules, ReserveOrderRules, TradingState,
@@ -18,7 +21,7 @@ use quotick::matching::{
 };
 use quotick::risk::{
     AccountRiskDefinition, AccountRiskState, RiskLimitSpec, RiskLimits, RiskManagedCheckpoint,
-    RiskManagedOrderBook, RiskProfile,
+    RiskManagedCheckpointCapture, RiskManagedOrderBook, RiskProfile,
 };
 use quotick::snapshot::{CheckpointSlot, SnapshotFile, SnapshotOptions};
 use quotick::{
@@ -152,11 +155,259 @@ fn journal_options() -> JournalOptions {
 }
 
 #[test]
+fn staged_risk_capture_is_shared_and_survives_source_suffix_growth() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<RiskManagedCheckpointCapture>();
+    let profile_values = profiles(40);
+    let reserve = order(
+        1,
+        1,
+        11,
+        Side::Sell,
+        30,
+        OrderDisplay::Reserve {
+            peak: Quantity::new(10).unwrap(),
+        },
+        100,
+        TimeInForce::GoodTilCancelled,
+    );
+    let execution = order(
+        2,
+        2,
+        12,
+        Side::Buy,
+        10,
+        OrderDisplay::FullyDisplayed,
+        100,
+        TimeInForce::ImmediateOrCancel,
+    );
+    let rejected = resting(3, 3, 12, 41);
+    let suffix = resting(4, 4, 12, 5);
+    let mut managed = RiskManagedOrderBook::new(definition());
+    for value in profile_values {
+        managed
+            .register_account(value.account_id(), value.profile())
+            .unwrap();
+    }
+    managed.submit(reserve).unwrap();
+    managed.submit(execution).unwrap();
+    assert_eq!(
+        managed.submit(rejected).unwrap().outcome,
+        CommandOutcome::Rejected(RejectReason::RiskOrderQuantityLimit)
+    );
+
+    let capture = managed.capture_checkpoint_candidate(1, 3, 9).unwrap();
+    let shared = capture.clone();
+    assert!(capture.shares_checkpoint_storage_with(&shared));
+    assert_eq!(capture.account_count(), 2);
+    assert_eq!(capture.command_count(), 3);
+    assert_eq!(capture.active_order_count(), 1);
+    let synchronous = managed.checkpoint(1, 3, 9).unwrap();
+    let worker = std::thread::spawn(move || capture.verify().unwrap());
+    managed.submit(suffix).unwrap();
+    let verified = worker.join().unwrap();
+
+    assert_eq!(verified, synchronous);
+    assert_eq!(verified.generation(), 9);
+    let restored = RiskManagedOrderBook::from_checkpoint(&verified).unwrap();
+    assert_eq!(restored.risk().reservation_count(), 1);
+    assert_eq!(
+        restored
+            .risk()
+            .reservation(OrderId::new(1).unwrap())
+            .unwrap()
+            .quantity_lots(),
+        20
+    );
+    assert_eq!(
+        restored
+            .risk()
+            .snapshot(account(11))
+            .unwrap()
+            .position_lots(),
+        -10
+    );
+    assert_eq!(
+        restored
+            .risk()
+            .snapshot(account(12))
+            .unwrap()
+            .position_lots(),
+        10
+    );
+    assert_eq!(managed.book().active_order_count(), 2);
+}
+
+#[test]
+fn staged_durable_risk_checkpoint_allows_suffix_and_recovers_exact_coupled_state() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<DurableRiskManagedCheckpointCapture>();
+    assert_send_sync::<VerifiedDurableRiskManagedCheckpoint>();
+    let area = TestArea::new("staged-durable");
+    let wal = area.join("risk.wal");
+    let snapshot = area.join("risk.qsnp");
+    let profile_values = profiles(40);
+    let reserve = order(
+        1,
+        1,
+        11,
+        Side::Sell,
+        30,
+        OrderDisplay::Reserve {
+            peak: Quantity::new(10).unwrap(),
+        },
+        100,
+        TimeInForce::GoodTilCancelled,
+    );
+    let execution = order(
+        2,
+        2,
+        12,
+        Side::Buy,
+        10,
+        OrderDisplay::FullyDisplayed,
+        100,
+        TimeInForce::ImmediateOrCancel,
+    );
+    let rejected = resting(3, 3, 12, 41);
+    let suffix = resting(4, 4, 12, 5);
+    let mut durable =
+        DurableRiskOrderBook::open(&wal, definition(), &profile_values, journal_options()).unwrap();
+    durable.submit(reserve).unwrap();
+    durable.submit(execution).unwrap();
+    durable.submit(rejected).unwrap();
+
+    let capture = durable.capture_checkpoint_candidate().unwrap();
+    let shared = capture.clone();
+    assert!(capture.shares_checkpoint_storage_with(&shared));
+    assert_eq!(capture.wal_first_sequence(), 1);
+    assert_eq!(capture.wal_metadata_sequence(), 3);
+    assert_eq!(capture.generation(), 9);
+    let worker = std::thread::spawn(move || capture.verify().unwrap());
+    durable.submit(suffix).unwrap();
+    let verified = worker.join().unwrap();
+    assert_eq!(verified.account_count(), 2);
+    assert_eq!(verified.command_count(), 3);
+    assert_eq!(verified.active_order_count(), 1);
+    durable
+        .write_verified_checkpoint(&snapshot, &verified, SnapshotOptions::default())
+        .unwrap();
+    durable.close().unwrap();
+
+    let recovered = DurableRiskOrderBook::open_with_checkpoint(
+        &wal,
+        &snapshot,
+        definition(),
+        &profile_values,
+        journal_options(),
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().checkpointed_commands, 3);
+    assert_eq!(recovered.recovery().replayed_commands, 1);
+    assert_eq!(recovered.managed().risk().reservation_count(), 2);
+    assert_eq!(
+        recovered
+            .managed()
+            .risk()
+            .reservation(OrderId::new(1).unwrap())
+            .unwrap()
+            .quantity_lots(),
+        20
+    );
+    assert_eq!(
+        recovered
+            .managed()
+            .risk()
+            .snapshot(account(11))
+            .unwrap()
+            .position_lots(),
+        -10
+    );
+    recovered.managed().validate().unwrap();
+}
+
+#[test]
+fn verified_durable_risk_checkpoint_rejects_other_reopen_and_cutover_epoch() {
+    let area = TestArea::new("staged-fences");
+    let source_wal = area.join("source.wal");
+    let other_wal = area.join("other.wal");
+    let other_output = area.join("other.qsnp");
+    let reopen_output = area.join("reopen.qsnp");
+    let stale_output = area.join("stale.qsnp");
+    let cutover_base = area.join("cutover.qsnp");
+    let profile_values = profiles(40);
+    let mut source = DurableRiskOrderBook::open(
+        &source_wal,
+        definition(),
+        &profile_values,
+        journal_options(),
+    )
+    .unwrap();
+    source.submit(resting(1, 1, 11, 5)).unwrap();
+    let verified = source
+        .capture_checkpoint_candidate()
+        .unwrap()
+        .verify()
+        .unwrap();
+
+    let mut other =
+        DurableRiskOrderBook::open(&other_wal, definition(), &profile_values, journal_options())
+            .unwrap();
+    assert!(matches!(
+        other.write_verified_checkpoint(&other_output, &verified, SnapshotOptions::default()),
+        Err(DurableRiskError::CheckpointCaptureOriginMismatch)
+    ));
+    assert!(!other_output.exists());
+    assert!(!other.is_poisoned());
+    other.close().unwrap();
+
+    source.close().unwrap();
+    let mut reopened = DurableRiskOrderBook::open(
+        &source_wal,
+        definition(),
+        &profile_values,
+        journal_options(),
+    )
+    .unwrap();
+    assert!(matches!(
+        reopened.write_verified_checkpoint(&reopen_output, &verified, SnapshotOptions::default()),
+        Err(DurableRiskError::CheckpointCaptureOriginMismatch)
+    ));
+    assert!(!reopen_output.exists());
+    assert!(!reopened.is_poisoned());
+
+    let stale = reopened
+        .capture_checkpoint_candidate()
+        .unwrap()
+        .verify()
+        .unwrap();
+    reopened
+        .compact_to_checkpoint(&cutover_base, SnapshotOptions::default())
+        .unwrap();
+    assert!(matches!(
+        reopened.write_verified_checkpoint(&stale_output, &stale, SnapshotOptions::default()),
+        Err(DurableRiskError::CheckpointCaptureStale {
+            captured_epoch: 0,
+            current_epoch: 1
+        })
+    ));
+    assert!(!stale_output.exists());
+    assert!(!reopened.is_poisoned());
+    reopened.close().unwrap();
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "one coupled scenario keeps rejection, execution, hidden leaves, retry, and suffix evidence contiguous"
 )]
 fn risk_checkpoint_preserves_rejections_positions_reserve_exposure_and_suffix_recovery() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<RiskManagedCheckpoint>();
     let area = TestArea::new("round-trip");
     let wal = area.join("risk.wal");
     let snapshot = area.join("risk.qsnp");
@@ -207,7 +458,20 @@ fn risk_checkpoint_preserves_rejections_positions_reserve_exposure_and_suffix_re
     assert_eq!(checkpoint.wal_first_sequence(), 1);
     assert_eq!(checkpoint.matching().wal_metadata_sequence(), 3);
     assert_eq!(checkpoint.matching().command_count(), 3);
-    let mut direct = RiskManagedOrderBook::from_checkpoint(&checkpoint).unwrap();
+    let shared = checkpoint.clone();
+    assert!(shared.shares_account_storage_with(&checkpoint));
+    assert!(
+        shared
+            .matching()
+            .shares_order_storage_with(checkpoint.matching())
+    );
+    assert!(
+        shared
+            .matching()
+            .shares_history_storage_with(checkpoint.matching())
+    );
+    drop(checkpoint);
+    let mut direct = RiskManagedOrderBook::from_checkpoint(&shared).unwrap();
     assert_eq!(
         direct
             .risk()
@@ -270,7 +534,19 @@ fn risk_checkpoint_has_stable_kind_codec_and_rejects_semantic_corruption_without
     let checkpoint: RiskManagedCheckpoint =
         SnapshotFile::read(&snapshot, SnapshotOptions::default()).unwrap();
     let encoded = checkpoint.encode().unwrap();
-    assert_eq!(RiskManagedCheckpoint::decode(&encoded).unwrap(), checkpoint);
+    let decoded = RiskManagedCheckpoint::decode(&encoded).unwrap();
+    assert_eq!(decoded, checkpoint);
+    assert!(!decoded.shares_account_storage_with(&checkpoint));
+    assert!(
+        !decoded
+            .matching()
+            .shares_order_storage_with(checkpoint.matching())
+    );
+    assert!(
+        !decoded
+            .matching()
+            .shares_history_storage_with(checkpoint.matching())
+    );
 
     let mut invalid_origin = encoded.clone();
     invalid_origin[0..8].copy_from_slice(&2_u64.to_le_bytes());
@@ -434,10 +710,13 @@ fn segmented_risk_checkpoint_recovers_across_physical_boundaries() {
         DurableRiskOrderBook::open_segmented(&segments, definition(), &profile_values, options)
             .unwrap();
     durable.submit(resting(1, 1, 11, 5)).unwrap();
-    durable
-        .write_checkpoint(&snapshot, SnapshotOptions::default())
-        .unwrap();
+    let capture = durable.capture_checkpoint_candidate().unwrap();
+    let worker = std::thread::spawn(move || capture.verify().unwrap());
     durable.submit(resting(2, 2, 12, 7)).unwrap();
+    let verified = worker.join().unwrap();
+    durable
+        .write_verified_checkpoint(&snapshot, &verified, SnapshotOptions::default())
+        .unwrap();
     durable.close().unwrap();
 
     let recovered = DurableRiskOrderBook::open_segmented_with_checkpoint(

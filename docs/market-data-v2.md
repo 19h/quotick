@@ -38,6 +38,10 @@ native Rust representation is serialized.
 - A publisher reconstructed from a WAL-recovered `OrderBook` starts at the
   book's last event sequence and trade identifier; historical increments are
   not emitted again.
+- `MarketDataLimits` is process-local operational policy and is never serialized
+  into an update or snapshot. A publisher envelope must cover the matching
+  shard's configured maxima. A replica rejects a batch or snapshot above its
+  selected envelope before changing its public sequence/depth boundary.
 
 ## Scalar notation
 
@@ -140,7 +144,12 @@ race-free consumer procedure is:
 
 `MarketDataReplica` is initialized with the definition's trading state and
 implements snapshot replacement, contiguous batch application, nonmutating gap
-detection, state-revision comparison, and fail-closed structural poisoning.
+detection, state-revision comparison, finite batch/side capacity preflight, and
+fail-closed structural poisoning. It owns active and standby price trees for
+both sides: after all snapshot checks pass, the image is constructed in standby
+storage and both sides are swapped atomically. Snapshot cardinality failure
+therefore retains the prior depth and does not poison the replica. Incremental
+structural failure after mutation still requires a new snapshot.
 Transport buffering and retry orchestration remain outside this payload layer.
 
 Version 2 preserves the byte representation of incremental tags `0`–`2` and

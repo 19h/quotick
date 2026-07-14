@@ -5,19 +5,21 @@
 //! may lock or cross. Admission and cancellation mutate constructor-reserved
 //! identity and price indexes without heap allocation.
 //! Indicative discovery and immutable allocation-plan construction delegate to
-//! [`crate::auction`]. A separate prepared transition pairs and consumes one
-//! allocation process-locally; sequencing, phase authority, durable events,
-//! recovery, risk, and settlement remain higher-layer responsibilities.
+//! [`crate::auction`]. Constructor-owned leased buffers prepare, pair, and
+//! consume uncrosses without hot-path allocation; sequencing, phase authority,
+//! durable events, recovery, risk, and settlement remain higher-layer
+//! responsibilities.
 
-use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::auction::{
     AuctionAllocationError, AuctionAllocationLimits, AuctionAllocationPlan, AuctionClearing,
     AuctionError, AuctionLevel, AuctionMarketInterest, AuctionOrder, AuctionOrderConstraint,
     AuctionOrderFill, AuctionPriceBand, AuctionPriceGrid, AuctionPricePolicy,
-    allocate_clearing_price_time, discover_bounded_clearing_price,
+    allocate_clearing_price_time, allocate_clearing_price_time_reusing,
+    discover_bounded_clearing_price,
 };
 use crate::domain::{
     AccountId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side, TradeId,
@@ -54,6 +56,8 @@ pub struct CallAuctionBookLimitsSpec {
     pub max_price_levels_per_side: usize,
     /// Maximum accepted, never-reusable order identifiers.
     pub max_accepted_order_ids: usize,
+    /// Maximum simultaneously retained uncross preparations/results.
+    pub max_prepared_uncrosses: usize,
 }
 
 /// Invalid bounded call-auction resource policy.
@@ -65,6 +69,8 @@ pub enum CallAuctionBookLimitsError {
     ZeroPriceLevels,
     /// Accepted-order-identifier maximum is zero.
     ZeroAcceptedOrderIds,
+    /// Prepared-uncross lease maximum is zero.
+    ZeroPreparedUncrosses,
     /// More price levels per side than total active orders were configured.
     PriceLevelsExceedActiveOrders,
     /// Active-order capacity exceeds accepted-identifier capacity.
@@ -77,6 +83,7 @@ impl fmt::Display for CallAuctionBookLimitsError {
             Self::ZeroActiveOrders => "call-auction active-order limit is zero",
             Self::ZeroPriceLevels => "call-auction per-side price-level limit is zero",
             Self::ZeroAcceptedOrderIds => "call-auction accepted-order-identifier limit is zero",
+            Self::ZeroPreparedUncrosses => "call-auction prepared-uncross limit is zero",
             Self::PriceLevelsExceedActiveOrders => {
                 "call-auction per-side price-level limit exceeds active-order limit"
             }
@@ -95,6 +102,7 @@ pub struct CallAuctionBookLimits {
     active_orders: usize,
     price_levels_per_side: usize,
     accepted_order_ids: usize,
+    prepared_uncrosses: usize,
 }
 
 impl CallAuctionBookLimits {
@@ -104,6 +112,8 @@ impl CallAuctionBookLimits {
     pub const DEFAULT_MAX_PRICE_LEVELS_PER_SIDE: usize = 4_096;
     /// Default maximum accepted, never-reusable order identifiers.
     pub const DEFAULT_MAX_ACCEPTED_ORDER_IDS: usize = 65_536;
+    /// Default maximum simultaneous prepared or externally retained uncrosses.
+    pub const DEFAULT_MAX_PREPARED_UNCROSSES: usize = 2;
 
     /// Validates one finite resource policy.
     ///
@@ -120,6 +130,9 @@ impl CallAuctionBookLimits {
         if spec.max_accepted_order_ids == 0 {
             return Err(CallAuctionBookLimitsError::ZeroAcceptedOrderIds);
         }
+        if spec.max_prepared_uncrosses == 0 {
+            return Err(CallAuctionBookLimitsError::ZeroPreparedUncrosses);
+        }
         if spec.max_price_levels_per_side > spec.max_active_orders {
             return Err(CallAuctionBookLimitsError::PriceLevelsExceedActiveOrders);
         }
@@ -130,6 +143,7 @@ impl CallAuctionBookLimits {
             active_orders: spec.max_active_orders,
             price_levels_per_side: spec.max_price_levels_per_side,
             accepted_order_ids: spec.max_accepted_order_ids,
+            prepared_uncrosses: spec.max_prepared_uncrosses,
         })
     }
 
@@ -150,6 +164,12 @@ impl CallAuctionBookLimits {
     pub const fn max_accepted_order_ids(self) -> usize {
         self.accepted_order_ids
     }
+
+    /// Maximum simultaneous prepared or externally retained uncrosses.
+    #[must_use]
+    pub const fn max_prepared_uncrosses(self) -> usize {
+        self.prepared_uncrosses
+    }
 }
 
 impl Default for CallAuctionBookLimits {
@@ -158,6 +178,7 @@ impl Default for CallAuctionBookLimits {
             max_active_orders: Self::DEFAULT_MAX_ACTIVE_ORDERS,
             max_price_levels_per_side: Self::DEFAULT_MAX_PRICE_LEVELS_PER_SIDE,
             max_accepted_order_ids: Self::DEFAULT_MAX_ACCEPTED_ORDER_IDS,
+            max_prepared_uncrosses: Self::DEFAULT_MAX_PREPARED_UNCROSSES,
         })
         .expect("built-in call-auction limits are valid")
     }
@@ -182,10 +203,16 @@ pub enum CallAuctionCapacity {
     BuyOrderScratch,
     /// Canonical sell order scratch.
     SellOrderScratch,
-    /// Exact deterministic counterparty-pair vector for one prepared uncross.
+    /// Constructor-owned buy-fill vectors for prepared uncrosses.
+    UncrossBuyFills,
+    /// Constructor-owned sell-fill vectors for prepared uncrosses.
+    UncrossSellFills,
+    /// Constructor-owned deterministic counterparty-pair vectors.
     UncrossTrades,
-    /// Exact unexecuted-remainder cancellation vector for one prepared uncross.
+    /// Constructor-owned unexecuted-remainder cancellation vectors.
     UncrossCancellations,
+    /// Fixed pool of simultaneously leased uncross buffer sets.
+    PreparedUncrosses,
 }
 
 impl fmt::Display for CallAuctionCapacity {
@@ -199,8 +226,11 @@ impl fmt::Display for CallAuctionCapacity {
             Self::AskLevelScratch => "aggregate ask scratch",
             Self::BuyOrderScratch => "canonical buy-order scratch",
             Self::SellOrderScratch => "canonical sell-order scratch",
+            Self::UncrossBuyFills => "prepared uncross buy fills",
+            Self::UncrossSellFills => "prepared uncross sell fills",
             Self::UncrossTrades => "prepared uncross trades",
             Self::UncrossCancellations => "prepared uncross cancellations",
+            Self::PreparedUncrosses => "prepared uncross pool",
         })
     }
 }
@@ -724,8 +754,11 @@ pub enum CallAuctionPrepareError {
     TradeIdentifierExhausted,
     /// Collection mutation revision cannot represent the atomic commit.
     StateRevisionExhausted,
-    /// Exact trade or cancellation result reservation failed.
-    CapacityReservationFailed(CallAuctionCapacity),
+    /// Every constructor-owned uncross buffer set is currently leased.
+    PreparationCapacityExhausted {
+        /// Configured simultaneous lease maximum.
+        maximum: usize,
+    },
     /// Private collection state contradicted its validated analytical plan.
     InternalInvariantViolation,
 }
@@ -740,9 +773,10 @@ impl fmt::Display for CallAuctionPrepareError {
             Self::StateRevisionExhausted => {
                 formatter.write_str("call-auction state revision exhausted")
             }
-            Self::CapacityReservationFailed(capacity) => {
-                write!(formatter, "call-auction {capacity} reservation failed")
-            }
+            Self::PreparationCapacityExhausted { maximum } => write!(
+                formatter,
+                "call-auction prepared-uncross capacity {maximum} is exhausted"
+            ),
             Self::InternalInvariantViolation => {
                 formatter.write_str("call-auction private state contradicts prepared uncross")
             }
@@ -752,6 +786,165 @@ impl fmt::Display for CallAuctionPrepareError {
 
 impl std::error::Error for CallAuctionPrepareError {}
 
+#[derive(Debug)]
+struct CallAuctionUncrossBuffers {
+    plan: AuctionAllocationPlan,
+    trades: Vec<CallAuctionTrade>,
+    cancellations: Vec<CallAuctionCancellation>,
+}
+
+impl CallAuctionUncrossBuffers {
+    fn try_new(maximum_orders: usize) -> Result<Self, CallAuctionConstructionError> {
+        let buy_fills = try_uncross_vector(maximum_orders, CallAuctionCapacity::UncrossBuyFills)?;
+        let sell_fills = try_uncross_vector(maximum_orders, CallAuctionCapacity::UncrossSellFills)?;
+        Ok(Self {
+            plan: AuctionAllocationPlan::with_fill_storage(buy_fills, sell_fills),
+            trades: try_uncross_vector(maximum_orders, CallAuctionCapacity::UncrossTrades)?,
+            cancellations: try_uncross_vector(
+                maximum_orders,
+                CallAuctionCapacity::UncrossCancellations,
+            )?,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.plan.clear_reusable();
+        self.trades.clear();
+        self.cancellations.clear();
+    }
+
+    fn plan(&self) -> &AuctionAllocationPlan {
+        &self.plan
+    }
+}
+
+fn try_uncross_vector<T>(
+    maximum: usize,
+    capacity: CallAuctionCapacity,
+) -> Result<Vec<T>, CallAuctionConstructionError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(maximum)
+        .map_err(|_| CallAuctionConstructionError::CapacityReservationFailed(capacity))?;
+    Ok(values)
+}
+
+#[derive(Debug)]
+struct CallAuctionUncrossPool {
+    available: Mutex<Vec<CallAuctionUncrossBuffers>>,
+    capacity: usize,
+    fill_capacity_per_side: usize,
+    trade_capacity: usize,
+    cancellation_capacity: usize,
+}
+
+impl CallAuctionUncrossPool {
+    fn try_new(
+        capacity: usize,
+        maximum_orders: usize,
+    ) -> Result<Arc<Self>, CallAuctionConstructionError> {
+        let mut available = Vec::new();
+        available.try_reserve_exact(capacity).map_err(|_| {
+            CallAuctionConstructionError::CapacityReservationFailed(
+                CallAuctionCapacity::PreparedUncrosses,
+            )
+        })?;
+        for _ in 0..capacity {
+            available.push(CallAuctionUncrossBuffers::try_new(maximum_orders)?);
+        }
+        let fill_capacity_per_side = available
+            .iter()
+            .map(|buffers| buffers.plan.minimum_fill_capacity())
+            .min()
+            .unwrap_or(0);
+        let trade_capacity = available
+            .iter()
+            .map(|buffers| buffers.trades.capacity())
+            .min()
+            .unwrap_or(0);
+        let cancellation_capacity = available
+            .iter()
+            .map(|buffers| buffers.cancellations.capacity())
+            .min()
+            .unwrap_or(0);
+        Ok(Arc::new(Self {
+            available: Mutex::new(available),
+            capacity,
+            fill_capacity_per_side,
+            trade_capacity,
+            cancellation_capacity,
+        }))
+    }
+
+    fn lock_available(&self) -> MutexGuard<'_, Vec<CallAuctionUncrossBuffers>> {
+        self.available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn acquire(self: &Arc<Self>) -> Option<PooledCallAuctionUncross> {
+        let buffers = self.lock_available().pop()?;
+        Some(PooledCallAuctionUncross {
+            pool: Arc::clone(self),
+            buffers: Some(buffers),
+        })
+    }
+
+    fn release(&self, mut buffers: CallAuctionUncrossBuffers) {
+        buffers.reset();
+        let mut available = self.lock_available();
+        assert!(
+            available.len() < self.capacity,
+            "uncross buffer must be returned exactly once"
+        );
+        available.push(buffers);
+    }
+
+    fn available(&self) -> usize {
+        self.lock_available().len()
+    }
+}
+
+struct PooledCallAuctionUncross {
+    pool: Arc<CallAuctionUncrossPool>,
+    buffers: Option<CallAuctionUncrossBuffers>,
+}
+
+impl PooledCallAuctionUncross {
+    fn buffers(&self) -> &CallAuctionUncrossBuffers {
+        self.buffers
+            .as_ref()
+            .expect("live uncross lease must contain its buffers")
+    }
+
+    fn buffers_mut(&mut self) -> &mut CallAuctionUncrossBuffers {
+        self.buffers
+            .as_mut()
+            .expect("live uncross lease must contain its buffers")
+    }
+}
+
+impl fmt::Debug for PooledCallAuctionUncross {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let buffers = self.buffers();
+        formatter
+            .debug_struct("PooledCallAuctionUncross")
+            .field("buy_fills", &buffers.plan.buy_fills().len())
+            .field("sell_fills", &buffers.plan.sell_fills().len())
+            .field("trades", &buffers.trades.len())
+            .field("cancellations", &buffers.cancellations.len())
+            .finish()
+    }
+}
+
+impl Drop for PooledCallAuctionUncross {
+    fn drop(&mut self) {
+        if let Some(buffers) = self.buffers.take() {
+            self.pool.release(buffers);
+        }
+    }
+}
+
 /// An immutable, process-local, revision-bound auction uncross preparation.
 #[derive(Debug)]
 pub struct PreparedCallAuctionUncross {
@@ -760,9 +953,7 @@ pub struct PreparedCallAuctionUncross {
     next_state_revision: u64,
     next_trade_id: u64,
     policy: CallAuctionUncrossPolicy,
-    plan: AuctionAllocationPlan,
-    trades: Vec<CallAuctionTrade>,
-    cancellations: Vec<CallAuctionCancellation>,
+    pooled: PooledCallAuctionUncross,
 }
 
 impl PreparedCallAuctionUncross {
@@ -780,20 +971,20 @@ impl PreparedCallAuctionUncross {
 
     /// Returns the immutable order-level allocation plan.
     #[must_use]
-    pub const fn allocation_plan(&self) -> &AuctionAllocationPlan {
-        &self.plan
+    pub fn allocation_plan(&self) -> &AuctionAllocationPlan {
+        self.pooled.buffers().plan()
     }
 
     /// Returns proposed counterparty pairs in deterministic priority-walk order.
     #[must_use]
     pub fn trades(&self) -> &[CallAuctionTrade] {
-        &self.trades
+        &self.pooled.buffers().trades
     }
 
     /// Returns proposed policy-driven remainder cancellations.
     #[must_use]
     pub fn cancellations(&self) -> &[CallAuctionCancellation] {
-        &self.cancellations
+        &self.pooled.buffers().cancellations
     }
 }
 
@@ -833,13 +1024,11 @@ impl fmt::Display for CallAuctionCommitError {
 impl std::error::Error for CallAuctionCommitError {}
 
 /// One atomically committed call-auction uncross result.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct CallAuctionUncross {
     state_revision: u64,
     policy: CallAuctionUncrossPolicy,
-    plan: AuctionAllocationPlan,
-    trades: Vec<CallAuctionTrade>,
-    cancellations: Vec<CallAuctionCancellation>,
+    pooled: PooledCallAuctionUncross,
 }
 
 impl CallAuctionUncross {
@@ -857,22 +1046,34 @@ impl CallAuctionUncross {
 
     /// Returns the allocation consumed by this commit.
     #[must_use]
-    pub const fn allocation_plan(&self) -> &AuctionAllocationPlan {
-        &self.plan
+    pub fn allocation_plan(&self) -> &AuctionAllocationPlan {
+        self.pooled.buffers().plan()
     }
 
     /// Returns deterministic counterparty pairs.
     #[must_use]
     pub fn trades(&self) -> &[CallAuctionTrade] {
-        &self.trades
+        &self.pooled.buffers().trades
     }
 
     /// Returns remainders canceled by policy.
     #[must_use]
     pub fn cancellations(&self) -> &[CallAuctionCancellation] {
-        &self.cancellations
+        &self.pooled.buffers().cancellations
     }
 }
+
+impl PartialEq for CallAuctionUncross {
+    fn eq(&self, other: &Self) -> bool {
+        self.state_revision == other.state_revision
+            && self.policy == other.policy
+            && self.allocation_plan() == other.allocation_plan()
+            && self.trades() == other.trades()
+            && self.cancellations() == other.cancellations()
+    }
+}
+
+impl Eq for CallAuctionUncross {}
 
 /// Process-local allocation telemetry for one call-auction collection book.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -905,6 +1106,16 @@ pub struct CallAuctionResourceStatus {
     pub buy_order_scratch: usize,
     /// Canonical sell-order scratch capacity.
     pub sell_order_scratch: usize,
+    /// Configured simultaneous uncross preparation/result leases.
+    pub configured_prepared_uncrosses: usize,
+    /// Unleased constructor-owned uncross buffer sets.
+    pub available_prepared_uncrosses: usize,
+    /// Fill capacity per side in each leased buffer set.
+    pub uncross_fill_capacity_per_side: usize,
+    /// Trade capacity in each leased buffer set.
+    pub uncross_trade_capacity: usize,
+    /// Cancellation capacity in each leased buffer set.
+    pub uncross_cancellation_capacity: usize,
 }
 
 /// Structural corruption detected by an offline call-auction audit.
@@ -1001,7 +1212,7 @@ impl AuctionPriceLevels {
         self.by_price.remove(&price)
     }
 
-    fn iter(&self) -> impl DoubleEndedIterator<Item = (&Price, &AuctionQueue)> {
+    fn iter(&self) -> impl DoubleEndedIterator<Item = (&Price, &AuctionQueue)> + ExactSizeIterator {
         self.by_price.iter()
     }
 
@@ -1034,6 +1245,7 @@ pub struct CallAuctionBook {
     ask_level_scratch: Vec<AuctionLevel>,
     buy_order_scratch: Vec<AuctionOrder>,
     sell_order_scratch: Vec<AuctionOrder>,
+    uncross_pool: Arc<CallAuctionUncrossPool>,
 }
 
 impl CallAuctionBook {
@@ -1119,6 +1331,10 @@ impl CallAuctionBook {
                     CallAuctionCapacity::SellOrderScratch,
                 )
             })?;
+        let uncross_pool = CallAuctionUncrossPool::try_new(
+            limits.max_prepared_uncrosses(),
+            limits.max_active_orders(),
+        )?;
         let instance_id = next_call_auction_book_instance_id()?;
         Ok(Self {
             instance_id,
@@ -1139,6 +1355,7 @@ impl CallAuctionBook {
             ask_level_scratch,
             buy_order_scratch,
             sell_order_scratch,
+            uncross_pool,
         })
     }
 
@@ -1194,18 +1411,16 @@ impl CallAuctionBook {
         self.next_priority_sequence
     }
 
-    pub(crate) fn checkpoint_active_orders(&self) -> Vec<CallAuctionOrderSnapshot> {
-        self.orders
-            .iter()
-            .map(|(_, order)| (*order).into())
-            .collect()
+    /// Iterates active order state in ascending identifier order without allocating.
+    pub(crate) fn active_order_states(
+        &self,
+    ) -> impl ExactSizeIterator<Item = CallAuctionOrderSnapshot> + '_ {
+        self.orders.iter().map(|(_, order)| (*order).into())
     }
 
-    pub(crate) fn checkpoint_accepted_order_ids(&self) -> Vec<OrderId> {
-        self.seen_order_ids
-            .iter()
-            .map(|(order_id, ())| *order_id)
-            .collect()
+    /// Iterates every accepted identifier in ascending order without allocating.
+    pub(crate) fn accepted_order_ids(&self) -> impl ExactSizeIterator<Item = OrderId> + '_ {
+        self.seen_order_ids.iter().map(|(order_id, ())| *order_id)
     }
 
     pub(crate) fn from_checkpoint_state(
@@ -1308,22 +1523,25 @@ impl CallAuctionBook {
     /// `O(min(P, limit))` time and result space for `P` occupied prices.
     #[must_use]
     pub fn limit_depth(&self, side: Side, limit: usize) -> Vec<CallAuctionLevelSnapshot> {
-        let level = |(&price, queue): (&Price, &AuctionQueue)| CallAuctionLevelSnapshot {
-            side,
-            price,
-            quantity: queue.total_quantity,
-            order_count: queue.order_count,
-        };
         match side {
-            Side::Buy => self
-                .levels(side)
-                .iter()
-                .rev()
-                .take(limit)
-                .map(level)
-                .collect(),
-            Side::Sell => self.levels(side).iter().take(limit).map(level).collect(),
+            Side::Buy => self.limit_depth_levels(side).rev().take(limit).collect(),
+            Side::Sell => self.limit_depth_levels(side).take(limit).collect(),
         }
+    }
+
+    /// Iterates aggregate limit depth in ascending price order without allocating.
+    pub(crate) fn limit_depth_levels(
+        &self,
+        side: Side,
+    ) -> impl DoubleEndedIterator<Item = CallAuctionLevelSnapshot> + ExactSizeIterator + '_ {
+        self.levels(side)
+            .iter()
+            .map(move |(&price, queue)| CallAuctionLevelSnapshot {
+                side,
+                price,
+                quantity: queue.total_quantity,
+                order_count: queue.order_count,
+            })
     }
 
     /// Returns immutable state for one active order.
@@ -1350,6 +1568,11 @@ impl CallAuctionBook {
             ask_level_scratch: self.ask_level_scratch.capacity(),
             buy_order_scratch: self.buy_order_scratch.capacity(),
             sell_order_scratch: self.sell_order_scratch.capacity(),
+            configured_prepared_uncrosses: self.limits.max_prepared_uncrosses(),
+            available_prepared_uncrosses: self.uncross_pool.available(),
+            uncross_fill_capacity_per_side: self.uncross_pool.fill_capacity_per_side,
+            uncross_trade_capacity: self.uncross_pool.trade_capacity,
+            uncross_cancellation_capacity: self.uncross_pool.cancellation_capacity,
         }
     }
 
@@ -1595,14 +1818,15 @@ impl CallAuctionBook {
     /// mutating active orders, trade identity, or collection revision.
     ///
     /// The supplied policy explicitly permits self-trade; no preventive policy
-    /// is inferred. Both side-fill vectors, the exact counterparty-pair vector,
-    /// and the exact cancellation vector exist before a preparation is returned.
+    /// is inferred. One constructor-owned lease supplies both side-fill vectors,
+    /// the counterparty-pair vector, and the cancellation vector. Dropping the
+    /// preparation or committed result returns that isolated storage to the pool.
     ///
     /// # Errors
     ///
     /// Returns [`CallAuctionPrepareError`] for foreign/stale indicative state,
-    /// allocation mismatch, identifier/revision exhaustion, capacity reservation
-    /// failure, or a private invariant contradiction.
+    /// allocation mismatch, identifier/revision exhaustion, exhaustion of all
+    /// prepared-uncross leases, or a private invariant contradiction.
     pub fn prepare_uncross(
         &mut self,
         indicative: CallAuctionIndicative,
@@ -1612,20 +1836,54 @@ impl CallAuctionBook {
             .state_revision
             .checked_add(1)
             .ok_or(CallAuctionPrepareError::StateRevisionExhausted)?;
-        let plan = self
-            .allocation_plan(indicative)
+        if indicative.book_instance_id != self.instance_id {
+            return Err(CallAuctionPrepareError::Plan(
+                CallAuctionPlanError::ForeignBook,
+            ));
+        }
+        if indicative.state_revision != self.state_revision {
+            return Err(CallAuctionPrepareError::Plan(
+                CallAuctionPlanError::StaleRevision {
+                    observed: indicative.state_revision,
+                    current: self.state_revision,
+                },
+            ));
+        }
+        let mut pooled = self.uncross_pool.acquire().ok_or(
+            CallAuctionPrepareError::PreparationCapacityExhausted {
+                maximum: self.limits.max_prepared_uncrosses(),
+            },
+        )?;
+        self.rebuild_order_scratch();
+        let limits = AuctionAllocationLimits::new(self.limits.max_active_orders())
+            .map_err(CallAuctionPlanError::Allocation)
             .map_err(CallAuctionPrepareError::Plan)?;
-        let (trades, next_trade_id) = self.prepare_trade_pairs(&plan)?;
-        let cancellations = self.prepare_remainder_cancellations(&plan, policy.remainder)?;
+        let buffers = pooled.buffers_mut();
+        allocate_clearing_price_time_reusing(
+            &self.buy_order_scratch,
+            &self.sell_order_scratch,
+            self.grid,
+            indicative.clearing,
+            limits,
+            &mut buffers.plan,
+        )
+        .map_err(CallAuctionPlanError::Allocation)
+        .map_err(CallAuctionPrepareError::Plan)?;
+        let CallAuctionUncrossBuffers {
+            plan,
+            trades,
+            cancellations,
+            ..
+        } = buffers;
+        let next_trade_id = self.prepare_trade_pairs(plan, trades)?;
+        self.prepare_remainder_cancellations(plan, policy.remainder, cancellations)?;
         Ok(PreparedCallAuctionUncross {
             book_instance_id: self.instance_id,
             state_revision: self.state_revision,
             next_state_revision,
             next_trade_id,
             policy,
-            plan,
-            trades,
-            cancellations,
+            pooled,
         })
     }
 
@@ -1653,13 +1911,13 @@ impl CallAuctionBook {
             });
         }
         self.validate_uncross_preparation(&prepared)?;
-        for fill in prepared.plan.buy_fills() {
+        for fill in prepared.allocation_plan().buy_fills() {
             self.apply_fill(*fill);
         }
-        for fill in prepared.plan.sell_fills() {
+        for fill in prepared.allocation_plan().sell_fills() {
             self.apply_fill(*fill);
         }
-        for cancellation in &prepared.cancellations {
+        for cancellation in prepared.cancellations() {
             if let Some(order) = self.orders.get(&cancellation.order_id).copied() {
                 self.remove_active_order(order);
             } else {
@@ -1671,42 +1929,46 @@ impl CallAuctionBook {
         Ok(CallAuctionUncross {
             state_revision: prepared.next_state_revision,
             policy: prepared.policy,
-            plan: prepared.plan,
-            trades: prepared.trades,
-            cancellations: prepared.cancellations,
+            pooled: prepared.pooled,
         })
     }
 
-    /// Performs an allocation-using offline audit of every redundant index,
-    /// intrusive queue, aggregate, priority relation, and finite bound.
+    /// Audits every redundant index, intrusive queue, aggregate, priority
+    /// relation, and finite bound.
+    ///
+    /// Successful validation uses `O(1)` auxiliary space and performs no heap
+    /// allocation. Queue traversal is `O(R log R)` for `R` active orders because
+    /// intrusive links resolve through the active-order AVL; accepted-identity
+    /// membership adds `O(R log I)` for `I` accepted identifiers. The four
+    /// allocation-free indexed-AVL audits take `O(S log S)` in aggregate for
+    /// `S` initialized active-order, accepted-identifier, and price-arena slots.
+    /// Failure-detail construction can allocate, so this remains an offline
+    /// audit rather than a collection-hot-path operation.
     ///
     /// # Errors
     ///
     /// Returns [`CallAuctionInvariantViolation`] at the first contradiction.
     pub fn validate(&self) -> Result<(), CallAuctionInvariantViolation> {
         self.validate_storage()?;
-        let mut visited = HashSet::new();
-        visited
-            .try_reserve(self.orders.len())
-            .map_err(|_| CallAuctionInvariantViolation::new("offline audit allocation failed"))?;
+        let mut indexed_orders = 0_usize;
         self.validate_queue(
             self.market_buys,
             Side::Buy,
             AuctionOrderConstraint::Market,
-            &mut visited,
+            &mut indexed_orders,
         )?;
         self.validate_queue(
             self.market_sells,
             Side::Sell,
             AuctionOrderConstraint::Market,
-            &mut visited,
+            &mut indexed_orders,
         )?;
         for (price, queue) in self.bids.iter() {
             self.validate_queue(
                 *queue,
                 Side::Buy,
                 AuctionOrderConstraint::Limit(*price),
-                &mut visited,
+                &mut indexed_orders,
             )?;
         }
         for (price, queue) in self.asks.iter() {
@@ -1714,10 +1976,10 @@ impl CallAuctionBook {
                 *queue,
                 Side::Sell,
                 AuctionOrderConstraint::Limit(*price),
-                &mut visited,
+                &mut indexed_orders,
             )?;
         }
-        if visited.len() != self.orders.len() {
+        if indexed_orders != self.orders.len() {
             return Err(CallAuctionInvariantViolation::new(
                 "active order index contains an unqueued order",
             ));
@@ -1766,6 +2028,11 @@ impl CallAuctionBook {
             || status.ask_level_scratch < self.limits.max_price_levels_per_side()
             || status.buy_order_scratch < self.limits.max_active_orders()
             || status.sell_order_scratch < self.limits.max_active_orders()
+            || status.configured_prepared_uncrosses != self.limits.max_prepared_uncrosses()
+            || status.available_prepared_uncrosses > status.configured_prepared_uncrosses
+            || status.uncross_fill_capacity_per_side < self.limits.max_active_orders()
+            || status.uncross_trade_capacity < self.limits.max_active_orders()
+            || status.uncross_cancellation_capacity < self.limits.max_active_orders()
         {
             return Err(CallAuctionInvariantViolation::new(
                 "constructor reservation is below a configured maximum",
@@ -1810,7 +2077,8 @@ impl CallAuctionBook {
     fn prepare_trade_pairs(
         &self,
         plan: &AuctionAllocationPlan,
-    ) -> Result<(Vec<CallAuctionTrade>, u64), CallAuctionPrepareError> {
+        trades: &mut Vec<CallAuctionTrade>,
+    ) -> Result<u64, CallAuctionPrepareError> {
         let pair_count = required_pair_count(plan.buy_fills(), plan.sell_fills())
             .ok_or(CallAuctionPrepareError::InternalInvariantViolation)?;
         let pair_count_u64 = u64::try_from(pair_count)
@@ -1819,10 +2087,10 @@ impl CallAuctionBook {
             .next_trade_id
             .checked_add(pair_count_u64)
             .ok_or(CallAuctionPrepareError::TradeIdentifierExhausted)?;
-        let mut trades = Vec::new();
-        trades.try_reserve_exact(pair_count).map_err(|_| {
-            CallAuctionPrepareError::CapacityReservationFailed(CallAuctionCapacity::UncrossTrades)
-        })?;
+        if trades.capacity() < pair_count {
+            return Err(CallAuctionPrepareError::InternalInvariantViolation);
+        }
+        trades.clear();
         let buys = plan.buy_fills();
         let sells = plan.sell_fills();
         let mut buy_index = 0_usize;
@@ -1884,14 +2152,15 @@ impl CallAuctionBook {
         {
             return Err(CallAuctionPrepareError::InternalInvariantViolation);
         }
-        Ok((trades, next_trade_id))
+        Ok(next_trade_id)
     }
 
     fn prepare_remainder_cancellations(
         &self,
         plan: &AuctionAllocationPlan,
         policy: CallAuctionRemainderPolicy,
-    ) -> Result<Vec<CallAuctionCancellation>, CallAuctionPrepareError> {
+        cancellations: &mut Vec<CallAuctionCancellation>,
+    ) -> Result<(), CallAuctionPrepareError> {
         let buy_count =
             required_cancellation_count(&self.buy_order_scratch, plan.buy_fills(), policy);
         let sell_count =
@@ -1899,30 +2168,28 @@ impl CallAuctionBook {
         let count = buy_count
             .checked_add(sell_count)
             .ok_or(CallAuctionPrepareError::InternalInvariantViolation)?;
-        let mut cancellations = Vec::new();
-        cancellations.try_reserve_exact(count).map_err(|_| {
-            CallAuctionPrepareError::CapacityReservationFailed(
-                CallAuctionCapacity::UncrossCancellations,
-            )
-        })?;
+        if cancellations.capacity() < count {
+            return Err(CallAuctionPrepareError::InternalInvariantViolation);
+        }
+        cancellations.clear();
         append_remainder_cancellations(
             &self.buy_order_scratch,
             plan.buy_fills(),
             policy,
             &self.orders,
-            &mut cancellations,
+            cancellations,
         )?;
         append_remainder_cancellations(
             &self.sell_order_scratch,
             plan.sell_fills(),
             policy,
             &self.orders,
-            &mut cancellations,
+            cancellations,
         )?;
         if cancellations.len() != count {
             return Err(CallAuctionPrepareError::InternalInvariantViolation);
         }
-        Ok(cancellations)
+        Ok(())
     }
 
     fn validate_uncross_preparation(
@@ -1933,12 +2200,12 @@ impl CallAuctionBook {
             return Err(CallAuctionCommitError::InternalInvariantViolation);
         }
         self.validate_prepared_fills(
-            prepared.plan.buy_fills(),
+            prepared.allocation_plan().buy_fills(),
             Side::Buy,
             &self.buy_order_scratch,
         )?;
         self.validate_prepared_fills(
-            prepared.plan.sell_fills(),
+            prepared.allocation_plan().sell_fills(),
             Side::Sell,
             &self.sell_order_scratch,
         )?;
@@ -1951,11 +2218,11 @@ impl CallAuctionBook {
         &self,
         prepared: &PreparedCallAuctionUncross,
     ) -> Result<(), CallAuctionCommitError> {
-        let buys = prepared.plan.buy_fills();
-        let sells = prepared.plan.sell_fills();
+        let buys = prepared.allocation_plan().buy_fills();
+        let sells = prepared.allocation_plan().sell_fills();
         let expected_count = required_pair_count(buys, sells)
             .ok_or(CallAuctionCommitError::InternalInvariantViolation)?;
-        if prepared.trades.len() != expected_count {
+        if prepared.trades().len() != expected_count {
             return Err(CallAuctionCommitError::InternalInvariantViolation);
         }
         let mut buy_index = 0_usize;
@@ -1963,7 +2230,7 @@ impl CallAuctionBook {
         let mut buy_remaining = buys.first().map_or(0_u64, |fill| fill.quantity_lots());
         let mut sell_remaining = sells.first().map_or(0_u64, |fill| fill.quantity_lots());
         let mut paired_quantity = 0_u128;
-        for (index, trade) in prepared.trades.iter().copied().enumerate() {
+        for (index, trade) in prepared.trades().iter().copied().enumerate() {
             let buy_fill = buys
                 .get(buy_index)
                 .copied()
@@ -1993,7 +2260,7 @@ impl CallAuctionBook {
                 .copied()
                 .ok_or(CallAuctionCommitError::InternalInvariantViolation)?;
             if trade.trade_id.get() != raw_trade_id
-                || trade.price != prepared.plan.clearing().price()
+                || trade.price != prepared.allocation_plan().clearing().price()
                 || trade.buy_order_id != buy_fill.order_id()
                 || trade.sell_order_id != sell_fill.order_id()
                 || trade.quantity.lots() != expected_quantity_lots
@@ -2022,10 +2289,10 @@ impl CallAuctionBook {
                     .map_or(0_u64, |fill| fill.quantity_lots());
             }
         }
-        let trade_count = u64::try_from(prepared.trades.len())
+        let trade_count = u64::try_from(prepared.trades().len())
             .map_err(|_| CallAuctionCommitError::InternalInvariantViolation)?;
         if self.next_trade_id.checked_add(trade_count) != Some(prepared.next_trade_id)
-            || paired_quantity != prepared.plan.executable_quantity()
+            || paired_quantity != prepared.allocation_plan().executable_quantity()
             || buy_index != buys.len()
             || sell_index != sells.len()
             || buy_remaining != 0
@@ -2043,19 +2310,19 @@ impl CallAuctionBook {
         let mut cancellation_index = 0_usize;
         self.validate_prepared_side_cancellations(
             &self.buy_order_scratch,
-            prepared.plan.buy_fills(),
+            prepared.allocation_plan().buy_fills(),
             prepared.policy.remainder,
-            &prepared.cancellations,
+            prepared.cancellations(),
             &mut cancellation_index,
         )?;
         self.validate_prepared_side_cancellations(
             &self.sell_order_scratch,
-            prepared.plan.sell_fills(),
+            prepared.allocation_plan().sell_fills(),
             prepared.policy.remainder,
-            &prepared.cancellations,
+            prepared.cancellations(),
             &mut cancellation_index,
         )?;
-        if cancellation_index != prepared.cancellations.len() {
+        if cancellation_index != prepared.cancellations().len() {
             return Err(CallAuctionCommitError::InternalInvariantViolation);
         }
         Ok(())
@@ -2309,7 +2576,7 @@ impl CallAuctionBook {
         queue: AuctionQueue,
         side: Side,
         constraint: AuctionOrderConstraint,
-        visited: &mut HashSet<OrderId>,
+        indexed_orders: &mut usize,
     ) -> Result<(), CallAuctionInvariantViolation> {
         if queue.order_count == 0 {
             if queue.head.is_some() || queue.tail.is_some() || queue.total_quantity != 0 {
@@ -2328,8 +2595,23 @@ impl CallAuctionBook {
         let mut previous = None;
         let mut previous_sequence = None;
         let mut total = 0_u128;
-        let mut count = 0_u64;
+        let mut count = 0_usize;
+        let expected_count = usize::try_from(queue.order_count).map_err(|_| {
+            CallAuctionInvariantViolation::new(
+                "auction queue count cannot be represented on this target",
+            )
+        })?;
         while let Some(order_id) = current {
+            if count >= expected_count {
+                return Err(CallAuctionInvariantViolation::new(
+                    "auction queue traversal exceeds recorded count",
+                ));
+            }
+            if *indexed_orders >= self.orders.len() {
+                return Err(CallAuctionInvariantViolation::new(
+                    "active order occurs more than once or participates in an auction queue cycle",
+                ));
+            }
             let order = self.orders.get(&order_id).copied().ok_or_else(|| {
                 CallAuctionInvariantViolation::new("auction queue references an absent order")
             })?;
@@ -2342,11 +2624,6 @@ impl CallAuctionBook {
                     "auction queue membership, link, or priority is inconsistent",
                 ));
             }
-            if !visited.insert(order_id) {
-                return Err(CallAuctionInvariantViolation::new(
-                    "active order occurs in multiple auction queue positions",
-                ));
-            }
             total = total
                 .checked_add(u128::from(order.quantity.lots()))
                 .ok_or_else(|| {
@@ -2355,16 +2632,14 @@ impl CallAuctionBook {
             count = count.checked_add(1).ok_or_else(|| {
                 CallAuctionInvariantViolation::new("auction queue count overflow")
             })?;
-            if count > queue.order_count {
-                return Err(CallAuctionInvariantViolation::new(
-                    "auction queue traversal exceeds recorded count",
-                ));
-            }
+            *indexed_orders = indexed_orders.checked_add(1).ok_or_else(|| {
+                CallAuctionInvariantViolation::new("auction queue total count overflow")
+            })?;
             previous = Some(order_id);
             previous_sequence = Some(order.priority_sequence);
             current = order.next;
         }
-        if previous != queue.tail || count != queue.order_count || total != queue.total_quantity {
+        if previous != queue.tail || count != expected_count || total != queue.total_quantity {
             return Err(CallAuctionInvariantViolation::new(
                 "auction queue tail, count, or quantity aggregate is inconsistent",
             ));
@@ -2504,5 +2779,144 @@ fn append_queue_orders(
         ));
         appended += 1;
         current = order.next;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AuctionOrderConstraint, AuctionQueue, CallAuctionBook, CallAuctionBookLimits,
+        CallAuctionBookLimitsSpec, CallAuctionCancellation, CallAuctionCapacity,
+        CallAuctionConstructionError, CallAuctionOrder, CallAuctionTrade, CallAuctionUncrossPool,
+        try_uncross_vector,
+    };
+    use crate::auction::AuctionOrderFill;
+    use crate::domain::{
+        AccountId, AssetId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
+        TimestampNs,
+    };
+    use crate::instrument::{
+        InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
+        QuantityRules, ReserveOrderRules, TradingState,
+    };
+
+    fn definition() -> InstrumentDefinition {
+        InstrumentDefinition::new(InstrumentSpec {
+            instrument_id: InstrumentId::new(7).unwrap(),
+            version: InstrumentVersion::new(3).unwrap(),
+            effective_from: TimestampNs::from_unix_nanos(0),
+            symbol: InstrumentSymbol::new("AUCTION-AUDIT").unwrap(),
+            kind: InstrumentKind::Spot,
+            base_asset_id: AssetId::new(1).unwrap(),
+            quote_asset_id: AssetId::new(2).unwrap(),
+            price: PriceRules::new(0, 5, Price::from_raw(-100), Price::from_raw(200)).unwrap(),
+            quantity: QuantityRules::new(1, 1, 1_000).unwrap(),
+            reserve: ReserveOrderRules::disabled(),
+            base_units_per_lot: 1,
+            quote_units_per_price_unit: 1,
+            trading_state: TradingState::Halted,
+        })
+        .unwrap()
+    }
+
+    fn two_order_book(constraint: AuctionOrderConstraint) -> CallAuctionBook {
+        let limits = CallAuctionBookLimits::new(CallAuctionBookLimitsSpec {
+            max_active_orders: 2,
+            max_price_levels_per_side: 2,
+            max_accepted_order_ids: 2,
+            max_prepared_uncrosses: 2,
+        })
+        .unwrap();
+        let mut book = CallAuctionBook::try_with_limits(definition(), limits).unwrap();
+        for order_id in [10_u64, 20] {
+            book.admit(CallAuctionOrder::new(
+                OrderId::new(order_id).unwrap(),
+                AccountId::new(1).unwrap(),
+                InstrumentId::new(7).unwrap(),
+                InstrumentVersion::new(3).unwrap(),
+                Side::Buy,
+                constraint,
+                Quantity::new(1).unwrap(),
+            ))
+            .unwrap();
+        }
+        book.validate().unwrap();
+        book
+    }
+
+    #[test]
+    fn every_uncross_buffer_class_reports_typed_unrepresentable_reservation() {
+        for (result, capacity) in [
+            (
+                try_uncross_vector::<AuctionOrderFill>(
+                    usize::MAX,
+                    CallAuctionCapacity::UncrossBuyFills,
+                ),
+                CallAuctionCapacity::UncrossBuyFills,
+            ),
+            (
+                try_uncross_vector::<AuctionOrderFill>(
+                    usize::MAX,
+                    CallAuctionCapacity::UncrossSellFills,
+                ),
+                CallAuctionCapacity::UncrossSellFills,
+            ),
+        ] {
+            assert_eq!(
+                result.unwrap_err(),
+                CallAuctionConstructionError::CapacityReservationFailed(capacity)
+            );
+        }
+        assert!(matches!(
+            try_uncross_vector::<CallAuctionTrade>(usize::MAX, CallAuctionCapacity::UncrossTrades,),
+            Err(CallAuctionConstructionError::CapacityReservationFailed(
+                CallAuctionCapacity::UncrossTrades
+            ))
+        ));
+        assert!(matches!(
+            try_uncross_vector::<CallAuctionCancellation>(
+                usize::MAX,
+                CallAuctionCapacity::UncrossCancellations,
+            ),
+            Err(CallAuctionConstructionError::CapacityReservationFailed(
+                CallAuctionCapacity::UncrossCancellations
+            ))
+        ));
+        assert!(matches!(
+            CallAuctionUncrossPool::try_new(usize::MAX, 1),
+            Err(CallAuctionConstructionError::CapacityReservationFailed(
+                CallAuctionCapacity::PreparedUncrosses
+            ))
+        ));
+    }
+
+    #[test]
+    fn allocation_free_validation_rejects_market_and_limit_queue_cycles() {
+        for constraint in [
+            AuctionOrderConstraint::Market,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        ] {
+            let mut book = two_order_book(constraint);
+            let head = OrderId::new(10).unwrap();
+            let tail = OrderId::new(20).unwrap();
+            book.orders.get_mut(&tail).unwrap().next = Some(head);
+            let detail = book.validate().unwrap_err().detail().to_owned();
+            assert!(
+                detail.contains("cycle") || detail.contains("exceeds recorded count"),
+                "unexpected invariant detail: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn allocation_free_validation_rejects_unqueued_active_orders() {
+        let mut book = two_order_book(AuctionOrderConstraint::Market);
+        book.market_buys = AuctionQueue::default();
+        assert!(
+            book.validate()
+                .unwrap_err()
+                .detail()
+                .contains("unqueued order")
+        );
     }
 }

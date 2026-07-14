@@ -312,16 +312,14 @@ fn empty_mass_cancel_is_an_accepted_acknowledged_control_in_every_trading_state(
             ))
             .unwrap();
         assert_eq!(report.outcome, CommandOutcome::Accepted);
+        assert_eq!(report.events.len(), 1);
         assert!(matches!(
-            report.events.as_slice(),
-            [quotick::matching::Event {
-                kind: EventKind::MassCancelCompleted {
-                    cancelled_order_count: 0,
-                    cancelled_quantity_lots: 0,
-                    ..
-                },
+            report.events[0].kind,
+            EventKind::MassCancelCompleted {
+                cancelled_order_count: 0,
+                cancelled_quantity_lots: 0,
                 ..
-            }]
+            }
         ));
     }
 }

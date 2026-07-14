@@ -117,7 +117,7 @@ fn snapshot_replacement_is_atomic_at_the_file_namespace() {
     let directory = TestDirectory::new("replacement");
     let path = directory.join("ledger.qsnp");
     let first = checkpoint(1, 100);
-    let mut ledger = Ledger::from_checkpoint(first).expect("checkpoint restores");
+    let mut ledger = Ledger::from_checkpoint(&first).expect("checkpoint restores");
     ledger
         .post(
             JournalEntry::new(
@@ -168,7 +168,7 @@ fn complete_pending_snapshot_is_promoted_and_invalid_pending_is_discarded() {
         value
     );
 
-    let mut ledger = Ledger::from_checkpoint(value).unwrap();
+    let mut ledger = Ledger::from_checkpoint(&value).unwrap();
     ledger
         .post(
             JournalEntry::new(
@@ -220,7 +220,7 @@ fn stale_redundant_and_divergent_pending_generations_are_distinguished() {
     let target = directory.join("ledger.qsnp");
     let staging = directory.join("staging.qsnp");
     let first = checkpoint(1, 100);
-    let mut ledger = Ledger::from_checkpoint(first.clone()).unwrap();
+    let mut ledger = Ledger::from_checkpoint(&first).unwrap();
     ledger
         .post(
             JournalEntry::new(
@@ -280,7 +280,7 @@ fn normal_writes_reject_generation_regression_and_same_generation_forks() {
     let directory = TestDirectory::new("write-order");
     let target = directory.join("ledger.qsnp");
     let first = checkpoint(1, 100);
-    let mut ledger = Ledger::from_checkpoint(first.clone()).unwrap();
+    let mut ledger = Ledger::from_checkpoint(&first).unwrap();
     ledger
         .post(
             JournalEntry::new(
@@ -314,7 +314,7 @@ fn normal_writes_reject_generation_regression_and_same_generation_forks() {
         })
     ));
 
-    let mut fork = Ledger::from_checkpoint(checkpoint(10, 999)).unwrap();
+    let mut fork = Ledger::from_checkpoint(&checkpoint(10, 999)).unwrap();
     fork.post(
         JournalEntry::new(
             TransactionId::new(11).unwrap(),
@@ -392,7 +392,7 @@ fn newer_generation_requires_a_proven_history_prefix() {
     let current = checkpoint(1, 100);
     SnapshotFile::write(&target, &current, SnapshotOptions::default()).unwrap();
 
-    let mut fork = Ledger::from_checkpoint(checkpoint(10, 999)).unwrap();
+    let mut fork = Ledger::from_checkpoint(&checkpoint(10, 999)).unwrap();
     fork.post(
         JournalEntry::new(
             TransactionId::new(11).unwrap(),

@@ -2,7 +2,12 @@
 //!
 //! All multibyte integers are little-endian. Enum discriminants are explicit
 //! `u8` values and are independent of Rust's in-memory representation. The WAL
-//! frame version identifies the codec version.
+//! frame version identifies the codec version. Every wire-derived collection
+//! count is proved against the remaining payload before one exact fallible
+//! output reservation; allocation failure names the field and validated count.
+//! Encoding routes every scalar and byte-slice write through one amortized
+//! fallible growth gate. The first encoding failure is retained, subsequent
+//! writes are suppressed, and no partial byte vector escapes [`BinaryCodec::encode`].
 
 use std::fmt;
 
@@ -70,6 +75,18 @@ pub enum CodecError {
         /// In-memory collection length.
         length: usize,
     },
+    /// The encoded byte length overflowed the addressable `usize` range.
+    EncodingLengthOverflow {
+        /// Bytes already encoded.
+        current_length: usize,
+        /// Bytes requested by the next scalar or slice.
+        additional: usize,
+    },
+    /// The encoded output could not reserve fallible growth.
+    EncodingCapacityReservationFailed {
+        /// Minimum complete byte length required by the failed write.
+        minimum_length: usize,
+    },
     /// A declared collection length cannot fit in the remaining payload.
     InvalidLength {
         /// Encoded collection name.
@@ -81,6 +98,8 @@ pub enum CodecError {
     CapacityReservationFailed {
         /// Logical collection whose reservation failed.
         field: &'static str,
+        /// Exact validated element count requested from the allocator.
+        maximum: usize,
     },
     /// A decoded identifier or quantity violated its domain invariant.
     InvalidDomain(DomainError),
@@ -128,11 +147,25 @@ impl fmt::Display for CodecError {
             Self::LengthOverflow { field, length } => {
                 write!(formatter, "{field} length {length} exceeds the wire limit")
             }
+            Self::EncodingLengthOverflow {
+                current_length,
+                additional,
+            } => write!(
+                formatter,
+                "encoded byte length {current_length} plus {additional} is unrepresentable"
+            ),
+            Self::EncodingCapacityReservationFailed { minimum_length } => write!(
+                formatter,
+                "could not reserve encoded output through {minimum_length} bytes"
+            ),
             Self::InvalidLength { field, length } => {
                 write!(formatter, "declared {field} length {length} is impossible")
             }
-            Self::CapacityReservationFailed { field } => {
-                write!(formatter, "could not reserve decoded {field} storage")
+            Self::CapacityReservationFailed { field, maximum } => {
+                write!(
+                    formatter,
+                    "could not reserve decoded {field} storage through {maximum} elements"
+                )
             }
             Self::InvalidDomain(error) => error.fmt(formatter),
             Self::InvalidValue(detail) => formatter.write_str(detail),
@@ -236,7 +269,9 @@ pub trait BinaryCodec: Sized {
     /// # Errors
     ///
     /// Returns [`CodecError::LengthOverflow`] when a collection exceeds the
-    /// format's `u32` element-count limit.
+    /// format's `u32` element-count limit. Encoded-length overflow and output
+    /// reservation failure are returned as [`CodecError::EncodingLengthOverflow`]
+    /// and [`CodecError::EncodingCapacityReservationFailed`], respectively.
     fn encode(&self) -> Result<Vec<u8>, CodecError>;
 
     /// Decodes one complete value and rejects trailing bytes.
@@ -244,18 +279,56 @@ pub trait BinaryCodec: Sized {
     /// # Errors
     ///
     /// Returns [`CodecError`] for truncation, invalid discriminants, invalid
-    /// domain values, impossible lengths, or trailing bytes.
+    /// domain values, impossible lengths, decoded-output reservation failure,
+    /// or trailing bytes.
     fn decode(bytes: &[u8]) -> Result<Self, CodecError>;
 }
 
 #[derive(Default)]
 struct Encoder {
     bytes: Vec<u8>,
+    failure: Option<CodecError>,
+}
+
+fn checked_encoding_length(current_length: usize, additional: usize) -> Result<usize, CodecError> {
+    current_length
+        .checked_add(additional)
+        .ok_or(CodecError::EncodingLengthOverflow {
+            current_length,
+            additional,
+        })
 }
 
 impl Encoder {
+    fn reserve(&mut self, additional: usize) {
+        if self.failure.is_some() {
+            return;
+        }
+        let current_length = self.bytes.len();
+        let minimum_length = match checked_encoding_length(current_length, additional) {
+            Ok(minimum_length) => minimum_length,
+            Err(error) => {
+                self.failure = Some(error);
+                return;
+            }
+        };
+        if minimum_length <= self.bytes.capacity() {
+            return;
+        }
+        if self.bytes.try_reserve(additional).is_err() {
+            self.failure = Some(CodecError::EncodingCapacityReservationFailed { minimum_length });
+        }
+    }
+
+    fn write(&mut self, value: &[u8]) {
+        self.reserve(value.len());
+        if self.failure.is_none() {
+            self.bytes.extend_from_slice(value);
+        }
+    }
+
     fn u8(&mut self, value: u8) {
-        self.bytes.push(value);
+        self.write(&[value]);
     }
 
     fn bool(&mut self, value: bool) {
@@ -263,42 +336,48 @@ impl Encoder {
     }
 
     fn u32(&mut self, value: u32) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+        self.write(&value.to_le_bytes());
     }
 
     fn i32(&mut self, value: i32) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+        self.write(&value.to_le_bytes());
     }
 
     fn u64(&mut self, value: u64) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+        self.write(&value.to_le_bytes());
     }
 
     fn i64(&mut self, value: i64) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+        self.write(&value.to_le_bytes());
     }
 
     fn i128(&mut self, value: i128) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+        self.write(&value.to_le_bytes());
     }
 
     fn u128(&mut self, value: u128) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+        self.write(&value.to_le_bytes());
     }
 
     fn bytes(&mut self, value: &[u8]) {
-        self.bytes.extend_from_slice(value);
+        self.write(value);
     }
 
     fn length(&mut self, field: &'static str, length: usize) -> Result<(), CodecError> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
         let wire =
             u32::try_from(length).map_err(|_| CodecError::LengthOverflow { field, length })?;
         self.u32(wire);
-        Ok(())
+        self.failure.clone().map_or(Ok(()), Err)
     }
 
-    fn finish(self) -> Vec<u8> {
-        self.bytes
+    fn finish(self) -> Result<Vec<u8>, CodecError> {
+        match self.failure {
+            Some(error) => Err(error),
+            None => Ok(self.bytes),
+        }
     }
 }
 
@@ -413,6 +492,14 @@ impl<'a> Decoder<'a> {
     }
 }
 
+fn reserve_decoded_vec<T>(field: &'static str, maximum: usize) -> Result<Vec<T>, CodecError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(maximum)
+        .map_err(|_| CodecError::CapacityReservationFailed { field, maximum })?;
+    Ok(values)
+}
+
 impl BinaryCodec for CheckpointAnchor {
     fn encode(&self) -> Result<Vec<u8>, CodecError> {
         if self.generation() == 0 {
@@ -438,7 +525,7 @@ impl BinaryCodec for CheckpointAnchor {
         encoder.u64(self.wal_sequence());
         encoder.u64(self.payload_length());
         encoder.u32(self.checksum());
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -962,7 +1049,7 @@ impl BinaryCodec for Command {
     fn encode(&self) -> Result<Vec<u8>, CodecError> {
         let mut encoder = Encoder::default();
         encode_command(&mut encoder, *self);
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -1057,7 +1144,7 @@ impl BinaryCodec for InstrumentDefinition {
         encoder.u64(settlement.base_units_per_lot);
         encoder.u64(settlement.quote_units_per_price_unit);
         encode_trading_state(&mut encoder, self.trading_state());
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -1142,7 +1229,7 @@ impl BinaryCodec for AccountRiskDefinition {
         encoder.u128(limits.max_open_notional());
         encoder.u128(limits.max_long_position_lots());
         encoder.u128(limits.max_short_position_lots());
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -1464,7 +1551,7 @@ impl BinaryCodec for ExecutionReport {
         for event in &self.events {
             encode_event(&mut encoder, *event);
         }
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -1487,7 +1574,7 @@ impl BinaryCodec for ExecutionReport {
                 "execution report must contain at least one event",
             ));
         }
-        let mut events = Vec::with_capacity(count);
+        let mut events = reserve_decoded_vec("execution report events", count)?;
         for _ in 0..count {
             events.push(decode_event(&mut decoder)?);
         }
@@ -1546,7 +1633,7 @@ impl BinaryCodec for OrderBookCheckpoint {
                 &entry.report().encode()?,
             )?;
         }
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -1557,7 +1644,7 @@ impl BinaryCodec for OrderBookCheckpoint {
             decoder.sized_bytes("matching checkpoint definition bytes")?,
         )?;
         let order_count = decoder.count("matching checkpoint active orders", 43)?;
-        let mut orders = Vec::with_capacity(order_count);
+        let mut orders = reserve_decoded_vec("matching checkpoint active orders", order_count)?;
         for _ in 0..order_count {
             orders.push(RestingOrderCheckpoint {
                 order_id: order(&mut decoder)?,
@@ -1571,7 +1658,8 @@ impl BinaryCodec for OrderBookCheckpoint {
             });
         }
         let history_count = decoder.count("matching checkpoint command history", 8)?;
-        let mut history = Vec::with_capacity(history_count);
+        let mut history =
+            reserve_decoded_vec("matching checkpoint command history", history_count)?;
         for _ in 0..history_count {
             let command =
                 Command::decode(decoder.sized_bytes("matching checkpoint command bytes")?)?;
@@ -1615,7 +1703,7 @@ impl BinaryCodec for RiskManagedCheckpoint {
             encoder.u128(exposure.open_notional());
             encoder.u64(exposure.open_orders());
         }
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -1624,7 +1712,7 @@ impl BinaryCodec for RiskManagedCheckpoint {
         let matching =
             OrderBookCheckpoint::decode(decoder.sized_bytes("risk checkpoint matching bytes")?)?;
         let account_count = decoder.count("risk checkpoint accounts", 76)?;
-        let mut accounts = Vec::with_capacity(account_count);
+        let mut accounts = reserve_decoded_vec("risk checkpoint accounts", account_count)?;
         for _ in 0..account_count {
             let definition = AccountRiskDefinition::decode(
                 decoder.sized_bytes("risk checkpoint account definition bytes")?,
@@ -1672,7 +1760,7 @@ impl BinaryCodec for CallAuctionRiskCheckpoint {
             encoder.u128(exposure.open_notional());
             encoder.u64(exposure.open_orders());
         }
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -1682,12 +1770,7 @@ impl BinaryCodec for CallAuctionRiskCheckpoint {
             decoder.sized_bytes("auction risk checkpoint auction bytes")?,
         )?;
         let account_count = decoder.count("auction risk checkpoint accounts", 76)?;
-        let mut accounts = Vec::new();
-        accounts.try_reserve_exact(account_count).map_err(|_| {
-            CodecError::CapacityReservationFailed {
-                field: "auction risk checkpoint accounts",
-            }
-        })?;
+        let mut accounts = reserve_decoded_vec("auction risk checkpoint accounts", account_count)?;
         for _ in 0..account_count {
             let definition = AccountRiskDefinition::decode(
                 decoder.sized_bytes("auction risk checkpoint account definition bytes")?,
@@ -1803,7 +1886,7 @@ impl BinaryCodec for MarketDataUpdate {
                 encoder.u64(revision);
             }
         }
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -1870,7 +1953,7 @@ impl BinaryCodec for MarketDataSnapshot {
         for level in self.asks() {
             encode_market_data_level(&mut encoder, *level);
         }
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -1891,12 +1974,12 @@ impl BinaryCodec for MarketDataSnapshot {
         let trading_state =
             TradingStateSnapshot::from_parts(decode_trading_state(&mut decoder)?, decoder.u64()?);
         let bid_count = decoder.count("market-data snapshot bids", 33)?;
-        let mut bids = Vec::with_capacity(bid_count);
+        let mut bids = reserve_decoded_vec("market-data snapshot bids", bid_count)?;
         for _ in 0..bid_count {
             bids.push(decode_market_data_level(&mut decoder)?);
         }
         let ask_count = decoder.count("market-data snapshot asks", 33)?;
-        let mut asks = Vec::with_capacity(ask_count);
+        let mut asks = reserve_decoded_vec("market-data snapshot asks", ask_count)?;
         for _ in 0..ask_count {
             asks.push(decode_market_data_level(&mut decoder)?);
         }
@@ -1942,7 +2025,7 @@ impl BinaryCodec for JournalEntry {
         encoder.u64(related_transaction);
         encoder.bool(period_boundary.is_some());
         encoder.i32(period_boundary.map_or(0, AccountingDate::days_since_unix_epoch));
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -1960,7 +2043,7 @@ impl BinaryCodec for JournalEntry {
             .then(|| AccountingDate::from_days_since_unix_epoch(effective_date_days));
         let recorded_at = TimestampNs::from_unix_nanos(decoder.u64()?);
         let count = decoder.count("journal entry postings", 32)?;
-        let mut postings = Vec::with_capacity(count);
+        let mut postings = reserve_decoded_vec("journal entry postings", count)?;
         for _ in 0..count {
             postings.push(Posting {
                 account_id: account(&mut decoder)?,
@@ -2014,20 +2097,22 @@ impl BinaryCodec for JournalEntry {
             }
         };
         decoder.finish()?;
+        if postings.windows(2).any(|pair| {
+            (pair[0].asset_id, pair[0].account_id) > (pair[1].asset_id, pair[1].account_id)
+        }) {
+            return Err(CodecError::InvalidValue(
+                "journal entry postings are not in canonical order",
+            ));
+        }
         let canonical = JournalEntry::with_kind(
             transaction_id,
             reference,
             effective_date,
             recorded_at,
-            postings.clone(),
+            postings,
             kind,
         )
         .map_err(CodecError::InvalidJournalEntry)?;
-        if canonical.postings() != postings {
-            return Err(CodecError::InvalidValue(
-                "journal entry postings are not in canonical order",
-            ));
-        }
         Ok(canonical)
     }
 }
@@ -2041,7 +2126,7 @@ impl BinaryCodec for LedgerCorrection {
         encoder.bytes(&reversal);
         encoder.length("ledger correction replacement", replacement.len())?;
         encoder.bytes(&replacement);
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -2066,7 +2151,7 @@ impl BinaryCodec for LedgerBatch {
             encoder.length("ledger batch entry payload", bytes.len())?;
             encoder.bytes(&bytes);
         }
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -2074,7 +2159,7 @@ impl BinaryCodec for LedgerBatch {
         // A period control is the smallest entry at 47 bytes; each member also
         // carries a four-byte payload length.
         let count = decoder.count("ledger batch entries", 51)?;
-        let mut entries = Vec::with_capacity(count);
+        let mut entries = reserve_decoded_vec("ledger batch entries", count)?;
         for _ in 0..count {
             let length = usize::try_from(decoder.u32()?)
                 .map_err(|_| CodecError::InvalidValue("ledger batch entry exceeds usize"))?;
@@ -2102,7 +2187,7 @@ impl BinaryCodec for LedgerRecord {
                 encoder.bytes(&batch.encode()?);
             }
         }
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -2138,14 +2223,14 @@ impl BinaryCodec for LedgerCheckpoint {
             encoder.length("ledger checkpoint record payload", bytes.len())?;
             encoder.bytes(&bytes);
         }
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
         let mut decoder = Decoder::new(bytes);
         let generation = decoder.u64()?;
         let balance_count = decoder.count("ledger checkpoint balances", 32)?;
-        let mut balances = Vec::with_capacity(balance_count);
+        let mut balances = reserve_decoded_vec("ledger checkpoint balances", balance_count)?;
         for _ in 0..balance_count {
             balances.push(LedgerBalance::from_parts(
                 account(&mut decoder)?,
@@ -2156,7 +2241,7 @@ impl BinaryCodec for LedgerCheckpoint {
         // The smallest record is a one-byte tag plus a 47-byte period control.
         // Include its four-byte length prefix before allocating the collection.
         let record_count = decoder.count("ledger checkpoint records", 52)?;
-        let mut records = Vec::with_capacity(record_count);
+        let mut records = reserve_decoded_vec("ledger checkpoint records", record_count)?;
         for _ in 0..record_count {
             let length = usize::try_from(decoder.u32()?).map_err(|_| {
                 CodecError::InvalidValue("ledger checkpoint record length exceeds usize")
@@ -2165,5 +2250,64 @@ impl BinaryCodec for LedgerCheckpoint {
         }
         decoder.finish()?;
         LedgerCheckpoint::from_parts(generation, balances, records).map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::{CodecError, Decoder, Encoder, checked_encoding_length, reserve_decoded_vec};
+
+    #[test]
+    fn encoded_length_overflow_is_typed_by_both_operands() {
+        assert_eq!(
+            checked_encoding_length(1, usize::MAX),
+            Err(CodecError::EncodingLengthOverflow {
+                current_length: 1,
+                additional: usize::MAX,
+            })
+        );
+    }
+
+    #[test]
+    fn unrepresentable_encoder_growth_is_typed_by_minimum_length() {
+        let mut encoder = Encoder::default();
+        encoder.reserve(usize::MAX);
+        encoder.u64(7);
+        assert_eq!(
+            encoder.length("later semantic length", usize::MAX),
+            Err(CodecError::EncodingCapacityReservationFailed {
+                minimum_length: usize::MAX,
+            })
+        );
+        assert_eq!(
+            encoder.finish(),
+            Err(CodecError::EncodingCapacityReservationFailed {
+                minimum_length: usize::MAX,
+            })
+        );
+    }
+
+    #[test]
+    fn impossible_wire_count_is_rejected_before_output_reservation() {
+        let encoded = u32::MAX.to_le_bytes();
+        let mut decoder = Decoder::new(&encoded);
+        assert_eq!(
+            decoder.count("adversarial decoded values", 1),
+            Err(CodecError::InvalidLength {
+                field: "adversarial decoded values",
+                length: usize::try_from(u32::MAX).unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn unrepresentable_decode_vector_is_typed_by_field_and_maximum() {
+        assert_eq!(
+            reserve_decoded_vec::<u128>("adversarial decoded values", usize::MAX).unwrap_err(),
+            CodecError::CapacityReservationFailed {
+                field: "adversarial decoded values",
+                maximum: usize::MAX,
+            }
+        );
     }
 }

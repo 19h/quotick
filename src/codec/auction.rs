@@ -20,7 +20,8 @@ use crate::{AuctionId, Price, TimestampNs};
 
 use super::{
     BinaryCodec, CodecError, Decoder, Encoder, account, command_id, decode_side, encode_side,
-    encode_sized_bytes, instrument, instrument_version, order, quantity, trade_id,
+    encode_sized_bytes, instrument, instrument_version, order, quantity, reserve_decoded_vec,
+    trade_id,
 };
 
 fn auction_id(decoder: &mut Decoder<'_>) -> Result<AuctionId, CodecError> {
@@ -461,7 +462,7 @@ impl BinaryCodec for CallAuctionCommand {
     fn encode(&self) -> Result<Vec<u8>, CodecError> {
         let mut encoder = Encoder::default();
         encode_command(&mut encoder, *self);
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -696,7 +697,7 @@ impl BinaryCodec for CallAuctionExecutionReport {
             encode_event(&mut encoder, event);
         }
         encoder.bool(self.replayed);
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -714,12 +715,7 @@ impl BinaryCodec for CallAuctionExecutionReport {
             }
         };
         let count = decoder.count("call-auction events", 25)?;
-        let mut events = Vec::new();
-        events
-            .try_reserve_exact(count)
-            .map_err(|_| CodecError::CapacityReservationFailed {
-                field: "call-auction events",
-            })?;
+        let mut events = reserve_decoded_vec("call-auction events", count)?;
         for _ in 0..count {
             events.push(decode_event(&mut decoder)?);
         }
@@ -781,7 +777,7 @@ impl BinaryCodec for CallAuctionCheckpoint {
                 &entry.report().encode()?,
             )?;
         }
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -800,34 +796,21 @@ impl BinaryCodec for CallAuctionCheckpoint {
         let next_trade_id = decoder.u64()?;
 
         let accepted_count = decoder.count("auction checkpoint accepted identities", 8)?;
-        let mut accepted_order_ids = Vec::new();
-        accepted_order_ids
-            .try_reserve_exact(accepted_count)
-            .map_err(|_| CodecError::CapacityReservationFailed {
-                field: "auction checkpoint accepted identities",
-            })?;
+        let mut accepted_order_ids =
+            reserve_decoded_vec("auction checkpoint accepted identities", accepted_count)?;
         for _ in 0..accepted_count {
             accepted_order_ids.push(order(&mut decoder)?);
         }
 
         let active_count = decoder.count("auction checkpoint active orders", 34)?;
-        let mut active_orders = Vec::new();
-        active_orders.try_reserve_exact(active_count).map_err(|_| {
-            CodecError::CapacityReservationFailed {
-                field: "auction checkpoint active orders",
-            }
-        })?;
+        let mut active_orders =
+            reserve_decoded_vec("auction checkpoint active orders", active_count)?;
         for _ in 0..active_count {
             active_orders.push(decode_snapshot(&mut decoder)?);
         }
 
         let history_count = decoder.count("auction checkpoint command history", 8)?;
-        let mut history = Vec::new();
-        history.try_reserve_exact(history_count).map_err(|_| {
-            CodecError::CapacityReservationFailed {
-                field: "auction checkpoint command history",
-            }
-        })?;
+        let mut history = reserve_decoded_vec("auction checkpoint command history", history_count)?;
         for _ in 0..history_count {
             let command = CallAuctionCommand::decode(
                 decoder.sized_bytes("auction checkpoint command bytes")?,

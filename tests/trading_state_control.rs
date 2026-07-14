@@ -136,8 +136,10 @@ fn transition_and_cancel_is_revisioned_canonical_atomic_and_public() {
     assert_eq!(report.outcome, CommandOutcome::Accepted);
     assert_eq!(report.events.len(), 4);
     assert_eq!(
-        report.events[..3]
+        report
+            .events
             .iter()
+            .take(3)
             .map(|event| match event.kind {
                 EventKind::OrderCancelled {
                     order_id,
@@ -277,7 +279,7 @@ fn checkpoint_codec_and_restore_derive_effective_state_from_control_history() {
     let checkpoint = book.checkpoint(1, 5).unwrap();
     let encoded = checkpoint.encode().unwrap();
     let decoded = OrderBookCheckpoint::decode(&encoded).unwrap();
-    let mut restored = OrderBook::from_checkpoint(decoded).unwrap();
+    let mut restored = OrderBook::from_checkpoint(&decoded).unwrap();
 
     assert_eq!(restored.trading_state().state(), TradingState::Halted);
     assert_eq!(restored.trading_state().revision(), 1);
@@ -333,6 +335,8 @@ fn entry_closing_cancel_all_uses_protected_history_but_transition_only_does_not(
         max_retained_commands: 3,
         cancellation_reserve: 1,
         max_report_events: 2,
+        max_retained_events: 16,
+        max_prepared_order_selections: 2,
     })
     .unwrap();
     let mut book = OrderBook::with_limits(definition(), limits);

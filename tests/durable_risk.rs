@@ -263,6 +263,8 @@ fn report_event_capacity_failure_precedes_durable_risk_command_append() {
         max_retained_commands: 8,
         cancellation_reserve: 1,
         max_report_events: 2,
+        max_retained_events: 16,
+        max_prepared_order_selections: 2,
     })
     .unwrap();
     let mut durable = DurableRiskOrderBook::open_with_limits(

@@ -1,8 +1,9 @@
 //! Immutable asset metadata and effective-time-versioned instrument rules.
 
-use std::collections::HashMap;
 use std::fmt;
+use std::hash::Hash;
 
+use crate::bounded_hash::BoundedHashMap;
 use crate::domain::{AssetId, InstrumentId, InstrumentVersion, Price, Quantity, TimestampNs};
 use crate::ledger::SettlementConvention;
 use crate::matching::{Command, NewOrder, OrderDisplay, OrderType, ReplaceOrder, Trade};
@@ -10,6 +11,210 @@ use crate::matching::{Command, NewOrder, OrderDisplay, OrderType, ReplaceOrder, 
 const MAX_CODE_LENGTH: usize = 16;
 const MAX_SYMBOL_LENGTH: usize = 32;
 const MAX_DECIMAL_SCALE: u8 = 18;
+
+/// One finite authoritative instrument-catalog resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstrumentCatalogResource {
+    /// Stable asset-identifier index.
+    AssetIdentifiers,
+    /// Canonical asset-code index.
+    AssetCodes,
+    /// Instrument-identifier to version-range index.
+    Instruments,
+    /// Immutable instrument definitions across all version histories.
+    InstrumentVersions,
+}
+
+impl fmt::Display for InstrumentCatalogResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::AssetIdentifiers => "asset identifiers",
+            Self::AssetCodes => "asset codes",
+            Self::Instruments => "instrument identifiers",
+            Self::InstrumentVersions => "instrument versions",
+        })
+    }
+}
+
+/// Raw finite resource envelope for one instrument-catalog generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstrumentCatalogLimitsSpec {
+    /// Maximum registered assets and canonical asset codes.
+    pub max_assets: usize,
+    /// Maximum distinct instrument identifiers.
+    pub max_instruments: usize,
+    /// Maximum immutable definitions across all instrument histories.
+    pub max_instrument_versions: usize,
+}
+
+impl Default for InstrumentCatalogLimitsSpec {
+    fn default() -> Self {
+        Self {
+            max_assets: InstrumentCatalogLimits::DEFAULT_MAX_ASSETS,
+            max_instruments: InstrumentCatalogLimits::DEFAULT_MAX_INSTRUMENTS,
+            max_instrument_versions: InstrumentCatalogLimits::DEFAULT_MAX_INSTRUMENT_VERSIONS,
+        }
+    }
+}
+
+/// Contradiction in a requested finite instrument-catalog envelope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstrumentCatalogLimitsError {
+    /// Every finite maximum must be positive.
+    ZeroMaximum(InstrumentCatalogResource),
+    /// Every registered instrument consumes at least one version slot.
+    InstrumentsExceedVersions {
+        /// Instrument-identifier maximum.
+        instruments: usize,
+        /// Global immutable-definition maximum.
+        versions: usize,
+    },
+}
+
+impl fmt::Display for InstrumentCatalogLimitsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroMaximum(resource) => {
+                write!(formatter, "instrument-catalog {resource} maximum is zero")
+            }
+            Self::InstrumentsExceedVersions {
+                instruments,
+                versions,
+            } => write!(
+                formatter,
+                "instrument-catalog instrument maximum {instruments} exceeds version maximum {versions}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InstrumentCatalogLimitsError {}
+
+/// Validated immutable instrument-catalog resource envelope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstrumentCatalogLimits(InstrumentCatalogLimitsSpec);
+
+impl InstrumentCatalogLimits {
+    /// Default registered-asset and canonical-code maximum.
+    pub const DEFAULT_MAX_ASSETS: usize = 4_096;
+    /// Default distinct-instrument maximum.
+    pub const DEFAULT_MAX_INSTRUMENTS: usize = 16_384;
+    /// Default immutable-definition maximum across all histories.
+    pub const DEFAULT_MAX_INSTRUMENT_VERSIONS: usize = 65_536;
+
+    /// Validates one finite catalog envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstrumentCatalogLimitsError`] for a zero or contradictory
+    /// maximum.
+    pub const fn new(
+        spec: InstrumentCatalogLimitsSpec,
+    ) -> Result<Self, InstrumentCatalogLimitsError> {
+        if spec.max_assets == 0 {
+            return Err(InstrumentCatalogLimitsError::ZeroMaximum(
+                InstrumentCatalogResource::AssetIdentifiers,
+            ));
+        }
+        if spec.max_instruments == 0 {
+            return Err(InstrumentCatalogLimitsError::ZeroMaximum(
+                InstrumentCatalogResource::Instruments,
+            ));
+        }
+        if spec.max_instrument_versions == 0 {
+            return Err(InstrumentCatalogLimitsError::ZeroMaximum(
+                InstrumentCatalogResource::InstrumentVersions,
+            ));
+        }
+        if spec.max_instruments > spec.max_instrument_versions {
+            return Err(InstrumentCatalogLimitsError::InstrumentsExceedVersions {
+                instruments: spec.max_instruments,
+                versions: spec.max_instrument_versions,
+            });
+        }
+        Ok(Self(spec))
+    }
+
+    /// Returns the corresponding raw specification.
+    #[must_use]
+    pub const fn spec(self) -> InstrumentCatalogLimitsSpec {
+        self.0
+    }
+
+    /// Maximum registered assets and canonical codes.
+    #[must_use]
+    pub const fn max_assets(self) -> usize {
+        self.0.max_assets
+    }
+
+    /// Maximum distinct instrument identifiers.
+    #[must_use]
+    pub const fn max_instruments(self) -> usize {
+        self.0.max_instruments
+    }
+
+    /// Maximum immutable definitions across all histories.
+    #[must_use]
+    pub const fn max_instrument_versions(self) -> usize {
+        self.0.max_instrument_versions
+    }
+}
+
+impl Default for InstrumentCatalogLimits {
+    fn default() -> Self {
+        Self::new(InstrumentCatalogLimitsSpec::default())
+            .expect("default instrument-catalog limits must be valid")
+    }
+}
+
+impl TryFrom<InstrumentCatalogLimitsSpec> for InstrumentCatalogLimits {
+    type Error = InstrumentCatalogLimitsError;
+
+    fn try_from(spec: InstrumentCatalogLimitsSpec) -> Result<Self, Self::Error> {
+        Self::new(spec)
+    }
+}
+
+/// Failure before an instrument catalog owns usable state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstrumentCatalogConstructionError {
+    /// The requested finite resource envelope is invalid.
+    InvalidLimits(InstrumentCatalogLimitsError),
+    /// Complete constructor-owned storage could not be represented or reserved.
+    ReservationFailed {
+        /// Resource whose fixed layout could not be reserved.
+        resource: InstrumentCatalogResource,
+        /// Requested semantic maximum.
+        maximum: usize,
+    },
+}
+
+impl fmt::Display for InstrumentCatalogConstructionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLimits(error) => error.fmt(formatter),
+            Self::ReservationFailed { resource, maximum } => write!(
+                formatter,
+                "failed to reserve instrument-catalog {resource} storage through {maximum} entries"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InstrumentCatalogConstructionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidLimits(error) => Some(error),
+            Self::ReservationFailed { .. } => None,
+        }
+    }
+}
+
+impl From<InstrumentCatalogLimitsError> for InstrumentCatalogConstructionError {
+    fn from(error: InstrumentCatalogLimitsError) -> Self {
+        Self::InvalidLimits(error)
+    }
+}
 
 /// Instrument-master validation, registration, or lookup failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +267,15 @@ pub enum InstrumentError {
     NonMonotonicVersion,
     /// Immutable identity fields changed under one instrument identifier.
     IdentityChanged,
+    /// A new identity or definition would exceed the finite catalog envelope.
+    CapacityExceeded {
+        /// Exhausted catalog resource.
+        resource: InstrumentCatalogResource,
+        /// Configured semantic maximum.
+        maximum: usize,
+        /// Cardinality that the rejected registration would require.
+        attempted: usize,
+    },
     /// No instrument definition was effective at the requested time.
     NoEffectiveVersion {
         /// Instrument requested.
@@ -124,6 +338,14 @@ impl fmt::Display for InstrumentError {
             Self::IdentityChanged => {
                 formatter.write_str("immutable instrument identity changed across versions")
             }
+            Self::CapacityExceeded {
+                resource,
+                maximum,
+                attempted,
+            } => write!(
+                formatter,
+                "instrument-catalog {resource} capacity {maximum} cannot admit cardinality {attempted}"
+            ),
             Self::NoEffectiveVersion { instrument_id, at } => write!(
                 formatter,
                 "instrument {instrument_id} has no version effective at {}",
@@ -817,19 +1039,168 @@ impl InstrumentDefinition {
     }
 }
 
-/// Append-only effective-time instrument and asset catalog.
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InstrumentSeries {
+    start: usize,
+    length: usize,
+}
+
+impl InstrumentSeries {
+    fn end(self) -> usize {
+        self.checked_end()
+            .expect("validated instrument series range must be representable")
+    }
+
+    const fn checked_end(self) -> Option<usize> {
+        self.start.checked_add(self.length)
+    }
+}
+
+/// One constructor-reserved instrument-catalog hash index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstrumentCatalogHashIndex {
+    /// Stable asset identifier to immutable metadata.
+    AssetIdentifiers,
+    /// Canonical asset code to stable asset identifier.
+    AssetCodes,
+    /// Stable instrument identifier to its contiguous version range.
+    Instruments,
+}
+
+/// Process-local fixed hash-index allocation telemetry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstrumentCatalogHashIndexStatus {
+    /// Configured semantic entry maximum.
+    pub configured_entries: usize,
+    /// Constructor-allocated dense-entry capacity.
+    pub allocated_entries: usize,
+    /// Initialized open-addressed lookup buckets.
+    pub initialized_buckets: usize,
+    /// Currently occupied entries.
+    pub occupied_entries: usize,
+}
+
+/// Process-local immutable-definition arena telemetry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstrumentCatalogArenaStatus {
+    /// Configured semantic definition maximum.
+    pub configured_definitions: usize,
+    /// Constructor-allocated definition capacity.
+    pub allocated_definitions: usize,
+    /// Currently occupied definition slots.
+    pub occupied_definitions: usize,
+}
+
+/// Structural contradiction in authoritative catalog state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstrumentCatalogInvariantViolation(&'static str);
+
+impl InstrumentCatalogInvariantViolation {
+    /// Returns the invariant diagnostic.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        self.0
+    }
+}
+
+impl fmt::Display for InstrumentCatalogInvariantViolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for InstrumentCatalogInvariantViolation {}
+
+/// Append-only, finitely bounded effective-time instrument and asset catalog.
+///
+/// Lookup first selects a contiguous per-instrument range through a bounded
+/// hash index and then binary-searches that immutable history. Registration is
+/// a control-plane operation: interleaved version appends can shift later
+/// ranges within the constructor-reserved flat arena but never grow storage.
+#[derive(Debug)]
 pub struct InstrumentCatalog {
-    assets: HashMap<AssetId, AssetDefinition>,
-    asset_codes: HashMap<AssetCode, AssetId>,
-    instruments: HashMap<InstrumentId, Vec<InstrumentDefinition>>,
+    limits: InstrumentCatalogLimits,
+    assets: BoundedHashMap<AssetId, AssetDefinition>,
+    asset_codes: BoundedHashMap<AssetCode, AssetId>,
+    instruments: BoundedHashMap<InstrumentId, InstrumentSeries>,
+    definitions: Vec<InstrumentDefinition>,
 }
 
 impl InstrumentCatalog {
-    /// Creates an empty catalog.
+    /// Creates an empty catalog under the finite default resource envelope.
+    ///
+    /// Production initialization that must report reservation failure uses
+    /// [`InstrumentCatalog::try_with_limits`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process cannot reserve the documented default envelope.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::try_with_limits(InstrumentCatalogLimitsSpec::default())
+            .expect("default instrument-catalog envelope must be representable")
+    }
+
+    /// Creates an empty catalog after reserving every authoritative index and
+    /// immutable-definition slot through its complete configured maximum.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstrumentCatalogConstructionError`] before state exists when
+    /// limits are contradictory or a complete fixed layout cannot be reserved.
+    pub fn try_with_limits(
+        spec: InstrumentCatalogLimitsSpec,
+    ) -> Result<Self, InstrumentCatalogConstructionError> {
+        let limits = InstrumentCatalogLimits::try_from(spec)?;
+        let assets =
+            reserve_catalog_map(spec.max_assets, InstrumentCatalogResource::AssetIdentifiers)?;
+        let asset_codes =
+            reserve_catalog_map(spec.max_assets, InstrumentCatalogResource::AssetCodes)?;
+        let instruments =
+            reserve_catalog_map(spec.max_instruments, InstrumentCatalogResource::Instruments)?;
+        let mut definitions = Vec::new();
+        definitions
+            .try_reserve_exact(spec.max_instrument_versions)
+            .map_err(|_| InstrumentCatalogConstructionError::ReservationFailed {
+                resource: InstrumentCatalogResource::InstrumentVersions,
+                maximum: spec.max_instrument_versions,
+            })?;
+        Ok(Self {
+            limits,
+            assets,
+            asset_codes,
+            instruments,
+            definitions,
+        })
+    }
+
+    /// Returns the immutable validated generation limits.
+    #[must_use]
+    pub const fn limits(&self) -> InstrumentCatalogLimits {
+        self.limits
+    }
+
+    /// Returns fixed allocation and occupancy telemetry for one catalog index.
+    #[must_use]
+    pub fn hash_index_status(
+        &self,
+        index: InstrumentCatalogHashIndex,
+    ) -> InstrumentCatalogHashIndexStatus {
+        match index {
+            InstrumentCatalogHashIndex::AssetIdentifiers => catalog_hash_status(&self.assets),
+            InstrumentCatalogHashIndex::AssetCodes => catalog_hash_status(&self.asset_codes),
+            InstrumentCatalogHashIndex::Instruments => catalog_hash_status(&self.instruments),
+        }
+    }
+
+    /// Returns fixed allocation and occupancy telemetry for all definitions.
+    #[must_use]
+    pub fn definition_arena_status(&self) -> InstrumentCatalogArenaStatus {
+        InstrumentCatalogArenaStatus {
+            configured_definitions: self.limits.max_instrument_versions(),
+            allocated_definitions: self.definitions.capacity(),
+            occupied_definitions: self.definitions.len(),
+        }
     }
 
     /// Registers immutable asset metadata.
@@ -840,6 +1211,14 @@ impl InstrumentCatalog {
     pub fn register_asset(&mut self, asset: AssetDefinition) -> Result<(), InstrumentError> {
         if self.assets.contains_key(&asset.asset_id) || self.asset_codes.contains_key(&asset.code) {
             return Err(InstrumentError::DuplicateAsset);
+        }
+        let attempted = self.assets.len() + 1;
+        if attempted > self.limits.max_assets() {
+            return Err(InstrumentError::CapacityExceeded {
+                resource: InstrumentCatalogResource::AssetIdentifiers,
+                maximum: self.limits.max_assets(),
+                attempted,
+            });
         }
         self.asset_codes.insert(asset.code, asset.asset_id);
         self.assets.insert(asset.asset_id, asset);
@@ -877,6 +1256,11 @@ impl InstrumentCatalog {
     ///
     /// Returns [`InstrumentError`] for unknown assets, duplicate/nonmonotonic
     /// versions, or changed identity fields.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if previously validated private catalog structure or its
+    /// constructor-owned definition reservation has been corrupted in memory.
     pub fn register_instrument(
         &mut self,
         definition: InstrumentDefinition,
@@ -886,17 +1270,20 @@ impl InstrumentCatalog {
                 return Err(InstrumentError::UnknownAsset(asset_id));
             }
         }
-        let versions = self
-            .instruments
-            .entry(definition.instrument_id())
-            .or_default();
-        if versions
-            .binary_search_by_key(&definition.version(), |value| value.version())
-            .is_ok()
-        {
-            return Err(InstrumentError::DuplicateInstrumentVersion);
-        }
-        if let Some(previous) = versions.last().copied() {
+        let instrument_id = definition.instrument_id();
+        let existing = self.instruments.get(&instrument_id).copied();
+        if let Some(series) = existing {
+            let versions = &self.definitions[series.start..series.end()];
+            if versions
+                .binary_search_by_key(&definition.version(), |value| value.version())
+                .is_ok()
+            {
+                return Err(InstrumentError::DuplicateInstrumentVersion);
+            }
+            let previous = versions
+                .last()
+                .copied()
+                .expect("registered instrument series must not be empty");
             if definition.version() <= previous.version()
                 || definition.effective_from() <= previous.effective_from()
             {
@@ -910,7 +1297,44 @@ impl InstrumentCatalog {
                 return Err(InstrumentError::IdentityChanged);
             }
         }
-        versions.push(definition);
+
+        if existing.is_none() && self.instruments.len() >= self.limits.max_instruments() {
+            return Err(InstrumentError::CapacityExceeded {
+                resource: InstrumentCatalogResource::Instruments,
+                maximum: self.limits.max_instruments(),
+                attempted: self.instruments.len() + 1,
+            });
+        }
+        if self.definitions.len() >= self.limits.max_instrument_versions() {
+            return Err(InstrumentError::CapacityExceeded {
+                resource: InstrumentCatalogResource::InstrumentVersions,
+                maximum: self.limits.max_instrument_versions(),
+                attempted: self.definitions.len() + 1,
+            });
+        }
+
+        assert!(
+            self.definitions.len() < self.definitions.capacity(),
+            "instrument-catalog definition reservation disappeared"
+        );
+        if let Some(series) = existing {
+            let insertion_index = series.end();
+            self.definitions.insert(insertion_index, definition);
+            for later in self.instruments.values_mut() {
+                if later.start >= insertion_index {
+                    later.start += 1;
+                }
+            }
+            self.instruments
+                .get_mut(&instrument_id)
+                .expect("registered instrument range must remain indexed")
+                .length += 1;
+        } else {
+            let start = self.definitions.len();
+            self.instruments
+                .insert(instrument_id, InstrumentSeries { start, length: 1 });
+            self.definitions.push(definition);
+        }
         Ok(())
     }
 
@@ -925,10 +1349,11 @@ impl InstrumentCatalog {
         instrument_id: InstrumentId,
         at: TimestampNs,
     ) -> Result<&InstrumentDefinition, InstrumentError> {
-        let versions = self
+        let series = self
             .instruments
             .get(&instrument_id)
             .ok_or(InstrumentError::UnknownInstrument(instrument_id))?;
+        let versions = &self.definitions[series.start..series.end()];
         let index = versions.partition_point(|value| value.effective_from() <= at);
         if index == 0 {
             Err(InstrumentError::NoEffectiveVersion { instrument_id, at })
@@ -947,10 +1372,11 @@ impl InstrumentCatalog {
         instrument_id: InstrumentId,
         version: InstrumentVersion,
     ) -> Result<&InstrumentDefinition, InstrumentError> {
-        let versions = self
+        let series = self
             .instruments
             .get(&instrument_id)
             .ok_or(InstrumentError::UnknownInstrument(instrument_id))?;
+        let versions = &self.definitions[series.start..series.end()];
         let index = versions
             .binary_search_by_key(&version, |definition| definition.version())
             .map_err(|_| InstrumentError::UnknownInstrumentVersion {
@@ -959,6 +1385,141 @@ impl InstrumentCatalog {
             })?;
         Ok(&versions[index])
     }
+
+    /// Audits fixed layouts, bidirectional asset indexes, version ranges,
+    /// identity stability, monotonic histories, and complete arena coverage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstrumentCatalogInvariantViolation`] for any structural
+    /// contradiction.
+    pub fn validate(&self) -> Result<(), InstrumentCatalogInvariantViolation> {
+        InstrumentCatalogLimits::new(self.limits.spec())
+            .map_err(|_| invariant("instrument-catalog limits are contradictory"))?;
+        self.assets
+            .validate_layout()
+            .map_err(|_| invariant("asset-identifier hash layout is invalid"))?;
+        self.asset_codes
+            .validate_layout()
+            .map_err(|_| invariant("asset-code hash layout is invalid"))?;
+        self.instruments
+            .validate_layout()
+            .map_err(|_| invariant("instrument hash layout is invalid"))?;
+        if self.assets.len() != self.asset_codes.len() {
+            return Err(invariant("asset identifier and code cardinalities differ"));
+        }
+        if self.definitions.len() > self.limits.max_instrument_versions()
+            || self.definitions.capacity() < self.limits.max_instrument_versions()
+        {
+            return Err(invariant(
+                "definition arena capacity or cardinality contradicts its maximum",
+            ));
+        }
+        for (asset_id, asset) in self.assets.iter() {
+            if asset.asset_id != *asset_id || self.asset_codes.get(&asset.code) != Some(asset_id) {
+                return Err(invariant("asset identifier and code indexes disagree"));
+            }
+        }
+        for (code, asset_id) in self.asset_codes.iter() {
+            if self.assets.get(asset_id).map(|asset| asset.code) != Some(*code) {
+                return Err(invariant("asset code references inconsistent metadata"));
+            }
+        }
+
+        let mut covered = 0_usize;
+        for (instrument_id, series) in self.instruments.iter() {
+            let Some(series_end) = series.checked_end() else {
+                return Err(invariant("instrument version range overflows its index"));
+            };
+            if series.length == 0 || series_end > self.definitions.len() {
+                return Err(invariant(
+                    "instrument version range is empty or out of bounds",
+                ));
+            }
+            covered = covered
+                .checked_add(series.length)
+                .ok_or_else(|| invariant("instrument version cardinality overflowed"))?;
+            for (other_id, other) in self.instruments.iter() {
+                let Some(other_end) = other.checked_end() else {
+                    return Err(invariant("instrument version range overflows its index"));
+                };
+                if instrument_id != other_id && series.start < other_end && other.start < series_end
+                {
+                    return Err(invariant("instrument version ranges overlap"));
+                }
+            }
+            let versions = &self.definitions[series.start..series_end];
+            let first = versions[0];
+            if first.instrument_id() != *instrument_id {
+                return Err(invariant("instrument range key and definition disagree"));
+            }
+            for definition in versions {
+                if definition.instrument_id() != *instrument_id
+                    || !same_instrument_identity(first, *definition)
+                {
+                    return Err(invariant("instrument identity changes within one range"));
+                }
+                if !self.assets.contains_key(&definition.base_asset_id())
+                    || !self.assets.contains_key(&definition.quote_asset_id())
+                {
+                    return Err(invariant("instrument range references an unknown asset"));
+                }
+            }
+            for pair in versions.windows(2) {
+                if pair[0].version() >= pair[1].version()
+                    || pair[0].effective_from() >= pair[1].effective_from()
+                {
+                    return Err(invariant("instrument history is not strictly monotonic"));
+                }
+            }
+        }
+        if covered != self.definitions.len() {
+            return Err(invariant(
+                "instrument ranges do not cover the definition arena exactly",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for InstrumentCatalog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn reserve_catalog_map<K, V>(
+    maximum: usize,
+    resource: InstrumentCatalogResource,
+) -> Result<BoundedHashMap<K, V>, InstrumentCatalogConstructionError>
+where
+    K: Eq + Hash,
+{
+    BoundedHashMap::try_new(maximum)
+        .map_err(|_| InstrumentCatalogConstructionError::ReservationFailed { resource, maximum })
+}
+
+fn catalog_hash_status<K, V>(map: &BoundedHashMap<K, V>) -> InstrumentCatalogHashIndexStatus
+where
+    K: Eq + Hash,
+{
+    InstrumentCatalogHashIndexStatus {
+        configured_entries: map.maximum(),
+        allocated_entries: map.capacity(),
+        initialized_buckets: map.bucket_count(),
+        occupied_entries: map.len(),
+    }
+}
+
+fn same_instrument_identity(left: InstrumentDefinition, right: InstrumentDefinition) -> bool {
+    left.symbol() == right.symbol()
+        && left.kind() == right.kind()
+        && left.base_asset_id() == right.base_asset_id()
+        && left.quote_asset_id() == right.quote_asset_id()
+}
+
+const fn invariant(message: &'static str) -> InstrumentCatalogInvariantViolation {
+    InstrumentCatalogInvariantViolation(message)
 }
 
 fn validate_text(field: &'static str, bytes: &[u8], maximum: usize) -> Result<(), InstrumentError> {
@@ -981,4 +1542,47 @@ fn validate_text(field: &'static str, bytes: &[u8], maximum: usize) -> Result<()
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::domain::InstrumentId;
+
+    use super::{InstrumentCatalog, InstrumentCatalogLimitsSpec, InstrumentSeries};
+
+    #[test]
+    fn catalog_validation_detects_lost_definition_reservation() {
+        let mut catalog = InstrumentCatalog::try_with_limits(InstrumentCatalogLimitsSpec {
+            max_assets: 1,
+            max_instruments: 1,
+            max_instrument_versions: 1,
+        })
+        .unwrap();
+        catalog.definitions.shrink_to_fit();
+        assert_eq!(
+            catalog.validate().unwrap_err().message(),
+            "definition arena capacity or cardinality contradicts its maximum"
+        );
+    }
+
+    #[test]
+    fn catalog_validation_reports_overflowing_range_without_panicking() {
+        let mut catalog = InstrumentCatalog::try_with_limits(InstrumentCatalogLimitsSpec {
+            max_assets: 1,
+            max_instruments: 1,
+            max_instrument_versions: 1,
+        })
+        .unwrap();
+        catalog.instruments.insert(
+            InstrumentId::new(1).unwrap(),
+            InstrumentSeries {
+                start: usize::MAX,
+                length: 2,
+            },
+        );
+        assert_eq!(
+            catalog.validate().unwrap_err().message(),
+            "instrument version range overflows its index"
+        );
+    }
 }

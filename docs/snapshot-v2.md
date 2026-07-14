@@ -208,16 +208,26 @@ A matching checkpoint is accepted structurally only when:
    revisions and exact cancellation/completion grammar;
 8. reconstruction produces valid FIFO links, price-level aggregates, accepted-
    order membership, and an uncrossed book.
-9. restoration under caller-selected `OrderBookLimits` proves retained command,
-   accepted-ID, account-control, active-order, active-account, and per-side occupied-level
-   cardinalities fit before allocating live indexes.
+9. restoration under caller-selected `OrderBookLimits` proves retained command
+   and event totals, per-report events, accepted-ID, account-control,
+   active-order, active-account, and per-side occupied-level cardinalities fit
+   before allocating live indexes and the retained-event arena.
 
-`OrderBook::checkpoint` first audits the live structure, captures the image,
-then independently replays every retained command and requires every report and
-the complete resulting `OrderBook` to equal live state. This capture-time replay
+`OrderBook::capture_checkpoint_candidate` first audits the live structure,
+captures the image at one completed-report boundary, derives accepted-order,
+account-control, trading-state, and event/trade-counter lineage from history,
+and requires it to equal live semantics. The resulting
+`OrderBookCheckpointCapture` has no stable codec or snapshot implementation.
+Its consuming `verify` transition independently replays every retained command,
+requires every report, and compares a fresh canonical projection with the
+candidate before returning `OrderBookCheckpoint`. `OrderBook::checkpoint`
+invokes both phases synchronously. The durable layer can instead synchronize
+the represented WAL prefix, hand off an origin/epoch-bound candidate, and later
+accept only the verified typestate from the same open shard before cutover. This typestate boundary
 prevents publication of a structurally valid image that contradicts its own
-history. Read-time decoding performs the structural checks above; it does not
-repeat prefix matching. The envelope checksum detects accidental image changes.
+history while permitting a direct-book caller to move replay verification to
+another thread. Read-time decoding performs the structural checks above; it
+does not repeat prefix matching. The envelope checksum detects accidental image changes.
 An actor able to rewrite both image and checksum remains outside the authenticity
 model under A14, A39, and A40.
 
@@ -368,19 +378,28 @@ uses `O(W + C + O log P + suffix matching work)` time. It does not perform the
 matching transitions for the first `C` commands. Memory remains
 `O(min(C,C_max) + O + P + S)` because exact retries and never-reusable accepted
 order IDs retain complete history only through the finite generation bounds
-under A9/A39/A46. Capture performs one independent complete-history replay
-plus `O(O + P)` structural audit synchronously under exclusive shard ownership.
-These are cold-path costs, but they create an `O(C)` capture pause until a
-generation-fenced immutable/COW handoff is implemented and verified.
+under A9/A39/A46. Direct `OrderBook` callers may capture a nonencodable
+candidate under exclusive access and move complete-history replay to another
+thread; canonical row copying and structural/lineage audit remain
+history-dependent writer work. `DurableOrderBook` first synchronizes the exact
+represented WAL prefix, then supports the same off-thread replay. Verified
+publication is accepted after ordinary suffix growth only through the same open
+shard and unchanged physical-cutover epoch. Reopen or cutover rejects the
+handle; asynchronous prefix retirement remains unavailable because it requires
+crash-consistent suffix migration.
 
 ## Durable-risk checkpoint recovery
 
 `DurableRiskOrderBook::write_checkpoint` rejects poisoned state and path
 conflicts, synchronizes the WAL, captures canonical matching/account state,
-derives and cross-checks reservations, independently replays the complete
-history through the coupled risk/matching state machine, and publishes only an
-exact live-state image. For an uncut WAL, `open_with_checkpoint` and
-`open_segmented_with_checkpoint`:
+derives and cross-checks reservations, and proves direct/live equality without
+history replay. Its consuming verifier independently replays the complete
+history through the coupled risk/matching state machine before releasing the
+only snapshot-capable checkpoint type. The durable capture is bound to one open
+shard and physical-cutover epoch; verified standalone publication accepts an
+append-only suffix but rejects another shard, reopen, or successful cutover.
+The synchronous method composes these stages. For an uncut WAL,
+`open_with_checkpoint` and `open_segmented_with_checkpoint`:
 
 1. acquire WAL ownership and complete physical recovery;
 2. prove the checkpoint's `F`, `M`, definition, and canonical immutable profile
@@ -406,9 +425,11 @@ WAL.
 For `W` verified WAL bytes across `S` segments, `C` retained checkpoint
 commands, `O` active orders over `P` price levels, `A` accounts, and `N` suffix
 commands, open uses `O(W + C + O log P + A + suffix matching/risk work)` time
-and `O(C + O + P + A + S)` memory. Capture performs one complete coupled replay
-plus structural and exposure audits synchronously under exclusive shard
-ownership. It therefore has an `O(C)` admission pause and retains `O(C)`
+and `O(C + O + P + A + S)` memory. Writer-side capture performs structural and
+command-derived lineage audits, account sorting, and direct coupled
+reconstruction, but no matching/risk history transitions. Complete replay may
+run off-thread while the serialized source appends a suffix. The writer pause
+and worker memory remain history-dependent and the checkpoint retains `O(C)`
 history. Uncut recovery scans `O(W)` bytes; anchored recovery in either physical
 layout replaces that term with the compacted suffix bytes. The finite
 matching limits bound current in-process history but no automatic shard
@@ -440,19 +461,22 @@ Uncut recovery retains and scans the complete WAL. If `W` is
 verified WAL bytes, `S` physical segments, `R` checkpoint records, and `N` WAL
 records after the checkpoint, open remains `O(W + R + N)` time. The segmented
 reader uses `O(S)` descriptors and one bounded frame payload; the restored
-ledger and checkpoint payload require state proportional to retained balances
-and complete checkpoint history. Snapshot construction and validation are
-linear in retained balances and record/entry/posting history, apart from
-logarithmic ordered-map/set factors inside accounting validation.
+ledger is limited by the selected `LedgerLimits` balance/transaction/reversal/
+record/posting envelope. The decoded checkpoint payload still requires memory
+proportional to its declared retained balances and complete history before that
+operator-selected restore envelope is applied. Snapshot construction and
+validation are linear in retained balances and record/entry/posting history,
+apart from diagnostic ordered-map factors.
 
 Version 2 checkpoint payloads still retain complete semantic history. Version
 3 WAL cutover in either physical layout removes prefix bytes from subsequent
 WAL scans and disk occupancy while preserving that history in the selected checkpoint.
-Consequently this establishes bounded physical WAL suffix recovery only under
-the selected snapshot payload limit; it does not establish bounded ledger
-checkpoint memory, bounded retained audit/idempotency history, semantic
-generation rollover, or external archival continuity. Those require separately
-fenced lifecycle and external audit/idempotency proofs.
+Live retained cardinality and checkpoints captured from it are finite under
+`LedgerLimits`; the independent snapshot payload limit also bounds accepted
+wire bytes. This does not pool or preallocate checkpoint capture/decode memory,
+provide semantic generation rollover, or prove external archival and
+idempotency continuity. Those require separately fenced lifecycle and external
+audit/idempotency proofs.
 
 ## Primary-source provenance
 

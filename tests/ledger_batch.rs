@@ -89,9 +89,47 @@ fn batch_is_one_idempotent_multi_asset_event_with_canonical_transaction_order() 
 
     let checkpoint = ledger.checkpoint().unwrap();
     let decoded = quotick::ledger::LedgerCheckpoint::decode(&checkpoint.encode().unwrap()).unwrap();
-    let mut restored = Ledger::from_checkpoint(decoded).unwrap();
+    let mut restored = Ledger::from_checkpoint(&decoded).unwrap();
     assert!(restored.post_batch(batch).unwrap().replayed);
     restored.validate().unwrap();
+}
+
+#[test]
+fn immutable_entry_batch_checkpoint_and_restore_clones_share_storage() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<JournalEntry>();
+    assert_send_sync::<LedgerBatch>();
+    assert_send_sync::<LedgerRecord>();
+
+    let first = transfer(1, 100, 10);
+    let first_clone = first.clone();
+    assert!(first.shares_posting_storage_with(&first_clone));
+
+    let second = transfer(2, 50, 11);
+    let batch = LedgerBatch::new(vec![first, second]).unwrap();
+    let batch_clone = batch.clone();
+    assert!(batch.shares_entry_storage_with(&batch_clone));
+    assert!(batch.entries()[0].shares_posting_storage_with(&first_clone));
+
+    let mut ledger = Ledger::new();
+    ledger.post_batch(batch.clone()).unwrap();
+    let Some(LedgerRecord::Batch(live_record)) = ledger.record(1) else {
+        panic!("ledger record must retain the committed batch");
+    };
+    assert!(live_record.shares_entry_storage_with(&batch));
+
+    let checkpoint = ledger.checkpoint().unwrap();
+    let LedgerRecord::Batch(checkpoint_record) = &checkpoint.records()[0] else {
+        panic!("checkpoint must retain the committed batch");
+    };
+    assert!(checkpoint_record.shares_entry_storage_with(&batch));
+    assert!(checkpoint_record.entries()[0].shares_posting_storage_with(&first_clone));
+
+    let restored = Ledger::from_checkpoint(&checkpoint).unwrap();
+    let Some(LedgerRecord::Batch(restored_record)) = restored.record(1) else {
+        panic!("restored record must retain the checkpoint batch");
+    };
+    assert!(restored_record.shares_entry_storage_with(checkpoint_record));
 }
 
 #[test]

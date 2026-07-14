@@ -741,7 +741,7 @@ impl DurableCallAuctionEngine {
         {
             Ok(value) => value,
             Err(error) => {
-                self.poisoned = true;
+                self.poisoned = checkpoint_failure_requires_poison(&error);
                 return Err(DurableCallAuctionError::Checkpoint(error));
             }
         };
@@ -780,7 +780,7 @@ impl DurableCallAuctionEngine {
         {
             Ok(value) => value,
             Err(error) => {
-                self.poisoned = true;
+                self.poisoned = checkpoint_failure_requires_poison(&error);
                 return Err(DurableCallAuctionError::Checkpoint(error));
             }
         };
@@ -1180,7 +1180,7 @@ impl DurableCallAuctionRiskEngine {
         ) {
             Ok(value) => value,
             Err(error) => {
-                self.poisoned = true;
+                self.poisoned = risk_checkpoint_failure_requires_poison(&error);
                 return Err(DurableCallAuctionError::RiskCheckpoint(error));
             }
         };
@@ -1219,7 +1219,7 @@ impl DurableCallAuctionRiskEngine {
         ) {
             Ok(value) => value,
             Err(error) => {
-                self.poisoned = true;
+                self.poisoned = risk_checkpoint_failure_requires_poison(&error);
                 return Err(DurableCallAuctionError::RiskCheckpoint(error));
             }
         };
@@ -1272,6 +1272,14 @@ impl DurableCallAuctionRiskEngine {
         }
         self.journal.close().map_err(Into::into)
     }
+}
+
+const fn checkpoint_failure_requires_poison(error: &CallAuctionCheckpointError) -> bool {
+    !error.is_operational_failure()
+}
+
+const fn risk_checkpoint_failure_requires_poison(error: &CallAuctionRiskCheckpointError) -> bool {
+    !error.is_operational_failure()
 }
 
 struct OpenedAuctionJournal {
@@ -1443,10 +1451,11 @@ fn replay_auction_suffix(
         if engine.is_none() {
             engine = Some(CallAuctionEngine::from_checkpoint_with_limits(
                 checkpoint
-                    .take()
+                    .as_ref()
                     .expect("first suffix frame follows a checkpoint"),
                 limits,
             )?);
+            checkpoint = None;
         }
         if replay_frame(
             engine
@@ -1468,7 +1477,7 @@ fn replay_auction_suffix(
             });
         }
         engine = Some(CallAuctionEngine::from_checkpoint_with_limits(
-            value, limits,
+            &value, limits,
         )?);
     }
     Ok(AuctionReplay {
@@ -2053,4 +2062,48 @@ fn validate_auction_risk_checkpoint_prefix_frame(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod checkpoint_failure_tests {
+    use super::{checkpoint_failure_requires_poison, risk_checkpoint_failure_requires_poison};
+    use crate::auction_engine::{
+        CallAuctionCheckpointError, CallAuctionCheckpointResource,
+        CallAuctionEngineConstructionError,
+    };
+    use crate::auction_risk::{
+        CallAuctionRiskCheckpointError, CallAuctionRiskCheckpointResource,
+        CallAuctionRiskConstructionError,
+    };
+
+    #[test]
+    fn resource_pressure_is_retryable_but_semantic_failure_requires_poison() {
+        let resource = CallAuctionCheckpointError::ResourceReservationFailed {
+            resource: CallAuctionCheckpointResource::CaptureHistory,
+            maximum: usize::MAX,
+        };
+        let construction = CallAuctionCheckpointError::Construction(
+            CallAuctionEngineConstructionError::CommandHistoryReservationFailed,
+        );
+        assert!(!checkpoint_failure_requires_poison(&resource));
+        assert!(!checkpoint_failure_requires_poison(&construction));
+        assert!(checkpoint_failure_requires_poison(
+            &CallAuctionCheckpointError::Invalid("semantic contradiction".into())
+        ));
+
+        let accounts = CallAuctionRiskCheckpointError::ResourceReservationFailed {
+            resource: CallAuctionRiskCheckpointResource::CaptureAccounts,
+            maximum: usize::MAX,
+        };
+        let nested = CallAuctionRiskCheckpointError::Auction(resource);
+        let risk_construction = CallAuctionRiskCheckpointError::Construction(
+            CallAuctionRiskConstructionError::AccountReservationFailed,
+        );
+        assert!(!risk_checkpoint_failure_requires_poison(&accounts));
+        assert!(!risk_checkpoint_failure_requires_poison(&nested));
+        assert!(!risk_checkpoint_failure_requires_poison(&risk_construction));
+        assert!(risk_checkpoint_failure_requires_poison(
+            &CallAuctionRiskCheckpointError::Invalid("semantic contradiction".into())
+        ));
+    }
 }

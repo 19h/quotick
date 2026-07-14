@@ -4,23 +4,331 @@
 //! event sequence. Absolute market/limit aggregates permit deterministic gap
 //! recovery without exposing order or account identity. Full-depth snapshots
 //! establish an atomic replica repair boundary.
+//!
+//! Publisher order/uncross mirrors, ordered limit depth, replica active/standby
+//! depth, and replica batch-capacity scratch are finitely bounded and completely
+//! reserved before usable state exists. Incremental state mutation never grows,
+//! shrinks, or rehashes authoritative storage.
 
-use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::hash::Hash;
 
 use crate::auction::{AuctionClearing, AuctionOrderConstraint};
 use crate::auction_book::{
-    CallAuctionCancellation, CallAuctionLevelSnapshot, CallAuctionOrderSnapshot, CallAuctionTrade,
+    CallAuctionBookLimits, CallAuctionCancellation, CallAuctionLevelSnapshot,
+    CallAuctionOrderSnapshot, CallAuctionTrade,
 };
 use crate::auction_engine::{
-    CallAuctionCommand, CallAuctionCommandOutcome, CallAuctionEngine, CallAuctionEvent,
-    CallAuctionEventKind, CallAuctionExecutionReport, CallAuctionPhase, CallAuctionPhaseSnapshot,
+    CallAuctionCommand, CallAuctionCommandOutcome, CallAuctionEngine, CallAuctionEngineLimits,
+    CallAuctionEvent, CallAuctionEventKind, CallAuctionExecutionReport, CallAuctionPhase,
+    CallAuctionPhaseSnapshot,
 };
+use crate::bounded_hash::{BoundedHashError, BoundedHashMap};
 use crate::domain::{
     AccountId, AuctionId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
     TimestampNs, TradeId,
 };
+use crate::indexed_avl::IndexedAvlMap;
 use crate::instrument::InstrumentDefinition;
+
+type AuctionDepthMap = IndexedAvlMap<Price, Aggregate>;
+
+/// One finite call-auction market-data state or preparation resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallAuctionMarketDataResource {
+    /// Active order identities mirrored by a publisher.
+    TrackedOrders,
+    /// Occupied bid limit prices.
+    BidPriceLevels,
+    /// Occupied ask limit prices.
+    AskPriceLevels,
+    /// Updates emitted or consumed by one command batch.
+    BatchUpdates,
+    /// Source-order quantities retained while validating one uncross.
+    UncrossSourceOrders,
+    /// Unique limit-level identities used for nonmutating replica preflight.
+    BatchLevelIdentities,
+}
+
+impl fmt::Display for CallAuctionMarketDataResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TrackedOrders => "tracked orders",
+            Self::BidPriceLevels => "bid price levels",
+            Self::AskPriceLevels => "ask price levels",
+            Self::BatchUpdates => "batch updates",
+            Self::UncrossSourceOrders => "uncross source orders",
+            Self::BatchLevelIdentities => "batch level identities",
+        })
+    }
+}
+
+/// Raw construction values for bounded call-auction public state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionMarketDataLimitsSpec {
+    /// Maximum active orders mirrored by a publisher.
+    pub max_active_orders: usize,
+    /// Maximum occupied limit prices independently on each side.
+    pub max_price_levels_per_side: usize,
+    /// Maximum updates in one auction-command publication batch.
+    pub max_batch_updates: usize,
+}
+
+impl Default for CallAuctionMarketDataLimitsSpec {
+    fn default() -> Self {
+        Self {
+            max_active_orders: CallAuctionBookLimits::DEFAULT_MAX_ACTIVE_ORDERS,
+            max_price_levels_per_side: CallAuctionBookLimits::DEFAULT_MAX_PRICE_LEVELS_PER_SIDE,
+            max_batch_updates: CallAuctionBookLimits::DEFAULT_MAX_ACTIVE_ORDERS * 2 + 1,
+        }
+    }
+}
+
+/// Invalid finite call-auction market-data policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallAuctionMarketDataLimitsError {
+    /// Active-order maximum is zero.
+    ZeroActiveOrders,
+    /// Per-side limit-price maximum is zero.
+    ZeroPriceLevels,
+    /// Per-batch update maximum is zero.
+    ZeroBatchUpdates,
+    /// More prices per side than total active orders were configured.
+    PriceLevelsExceedActiveOrders,
+    /// One maximum-size uncross report cannot fit in a publication batch.
+    BatchUpdatesBelowUncrossMaximum,
+    /// A derived maximum cannot be represented by `usize`.
+    DerivedBoundOverflow,
+}
+
+impl fmt::Display for CallAuctionMarketDataLimitsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ZeroActiveOrders => "call-auction market-data active-order limit is zero",
+            Self::ZeroPriceLevels => "call-auction market-data per-side price-level limit is zero",
+            Self::ZeroBatchUpdates => "call-auction market-data batch-update limit is zero",
+            Self::PriceLevelsExceedActiveOrders => {
+                "call-auction market-data price-level limit exceeds its active-order limit"
+            }
+            Self::BatchUpdatesBelowUncrossMaximum => {
+                "call-auction market-data batch limit cannot hold a maximum-size uncross"
+            }
+            Self::DerivedBoundOverflow => {
+                "call-auction market-data derived resource bound overflows usize"
+            }
+        })
+    }
+}
+
+impl std::error::Error for CallAuctionMarketDataLimitsError {}
+
+/// Validated immutable finite resource policy for call-auction public state.
+#[allow(
+    clippy::struct_field_names,
+    reason = "the max prefix distinguishes configured limits from occupancy"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionMarketDataLimits {
+    max_active_orders: usize,
+    max_price_levels_per_side: usize,
+    max_batch_updates: usize,
+}
+
+impl CallAuctionMarketDataLimits {
+    /// Validates one call-auction public-state resource policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionMarketDataLimitsError`] for a zero, contradictory,
+    /// or arithmetically unrepresentable envelope.
+    pub const fn new(
+        spec: CallAuctionMarketDataLimitsSpec,
+    ) -> Result<Self, CallAuctionMarketDataLimitsError> {
+        if spec.max_active_orders == 0 {
+            return Err(CallAuctionMarketDataLimitsError::ZeroActiveOrders);
+        }
+        if spec.max_price_levels_per_side == 0 {
+            return Err(CallAuctionMarketDataLimitsError::ZeroPriceLevels);
+        }
+        if spec.max_batch_updates == 0 {
+            return Err(CallAuctionMarketDataLimitsError::ZeroBatchUpdates);
+        }
+        if spec.max_price_levels_per_side > spec.max_active_orders {
+            return Err(CallAuctionMarketDataLimitsError::PriceLevelsExceedActiveOrders);
+        }
+        let Some(maximum_uncross_updates) = spec.max_active_orders.checked_mul(2) else {
+            return Err(CallAuctionMarketDataLimitsError::DerivedBoundOverflow);
+        };
+        let Some(maximum_uncross_updates) = maximum_uncross_updates.checked_add(1) else {
+            return Err(CallAuctionMarketDataLimitsError::DerivedBoundOverflow);
+        };
+        if spec.max_batch_updates < maximum_uncross_updates {
+            return Err(CallAuctionMarketDataLimitsError::BatchUpdatesBelowUncrossMaximum);
+        }
+        Ok(Self {
+            max_active_orders: spec.max_active_orders,
+            max_price_levels_per_side: spec.max_price_levels_per_side,
+            max_batch_updates: spec.max_batch_updates,
+        })
+    }
+
+    /// Derives the exact public-state envelope of one sequenced auction shard.
+    #[must_use]
+    pub const fn from_engine(limits: CallAuctionEngineLimits) -> Self {
+        Self {
+            max_active_orders: limits.book().max_active_orders(),
+            max_price_levels_per_side: limits.book().max_price_levels_per_side(),
+            max_batch_updates: limits.max_report_events(),
+        }
+    }
+
+    /// Maximum publisher-mirrored active orders.
+    #[must_use]
+    pub const fn max_active_orders(self) -> usize {
+        self.max_active_orders
+    }
+
+    /// Maximum occupied limit prices independently on each side.
+    #[must_use]
+    pub const fn max_price_levels_per_side(self) -> usize {
+        self.max_price_levels_per_side
+    }
+
+    /// Maximum updates in one command batch.
+    #[must_use]
+    pub const fn max_batch_updates(self) -> usize {
+        self.max_batch_updates
+    }
+
+    /// Returns the corresponding raw specification.
+    #[must_use]
+    pub const fn spec(self) -> CallAuctionMarketDataLimitsSpec {
+        CallAuctionMarketDataLimitsSpec {
+            max_active_orders: self.max_active_orders,
+            max_price_levels_per_side: self.max_price_levels_per_side,
+            max_batch_updates: self.max_batch_updates,
+        }
+    }
+}
+
+impl Default for CallAuctionMarketDataLimits {
+    fn default() -> Self {
+        Self::new(CallAuctionMarketDataLimitsSpec::default())
+            .expect("default call-auction market-data limits must be valid")
+    }
+}
+
+impl TryFrom<CallAuctionMarketDataLimitsSpec> for CallAuctionMarketDataLimits {
+    type Error = CallAuctionMarketDataLimitsError;
+
+    fn try_from(spec: CallAuctionMarketDataLimitsSpec) -> Result<Self, Self::Error> {
+        Self::new(spec)
+    }
+}
+
+/// Failure before a call-auction publisher or replica owns usable state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallAuctionMarketDataConstructionError {
+    /// The selected finite policy is invalid.
+    InvalidLimits(CallAuctionMarketDataLimitsError),
+    /// A publisher envelope is smaller than its authoritative engine.
+    LimitsBelowSource {
+        /// Insufficient resource.
+        resource: CallAuctionMarketDataResource,
+        /// Selected maximum.
+        selected: usize,
+        /// Required source maximum.
+        required: usize,
+    },
+    /// Complete constructor-owned storage could not be reserved.
+    ReservationFailed {
+        /// Resource whose layout could not be represented or allocated.
+        resource: CallAuctionMarketDataResource,
+        /// Requested semantic maximum.
+        maximum: usize,
+    },
+    /// The source engine failed bootstrap validation.
+    Source(CallAuctionMarketDataError),
+}
+
+impl fmt::Display for CallAuctionMarketDataConstructionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLimits(error) => error.fmt(formatter),
+            Self::LimitsBelowSource {
+                resource,
+                selected,
+                required,
+            } => write!(
+                formatter,
+                "call-auction market-data {resource} limit {selected} is below source requirement {required}"
+            ),
+            Self::ReservationFailed { resource, maximum } => write!(
+                formatter,
+                "failed to reserve call-auction market-data {resource} through {maximum} entries"
+            ),
+            Self::Source(error) => write!(
+                formatter,
+                "call-auction market-data source is invalid: {error}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CallAuctionMarketDataConstructionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidLimits(error) => Some(error),
+            Self::Source(error) => Some(error),
+            Self::LimitsBelowSource { .. } | Self::ReservationFailed { .. } => None,
+        }
+    }
+}
+
+impl From<CallAuctionMarketDataLimitsError> for CallAuctionMarketDataConstructionError {
+    fn from(error: CallAuctionMarketDataLimitsError) -> Self {
+        Self::InvalidLimits(error)
+    }
+}
+
+/// Publisher/replica bounded hash layout identifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallAuctionMarketDataHashIndex {
+    /// Publisher active-order mirror.
+    TrackedOrders,
+    /// Publisher uncross-source scratch.
+    PublisherUncrossSources,
+    /// Replica batch level-capacity scratch.
+    ReplicaBatchLevels,
+}
+
+/// Allocation and occupancy telemetry for one bounded hash layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionMarketDataHashIndexStatus {
+    /// Configured semantic maximum.
+    pub configured_entries: usize,
+    /// Dense-entry allocation capacity.
+    pub allocated_entries: usize,
+    /// Initialized open-addressed bucket count.
+    pub initialized_buckets: usize,
+    /// Current occupied entries.
+    pub occupied_entries: usize,
+}
+
+/// Allocation, high-water, occupancy, and reuse telemetry for one limit-depth arena.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionMarketDataArenaStatus {
+    /// Configured semantic slot maximum.
+    pub configured_slots: usize,
+    /// Allocated slot capacity.
+    pub allocated_slots: usize,
+    /// Slots initialized at least once.
+    pub initialized_slots: usize,
+    /// Currently occupied slots.
+    pub occupied_slots: usize,
+    /// Initialized vacant slots available for immediate reuse.
+    pub reusable_slots: usize,
+}
 
 /// Absolute public state for one market or limit constraint on one side.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -462,8 +770,17 @@ pub enum CallAuctionMarketDataError {
     SourceDivergence(&'static str),
     /// Checked aggregate or sequence arithmetic overflowed.
     ArithmeticOverflow,
-    /// Publication scratch or mirror storage could not be reserved.
-    CapacityReservationFailed(&'static str),
+    /// A finite state or batch cardinality would exceed its selected maximum.
+    CapacityExceeded {
+        /// Exhausted resource.
+        resource: CallAuctionMarketDataResource,
+        /// Selected maximum.
+        maximum: usize,
+        /// Cardinality the operation attempted to establish.
+        attempted: usize,
+    },
+    /// Caller-owned batch, snapshot, or depth output could not be reserved.
+    PreparationAllocationFailed(CallAuctionMarketDataResource),
     /// A previous partial publication or replica failure requires a snapshot.
     Poisoned,
 }
@@ -496,12 +813,18 @@ impl fmt::Display for CallAuctionMarketDataError {
             Self::ArithmeticOverflow => {
                 formatter.write_str("auction market-data arithmetic overflow")
             }
-            Self::CapacityReservationFailed(resource) => {
-                write!(
-                    formatter,
-                    "could not reserve auction market-data {resource}"
-                )
-            }
+            Self::CapacityExceeded {
+                resource,
+                maximum,
+                attempted,
+            } => write!(
+                formatter,
+                "call-auction market-data {resource} capacity {maximum} cannot hold {attempted} entries"
+            ),
+            Self::PreparationAllocationFailed(resource) => write!(
+                formatter,
+                "could not reserve call-auction market-data {resource} output"
+            ),
             Self::Poisoned => formatter.write_str("auction market-data state is poisoned"),
         }
     }
@@ -538,7 +861,6 @@ impl From<CallAuctionOrderSnapshot> for TrackedOrder {
 
 #[derive(Debug, Default)]
 struct UncrossProgress {
-    sources: HashMap<OrderId, u64>,
     trade_count: u64,
     cancellation_count: u64,
     executed_quantity: u128,
@@ -549,15 +871,17 @@ struct UncrossProgress {
 /// Stateful adapter from private auction traces to anonymized public state.
 #[derive(Debug)]
 pub struct CallAuctionMarketDataPublisher {
+    limits: CallAuctionMarketDataLimits,
     instrument_id: InstrumentId,
     instrument_version: InstrumentVersion,
     phase: CallAuctionPhaseSnapshot,
     book_revision: u64,
     market_buy: Aggregate,
     market_sell: Aggregate,
-    bids: BTreeMap<Price, Aggregate>,
-    asks: BTreeMap<Price, Aggregate>,
-    orders: HashMap<OrderId, TrackedOrder>,
+    bids: AuctionDepthMap,
+    asks: AuctionDepthMap,
+    orders: BoundedHashMap<OrderId, TrackedOrder>,
+    uncross_sources: BoundedHashMap<OrderId, u64>,
     last_command_sequence: u64,
     last_event_sequence: u64,
     last_trade_id: Option<TradeId>,
@@ -569,40 +893,129 @@ impl CallAuctionMarketDataPublisher {
     ///
     /// # Errors
     ///
-    /// Returns [`CallAuctionMarketDataError::SourceDivergence`] if the engine's
-    /// private orders and maintained aggregate book disagree.
-    pub fn from_engine(engine: &CallAuctionEngine) -> Result<Self, CallAuctionMarketDataError> {
+    /// Returns [`CallAuctionMarketDataConstructionError`] if complete fixed
+    /// storage cannot be reserved or source bootstrap validation fails.
+    pub fn from_engine(
+        engine: &CallAuctionEngine,
+    ) -> Result<Self, CallAuctionMarketDataConstructionError> {
+        Self::construct(
+            engine,
+            CallAuctionMarketDataLimits::from_engine(engine.limits()),
+        )
+    }
+
+    /// Bootstraps under an explicit finite envelope covering the source engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionMarketDataConstructionError`] for an invalid or
+    /// undersized policy, reservation failure, or source divergence.
+    pub fn try_from_engine_with_limits(
+        engine: &CallAuctionEngine,
+        spec: CallAuctionMarketDataLimitsSpec,
+    ) -> Result<Self, CallAuctionMarketDataConstructionError> {
+        let limits = CallAuctionMarketDataLimits::new(spec)?;
+        Self::construct(engine, limits)
+    }
+
+    fn construct(
+        engine: &CallAuctionEngine,
+        limits: CallAuctionMarketDataLimits,
+    ) -> Result<Self, CallAuctionMarketDataConstructionError> {
+        ensure_source_limits(limits, engine.limits())?;
         let definition = engine.book().definition();
-        let mut orders = HashMap::new();
-        orders
-            .try_reserve(engine.limits().book().max_active_orders())
-            .map_err(|_| CallAuctionMarketDataError::CapacityReservationFailed("order mirror"))?;
-        for order in engine.book().checkpoint_active_orders() {
-            orders.insert(order.order_id, order.into());
-        }
-        let publisher = Self {
+        let maximum_levels = limits.max_price_levels_per_side();
+        let mut publisher = Self {
+            limits,
             instrument_id: definition.instrument_id(),
             instrument_version: definition.version(),
             phase: engine.phase_snapshot(),
             book_revision: engine.book().state_revision(),
             market_buy: aggregate_market(engine, Side::Buy),
             market_sell: aggregate_market(engine, Side::Sell),
-            bids: aggregate_depth(engine, Side::Buy),
-            asks: aggregate_depth(engine, Side::Sell),
-            orders,
+            bids: try_depth_map(
+                maximum_levels,
+                CallAuctionMarketDataResource::BidPriceLevels,
+            )?,
+            asks: try_depth_map(
+                maximum_levels,
+                CallAuctionMarketDataResource::AskPriceLevels,
+            )?,
+            orders: try_hash_map(
+                limits.max_active_orders(),
+                CallAuctionMarketDataResource::TrackedOrders,
+            )?,
+            uncross_sources: try_hash_map(
+                limits.max_active_orders(),
+                CallAuctionMarketDataResource::UncrossSourceOrders,
+            )?,
             last_command_sequence: previous_sequence(
                 engine.next_command_sequence(),
                 "auction next command sequence is zero",
-            )?,
+            )
+            .map_err(CallAuctionMarketDataConstructionError::Source)?,
             last_event_sequence: previous_sequence(
                 engine.next_event_sequence(),
                 "auction next event sequence is zero",
-            )?,
-            last_trade_id: previous_trade_id(engine.book().next_trade_id())?,
+            )
+            .map_err(CallAuctionMarketDataConstructionError::Source)?,
+            last_trade_id: previous_trade_id(engine.book().next_trade_id())
+                .map_err(CallAuctionMarketDataConstructionError::Source)?,
             poisoned: false,
         };
-        publisher.validate_against(engine)?;
+
+        for level in engine.book().limit_depth_levels(Side::Buy) {
+            publisher.bids.insert(
+                level.price(),
+                Aggregate {
+                    quantity: level.quantity(),
+                    order_count: level.order_count(),
+                },
+            );
+        }
+        for level in engine.book().limit_depth_levels(Side::Sell) {
+            publisher.asks.insert(
+                level.price(),
+                Aggregate {
+                    quantity: level.quantity(),
+                    order_count: level.order_count(),
+                },
+            );
+        }
+        for order in engine.book().active_order_states() {
+            publisher.orders.insert(order.order_id, order.into());
+        }
+        publisher
+            .validate_against(engine)
+            .map_err(CallAuctionMarketDataConstructionError::Source)?;
         Ok(publisher)
+    }
+
+    /// Returns this publisher's immutable finite resource envelope.
+    #[must_use]
+    pub const fn limits(&self) -> CallAuctionMarketDataLimits {
+        self.limits
+    }
+
+    /// Returns fixed limit-price arena telemetry for one side.
+    #[must_use]
+    pub fn price_level_arena_status(&self, side: Side) -> CallAuctionMarketDataArenaStatus {
+        arena_status(self.levels(side))
+    }
+
+    /// Returns publisher hash telemetry, or `None` for replica-only scratch.
+    #[must_use]
+    pub fn hash_index_status(
+        &self,
+        index: CallAuctionMarketDataHashIndex,
+    ) -> Option<CallAuctionMarketDataHashIndexStatus> {
+        match index {
+            CallAuctionMarketDataHashIndex::TrackedOrders => Some(hash_status(&self.orders)),
+            CallAuctionMarketDataHashIndex::PublisherUncrossSources => {
+                Some(hash_status(&self.uncross_sources))
+            }
+            CallAuctionMarketDataHashIndex::ReplicaBatchLevels => None,
+        }
     }
 
     /// Returns the final published source-event sequence.
@@ -623,10 +1036,42 @@ impl CallAuctionMarketDataPublisher {
         self.poisoned
     }
 
-    /// Materializes a complete full-depth recovery image in `O(P)` time.
-    #[must_use]
-    pub fn snapshot(&self) -> CallAuctionMarketDataSnapshot {
-        CallAuctionMarketDataSnapshot {
+    /// Fallibly materializes a complete full-depth recovery image in `O(P)` time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionMarketDataError::PreparationAllocationFailed`]
+    /// before returning a partial image if either output vector cannot be reserved.
+    pub fn try_snapshot(
+        &self,
+    ) -> Result<CallAuctionMarketDataSnapshot, CallAuctionMarketDataError> {
+        let mut bids = Vec::new();
+        bids.try_reserve_exact(self.bids.len()).map_err(|_| {
+            CallAuctionMarketDataError::PreparationAllocationFailed(
+                CallAuctionMarketDataResource::BidPriceLevels,
+            )
+        })?;
+        for (&price, &aggregate) in self.bids.iter().rev() {
+            bids.push(level_from_aggregate(
+                Side::Buy,
+                AuctionOrderConstraint::Limit(price),
+                aggregate,
+            )?);
+        }
+        let mut asks = Vec::new();
+        asks.try_reserve_exact(self.asks.len()).map_err(|_| {
+            CallAuctionMarketDataError::PreparationAllocationFailed(
+                CallAuctionMarketDataResource::AskPriceLevels,
+            )
+        })?;
+        for (&price, &aggregate) in self.asks.iter() {
+            asks.push(level_from_aggregate(
+                Side::Sell,
+                AuctionOrderConstraint::Limit(price),
+                aggregate,
+            )?);
+        }
+        Ok(CallAuctionMarketDataSnapshot {
             instrument_id: self.instrument_id,
             instrument_version: self.instrument_version,
             as_of_sequence: self.last_event_sequence,
@@ -636,9 +1081,21 @@ impl CallAuctionMarketDataPublisher {
             last_trade_id: self.last_trade_id,
             market_buy: self.market_level(Side::Buy),
             market_sell: self.market_level(Side::Sell),
-            bids: self.limit_levels(Side::Buy),
-            asks: self.limit_levels(Side::Sell),
-        }
+            bids,
+            asks,
+        })
+    }
+
+    /// Materializes a complete full-depth image using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if output-vector allocation fails. Use [`Self::try_snapshot`]
+    /// when allocation failure must remain typed.
+    #[must_use]
+    pub fn snapshot(&self) -> CallAuctionMarketDataSnapshot {
+        self.try_snapshot()
+            .expect("call-auction market-data snapshot output allocation failed")
     }
 
     /// Publishes one complete auction command/report trace.
@@ -710,19 +1167,22 @@ impl CallAuctionMarketDataPublisher {
                 actual: report.command_sequence,
             });
         }
+        if report.events.len() > self.limits.max_batch_updates() {
+            return Err(CallAuctionMarketDataError::CapacityExceeded {
+                resource: CallAuctionMarketDataResource::BatchUpdates,
+                maximum: self.limits.max_batch_updates(),
+                attempted: report.events.len(),
+            });
+        }
 
         let mut updates = Vec::new();
         if updates.try_reserve_exact(report.events.len()).is_err() {
-            return self.fail(CallAuctionMarketDataError::CapacityReservationFailed(
-                "update batch",
+            return Err(CallAuctionMarketDataError::PreparationAllocationFailed(
+                CallAuctionMarketDataResource::BatchUpdates,
             ));
         }
         let mut uncross = UncrossProgress::default();
-        if uncross.sources.try_reserve(self.orders.len()).is_err() {
-            return self.fail(CallAuctionMarketDataError::CapacityReservationFailed(
-                "uncross source mirror",
-            ));
-        }
+        self.uncross_sources.clear();
         for event in report.events.iter().copied() {
             let expected = self
                 .last_event_sequence
@@ -755,6 +1215,7 @@ impl CallAuctionMarketDataPublisher {
             ));
         }
         self.last_command_sequence = report.command_sequence;
+        self.uncross_sources.clear();
         if let Err(error) = self.validate_against(engine) {
             return self.fail(error);
         }
@@ -801,11 +1262,11 @@ impl CallAuctionMarketDataPublisher {
                 "publisher sequence, phase, book revision, or trade state differs from the engine",
             ));
         }
-        let active = engine.book().checkpoint_active_orders();
+        let active = engine.book().active_order_states();
         if active.len() != self.orders.len()
             || active
-                .iter()
-                .any(|order| self.orders.get(&order.order_id).copied() != Some((*order).into()))
+                .into_iter()
+                .any(|order| self.orders.get(&order.order_id).copied() != Some(order.into()))
         {
             return Err(CallAuctionMarketDataError::SourceDivergence(
                 "publisher active-order mirror differs from the auction book",
@@ -813,11 +1274,59 @@ impl CallAuctionMarketDataPublisher {
         }
         if self.market_buy != aggregate_market(engine, Side::Buy)
             || self.market_sell != aggregate_market(engine, Side::Sell)
-            || self.bids != aggregate_depth(engine, Side::Buy)
-            || self.asks != aggregate_depth(engine, Side::Sell)
+            || !auction_depth_matches(&self.bids, engine.book().limit_depth_levels(Side::Buy))
+            || !auction_depth_matches(&self.asks, engine.book().limit_depth_levels(Side::Sell))
         {
             return Err(CallAuctionMarketDataError::SourceDivergence(
                 "publisher aggregate state differs from the auction book",
+            ));
+        }
+        self.validate_layouts()?;
+        Ok(())
+    }
+
+    fn validate_layouts(&self) -> Result<(), CallAuctionMarketDataError> {
+        let maximum_levels = self.limits.max_price_levels_per_side();
+        if self.bids.maximum() != maximum_levels
+            || self.asks.maximum() != maximum_levels
+            || self.orders.maximum() != self.limits.max_active_orders()
+            || self.uncross_sources.maximum() != self.limits.max_active_orders()
+            || !self.uncross_sources.is_empty()
+            || self.bids.allocation_capacity() < maximum_levels
+            || self.asks.allocation_capacity() < maximum_levels
+        {
+            return Err(CallAuctionMarketDataError::SourceDivergence(
+                "auction publisher fixed storage contradicts its configured limits",
+            ));
+        }
+        self.bids.validate().map_err(|_| {
+            CallAuctionMarketDataError::SourceDivergence(
+                "auction publisher bid arena is structurally invalid",
+            )
+        })?;
+        self.asks.validate().map_err(|_| {
+            CallAuctionMarketDataError::SourceDivergence(
+                "auction publisher ask arena is structurally invalid",
+            )
+        })?;
+        self.orders.validate_layout().map_err(|_| {
+            CallAuctionMarketDataError::SourceDivergence(
+                "auction publisher order hash layout is invalid",
+            )
+        })?;
+        self.uncross_sources.validate_layout().map_err(|_| {
+            CallAuctionMarketDataError::SourceDivergence(
+                "auction publisher uncross scratch layout is invalid",
+            )
+        })?;
+        if self
+            .bids
+            .iter()
+            .chain(self.asks.iter())
+            .any(|(_, aggregate)| aggregate.quantity == 0 || aggregate.order_count == 0)
+        {
+            return Err(CallAuctionMarketDataError::SourceDivergence(
+                "auction publisher retains an empty limit aggregate",
             ));
         }
         Ok(())
@@ -948,6 +1457,14 @@ impl CallAuctionMarketDataPublisher {
                 "accepted order contradicts its command or collection state",
             ));
         }
+        if self.orders.len() >= self.limits.max_active_orders() {
+            return Err(CallAuctionMarketDataError::CapacityExceeded {
+                resource: CallAuctionMarketDataResource::TrackedOrders,
+                maximum: self.limits.max_active_orders(),
+                attempted: self.orders.len().saturating_add(1),
+            });
+        }
+        self.preflight_new_limit_level(order.side, order.constraint)?;
         self.orders.insert(order.order_id, order.into());
         let level = self.add_level(order.side, order.constraint, order.quantity.lots())?;
         self.book_revision = self
@@ -1030,8 +1547,8 @@ impl CallAuctionMarketDataPublisher {
                 "auction trade identities or owners contradict tracked state",
             ));
         }
-        remember_source(uncross, trade.buy_order_id(), buy_order.leaves)?;
-        remember_source(uncross, trade.sell_order_id(), sell_order.leaves)?;
+        self.remember_source(trade.buy_order_id(), buy_order.leaves)?;
+        self.remember_source(trade.sell_order_id(), sell_order.leaves)?;
         let buy_change = self.decrement_order(trade.buy_order_id(), trade.quantity().lots())?;
         let sell_change = self.decrement_order(trade.sell_order_id(), trade.quantity().lots())?;
         uncross.trade_count = uncross
@@ -1086,8 +1603,11 @@ impl CallAuctionMarketDataPublisher {
                 "auction remainder contradicts tracked state",
             ));
         }
-        remember_source(uncross, cancellation.order_id(), tracked.leaves)?;
-        let source_quantity = uncross.sources[&cancellation.order_id()];
+        self.remember_source(cancellation.order_id(), tracked.leaves)?;
+        let source_quantity = *self
+            .uncross_sources
+            .get(&cancellation.order_id())
+            .expect("remembered uncross source must remain present");
         if source_quantity.checked_sub(cancellation.quantity().lots())
             != Some(cancellation.executed_quantity_lots())
         {
@@ -1168,7 +1688,7 @@ impl CallAuctionMarketDataPublisher {
         constraint: AuctionOrderConstraint,
         quantity: u64,
     ) -> Result<CallAuctionMarketDataLevel, CallAuctionMarketDataError> {
-        let aggregate = self.aggregate_mut(side, constraint);
+        let mut aggregate = self.aggregate_value(side, constraint);
         aggregate.quantity = aggregate
             .quantity
             .checked_add(u128::from(quantity))
@@ -1177,7 +1697,8 @@ impl CallAuctionMarketDataPublisher {
             .order_count
             .checked_add(1)
             .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
-        level_from_aggregate(side, constraint, *aggregate)
+        self.set_aggregate(side, constraint, aggregate)?;
+        level_from_aggregate(side, constraint, aggregate)
     }
 
     fn decrement_order(
@@ -1194,22 +1715,19 @@ impl CallAuctionMarketDataPublisher {
             ));
         }
         let removes_order = quantity == order.leaves;
-        let result = {
-            let aggregate = self.aggregate_mut(order.side, order.constraint);
-            aggregate.quantity = aggregate.quantity.checked_sub(u128::from(quantity)).ok_or(
+        let mut result = self.aggregate_value(order.side, order.constraint);
+        result.quantity = result.quantity.checked_sub(u128::from(quantity)).ok_or(
+            CallAuctionMarketDataError::TraceMismatch(
+                "auction aggregate underflowed during execution",
+            ),
+        )?;
+        if removes_order {
+            result.order_count = result.order_count.checked_sub(1).ok_or(
                 CallAuctionMarketDataError::TraceMismatch(
-                    "auction aggregate underflowed during execution",
+                    "auction aggregate order count underflowed",
                 ),
             )?;
-            if removes_order {
-                aggregate.order_count = aggregate.order_count.checked_sub(1).ok_or(
-                    CallAuctionMarketDataError::TraceMismatch(
-                        "auction aggregate order count underflowed",
-                    ),
-                )?;
-            }
-            *aggregate
-        };
+        }
         if removes_order {
             self.orders.remove(&order_id);
         } else {
@@ -1218,7 +1736,7 @@ impl CallAuctionMarketDataPublisher {
                 .expect("checked auction order exists")
                 .leaves -= quantity;
         }
-        self.remove_empty_level(order.side, order.constraint, result);
+        self.set_aggregate(order.side, order.constraint, result)?;
         level_from_aggregate(order.side, order.constraint, result)
     }
 
@@ -1255,37 +1773,90 @@ impl CallAuctionMarketDataPublisher {
         Ok(())
     }
 
-    fn aggregate_mut(&mut self, side: Side, constraint: AuctionOrderConstraint) -> &mut Aggregate {
+    fn aggregate_value(&self, side: Side, constraint: AuctionOrderConstraint) -> Aggregate {
         match (side, constraint) {
-            (Side::Buy, AuctionOrderConstraint::Market) => &mut self.market_buy,
-            (Side::Sell, AuctionOrderConstraint::Market) => &mut self.market_sell,
+            (Side::Buy, AuctionOrderConstraint::Market) => self.market_buy,
+            (Side::Sell, AuctionOrderConstraint::Market) => self.market_sell,
             (Side::Buy, AuctionOrderConstraint::Limit(price)) => {
-                self.bids.entry(price).or_default()
+                self.bids.get(&price).copied().unwrap_or_default()
             }
             (Side::Sell, AuctionOrderConstraint::Limit(price)) => {
-                self.asks.entry(price).or_default()
+                self.asks.get(&price).copied().unwrap_or_default()
             }
         }
     }
 
-    fn remove_empty_level(
+    fn set_aggregate(
         &mut self,
         side: Side,
         constraint: AuctionOrderConstraint,
         aggregate: Aggregate,
-    ) {
-        if aggregate != Aggregate::default() {
-            return;
-        }
+    ) -> Result<(), CallAuctionMarketDataError> {
         match (side, constraint) {
+            (Side::Buy, AuctionOrderConstraint::Market) => self.market_buy = aggregate,
+            (Side::Sell, AuctionOrderConstraint::Market) => self.market_sell = aggregate,
             (Side::Buy, AuctionOrderConstraint::Limit(price)) => {
-                self.bids.remove(&price);
+                set_bounded_limit_level(
+                    &mut self.bids,
+                    Side::Buy,
+                    price,
+                    aggregate,
+                    self.limits.max_price_levels_per_side(),
+                )?;
             }
             (Side::Sell, AuctionOrderConstraint::Limit(price)) => {
-                self.asks.remove(&price);
+                set_bounded_limit_level(
+                    &mut self.asks,
+                    Side::Sell,
+                    price,
+                    aggregate,
+                    self.limits.max_price_levels_per_side(),
+                )?;
             }
-            (_, AuctionOrderConstraint::Market) => {}
         }
+        Ok(())
+    }
+
+    fn preflight_new_limit_level(
+        &self,
+        side: Side,
+        constraint: AuctionOrderConstraint,
+    ) -> Result<(), CallAuctionMarketDataError> {
+        let AuctionOrderConstraint::Limit(price) = constraint else {
+            return Ok(());
+        };
+        let levels = self.levels(side);
+        if levels.get(&price).is_none() && levels.len() >= self.limits.max_price_levels_per_side() {
+            return Err(CallAuctionMarketDataError::CapacityExceeded {
+                resource: side_resource(side),
+                maximum: self.limits.max_price_levels_per_side(),
+                attempted: levels.len().saturating_add(1),
+            });
+        }
+        Ok(())
+    }
+
+    fn remember_source(
+        &mut self,
+        order_id: OrderId,
+        leaves: u64,
+    ) -> Result<(), CallAuctionMarketDataError> {
+        if let Some(source) = self.uncross_sources.get(&order_id) {
+            if *source < leaves {
+                return Err(CallAuctionMarketDataError::TraceMismatch(
+                    "auction order leaves increased during one uncross",
+                ));
+            }
+            return Ok(());
+        }
+        self.uncross_sources
+            .try_insert(order_id, leaves)
+            .map_err(|_| CallAuctionMarketDataError::CapacityExceeded {
+                resource: CallAuctionMarketDataResource::UncrossSourceOrders,
+                maximum: self.limits.max_active_orders(),
+                attempted: self.uncross_sources.len().saturating_add(1),
+            })?;
+        Ok(())
     }
 
     fn market_level(&self, side: Side) -> CallAuctionMarketDataLevel {
@@ -1297,14 +1868,10 @@ impl CallAuctionMarketDataPublisher {
             .expect("publisher maintains valid market aggregate")
     }
 
-    fn limit_levels(&self, side: Side) -> Vec<CallAuctionMarketDataLevel> {
-        let map = |(&price, &aggregate): (&Price, &Aggregate)| {
-            level_from_aggregate(side, AuctionOrderConstraint::Limit(price), aggregate)
-                .expect("publisher maintains valid limit aggregate")
-        };
+    fn levels(&self, side: Side) -> &AuctionDepthMap {
         match side {
-            Side::Buy => self.bids.iter().rev().map(map).collect(),
-            Side::Sell => self.asks.iter().map(map).collect(),
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
         }
     }
 
@@ -1312,6 +1879,7 @@ impl CallAuctionMarketDataPublisher {
         &mut self,
         error: CallAuctionMarketDataError,
     ) -> Result<T, CallAuctionMarketDataError> {
+        self.uncross_sources.clear();
         self.poisoned = true;
         Err(error)
     }
@@ -1320,13 +1888,17 @@ impl CallAuctionMarketDataPublisher {
 /// Gap-detecting consumer state for one immutable call-auction instrument version.
 #[derive(Debug)]
 pub struct CallAuctionMarketDataReplica {
+    limits: CallAuctionMarketDataLimits,
     definition: InstrumentDefinition,
     phase: CallAuctionPhaseSnapshot,
     book_revision: u64,
     market_buy: Aggregate,
     market_sell: Aggregate,
-    bids: BTreeMap<Price, Aggregate>,
-    asks: BTreeMap<Price, Aggregate>,
+    bids: AuctionDepthMap,
+    asks: AuctionDepthMap,
+    standby_bids: AuctionDepthMap,
+    standby_asks: AuctionDepthMap,
+    batch_levels: BoundedHashMap<(Side, Price), bool>,
     last_command_sequence: u64,
     last_event_sequence: u64,
     last_trade_id: Option<TradeId>,
@@ -1339,16 +1911,56 @@ pub struct CallAuctionMarketDataReplica {
 
 impl CallAuctionMarketDataReplica {
     /// Creates an empty consumer bound to one immutable instrument definition.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the documented default fixed storage cannot be allocated.
+    /// Use [`Self::try_with_limits`] when construction failure must remain typed.
     #[must_use]
     pub fn new(definition: InstrumentDefinition) -> Self {
-        Self {
+        Self::try_with_limits(definition, CallAuctionMarketDataLimitsSpec::default())
+            .expect("default call-auction market-data replica storage must be constructible")
+    }
+
+    /// Fallibly constructs a finite, double-buffered replica state machine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionMarketDataConstructionError`] before state exists if
+    /// the policy is invalid or any active/standby/scratch layout cannot be reserved.
+    pub fn try_with_limits(
+        definition: InstrumentDefinition,
+        spec: CallAuctionMarketDataLimitsSpec,
+    ) -> Result<Self, CallAuctionMarketDataConstructionError> {
+        let limits = CallAuctionMarketDataLimits::new(spec)?;
+        let maximum_levels = limits.max_price_levels_per_side();
+        Ok(Self {
+            limits,
             definition,
             phase: CallAuctionPhaseSnapshot::default(),
             book_revision: 0,
             market_buy: Aggregate::default(),
             market_sell: Aggregate::default(),
-            bids: BTreeMap::new(),
-            asks: BTreeMap::new(),
+            bids: try_depth_map(
+                maximum_levels,
+                CallAuctionMarketDataResource::BidPriceLevels,
+            )?,
+            asks: try_depth_map(
+                maximum_levels,
+                CallAuctionMarketDataResource::AskPriceLevels,
+            )?,
+            standby_bids: try_depth_map(
+                maximum_levels,
+                CallAuctionMarketDataResource::BidPriceLevels,
+            )?,
+            standby_asks: try_depth_map(
+                maximum_levels,
+                CallAuctionMarketDataResource::AskPriceLevels,
+            )?,
+            batch_levels: try_hash_map(
+                limits.max_batch_updates(),
+                CallAuctionMarketDataResource::BatchLevelIdentities,
+            )?,
             last_command_sequence: 0,
             last_event_sequence: 0,
             last_trade_id: None,
@@ -1357,7 +1969,34 @@ impl CallAuctionMarketDataReplica {
             cycle_executed_quantity: 0,
             cycle_trade_price: None,
             poisoned: false,
-        }
+        })
+    }
+
+    /// Returns this replica's immutable finite resource envelope.
+    #[must_use]
+    pub const fn limits(&self) -> CallAuctionMarketDataLimits {
+        self.limits
+    }
+
+    /// Returns active limit-price arena telemetry for one side.
+    #[must_use]
+    pub fn price_level_arena_status(&self, side: Side) -> CallAuctionMarketDataArenaStatus {
+        arena_status(self.levels(side))
+    }
+
+    /// Returns standby snapshot-arena telemetry for one side.
+    #[must_use]
+    pub fn standby_price_level_arena_status(&self, side: Side) -> CallAuctionMarketDataArenaStatus {
+        arena_status(match side {
+            Side::Buy => &self.standby_bids,
+            Side::Sell => &self.standby_asks,
+        })
+    }
+
+    /// Returns the fixed batch-capacity scratch hash telemetry.
+    #[must_use]
+    pub fn batch_level_hash_status(&self) -> CallAuctionMarketDataHashIndexStatus {
+        hash_status(&self.batch_levels)
     }
 
     /// Atomically replaces local state with a non-stale verified snapshot.
@@ -1384,20 +2023,37 @@ impl CallAuctionMarketDataReplica {
         }
         snapshot.validate()?;
         self.validate_snapshot_prices(snapshot)?;
+        let maximum = self.limits.max_price_levels_per_side();
+        if snapshot.bids.len() > maximum {
+            return Err(CallAuctionMarketDataError::CapacityExceeded {
+                resource: CallAuctionMarketDataResource::BidPriceLevels,
+                maximum,
+                attempted: snapshot.bids.len(),
+            });
+        }
+        if snapshot.asks.len() > maximum {
+            return Err(CallAuctionMarketDataError::CapacityExceeded {
+                resource: CallAuctionMarketDataResource::AskPriceLevels,
+                maximum,
+                attempted: snapshot.asks.len(),
+            });
+        }
+        self.standby_bids.clear();
+        self.standby_asks.clear();
+        for level in &snapshot.bids {
+            self.standby_bids
+                .insert(limit_price(*level), aggregate_from_level(*level));
+        }
+        for level in &snapshot.asks {
+            self.standby_asks
+                .insert(limit_price(*level), aggregate_from_level(*level));
+        }
+        std::mem::swap(&mut self.bids, &mut self.standby_bids);
+        std::mem::swap(&mut self.asks, &mut self.standby_asks);
         self.phase = snapshot.phase;
         self.book_revision = snapshot.book_revision;
         self.market_buy = aggregate_from_level(snapshot.market_buy);
         self.market_sell = aggregate_from_level(snapshot.market_sell);
-        self.bids = snapshot
-            .bids
-            .iter()
-            .map(|level| (limit_price(*level), aggregate_from_level(*level)))
-            .collect();
-        self.asks = snapshot
-            .asks
-            .iter()
-            .map(|level| (limit_price(*level), aggregate_from_level(*level)))
-            .collect();
         self.last_command_sequence = snapshot.command_sequence;
         self.last_event_sequence = snapshot.as_of_sequence;
         self.last_trade_id = snapshot.last_trade_id;
@@ -1433,6 +2089,13 @@ impl CallAuctionMarketDataReplica {
                 "non-replayed auction batch is empty",
             ));
         }
+        if batch.updates.len() > self.limits.max_batch_updates() {
+            return Err(CallAuctionMarketDataError::CapacityExceeded {
+                resource: CallAuctionMarketDataResource::BatchUpdates,
+                maximum: self.limits.max_batch_updates(),
+                attempted: batch.updates.len(),
+            });
+        }
         let next_command_sequence = self
             .last_command_sequence
             .checked_add(1)
@@ -1441,7 +2104,7 @@ impl CallAuctionMarketDataReplica {
             .last_event_sequence
             .checked_add(1)
             .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
-        for update in &batch.updates {
+        for (index, update) in batch.updates.iter().enumerate() {
             self.preflight_identity(*update)?;
             if update.sequence != expected {
                 return Err(CallAuctionMarketDataError::SequenceGap {
@@ -1449,10 +2112,13 @@ impl CallAuctionMarketDataReplica {
                     actual: update.sequence,
                 });
             }
-            expected = expected
-                .checked_add(1)
-                .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
+            if index + 1 < batch.updates.len() {
+                expected = expected
+                    .checked_add(1)
+                    .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
+            }
         }
+        self.preflight_batch_level_capacity(&batch.updates)?;
         for update in &batch.updates {
             if let Err(error) = self.apply_verified(*update) {
                 self.poisoned = true;
@@ -1488,6 +2154,7 @@ impl CallAuctionMarketDataReplica {
                 actual: update.sequence,
             });
         }
+        self.preflight_batch_level_capacity(std::slice::from_ref(&update))?;
         if let Err(error) = self.apply_verified(update) {
             self.poisoned = true;
             return Err(error);
@@ -1495,27 +2162,71 @@ impl CallAuctionMarketDataReplica {
         Ok(())
     }
 
-    /// Returns limit depth in best-to-worst order.
+    /// Fallibly returns limit depth in best-to-worst order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionMarketDataError::PreparationAllocationFailed`]
+    /// before partial output if the result vector cannot be reserved.
+    pub fn try_limit_depth(
+        &self,
+        side: Side,
+        limit: usize,
+    ) -> Result<Vec<CallAuctionLevelSnapshot>, CallAuctionMarketDataError> {
+        let output_len = self.levels(side).len().min(limit);
+        let mut output = Vec::new();
+        output.try_reserve_exact(output_len).map_err(|_| {
+            CallAuctionMarketDataError::PreparationAllocationFailed(side_resource(side))
+        })?;
+        match side {
+            Side::Buy => {
+                for (&price, aggregate) in self.bids.iter().rev().take(limit) {
+                    output.push(
+                        CallAuctionLevelSnapshot::from_parts(
+                            side,
+                            price,
+                            aggregate.quantity,
+                            aggregate.order_count,
+                        )
+                        .ok_or(
+                            CallAuctionMarketDataError::SourceDivergence(
+                                "auction replica bid output contains an empty level",
+                            ),
+                        )?,
+                    );
+                }
+            }
+            Side::Sell => {
+                for (&price, aggregate) in self.asks.iter().take(limit) {
+                    output.push(
+                        CallAuctionLevelSnapshot::from_parts(
+                            side,
+                            price,
+                            aggregate.quantity,
+                            aggregate.order_count,
+                        )
+                        .ok_or(
+                            CallAuctionMarketDataError::SourceDivergence(
+                                "auction replica ask output contains an empty level",
+                            ),
+                        )?,
+                    );
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    /// Returns limit depth using the fallible production path.
     ///
     /// # Panics
     ///
-    /// Panics only if previously validated replica state contains an empty
-    /// limit aggregate, which indicates an internal invariant violation.
+    /// Panics only if result-vector allocation fails. Use
+    /// [`Self::try_limit_depth`] when allocation failure must remain typed.
     #[must_use]
     pub fn limit_depth(&self, side: Side, limit: usize) -> Vec<CallAuctionLevelSnapshot> {
-        let map = |(&price, aggregate): (&Price, &Aggregate)| {
-            CallAuctionLevelSnapshot::from_parts(
-                side,
-                price,
-                aggregate.quantity,
-                aggregate.order_count,
-            )
-            .expect("replica stores only non-empty limit levels")
-        };
-        match side {
-            Side::Buy => self.bids.iter().rev().take(limit).map(map).collect(),
-            Side::Sell => self.asks.iter().take(limit).map(map).collect(),
-        }
+        self.try_limit_depth(side, limit)
+            .expect("call-auction market-data depth output allocation failed")
     }
 
     /// Returns active market-constrained quantity on one side in lots.
@@ -1564,6 +2275,83 @@ impl CallAuctionMarketDataReplica {
     #[must_use]
     pub const fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    /// Audits every fixed layout and active/standby public-state invariant.
+    ///
+    /// This diagnostic path is `O(P + U)` and can allocate inside the AVL
+    /// structural auditor; it is not part of incremental application.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionMarketDataError::SourceDivergence`] on the first
+    /// internal layout or state contradiction.
+    pub fn validate(&self) -> Result<(), CallAuctionMarketDataError> {
+        let maximum = self.limits.max_price_levels_per_side();
+        for (detail, side, levels) in [
+            (
+                "auction replica active bid arena is structurally invalid",
+                Side::Buy,
+                &self.bids,
+            ),
+            (
+                "auction replica active ask arena is structurally invalid",
+                Side::Sell,
+                &self.asks,
+            ),
+            (
+                "auction replica standby bid arena is structurally invalid",
+                Side::Buy,
+                &self.standby_bids,
+            ),
+            (
+                "auction replica standby ask arena is structurally invalid",
+                Side::Sell,
+                &self.standby_asks,
+            ),
+        ] {
+            if levels.maximum() != maximum || levels.allocation_capacity() < maximum {
+                return Err(CallAuctionMarketDataError::SourceDivergence(
+                    "auction replica price arena contradicts its configured limit",
+                ));
+            }
+            levels
+                .validate()
+                .map_err(|_| CallAuctionMarketDataError::SourceDivergence(detail))?;
+            for (price, aggregate) in levels.iter() {
+                if aggregate.quantity == 0
+                    || aggregate.order_count == 0
+                    || self.definition.price_rules().validate(*price).is_err()
+                {
+                    return Err(CallAuctionMarketDataError::SourceDivergence(match side {
+                        Side::Buy => "auction replica bid arena retains an invalid level",
+                        Side::Sell => "auction replica ask arena retains an invalid level",
+                    }));
+                }
+            }
+        }
+        if self.batch_levels.maximum() != self.limits.max_batch_updates()
+            || !self.batch_levels.is_empty()
+            || self.batch_levels.validate_layout().is_err()
+        {
+            return Err(CallAuctionMarketDataError::SourceDivergence(
+                "auction replica batch scratch contradicts its fixed empty layout",
+            ));
+        }
+        if (self.market_buy.quantity == 0) != (self.market_buy.order_count == 0)
+            || (self.market_sell.quantity == 0) != (self.market_sell.order_count == 0)
+            || self.last_command_sequence > self.last_event_sequence
+            || self.book_revision > self.last_event_sequence
+            || self
+                .last_trade_id
+                .is_some_and(|trade_id| trade_id.get() > self.last_event_sequence)
+            || validate_phase_snapshot(self.phase, self.last_event_sequence).is_err()
+        {
+            return Err(CallAuctionMarketDataError::SourceDivergence(
+                "auction replica scalar state is internally inconsistent",
+            ));
+        }
+        Ok(())
     }
 
     fn preflight_identity(
@@ -1632,7 +2420,7 @@ impl CallAuctionMarketDataReplica {
                             .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
                     }
                 }
-                self.set_level(level);
+                self.set_level(level)?;
             }
             CallAuctionMarketDataKind::Trade { print, buy, sell } => {
                 if self.phase.phase() != CallAuctionPhase::Frozen
@@ -1649,8 +2437,8 @@ impl CallAuctionMarketDataReplica {
                 self.validate_trade_transition(print, buy)?;
                 self.validate_trade_transition(print, sell)?;
                 self.advance_replica_trade_id(print.trade_id)?;
-                self.set_level(buy);
-                self.set_level(sell);
+                self.set_level(buy)?;
+                self.set_level(sell)?;
                 self.cycle_trade_count = self
                     .cycle_trade_count
                     .checked_add(1)
@@ -1817,17 +2605,55 @@ impl CallAuctionMarketDataReplica {
         .filter(|aggregate| *aggregate != Aggregate::default())
     }
 
-    fn set_level(&mut self, level: CallAuctionMarketDataLevel) {
+    fn set_level(
+        &mut self,
+        level: CallAuctionMarketDataLevel,
+    ) -> Result<(), CallAuctionMarketDataError> {
         let aggregate = aggregate_from_level(level);
         match (level.side, level.constraint) {
             (Side::Buy, AuctionOrderConstraint::Market) => self.market_buy = aggregate,
             (Side::Sell, AuctionOrderConstraint::Market) => self.market_sell = aggregate,
             (Side::Buy, AuctionOrderConstraint::Limit(price)) => {
-                set_limit_level(&mut self.bids, price, aggregate);
+                set_bounded_limit_level(
+                    &mut self.bids,
+                    Side::Buy,
+                    price,
+                    aggregate,
+                    self.limits.max_price_levels_per_side(),
+                )?;
             }
             (Side::Sell, AuctionOrderConstraint::Limit(price)) => {
-                set_limit_level(&mut self.asks, price, aggregate);
+                set_bounded_limit_level(
+                    &mut self.asks,
+                    Side::Sell,
+                    price,
+                    aggregate,
+                    self.limits.max_price_levels_per_side(),
+                )?;
             }
+        }
+        Ok(())
+    }
+
+    fn preflight_batch_level_capacity(
+        &mut self,
+        updates: &[CallAuctionMarketDataUpdate],
+    ) -> Result<(), CallAuctionMarketDataError> {
+        let result = preflight_replica_level_capacity(
+            &mut self.batch_levels,
+            &self.bids,
+            &self.asks,
+            self.limits.max_price_levels_per_side(),
+            updates,
+        );
+        self.batch_levels.clear();
+        result
+    }
+
+    fn levels(&self, side: Side) -> &AuctionDepthMap {
+        match side {
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
         }
     }
 
@@ -2070,12 +2896,16 @@ fn transition_cycle(
 fn validate_report_outcome(
     report: &CallAuctionExecutionReport,
 ) -> Result<(), CallAuctionMarketDataError> {
-    if report.events.windows(2).any(|window| {
-        window[0]
-            .sequence
-            .checked_add(1)
-            .is_none_or(|expected| window[1].sequence != expected)
-    }) {
+    if report
+        .events
+        .iter()
+        .zip(report.events.iter().skip(1))
+        .any(|(left, right)| {
+            left.sequence
+                .checked_add(1)
+                .is_none_or(|expected| right.sequence != expected)
+        })
+    {
         return Err(CallAuctionMarketDataError::TraceMismatch(
             "auction report event sequences are not contiguous",
         ));
@@ -2123,23 +2953,6 @@ fn command_version(command: CallAuctionCommand) -> InstrumentVersion {
     }
 }
 
-fn remember_source(
-    uncross: &mut UncrossProgress,
-    order_id: OrderId,
-    leaves: u64,
-) -> Result<(), CallAuctionMarketDataError> {
-    if let Some(source) = uncross.sources.get(&order_id) {
-        if *source < leaves {
-            return Err(CallAuctionMarketDataError::TraceMismatch(
-                "auction order leaves increased during one uncross",
-            ));
-        }
-    } else {
-        uncross.sources.insert(order_id, leaves);
-    }
-    Ok(())
-}
-
 fn level_from_aggregate(
     side: Side,
     constraint: AuctionOrderConstraint,
@@ -2167,23 +2980,6 @@ fn aggregate_market(engine: &CallAuctionEngine, side: Side) -> Aggregate {
     }
 }
 
-fn aggregate_depth(engine: &CallAuctionEngine, side: Side) -> BTreeMap<Price, Aggregate> {
-    engine
-        .book()
-        .limit_depth(side, usize::MAX)
-        .into_iter()
-        .map(|level| {
-            (
-                level.price(),
-                Aggregate {
-                    quantity: level.quantity(),
-                    order_count: level.order_count(),
-                },
-            )
-        })
-        .collect()
-}
-
 fn previous_trade_id(next_trade_id: u64) -> Result<Option<TradeId>, CallAuctionMarketDataError> {
     match next_trade_id.checked_sub(1) {
         Some(0) => Ok(None),
@@ -2201,11 +2997,197 @@ fn previous_sequence(next: u64, detail: &'static str) -> Result<u64, CallAuction
         .ok_or(CallAuctionMarketDataError::SourceDivergence(detail))
 }
 
-fn set_limit_level(levels: &mut BTreeMap<Price, Aggregate>, price: Price, aggregate: Aggregate) {
+fn try_depth_map(
+    maximum: usize,
+    resource: CallAuctionMarketDataResource,
+) -> Result<AuctionDepthMap, CallAuctionMarketDataConstructionError> {
+    IndexedAvlMap::try_with_capacity(maximum).map_err(|_| {
+        CallAuctionMarketDataConstructionError::ReservationFailed { resource, maximum }
+    })
+}
+
+fn try_hash_map<K, V>(
+    maximum: usize,
+    resource: CallAuctionMarketDataResource,
+) -> Result<BoundedHashMap<K, V>, CallAuctionMarketDataConstructionError>
+where
+    K: Eq + Hash,
+{
+    BoundedHashMap::try_new(maximum).map_err(|_: BoundedHashError| {
+        CallAuctionMarketDataConstructionError::ReservationFailed { resource, maximum }
+    })
+}
+
+fn ensure_source_limits(
+    selected: CallAuctionMarketDataLimits,
+    source: CallAuctionEngineLimits,
+) -> Result<(), CallAuctionMarketDataConstructionError> {
+    let requirements = [
+        (
+            CallAuctionMarketDataResource::TrackedOrders,
+            selected.max_active_orders(),
+            source.book().max_active_orders(),
+        ),
+        (
+            CallAuctionMarketDataResource::BidPriceLevels,
+            selected.max_price_levels_per_side(),
+            source.book().max_price_levels_per_side(),
+        ),
+        (
+            CallAuctionMarketDataResource::BatchUpdates,
+            selected.max_batch_updates(),
+            source.max_report_events(),
+        ),
+    ];
+    for (resource, selected, required) in requirements {
+        if selected < required {
+            return Err(CallAuctionMarketDataConstructionError::LimitsBelowSource {
+                resource,
+                selected,
+                required,
+            });
+        }
+    }
+    Ok(())
+}
+
+const fn side_resource(side: Side) -> CallAuctionMarketDataResource {
+    match side {
+        Side::Buy => CallAuctionMarketDataResource::BidPriceLevels,
+        Side::Sell => CallAuctionMarketDataResource::AskPriceLevels,
+    }
+}
+
+fn set_bounded_limit_level(
+    levels: &mut AuctionDepthMap,
+    side: Side,
+    price: Price,
+    aggregate: Aggregate,
+    maximum: usize,
+) -> Result<(), CallAuctionMarketDataError> {
     if aggregate == Aggregate::default() {
         levels.remove(&price);
     } else {
+        if levels.get(&price).is_none() && levels.len() >= maximum {
+            return Err(CallAuctionMarketDataError::CapacityExceeded {
+                resource: side_resource(side),
+                maximum,
+                attempted: levels.len().saturating_add(1),
+            });
+        }
         levels.insert(price, aggregate);
+    }
+    Ok(())
+}
+
+const fn update_levels(
+    update: CallAuctionMarketDataUpdate,
+) -> [Option<CallAuctionMarketDataLevel>; 2] {
+    match update.kind {
+        CallAuctionMarketDataKind::Book { level, .. } => [Some(level), None],
+        CallAuctionMarketDataKind::Trade { buy, sell, .. } => [Some(buy), Some(sell)],
+        CallAuctionMarketDataKind::NoPublicChange
+        | CallAuctionMarketDataKind::PhaseChanged { .. }
+        | CallAuctionMarketDataKind::UncrossCompleted { .. } => [None, None],
+    }
+}
+
+fn preflight_replica_level_capacity(
+    scratch: &mut BoundedHashMap<(Side, Price), bool>,
+    bids: &AuctionDepthMap,
+    asks: &AuctionDepthMap,
+    maximum: usize,
+    updates: &[CallAuctionMarketDataUpdate],
+) -> Result<(), CallAuctionMarketDataError> {
+    let mut bid_count = bids.len();
+    let mut ask_count = asks.len();
+    for &update in updates {
+        for level in update_levels(update).into_iter().flatten() {
+            let AuctionOrderConstraint::Limit(price) = level.constraint else {
+                continue;
+            };
+            let key = (level.side, price);
+            let previous = scratch.get(&key).copied().unwrap_or_else(|| {
+                let levels = match level.side {
+                    Side::Buy => bids,
+                    Side::Sell => asks,
+                };
+                levels.get(&price).is_some()
+            });
+            let next = level.quantity != 0;
+            let count = match level.side {
+                Side::Buy => &mut bid_count,
+                Side::Sell => &mut ask_count,
+            };
+            match (previous, next) {
+                (false, true) => {
+                    *count = count
+                        .checked_add(1)
+                        .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
+                }
+                (true, false) => {
+                    *count =
+                        count
+                            .checked_sub(1)
+                            .ok_or(CallAuctionMarketDataError::InvalidUpdate(
+                                "auction replica level-capacity preflight underflowed",
+                            ))?;
+                }
+                (false, false) | (true, true) => {}
+            }
+            if *count > maximum {
+                return Err(CallAuctionMarketDataError::CapacityExceeded {
+                    resource: side_resource(level.side),
+                    maximum,
+                    attempted: *count,
+                });
+            }
+            scratch.try_insert(key, next).map_err(|_| {
+                CallAuctionMarketDataError::CapacityExceeded {
+                    resource: CallAuctionMarketDataResource::BatchLevelIdentities,
+                    maximum: scratch.maximum(),
+                    attempted: scratch.len().saturating_add(1),
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn auction_depth_matches(
+    mirror: &AuctionDepthMap,
+    source: impl ExactSizeIterator<Item = CallAuctionLevelSnapshot>,
+) -> bool {
+    mirror.len() == source.len()
+        && mirror
+            .iter()
+            .zip(source)
+            .all(|((&price, aggregate), level)| {
+                price == level.price()
+                    && aggregate.quantity == level.quantity()
+                    && aggregate.order_count == level.order_count()
+            })
+}
+
+fn arena_status(levels: &AuctionDepthMap) -> CallAuctionMarketDataArenaStatus {
+    CallAuctionMarketDataArenaStatus {
+        configured_slots: levels.maximum(),
+        allocated_slots: levels.allocation_capacity(),
+        initialized_slots: levels.storage_len(),
+        occupied_slots: levels.len(),
+        reusable_slots: levels.storage_len().saturating_sub(levels.len()),
+    }
+}
+
+fn hash_status<K, V>(index: &BoundedHashMap<K, V>) -> CallAuctionMarketDataHashIndexStatus
+where
+    K: Eq + Hash,
+{
+    CallAuctionMarketDataHashIndexStatus {
+        configured_entries: index.maximum(),
+        allocated_entries: index.capacity(),
+        initialized_buckets: index.bucket_count(),
+        occupied_entries: index.len(),
     }
 }
 
@@ -2213,5 +3195,93 @@ fn limit_price(level: CallAuctionMarketDataLevel) -> Price {
     match level.constraint {
         AuctionOrderConstraint::Limit(price) => price,
         AuctionOrderConstraint::Market => unreachable!("validated snapshot limit"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::domain::{AssetId, InstrumentId, InstrumentVersion};
+    use crate::instrument::{
+        InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules, QuantityRules,
+        ReserveOrderRules, TradingState,
+    };
+
+    use super::*;
+
+    fn definition() -> InstrumentDefinition {
+        InstrumentDefinition::new(InstrumentSpec {
+            instrument_id: InstrumentId::new(1).unwrap(),
+            version: InstrumentVersion::new(1).unwrap(),
+            effective_from: TimestampNs::from_unix_nanos(0),
+            symbol: InstrumentSymbol::new("AUCT-MD-UNIT").unwrap(),
+            kind: InstrumentKind::Spot,
+            base_asset_id: AssetId::new(1).unwrap(),
+            quote_asset_id: AssetId::new(2).unwrap(),
+            price: PriceRules::new(0, 1, Price::from_raw(0), Price::from_raw(1_000)).unwrap(),
+            quantity: QuantityRules::new(1, 1, 1_000).unwrap(),
+            reserve: ReserveOrderRules::disabled(),
+            base_units_per_lot: 1,
+            quote_units_per_price_unit: 1,
+            trading_state: TradingState::Halted,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn invariant_validation_rejects_lost_arena_and_scratch_reservations() {
+        let spec = CallAuctionMarketDataLimitsSpec {
+            max_active_orders: 1,
+            max_price_levels_per_side: 1,
+            max_batch_updates: 3,
+        };
+        let mut lost_arena =
+            CallAuctionMarketDataReplica::try_with_limits(definition(), spec).unwrap();
+        lost_arena.bids.shrink_to_fit();
+        assert!(matches!(
+            lost_arena.validate(),
+            Err(CallAuctionMarketDataError::SourceDivergence(
+                "auction replica price arena contradicts its configured limit"
+            ))
+        ));
+
+        let mut lost_scratch =
+            CallAuctionMarketDataReplica::try_with_limits(definition(), spec).unwrap();
+        lost_scratch.batch_levels.shrink_to_fit();
+        assert!(matches!(
+            lost_scratch.validate(),
+            Err(CallAuctionMarketDataError::SourceDivergence(
+                "auction replica batch scratch contradicts its fixed empty layout"
+            ))
+        ));
+    }
+
+    #[test]
+    fn final_representable_event_sequence_applies_without_requiring_a_successor() {
+        let definition = definition();
+        let mut replica = CallAuctionMarketDataReplica::try_with_limits(
+            definition,
+            CallAuctionMarketDataLimitsSpec {
+                max_active_orders: 1,
+                max_price_levels_per_side: 1,
+                max_batch_updates: 3,
+            },
+        )
+        .unwrap();
+        replica.last_event_sequence = u64::MAX - 1;
+        let batch = CallAuctionMarketDataBatch {
+            updates: vec![CallAuctionMarketDataUpdate {
+                instrument_id: definition.instrument_id(),
+                instrument_version: definition.version(),
+                sequence: u64::MAX,
+                occurred_at: TimestampNs::from_unix_nanos(u64::MAX),
+                kind: CallAuctionMarketDataKind::NoPublicChange,
+            }],
+            replayed: false,
+        };
+
+        replica.apply_batch(&batch).unwrap();
+        assert_eq!(replica.last_sequence(), u64::MAX);
+        assert_eq!(replica.last_command_sequence(), 1);
+        replica.validate().unwrap();
     }
 }

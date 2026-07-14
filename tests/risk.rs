@@ -4,9 +4,9 @@ use quotick::instrument::{
 };
 use quotick::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, Command,
-    CommandOutcome, CommandPreparation, NewOrder, OrderBookLimits, OrderBookLimitsSpec, OrderType,
-    RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce, TradingStateControl,
-    TradingStateControlAction,
+    CommandOutcome, CommandPreparation, MatchingHashIndex, NewOrder, OrderBookLimits,
+    OrderBookLimitsSpec, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce,
+    TradingStateControl, TradingStateControlAction,
 };
 use quotick::risk::{
     AccountRiskState, RiskError, RiskHashIndex, RiskLimitSpec, RiskLimits, RiskManagedLimits,
@@ -208,6 +208,8 @@ fn managed_limits_reject_zero_profile_capacity() {
         max_retained_commands: 3,
         cancellation_reserve: 1,
         max_report_events: 2,
+        max_retained_events: 16,
+        max_prepared_order_selections: 2,
     })
     .unwrap();
     assert_eq!(
@@ -388,6 +390,8 @@ fn unrepresentable_profile_registry_is_a_typed_constructor_failure() {
         max_retained_commands: base.max_retained_commands(),
         cancellation_reserve: base.cancellation_reserve(),
         max_report_events: base.max_report_events(),
+        max_retained_events: base.max_retained_events(),
+        max_prepared_order_selections: base.max_prepared_order_selections(),
     })
     .unwrap();
     let selected = managed_limits(matching, usize::MAX);
@@ -481,6 +485,72 @@ fn constructor_reserves_risk_headroom_before_profile_registration_and_commit() {
 }
 
 #[test]
+fn five_thousand_different_identity_cycles_reuse_every_authoritative_index_allocation() {
+    const CYCLES: u64 = 5_000;
+    let mut book = RiskManagedOrderBook::new(definition());
+    book.register_account(account(11), profile(AccountRiskState::Active, 0))
+        .unwrap();
+    let indexes = [
+        MatchingHashIndex::ActiveOrders,
+        MatchingHashIndex::ActiveAccounts,
+        MatchingHashIndex::AcceptedOrderIds,
+        MatchingHashIndex::AccountControls,
+        MatchingHashIndex::CommandHistory,
+    ];
+    let matching_capacities =
+        indexes.map(|index| book.book().hash_index_status(index).allocated_entries);
+    let profile_capacity = book
+        .risk()
+        .hash_index_status(RiskHashIndex::AccountProfiles)
+        .allocated_entries;
+    let reservation_capacity = book
+        .risk()
+        .hash_index_status(RiskHashIndex::ActiveReservations)
+        .allocated_entries;
+
+    for cycle in 1..=CYCLES {
+        let new_command = cycle * 2 - 1;
+        let cancel_command = cycle * 2;
+        book.submit(limit_order(
+            new_command,
+            cycle,
+            11,
+            Side::Buy,
+            1,
+            100,
+            TimeInForce::GoodTilCancelled,
+        ))
+        .unwrap();
+        book.submit(cancel(cancel_command, cycle, 11)).unwrap();
+        if cycle % 500 == 0 {
+            book.validate().unwrap();
+        }
+    }
+
+    assert_eq!(book.book().active_order_count(), 0);
+    assert_eq!(book.risk().reservation_count(), 0);
+    for (index, expected_capacity) in indexes.into_iter().zip(matching_capacities) {
+        assert_eq!(
+            book.book().hash_index_status(index).allocated_entries,
+            expected_capacity
+        );
+    }
+    assert_eq!(
+        book.risk()
+            .hash_index_status(RiskHashIndex::AccountProfiles)
+            .allocated_entries,
+        profile_capacity
+    );
+    assert_eq!(
+        book.risk()
+            .hash_index_status(RiskHashIndex::ActiveReservations)
+            .allocated_entries,
+        reservation_capacity
+    );
+    book.validate().unwrap();
+}
+
+#[test]
 fn risk_reservation_capacity_is_constructor_reserved_and_reused_at_the_active_bound() {
     let reserved_limits = OrderBookLimits::new(OrderBookLimitsSpec {
         max_active_orders: 2,
@@ -491,6 +561,8 @@ fn risk_reservation_capacity_is_constructor_reserved_and_reused_at_the_active_bo
         max_retained_commands: 6,
         cancellation_reserve: 2,
         max_report_events: 4,
+        max_retained_events: 32,
+        max_prepared_order_selections: 2,
     })
     .unwrap();
     let reserved =
@@ -508,6 +580,8 @@ fn risk_reservation_capacity_is_constructor_reserved_and_reused_at_the_active_bo
         max_retained_commands: 5,
         cancellation_reserve: 1,
         max_report_events: 4,
+        max_retained_events: 32,
+        max_prepared_order_selections: 2,
     })
     .unwrap();
     let mut book =

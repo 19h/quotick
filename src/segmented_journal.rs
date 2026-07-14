@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use crate::codec::BinaryCodec;
 use crate::journal::{
     AppendReceipt, DurableRecord, HEADER_LENGTH, Journal, JournalBatch, JournalError, JournalFrame,
-    JournalOptions, JournalReader, RecordKind, SEGMENT_DIRECTORY_MARKER, WriterLease,
-    WriterLeaseOwner, crc32c_parts, normalize_journal_path, sync_parent,
+    JournalOptions, JournalReader, JournalResource, RecordKind, SEGMENT_DIRECTORY_MARKER,
+    WriterLease, WriterLeaseOwner, crc32c_parts, normalize_journal_path,
+    reserve_journal_additional, reserve_journal_vec, sync_parent,
 };
 use crate::snapshot::CheckpointAnchor;
 
@@ -603,6 +604,9 @@ impl SegmentedJournal {
         self.next_sequence()
             .checked_add(record_count)
             .ok_or(JournalError::SequenceExhausted)?;
+        let mut segmented_receipts =
+            reserve_journal_vec(JournalResource::SegmentedBatchReceipts, batch.len())
+                .map_err(SegmentedJournalError::Storage)?;
         self.rotate_if_needed(length)?;
         let segment_start = self.active_segment_start();
         let active_path = self.active_segment_path().to_path_buf();
@@ -619,13 +623,13 @@ impl SegmentedJournal {
             }
         };
         self.update_active_bytes(length)?;
-        Ok(receipts
-            .into_iter()
-            .map(|inner| SegmentedAppendReceipt {
+        for inner in receipts {
+            segmented_receipts.push(SegmentedAppendReceipt {
                 segment_start_sequence: segment_start,
                 inner,
-            })
-            .collect())
+            });
+        }
+        Ok(segmented_receipts)
     }
 
     /// Replaces the complete selected segment generation with one checkpoint
@@ -947,14 +951,16 @@ impl SegmentedJournal {
         if current_bytes == 0 || fits {
             return Ok(());
         }
+        reserve_journal_additional(&mut self.segments, JournalResource::SegmentInventory, 1)
+            .map_err(SegmentedJournalError::Storage)?;
         let start = self.next_sequence();
         let current_path = self.active_segment_path().to_path_buf();
+        let path = segment_path(&self.directory, self.marker.active_generation, start);
         let current = self.current.take().ok_or(SegmentedJournalError::Poisoned)?;
         if let Err(error) = current.close() {
             self.poisoned = true;
             return Err(segment_error(current_path, error));
         }
-        let path = segment_path(&self.directory, self.marker.active_generation, start);
         let next = match Journal::open_managed(&path, segment_options(self.options, start)) {
             Ok(journal) => journal,
             Err(error) => {

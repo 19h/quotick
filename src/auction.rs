@@ -373,6 +373,27 @@ impl AuctionAllocationPlan {
     pub fn sell_fills(&self) -> &[AuctionOrderFill] {
         &self.sell_fills
     }
+
+    pub(crate) fn with_fill_storage(
+        buy_fills: Vec<AuctionOrderFill>,
+        sell_fills: Vec<AuctionOrderFill>,
+    ) -> Self {
+        Self {
+            clearing: AuctionClearing::from_quantities(Price::from_raw(0), 0, 0),
+            buy_fills,
+            sell_fills,
+        }
+    }
+
+    pub(crate) fn clear_reusable(&mut self) {
+        self.clearing = AuctionClearing::from_quantities(Price::from_raw(0), 0, 0);
+        self.buy_fills.clear();
+        self.sell_fills.clear();
+    }
+
+    pub(crate) fn minimum_fill_capacity(&self) -> usize {
+        self.buy_fills.capacity().min(self.sell_fills.capacity())
+    }
 }
 
 /// Invalid input or resource exhaustion during order-level auction allocation.
@@ -953,6 +974,66 @@ pub fn allocate_clearing_price_time(
     clearing: AuctionClearing,
     limits: AuctionAllocationLimits,
 ) -> Result<AuctionAllocationPlan, AuctionAllocationError> {
+    let (buy_fill_count, sell_fill_count) =
+        validate_allocation_request(bids, asks, grid, clearing, limits)?;
+    let mut buy_fills = Vec::new();
+    buy_fills
+        .try_reserve_exact(buy_fill_count)
+        .map_err(|_| AuctionAllocationError::CapacityReservationFailed(Side::Buy))?;
+    let mut sell_fills = Vec::new();
+    sell_fills
+        .try_reserve_exact(sell_fill_count)
+        .map_err(|_| AuctionAllocationError::CapacityReservationFailed(Side::Sell))?;
+    build_allocation_plan(bids, asks, clearing, &mut buy_fills, &mut sell_fills)
+}
+
+/// Uses caller-owned fill vectors whose capacities cover the validated result.
+pub(crate) fn allocate_clearing_price_time_reusing(
+    bids: &[AuctionOrder],
+    asks: &[AuctionOrder],
+    grid: AuctionPriceGrid,
+    clearing: AuctionClearing,
+    limits: AuctionAllocationLimits,
+    plan: &mut AuctionAllocationPlan,
+) -> Result<(), AuctionAllocationError> {
+    let (buy_fill_count, sell_fill_count) =
+        validate_allocation_request(bids, asks, grid, clearing, limits)?;
+    if plan.buy_fills.capacity() < buy_fill_count {
+        return Err(AuctionAllocationError::CapacityReservationFailed(Side::Buy));
+    }
+    if plan.sell_fills.capacity() < sell_fill_count {
+        return Err(AuctionAllocationError::CapacityReservationFailed(
+            Side::Sell,
+        ));
+    }
+    plan.buy_fills.clear();
+    plan.sell_fills.clear();
+    let executable_quantity = clearing.executable_quantity();
+    append_fills(
+        bids,
+        Side::Buy,
+        clearing.price(),
+        executable_quantity,
+        &mut plan.buy_fills,
+    )?;
+    append_fills(
+        asks,
+        Side::Sell,
+        clearing.price(),
+        executable_quantity,
+        &mut plan.sell_fills,
+    )?;
+    plan.clearing = clearing;
+    Ok(())
+}
+
+fn validate_allocation_request(
+    bids: &[AuctionOrder],
+    asks: &[AuctionOrder],
+    grid: AuctionPriceGrid,
+    clearing: AuctionClearing,
+    limits: AuctionAllocationLimits,
+) -> Result<(usize, usize), AuctionAllocationError> {
     if limits.max_orders_per_side == 0 {
         return Err(AuctionAllocationError::InvalidOrderLimit(0));
     }
@@ -977,37 +1058,40 @@ pub fn allocate_clearing_price_time(
         return Err(AuctionAllocationError::ZeroExecutableQuantity);
     }
 
-    let buy_fill_count =
-        required_fill_count(bids, Side::Buy, clearing.price(), executable_quantity);
-    let sell_fill_count =
-        required_fill_count(asks, Side::Sell, clearing.price(), executable_quantity);
-    let mut buy_fills = Vec::new();
-    buy_fills
-        .try_reserve_exact(buy_fill_count)
-        .map_err(|_| AuctionAllocationError::CapacityReservationFailed(Side::Buy))?;
-    let mut sell_fills = Vec::new();
-    sell_fills
-        .try_reserve_exact(sell_fill_count)
-        .map_err(|_| AuctionAllocationError::CapacityReservationFailed(Side::Sell))?;
+    Ok((
+        required_fill_count(bids, Side::Buy, clearing.price(), executable_quantity),
+        required_fill_count(asks, Side::Sell, clearing.price(), executable_quantity),
+    ))
+}
 
+fn build_allocation_plan(
+    bids: &[AuctionOrder],
+    asks: &[AuctionOrder],
+    clearing: AuctionClearing,
+    buy_fills: &mut Vec<AuctionOrderFill>,
+    sell_fills: &mut Vec<AuctionOrderFill>,
+) -> Result<AuctionAllocationPlan, AuctionAllocationError> {
+    buy_fills.clear();
+    sell_fills.clear();
+    let executable_quantity = clearing.executable_quantity();
     append_fills(
         bids,
         Side::Buy,
         clearing.price(),
         executable_quantity,
-        &mut buy_fills,
+        buy_fills,
     )?;
     append_fills(
         asks,
         Side::Sell,
         clearing.price(),
         executable_quantity,
-        &mut sell_fills,
+        sell_fills,
     )?;
     Ok(AuctionAllocationPlan {
         clearing,
-        buy_fills,
-        sell_fills,
+        buy_fills: std::mem::take(buy_fills),
+        sell_fills: std::mem::take(sell_fills),
     })
 }
 

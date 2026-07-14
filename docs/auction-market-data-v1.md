@@ -33,6 +33,10 @@ No padding or native Rust representation is serialized.
   candidate band, and ranking policy are authoritative external query inputs.
 - Publisher bootstrap from a live or WAL/checkpoint-recovered engine starts at
   its final command/event/trade boundaries and emits no historical increments.
+- `CallAuctionMarketDataLimits` is process-local operational policy, not wire
+  semantics. Publisher construction must cover the source engine's configured
+  active-order, per-side limit-level, and per-report event maxima. Version-1
+  payload bytes contain no capacity or allocation metadata.
 
 ## Scalar notation
 
@@ -116,9 +120,14 @@ positive, side-correct, strictly price ordered, and may cross or lock.
 5. On any gap or structural failure, discard the incremental buffer and repeat.
 
 `CallAuctionMarketDataReplica` performs non-mutating identity/gap preflight and
-fail-closed poisoning after structural transition failure. A non-stale valid
-snapshot clears poisoning. Payloads contain no schema-version field; a
-transport/session must negotiate version 1 before decoding.
+simulates batch limit-level cardinality in constructor-owned scratch before
+transition. Batch-size, price-level, and snapshot-cardinality failures leave
+depth, sequences, poison state, and scratch unchanged. Structural failure after
+incremental mutation poisons state. The replica owns active and standby bid/ask
+arenas; a non-stale valid snapshot fills the standby image, swaps both sides
+atomically, retains the prior active image for reuse, and clears poisoning.
+Payloads contain no schema-version field; a transport/session must negotiate
+version 1 before decoding.
 
 ## Information boundary
 

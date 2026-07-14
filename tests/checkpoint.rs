@@ -52,6 +52,9 @@ fn populated_ledger() -> Ledger {
 
 #[test]
 fn trial_balance_and_checkpoint_are_canonical_and_independently_replayable() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<LedgerCheckpoint>();
     let ledger = populated_ledger();
     ledger.validate().expect("ledger cross-audits");
     let trial = ledger.trial_balance();
@@ -76,11 +79,19 @@ fn trial_balance_and_checkpoint_are_canonical_and_independently_replayable() {
         pair[1].account_id()
     )));
 
+    let shared = checkpoint.clone();
+    assert!(shared.shares_balance_storage_with(&checkpoint));
+    assert!(shared.shares_record_storage_with(&checkpoint));
+
     let encoded = checkpoint.encode().expect("checkpoint encodes");
     assert_eq!(encoded.len(), 524);
     let decoded = LedgerCheckpoint::decode(&encoded).expect("checkpoint decodes");
     assert_eq!(decoded, checkpoint);
-    let mut restored = Ledger::from_checkpoint(decoded).expect("checkpoint restores");
+    assert!(!decoded.shares_balance_storage_with(&checkpoint));
+    assert!(!decoded.shares_record_storage_with(&checkpoint));
+    drop(checkpoint);
+    drop(ledger);
+    let mut restored = Ledger::from_checkpoint(&shared).expect("checkpoint restores");
     restored.validate().expect("restored ledger validates");
     assert_eq!(restored.balance(account(1), asset(1)), 375);
     assert_eq!(restored.balance(account(2), asset(1)), -500);
@@ -153,7 +164,7 @@ fn zero_balances_are_omitted_without_losing_idempotency_history() {
     let checkpoint = ledger.checkpoint().expect("checkpoint captures");
     assert!(checkpoint.balances().is_empty());
     assert_eq!(checkpoint.records().len(), 2);
-    let mut restored = Ledger::from_checkpoint(checkpoint).expect("checkpoint restores");
+    let mut restored = Ledger::from_checkpoint(&checkpoint).expect("checkpoint restores");
     assert!(restored.post(first).expect("retry resolves").replayed);
     assert_eq!(restored.entry_count(), 2);
 }

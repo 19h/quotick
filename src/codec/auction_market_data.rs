@@ -8,7 +8,7 @@ use crate::{AuctionId, Price, TimestampNs};
 
 use super::{
     BinaryCodec, CodecError, Decoder, Encoder, decode_side, encode_side, instrument,
-    instrument_version, quantity, trade_id,
+    instrument_version, quantity, reserve_decoded_vec, trade_id,
 };
 
 fn auction_id(decoder: &mut Decoder<'_>) -> Result<AuctionId, CodecError> {
@@ -193,7 +193,7 @@ impl BinaryCodec for CallAuctionMarketDataUpdate {
                 encoder.u64(phase_revision);
             }
         }
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -273,7 +273,7 @@ impl BinaryCodec for CallAuctionMarketDataSnapshot {
         for level in self.asks() {
             encode_level(&mut encoder, *level);
         }
-        Ok(encoder.finish())
+        encoder.finish()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
@@ -295,20 +295,12 @@ impl BinaryCodec for CallAuctionMarketDataSnapshot {
         let market_buy = decode_level(&mut decoder)?;
         let market_sell = decode_level(&mut decoder)?;
         let bid_count = decoder.count("call-auction market-data bids", 26)?;
-        let mut bids = Vec::new();
-        bids.try_reserve_exact(bid_count)
-            .map_err(|_| CodecError::CapacityReservationFailed {
-                field: "call-auction market-data bids",
-            })?;
+        let mut bids = reserve_decoded_vec("call-auction market-data bids", bid_count)?;
         for _ in 0..bid_count {
             bids.push(decode_level(&mut decoder)?);
         }
         let ask_count = decoder.count("call-auction market-data asks", 26)?;
-        let mut asks = Vec::new();
-        asks.try_reserve_exact(ask_count)
-            .map_err(|_| CodecError::CapacityReservationFailed {
-                field: "call-auction market-data asks",
-            })?;
+        let mut asks = reserve_decoded_vec("call-auction market-data asks", ask_count)?;
         for _ in 0..ask_count {
             asks.push(decode_level(&mut decoder)?);
         }

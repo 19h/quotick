@@ -3,10 +3,16 @@
 //! The risk layer owns no matching priority. It authorizes a complete incoming
 //! quantity against worst-case position and absolute raw-price notional, then
 //! derives the retained reservation from the matching engine's sequenced trace.
+//! Profile and active-reservation indexes use fixed-capacity dense hash storage,
+//! so accepted hot-path mutations cannot trigger table growth or rehashing.
+//! Private intrusive per-account reservation links permit complete aggregate and
+//! membership auditing without a temporary collection; the links are derived
+//! process topology and are excluded from public economic state and equality.
 
-use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
+use crate::bounded_hash::BoundedHashMap;
 use crate::domain::{AccountId, OrderId, Price, Side};
 use crate::instrument::InstrumentDefinition;
 use crate::matching::{
@@ -232,6 +238,8 @@ fn checkpoint_validation_matching_limits(max_account_controls: usize) -> OrderBo
         max_retained_commands: base.max_retained_commands(),
         cancellation_reserve: base.cancellation_reserve(),
         max_report_events: base.max_report_events(),
+        max_retained_events: base.max_retained_events(),
+        max_prepared_order_selections: base.max_prepared_order_selections(),
     })
     .expect("checkpoint validation matching limits are coherent")
 }
@@ -510,11 +518,15 @@ impl RiskAccountCheckpoint {
 }
 
 /// Coupled matching/risk direct state at a completed risk-WAL report boundary.
+///
+/// The canonical account image is immutable shared storage. Together with the
+/// embedded shared matching checkpoint, this makes checkpoint cloning `O(1)`
+/// without allocating or copying semantic rows.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RiskManagedCheckpoint {
     wal_first_sequence: u64,
     matching: OrderBookCheckpoint,
-    accounts: Vec<RiskAccountCheckpoint>,
+    accounts: Arc<Vec<RiskAccountCheckpoint>>,
 }
 
 impl RiskManagedCheckpoint {
@@ -539,7 +551,13 @@ impl RiskManagedCheckpoint {
     /// Returns canonical account-sorted profiles and current exposures.
     #[must_use]
     pub fn accounts(&self) -> &[RiskAccountCheckpoint] {
-        &self.accounts
+        self.accounts.as_slice()
+    }
+
+    /// Returns whether two checkpoints share the identical immutable account image.
+    #[must_use]
+    pub fn shares_account_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.accounts, &other.accounts)
     }
 
     pub(crate) fn from_parts(
@@ -547,16 +565,26 @@ impl RiskManagedCheckpoint {
         matching: OrderBookCheckpoint,
         accounts: Vec<RiskAccountCheckpoint>,
     ) -> Result<Self, RiskManagedCheckpointError> {
-        let checkpoint = Self {
-            wal_first_sequence,
-            matching,
-            accounts,
-        };
-        checkpoint.validate()?;
+        let checkpoint = Self::from_captured_parts(wal_first_sequence, matching, accounts)?;
+        checkpoint.verify_replay_with_limits(checkpoint.validation_limits())?;
         Ok(checkpoint)
     }
 
-    fn validate(&self) -> Result<(), RiskManagedCheckpointError> {
+    fn from_captured_parts(
+        wal_first_sequence: u64,
+        matching: OrderBookCheckpoint,
+        accounts: Vec<RiskAccountCheckpoint>,
+    ) -> Result<Self, RiskManagedCheckpointError> {
+        let checkpoint = Self {
+            wal_first_sequence,
+            matching,
+            accounts: Arc::new(accounts),
+        };
+        checkpoint.validate_structure()?;
+        Ok(checkpoint)
+    }
+
+    fn validate_structure(&self) -> Result<(), RiskManagedCheckpointError> {
         if self.wal_first_sequence == 0 {
             return Err(RiskManagedCheckpointError::new(
                 "risk checkpoint WAL first sequence is zero",
@@ -583,20 +611,30 @@ impl RiskManagedCheckpoint {
                 ));
             }
         }
+        Ok(())
+    }
 
+    fn validation_limits(&self) -> RiskManagedLimits {
         let maximum_accounts = self
             .accounts
             .len()
             .max(RiskManagedLimits::DEFAULT_MAX_REGISTERED_ACCOUNTS);
-        let validation_limits = RiskManagedLimits::new(RiskManagedLimitsSpec {
+        RiskManagedLimits::new(RiskManagedLimitsSpec {
             matching: checkpoint_validation_matching_limits(maximum_accounts),
             max_registered_accounts: maximum_accounts,
         })
-        .expect("checkpoint validation profile capacity is non-zero");
-        let direct = self.restore_direct_with_limits(validation_limits)?;
-        let mut replay =
-            RiskManagedOrderBook::with_limits(self.matching.definition(), validation_limits);
-        for account in &self.accounts {
+        .expect("checkpoint validation profile capacity is non-zero")
+    }
+
+    fn verify_replay_with_limits(
+        &self,
+        limits: RiskManagedLimits,
+    ) -> Result<(), RiskManagedCheckpointError> {
+        self.validate_structure()?;
+        let direct = self.restore_direct_with_limits(limits)?;
+        let mut replay = RiskManagedOrderBook::try_with_limits(self.matching.definition(), limits)
+            .map_err(RiskManagedCheckpointError::ConstructionFailed)?;
+        for account in self.accounts.iter() {
             replay.register_account(account.account_id, account.profile)?;
         }
         for entry in self.matching.history() {
@@ -634,15 +672,10 @@ impl RiskManagedCheckpoint {
                 limits.max_registered_accounts()
             )));
         }
-        let book =
-            OrderBook::from_checkpoint_with_limits(self.matching.clone(), limits.matching())?;
-        let mut risk =
-            RiskEngine::try_with_limits(self.matching.definition(), limits).map_err(|error| {
-                RiskManagedCheckpointError::new(format!(
-                    "risk checkpoint capacity reservation failed: {error}"
-                ))
-            })?;
-        for account in &self.accounts {
+        let book = OrderBook::from_checkpoint_with_limits(&self.matching, limits.matching())?;
+        let mut risk = RiskEngine::try_with_limits(self.matching.definition(), limits)
+            .map_err(RiskManagedCheckpointError::ConstructionFailed)?;
+        for account in self.accounts.iter() {
             risk.register_account(account.account_id, account.profile)?;
             risk.accounts
                 .get_mut(&account.account_id)
@@ -665,7 +698,7 @@ impl RiskManagedCheckpoint {
                 order.leaves().lots(),
             );
         }
-        for account in &self.accounts {
+        for account in self.accounts.iter() {
             let restored = risk
                 .snapshot(account.account_id)
                 .expect("registered checkpoint account exists");
@@ -689,7 +722,7 @@ impl RiskManagedCheckpoint {
             && self
                 .accounts
                 .iter()
-                .zip(&previous.accounts)
+                .zip(previous.accounts.iter())
                 .all(|(current, old)| {
                     current.account_id == old.account_id && current.profile == old.profile
                 })
@@ -697,37 +730,240 @@ impl RiskManagedCheckpoint {
     }
 }
 
+/// An immutable but not yet coupled-replay-verified risk checkpoint capture.
+///
+/// Capture audits live matching topology, command-derived lineage, profiles,
+/// positions, and reservations, but defers deterministic coupled replay. This
+/// type has no codec or snapshot payload implementation. Clones share every
+/// immutable checkpoint row image and are therefore `O(1)`.
+#[derive(Clone)]
+pub struct RiskManagedCheckpointCapture {
+    checkpoint: RiskManagedCheckpoint,
+    limits: RiskManagedLimits,
+}
+
+impl RiskManagedCheckpointCapture {
+    /// Returns the first physical WAL sequence occupied by the definition.
+    #[must_use]
+    pub const fn wal_first_sequence(&self) -> u64 {
+        self.checkpoint.wal_first_sequence()
+    }
+
+    /// Returns the final immutable definition/profile metadata sequence.
+    #[must_use]
+    pub const fn wal_metadata_sequence(&self) -> u64 {
+        self.checkpoint.matching().wal_metadata_sequence()
+    }
+
+    /// Returns the completed execution-report WAL boundary represented here.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.checkpoint.generation()
+    }
+
+    /// Returns the finite policy under which coupled replay will run.
+    #[must_use]
+    pub const fn limits(&self) -> RiskManagedLimits {
+        self.limits
+    }
+
+    /// Returns the captured account/profile cardinality without exposing rows.
+    #[must_use]
+    pub fn account_count(&self) -> usize {
+        self.checkpoint.accounts().len()
+    }
+
+    /// Returns the captured active-order/reservation cardinality.
+    #[must_use]
+    pub fn active_order_count(&self) -> usize {
+        self.checkpoint.matching().active_order_count()
+    }
+
+    /// Returns the captured command/report cardinality.
+    #[must_use]
+    pub fn command_count(&self) -> usize {
+        self.checkpoint.matching().command_count()
+    }
+
+    /// Returns whether two captures share every immutable checkpoint row image.
+    #[must_use]
+    pub fn shares_checkpoint_storage_with(&self, other: &Self) -> bool {
+        self.checkpoint
+            .shares_account_storage_with(&other.checkpoint)
+            && self
+                .checkpoint
+                .matching()
+                .shares_order_storage_with(other.checkpoint.matching())
+            && self
+                .checkpoint
+                .matching()
+                .shares_history_storage_with(other.checkpoint.matching())
+    }
+
+    /// Consumes the capture and proves deterministic coupled matching/risk replay.
+    ///
+    /// Verification reconstructs direct positions and reservations, registers
+    /// the captured immutable profiles in an isolated shard, requires exact
+    /// command/report reproduction, and compares the replayed coupled state with
+    /// the direct image. It may run on another thread while the source advances.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed matching/resource/construction failure or `Invalid` for
+    /// any structural, exposure, reservation, or deterministic replay divergence.
+    pub fn verify(self) -> Result<RiskManagedCheckpoint, RiskManagedCheckpointError> {
+        let Self { checkpoint, limits } = self;
+        checkpoint.verify_replay_with_limits(limits)?;
+        Ok(checkpoint)
+    }
+}
+
+#[cfg(test)]
+impl RiskManagedCheckpointCapture {
+    pub(crate) fn corrupt_wal_lineage_for_test(&mut self) {
+        self.checkpoint.wal_first_sequence = 0;
+    }
+}
+
+/// One fallibly reserved coupled-risk checkpoint capture resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RiskManagedCheckpointResource {
+    /// Canonical account/profile/exposure rows owned by a captured checkpoint.
+    CaptureAccounts,
+}
+
+impl RiskManagedCheckpointResource {
+    const fn failure_detail(self) -> &'static str {
+        match self {
+            Self::CaptureAccounts => "risk checkpoint account capture reservation failed",
+        }
+    }
+}
+
+impl fmt::Display for RiskManagedCheckpointResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::CaptureAccounts => "captured account rows",
+        })
+    }
+}
+
 /// Semantic coupled risk/matching checkpoint construction or restoration failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RiskManagedCheckpointError {
-    detail: String,
+pub enum RiskManagedCheckpointError {
+    /// Coupled checkpoint content or selected-limit contradiction.
+    Invalid(String),
+    /// The embedded matching checkpoint failed with preserved typed context.
+    Matching(OrderBookCheckpointError),
+    /// Temporary coupled state required for validation could not be constructed.
+    ConstructionFailed(MatchingError),
+    /// A complete risk-checkpoint capture resource could not be reserved.
+    ResourceReservationFailed {
+        /// Capture vector whose construction failed.
+        resource: RiskManagedCheckpointResource,
+        /// Requested semantic maximum rows.
+        maximum: usize,
+    },
 }
 
 impl RiskManagedCheckpointError {
     fn new(detail: impl Into<String>) -> Self {
-        Self {
-            detail: detail.into(),
-        }
+        Self::Invalid(detail.into())
     }
 
     /// Returns a stable diagnostic description.
     #[must_use]
     pub fn detail(&self) -> &str {
-        &self.detail
+        match self {
+            Self::Invalid(detail) => detail,
+            Self::Matching(error) => error.detail(),
+            Self::ConstructionFailed(_) => "risk checkpoint shard construction failed",
+            Self::ResourceReservationFailed { resource, .. } => resource.failure_detail(),
+        }
+    }
+
+    /// Returns the failed risk capture resource, if reservation failed there.
+    #[must_use]
+    pub const fn resource(&self) -> Option<RiskManagedCheckpointResource> {
+        match self {
+            Self::ResourceReservationFailed { resource, .. } => Some(*resource),
+            Self::Invalid(_) | Self::Matching(_) | Self::ConstructionFailed(_) => None,
+        }
+    }
+
+    /// Returns the typed embedded matching-checkpoint failure, if present.
+    #[must_use]
+    pub const fn matching_error(&self) -> Option<&OrderBookCheckpointError> {
+        match self {
+            Self::Matching(error) => Some(error),
+            Self::Invalid(_)
+            | Self::ConstructionFailed(_)
+            | Self::ResourceReservationFailed { .. } => None,
+        }
+    }
+
+    /// Returns the underlying temporary coupled-shard construction failure, if present.
+    #[must_use]
+    pub const fn construction_error(&self) -> Option<MatchingError> {
+        match self {
+            Self::ConstructionFailed(error) => Some(*error),
+            Self::Invalid(_) | Self::Matching(_) | Self::ResourceReservationFailed { .. } => None,
+        }
+    }
+
+    /// Returns whether this failure is an explicitly typed reservation result.
+    #[must_use]
+    pub const fn is_resource_exhaustion(&self) -> bool {
+        match self {
+            Self::ResourceReservationFailed { .. } => true,
+            Self::Matching(error) => error.is_resource_exhaustion(),
+            Self::Invalid(_) | Self::ConstructionFailed(_) => false,
+        }
+    }
+
+    /// Returns whether failure occurred before semantic validation could mutate state.
+    #[must_use]
+    pub const fn is_operational_failure(&self) -> bool {
+        match self {
+            Self::Matching(error) => error.is_operational_failure(),
+            Self::ConstructionFailed(_) | Self::ResourceReservationFailed { .. } => true,
+            Self::Invalid(_) => false,
+        }
     }
 }
 
 impl fmt::Display for RiskManagedCheckpointError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.detail.fmt(formatter)
+        match self {
+            Self::Invalid(detail) => detail.fmt(formatter),
+            Self::Matching(error) => error.fmt(formatter),
+            Self::ConstructionFailed(error) => {
+                write!(
+                    formatter,
+                    "risk checkpoint shard construction failed: {error}"
+                )
+            }
+            Self::ResourceReservationFailed { resource, maximum } => write!(
+                formatter,
+                "failed to reserve risk checkpoint {resource} through {maximum} rows"
+            ),
+        }
     }
 }
 
-impl std::error::Error for RiskManagedCheckpointError {}
+impl std::error::Error for RiskManagedCheckpointError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Matching(error) => Some(error),
+            Self::ConstructionFailed(error) => Some(error),
+            Self::Invalid(_) | Self::ResourceReservationFailed { .. } => None,
+        }
+    }
+}
 
 impl From<OrderBookCheckpointError> for RiskManagedCheckpointError {
     fn from(error: OrderBookCheckpointError) -> Self {
-        Self::new(error.detail())
+        Self::Matching(error)
     }
 }
 
@@ -737,11 +973,56 @@ impl From<RiskError> for RiskManagedCheckpointError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+fn reserve_risk_checkpoint_vec<T>(
+    maximum: usize,
+    resource: RiskManagedCheckpointResource,
+) -> Result<Vec<T>, RiskManagedCheckpointError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(maximum)
+        .map_err(|_| RiskManagedCheckpointError::ResourceReservationFailed { resource, maximum })?;
+    Ok(values)
+}
+
+#[cfg(test)]
+mod checkpoint_resource_tests {
+    use super::{
+        RiskAccountCheckpoint, RiskManagedCheckpointError, RiskManagedCheckpointResource,
+        reserve_risk_checkpoint_vec,
+    };
+
+    #[test]
+    fn unrepresentable_risk_checkpoint_capture_is_typed_and_nonpoisoning() {
+        let resource = RiskManagedCheckpointResource::CaptureAccounts;
+        let error =
+            reserve_risk_checkpoint_vec::<RiskAccountCheckpoint>(usize::MAX, resource).unwrap_err();
+        assert_eq!(
+            error,
+            RiskManagedCheckpointError::ResourceReservationFailed {
+                resource,
+                maximum: usize::MAX,
+            }
+        );
+        assert_eq!(error.resource(), Some(resource));
+        assert!(error.is_resource_exhaustion());
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct RiskAccount {
     profile: RiskProfile,
     exposure: RiskSnapshot,
+    reservation_head: Option<OrderId>,
+    reservation_tail: Option<OrderId>,
 }
+
+impl PartialEq for RiskAccount {
+    fn eq(&self, other: &Self) -> bool {
+        self.profile == other.profile && self.exposure == other.exposure
+    }
+}
+
+impl Eq for RiskAccount {}
 
 /// One constructor-reserved coupled-risk hash index.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -776,6 +1057,21 @@ pub struct ReservationSnapshot {
     quantity_lots: u64,
     notional: u128,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveReservation {
+    snapshot: ReservationSnapshot,
+    previous: Option<OrderId>,
+    next: Option<OrderId>,
+}
+
+impl PartialEq for ActiveReservation {
+    fn eq(&self, other: &Self) -> bool {
+        self.snapshot == other.snapshot
+    }
+}
+
+impl Eq for ActiveReservation {}
 
 impl ReservationSnapshot {
     /// Returns the owning account.
@@ -819,61 +1115,40 @@ impl ReservationSnapshot {
 #[derive(Debug, Eq, PartialEq)]
 pub struct RiskEngine {
     definition: InstrumentDefinition,
-    accounts: HashMap<AccountId, RiskAccount>,
-    reservations: HashMap<OrderId, ReservationSnapshot>,
+    accounts: BoundedHashMap<AccountId, RiskAccount>,
+    reservations: BoundedHashMap<OrderId, ActiveReservation>,
     maximum_accounts: usize,
     maximum_reservations: usize,
 }
 
-fn try_reserve_risk_accounts(
-    accounts: &mut HashMap<AccountId, RiskAccount>,
-    additional: usize,
-) -> Result<(), MatchingError> {
-    accounts
-        .try_reserve(additional)
+fn try_new_risk_accounts(
+    maximum: usize,
+) -> Result<BoundedHashMap<AccountId, RiskAccount>, MatchingError> {
+    BoundedHashMap::try_new(maximum)
         .map_err(|_| MatchingError::CapacityReservationFailed(MatchingCapacity::RiskAccounts))
 }
 
-fn try_reserve_risk_reservations(
-    reservations: &mut HashMap<OrderId, ReservationSnapshot>,
-    additional: usize,
-) -> Result<(), MatchingError> {
-    reservations
-        .try_reserve(additional)
+fn try_new_risk_reservations(
+    maximum: usize,
+) -> Result<BoundedHashMap<OrderId, ActiveReservation>, MatchingError> {
+    BoundedHashMap::try_new(maximum)
         .map_err(|_| MatchingError::CapacityReservationFailed(MatchingCapacity::RiskReservations))
 }
 
 impl RiskEngine {
-    fn new(
-        definition: InstrumentDefinition,
-        maximum_accounts: usize,
-        maximum_reservations: usize,
-    ) -> Self {
-        Self {
-            definition,
-            accounts: HashMap::new(),
-            reservations: HashMap::new(),
-            maximum_accounts,
-            maximum_reservations,
-        }
-    }
-
     fn try_with_limits(
         definition: InstrumentDefinition,
         limits: RiskManagedLimits,
     ) -> Result<Self, MatchingError> {
-        let mut risk = Self::new(
+        let maximum_accounts = limits.max_registered_accounts();
+        let maximum_reservations = limits.matching().max_active_orders();
+        Ok(Self {
             definition,
-            limits.max_registered_accounts(),
-            limits.matching().max_active_orders(),
-        );
-        try_reserve_risk_accounts(&mut risk.accounts, limits.max_registered_accounts())?;
-        risk.reserve_additional_reservations(limits.matching().max_active_orders())?;
-        Ok(risk)
-    }
-
-    fn reserve_additional_reservations(&mut self, additional: usize) -> Result<(), MatchingError> {
-        try_reserve_risk_reservations(&mut self.reservations, additional)
+            accounts: try_new_risk_accounts(maximum_accounts)?,
+            reservations: try_new_risk_reservations(maximum_reservations)?,
+            maximum_accounts,
+            maximum_reservations,
+        })
     }
 
     /// Registers one immutable account profile.
@@ -919,6 +1194,8 @@ impl RiskEngine {
                             open_notional: 0,
                             open_orders: 0,
                         },
+                        reservation_head: None,
+                        reservation_tail: None,
                     },
                 )
                 .is_none(),
@@ -954,7 +1231,9 @@ impl RiskEngine {
     /// Returns one active order reservation.
     #[must_use]
     pub fn reservation(&self, order_id: OrderId) -> Option<ReservationSnapshot> {
-        self.reservations.get(&order_id).copied()
+        self.reservations
+            .get(&order_id)
+            .map(|reservation| reservation.snapshot)
     }
 
     /// Returns the active reservation count.
@@ -1021,7 +1300,7 @@ impl RiskEngine {
         let old = self
             .reservations
             .get(&order.order_id)
-            .copied()
+            .map(|reservation| reservation.snapshot)
             .ok_or(RejectReason::RiskArithmeticOverflow)?;
         if old.account_id != order.account_id {
             return Err(RejectReason::RiskArithmeticOverflow);
@@ -1085,6 +1364,7 @@ impl RiskEngine {
                 self.reservations
                     .get(&order.order_id)
                     .expect("accepted replacement must have an existing reservation")
+                    .snapshot
                     .side,
             )
         } else {
@@ -1181,11 +1461,6 @@ impl RiskEngine {
         price: Price,
         quantity_lots: u64,
     ) {
-        let prepared_capacity = self.reservations.capacity();
-        assert!(
-            self.reservations.len() < prepared_capacity,
-            "risk construction/restoration must reserve insertion headroom"
-        );
         let valuation_per_lot =
             conservative_price_magnitude(self.definition, side, RiskPriceConstraint::Limit(price));
         let notional = u128::from(valuation_per_lot)
@@ -1199,30 +1474,69 @@ impl RiskEngine {
             quantity_lots,
             notional,
         };
-        assert!(self.reservations.insert(order_id, reservation).is_none());
-        debug_assert_eq!(self.reservations.capacity(), prepared_capacity);
-        let exposure = &mut self
+        self.append_reservation(order_id, reservation);
+    }
+
+    fn append_reservation(&mut self, order_id: OrderId, reservation: ReservationSnapshot) {
+        let prepared_capacity = self.reservations.capacity();
+        assert!(
+            self.reservations.len() < prepared_capacity,
+            "risk construction/restoration must reserve insertion headroom"
+        );
+        assert!(!self.reservations.contains_key(&order_id));
+        let previous = self
             .accounts
-            .get_mut(&account_id)
+            .get(&reservation.account_id)
             .expect("authorized account must have a risk profile")
-            .exposure;
-        match side {
+            .reservation_tail;
+        if let Some(previous_id) = previous {
+            let tail = self
+                .reservations
+                .get_mut(&previous_id)
+                .expect("risk account tail must reference a reservation");
+            assert!(tail.next.is_none());
+            tail.next = Some(order_id);
+        }
+        assert!(
+            self.reservations
+                .insert(
+                    order_id,
+                    ActiveReservation {
+                        snapshot: reservation,
+                        previous,
+                        next: None,
+                    },
+                )
+                .is_none()
+        );
+        let account = self
+            .accounts
+            .get_mut(&reservation.account_id)
+            .expect("authorized account must have a risk profile");
+        if account.reservation_head.is_none() {
+            assert!(previous.is_none());
+            account.reservation_head = Some(order_id);
+        }
+        account.reservation_tail = Some(order_id);
+        debug_assert_eq!(self.reservations.capacity(), prepared_capacity);
+        let exposure = &mut account.exposure;
+        match reservation.side {
             Side::Buy => {
                 exposure.open_buy_lots = exposure
                     .open_buy_lots
-                    .checked_add(u128::from(quantity_lots))
+                    .checked_add(u128::from(reservation.quantity_lots))
                     .expect("authorization reserved aggregate buy capacity");
             }
             Side::Sell => {
                 exposure.open_sell_lots = exposure
                     .open_sell_lots
-                    .checked_add(u128::from(quantity_lots))
+                    .checked_add(u128::from(reservation.quantity_lots))
                     .expect("authorization reserved aggregate sell capacity");
             }
         }
         exposure.open_notional = exposure
             .open_notional
-            .checked_add(notional)
+            .checked_add(reservation.notional)
             .expect("authorization reserved aggregate notional capacity");
         exposure.open_orders = exposure
             .open_orders
@@ -1231,7 +1545,11 @@ impl RiskEngine {
     }
 
     fn decrement_reservation(&mut self, order_id: OrderId, quantity_lots: u64) {
-        let Some(current) = self.reservations.get(&order_id).copied() else {
+        let Some(current) = self
+            .reservations
+            .get(&order_id)
+            .map(|reservation| reservation.snapshot)
+        else {
             return;
         };
         assert!(quantity_lots <= current.quantity_lots);
@@ -1250,15 +1568,44 @@ impl RiskEngine {
     }
 
     fn remove_reservation(&mut self, order_id: OrderId) -> ReservationSnapshot {
-        let reservation = self
+        let active = self
             .reservations
             .remove(&order_id)
             .expect("active matching order must have a risk reservation");
-        let exposure = &mut self
+        if let Some(previous_id) = active.previous {
+            let previous = self
+                .reservations
+                .get_mut(&previous_id)
+                .expect("risk reservation previous link must resolve");
+            assert_eq!(previous.next, Some(order_id));
+            previous.next = active.next;
+        }
+        if let Some(next_id) = active.next {
+            let next = self
+                .reservations
+                .get_mut(&next_id)
+                .expect("risk reservation next link must resolve");
+            assert_eq!(next.previous, Some(order_id));
+            next.previous = active.previous;
+        }
+        let reservation = active.snapshot;
+        let account = self
             .accounts
             .get_mut(&reservation.account_id)
-            .expect("reserved account must have a risk profile")
-            .exposure;
+            .expect("reserved account must have a risk profile");
+        if active.previous.is_none() {
+            assert_eq!(account.reservation_head, Some(order_id));
+            account.reservation_head = active.next;
+        }
+        if active.next.is_none() {
+            assert_eq!(account.reservation_tail, Some(order_id));
+            account.reservation_tail = active.previous;
+        }
+        assert_eq!(
+            account.reservation_head.is_none(),
+            account.reservation_tail.is_none()
+        );
+        let exposure = &mut account.exposure;
         match reservation.side {
             Side::Buy => exposure.open_buy_lots -= u128::from(reservation.quantity_lots),
             Side::Sell => exposure.open_sell_lots -= u128::from(reservation.quantity_lots),
@@ -1269,6 +1616,12 @@ impl RiskEngine {
     }
 
     fn validate(&self) -> Result<(), RiskInvariantViolation> {
+        self.validate_resource_bounds()?;
+        self.validate_reservation_economics()?;
+        self.validate_account_reservation_index()
+    }
+
+    fn validate_resource_bounds(&self) -> Result<(), RiskInvariantViolation> {
         if self.accounts.capacity() < self.maximum_accounts {
             return Err(RiskInvariantViolation::new(format!(
                 "risk-account hash capacity {} is below its constructor reservation {}",
@@ -1297,8 +1650,20 @@ impl RiskEngine {
                 self.maximum_reservations
             )));
         }
-        let mut calculated: HashMap<AccountId, (u128, u128, u128, u64)> = HashMap::new();
-        for (&order_id, reservation) in &self.reservations {
+        self.accounts.validate_layout().map_err(|detail| {
+            RiskInvariantViolation::new(format!("risk-account hash layout is invalid: {detail}"))
+        })?;
+        self.reservations.validate_layout().map_err(|detail| {
+            RiskInvariantViolation::new(format!(
+                "risk-reservation hash layout is invalid: {detail}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn validate_reservation_economics(&self) -> Result<(), RiskInvariantViolation> {
+        for (&order_id, active) in self.reservations.iter() {
+            let reservation = active.snapshot;
             let expected_valuation = conservative_price_magnitude(
                 self.definition,
                 reservation.side,
@@ -1311,51 +1676,109 @@ impl RiskEngine {
                         "reservation {order_id} notional cannot be represented"
                     ))
                 })?;
-            if reservation.valuation_per_lot != expected_valuation
+            if reservation.quantity_lots == 0
+                || reservation.valuation_per_lot != expected_valuation
                 || reservation.notional != expected_notional
+                || !self.accounts.contains_key(&reservation.account_id)
             {
                 return Err(RiskInvariantViolation::new(format!(
-                    "reservation {order_id} has inconsistent notional"
+                    "reservation {order_id} has invalid ownership, quantity, or notional"
                 )));
             }
-            let entry = calculated.entry(reservation.account_id).or_default();
-            match reservation.side {
-                Side::Buy => entry.0 = checked_audit_add(entry.0, reservation.quantity_lots)?,
-                Side::Sell => entry.1 = checked_audit_add(entry.1, reservation.quantity_lots)?,
+        }
+        Ok(())
+    }
+
+    fn validate_account_reservation_index(&self) -> Result<(), RiskInvariantViolation> {
+        let mut indexed_reservations = 0_usize;
+        for (&account_id, account) in self.accounts.iter() {
+            self.validate_account_reservations(account_id, account, &mut indexed_reservations)?;
+        }
+        if indexed_reservations != self.reservations.len() {
+            return Err(RiskInvariantViolation::new(
+                "active reservation is absent from its risk-account index",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_account_reservations(
+        &self,
+        account_id: AccountId,
+        account: &RiskAccount,
+        indexed_reservations: &mut usize,
+    ) -> Result<(), RiskInvariantViolation> {
+        let mut current = account.reservation_head;
+        let mut previous = None;
+        let mut open_buy_lots = 0_u128;
+        let mut open_sell_lots = 0_u128;
+        let mut open_notional = 0_u128;
+        let mut open_orders = 0_u64;
+        while let Some(order_id) = current {
+            if *indexed_reservations >= self.reservations.len() {
+                return Err(RiskInvariantViolation::new(
+                    "reservation occurs more than once or participates in a risk-account cycle",
+                ));
             }
-            entry.2 = entry.2.checked_add(reservation.notional).ok_or_else(|| {
-                RiskInvariantViolation::new("aggregate reservation notional overflow")
+            let active = self.reservations.get(&order_id).ok_or_else(|| {
+                RiskInvariantViolation::new("risk-account index references an absent reservation")
             })?;
-            entry.3 = entry.3.checked_add(1).ok_or_else(|| {
+            let reservation = active.snapshot;
+            if reservation.account_id != account_id || active.previous != previous {
+                return Err(RiskInvariantViolation::new(
+                    "reservation account membership or previous link is inconsistent",
+                ));
+            }
+            match reservation.side {
+                Side::Buy => {
+                    open_buy_lots = checked_audit_add(open_buy_lots, reservation.quantity_lots)?;
+                }
+                Side::Sell => {
+                    open_sell_lots = checked_audit_add(open_sell_lots, reservation.quantity_lots)?;
+                }
+            }
+            open_notional = open_notional
+                .checked_add(reservation.notional)
+                .ok_or_else(|| {
+                    RiskInvariantViolation::new("aggregate reservation notional overflow")
+                })?;
+            open_orders = open_orders.checked_add(1).ok_or_else(|| {
                 RiskInvariantViolation::new("aggregate reservation count overflow")
             })?;
+            *indexed_reservations = indexed_reservations
+                .checked_add(1)
+                .ok_or_else(|| RiskInvariantViolation::new("indexed reservation count overflow"))?;
+            previous = Some(order_id);
+            current = active.next;
         }
-        for (&account_id, account) in &self.accounts {
-            let expected = calculated.get(&account_id).copied().unwrap_or_default();
-            let actual = account.exposure;
-            if (
+        if previous != account.reservation_tail {
+            return Err(RiskInvariantViolation::new(
+                "risk-account reservation tail is inconsistent",
+            ));
+        }
+        let actual = account.exposure;
+        if (
+            actual.open_buy_lots,
+            actual.open_sell_lots,
+            actual.open_notional,
+            actual.open_orders,
+        ) != (open_buy_lots, open_sell_lots, open_notional, open_orders)
+        {
+            return Err(RiskInvariantViolation::new(format!(
+                "account {account_id} exposure aggregates differ from reservations"
+            )));
+        }
+        if !position_within_limits(actual.position_lots, account.profile.limits)
+            || !worst_case_position_within_limits(
+                actual.position_lots,
                 actual.open_buy_lots,
                 actual.open_sell_lots,
-                actual.open_notional,
-                actual.open_orders,
-            ) != expected
-            {
-                return Err(RiskInvariantViolation::new(format!(
-                    "account {account_id} exposure aggregates differ from reservations"
-                )));
-            }
-            if !position_within_limits(actual.position_lots, account.profile.limits)
-                || !worst_case_position_within_limits(
-                    actual.position_lots,
-                    actual.open_buy_lots,
-                    actual.open_sell_lots,
-                    account.profile.limits,
-                )
-            {
-                return Err(RiskInvariantViolation::new(format!(
-                    "account {account_id} exceeds position limits"
-                )));
-            }
+                account.profile.limits,
+            )
+        {
+            return Err(RiskInvariantViolation::new(format!(
+                "account {account_id} exceeds position limits"
+            )));
         }
         Ok(())
     }
@@ -1519,38 +1942,68 @@ impl RiskManagedOrderBook {
     ///
     /// # Errors
     ///
-    /// Returns [`RiskManagedCheckpointError`] when live state, physical WAL
-    /// boundaries, canonical account state, or coupled deterministic replay diverge.
+    /// Returns [`RiskManagedCheckpointError::ResourceReservationFailed`] when
+    /// canonical account rows cannot be reserved, preserves embedded matching
+    /// and temporary-shard construction failures, or reports divergent live
+    /// state, physical WAL boundaries, account state, or deterministic replay.
     pub fn checkpoint(
         &self,
         wal_first_sequence: u64,
         wal_metadata_sequence: u64,
         wal_sequence: u64,
     ) -> Result<RiskManagedCheckpoint, RiskManagedCheckpointError> {
+        self.capture_checkpoint_candidate(wal_first_sequence, wal_metadata_sequence, wal_sequence)?
+            .verify()
+    }
+
+    /// Captures immutable coupled state without deterministic history replay.
+    ///
+    /// The writer-side phase audits live matching/risk structure and complete
+    /// command-derived lineage, captures canonical account and matching rows,
+    /// and proves that direct reconstruction equals the live coupled state. The
+    /// returned value cannot be encoded or persisted until consumed by
+    /// [`RiskManagedCheckpointCapture::verify`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed capture/validation reservation failure or `Invalid` for
+    /// a live structural, lineage, WAL-boundary, exposure, or reservation
+    /// contradiction.
+    pub fn capture_checkpoint_candidate(
+        &self,
+        wal_first_sequence: u64,
+        wal_metadata_sequence: u64,
+        wal_sequence: u64,
+    ) -> Result<RiskManagedCheckpointCapture, RiskManagedCheckpointError> {
         self.validate()
             .map_err(|error| RiskManagedCheckpointError::new(error.detail()))?;
         let matching = self
             .book
             .checkpoint_state(wal_metadata_sequence, wal_sequence)?;
-        let mut accounts: Vec<_> = self
-            .risk
-            .accounts
-            .iter()
-            .map(|(&account_id, account)| RiskAccountCheckpoint {
+        let mut accounts = reserve_risk_checkpoint_vec(
+            self.risk.accounts.len(),
+            RiskManagedCheckpointResource::CaptureAccounts,
+        )?;
+        for (&account_id, account) in self.risk.accounts.iter() {
+            accounts.push(RiskAccountCheckpoint {
                 account_id,
                 profile: account.profile,
                 exposure: account.exposure,
-            })
-            .collect();
+            });
+        }
         accounts.sort_unstable_by_key(|value| value.account_id);
-        let checkpoint = RiskManagedCheckpoint::from_parts(wal_first_sequence, matching, accounts)?;
+        let checkpoint =
+            RiskManagedCheckpoint::from_captured_parts(wal_first_sequence, matching, accounts)?;
         let restored = checkpoint.restore_direct_with_limits(self.limits())?;
         if restored != *self {
             return Err(RiskManagedCheckpointError::new(
                 "risk checkpoint direct state differs from live coupled state",
             ));
         }
-        Ok(checkpoint)
+        Ok(RiskManagedCheckpointCapture {
+            checkpoint,
+            limits: self.limits(),
+        })
     }
 
     /// Restores directly indexed matching/risk state from an audited checkpoint.
@@ -1601,6 +2054,14 @@ impl RiskManagedOrderBook {
 
     /// Cross-checks matching structure, every reservation, and account aggregates.
     ///
+    /// A successful audit allocates no heap storage and uses `O(1)` auxiliary
+    /// space. For `A` registered accounts, `O` active orders/reservations, and
+    /// `P` initialized price-arena slots, risk membership and book/risk parity
+    /// take expected `O(A + O)` time, while the embedded matching-book audit has
+    /// the `O(O + P log P)` bound documented by [`OrderBook::validate`]. A full
+    /// adversarial hash-collision cluster can make the hash-backed risk work
+    /// quadratic. Constructing a human-readable failure detail can allocate.
+    ///
     /// # Errors
     ///
     /// Returns [`RiskInvariantViolation`] at the first inconsistency.
@@ -1614,19 +2075,27 @@ impl RiskManagedOrderBook {
                 "active order count differs from reservation count",
             ));
         }
-        for (&order_id, reservation) in &self.risk.reservations {
-            let order = self.book.order(order_id).ok_or_else(|| {
-                RiskInvariantViolation::new(format!(
-                    "reservation {order_id} has no active matching order"
-                ))
-            })?;
+        for order in self.book.active_order_states() {
+            let order = order.map_err(|error| RiskInvariantViolation::new(error.detail()))?;
+            let reservation = self
+                .risk
+                .reservations
+                .get(&order.order_id)
+                .map(|active| active.snapshot)
+                .ok_or_else(|| {
+                    RiskInvariantViolation::new(format!(
+                        "active matching order {} has no risk reservation",
+                        order.order_id
+                    ))
+                })?;
             if order.account_id != reservation.account_id
                 || order.side != reservation.side
                 || order.price != reservation.price
                 || order.leaves_quantity.lots() != reservation.quantity_lots
             {
                 return Err(RiskInvariantViolation::new(format!(
-                    "reservation {order_id} differs from matching order"
+                    "reservation {} differs from matching order",
+                    order.order_id
                 )));
             }
         }
@@ -1891,18 +2360,19 @@ fn checked_audit_add(current: u128, quantity: u64) -> Result<u128, RiskInvariant
 
 #[cfg(test)]
 mod reservation_capacity_tests {
-    use std::collections::HashMap;
-
     use super::{
-        MatchingCapacity, MatchingError, RiskEngine, RiskManagedLimits, RiskManagedLimitsSpec,
-        try_reserve_risk_accounts, try_reserve_risk_reservations,
+        AccountRiskState, MatchingCapacity, MatchingError, RiskEngine, RiskLimitSpec, RiskLimits,
+        RiskManagedLimits, RiskManagedLimitsSpec, RiskProfile, RiskSnapshot, try_new_risk_accounts,
+        try_new_risk_reservations,
     };
     use crate::instrument::{
         InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
         QuantityRules, ReserveOrderRules, TradingState,
     };
     use crate::matching::OrderBookLimits;
-    use crate::{AssetId, InstrumentId, InstrumentVersion, Price, TimestampNs};
+    use crate::{
+        AccountId, AssetId, InstrumentId, InstrumentVersion, OrderId, Price, Side, TimestampNs,
+    };
 
     fn definition() -> InstrumentDefinition {
         InstrumentDefinition::new(InstrumentSpec {
@@ -1923,30 +2393,61 @@ mod reservation_capacity_tests {
         .unwrap()
     }
 
+    fn risk_with_reservations() -> RiskEngine {
+        let coupled = RiskManagedLimits::new(RiskManagedLimitsSpec {
+            matching: OrderBookLimits::default(),
+            max_registered_accounts: 1,
+        })
+        .unwrap();
+        let mut risk = RiskEngine::try_with_limits(definition(), coupled).unwrap();
+        let profile = RiskProfile::new(
+            AccountRiskState::Active,
+            0,
+            RiskLimits::new(RiskLimitSpec {
+                max_order_quantity_lots: 1_000,
+                max_order_notional: 1_000_000,
+                max_open_orders: 8,
+                max_open_quantity_lots: 8_000,
+                max_open_notional: 8_000_000,
+                max_long_position_lots: i128::MAX.unsigned_abs(),
+                max_short_position_lots: i128::MAX.unsigned_abs(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let account_id = AccountId::new(1).unwrap();
+        risk.register_account(account_id, profile).unwrap();
+        for order_id in [10_u64, 20] {
+            risk.insert_reservation(
+                OrderId::new(order_id).unwrap(),
+                account_id,
+                Side::Buy,
+                Price::from_raw(100),
+                2,
+            );
+        }
+        risk.validate().unwrap();
+        risk
+    }
+
     #[test]
     fn unrepresentable_reservation_capacity_is_a_typed_failure() {
-        let mut reservations = HashMap::new();
         assert!(matches!(
-            try_reserve_risk_reservations(&mut reservations, usize::MAX),
+            try_new_risk_reservations(usize::MAX),
             Err(MatchingError::CapacityReservationFailed(
                 MatchingCapacity::RiskReservations
             ))
         ));
-        assert!(reservations.is_empty());
-        assert_eq!(reservations.capacity(), 0);
     }
 
     #[test]
     fn unrepresentable_account_capacity_is_a_typed_failure() {
-        let mut accounts = HashMap::new();
         assert!(matches!(
-            try_reserve_risk_accounts(&mut accounts, usize::MAX),
+            try_new_risk_accounts(usize::MAX),
             Err(MatchingError::CapacityReservationFailed(
                 MatchingCapacity::RiskAccounts
             ))
         ));
-        assert!(accounts.is_empty());
-        assert_eq!(accounts.capacity(), 0);
     }
 
     #[test]
@@ -1979,5 +2480,72 @@ mod reservation_capacity_tests {
             .validate()
             .expect_err("account capacity below its constructor bound is invalid");
         assert!(error.detail().contains("risk-account hash capacity"));
+    }
+
+    #[test]
+    fn allocation_free_audit_rejects_cycles_and_unlinked_reservations() {
+        let head = OrderId::new(10).unwrap();
+        let tail = OrderId::new(20).unwrap();
+
+        let mut cycle = risk_with_reservations();
+        cycle.reservations.get_mut(&tail).unwrap().next = Some(head);
+        assert!(
+            cycle
+                .validate()
+                .unwrap_err()
+                .detail()
+                .contains("risk-account cycle")
+        );
+
+        let mut unlinked = risk_with_reservations();
+        unlinked.reservations.get_mut(&head).unwrap().next = None;
+        let account = unlinked
+            .accounts
+            .get_mut(&AccountId::new(1).unwrap())
+            .unwrap();
+        account.reservation_tail = Some(head);
+        account.exposure = RiskSnapshot {
+            position_lots: 0,
+            open_buy_lots: 2,
+            open_sell_lots: 0,
+            open_notional: 200,
+            open_orders: 1,
+        };
+        assert!(
+            unlinked
+                .validate()
+                .unwrap_err()
+                .detail()
+                .contains("absent from its risk-account index")
+        );
+    }
+
+    #[test]
+    fn topology_is_nonsemantic_and_survives_every_removal_shape() {
+        let expected = risk_with_reservations();
+        let mut reordered = risk_with_reservations();
+        let first_id = OrderId::new(10).unwrap();
+        let first = reordered.remove_reservation(first_id);
+        reordered.append_reservation(first_id, first);
+        reordered.validate().unwrap();
+        assert_eq!(reordered, expected);
+
+        let third = OrderId::new(30).unwrap();
+        reordered.insert_reservation(
+            third,
+            AccountId::new(1).unwrap(),
+            Side::Buy,
+            Price::from_raw(100),
+            4,
+        );
+        reordered.remove_reservation(OrderId::new(20).unwrap());
+        reordered.validate().unwrap();
+        reordered.decrement_reservation(third, 1);
+        reordered.validate().unwrap();
+        reordered.remove_reservation(first_id);
+        reordered.validate().unwrap();
+        reordered.remove_reservation(third);
+        reordered.validate().unwrap();
+        assert_eq!(reordered.reservation_count(), 0);
     }
 }

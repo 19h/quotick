@@ -493,6 +493,9 @@ fn segmented_durable_auction_rotates_and_replays_one_global_sequence() {
 
 #[test]
 fn auction_checkpoint_has_stable_kind_codec_and_direct_restore() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<CallAuctionCheckpoint>();
     let mut engine = CallAuctionEngine::try_new(definition()).unwrap();
     let commands = [
         phase(1, 0, CallAuctionPhase::Collecting),
@@ -509,8 +512,24 @@ fn auction_checkpoint_has_stable_kind_codec_and_direct_restore() {
     assert_eq!(checkpoint.accepted_order_ids().len(), 2);
     assert_eq!(checkpoint.next_trade_id(), 2);
 
-    let encoded = checkpoint.encode().unwrap();
-    assert_eq!(CallAuctionCheckpoint::decode(&encoded).unwrap(), checkpoint);
+    let shared = checkpoint.clone();
+    assert!(shared.shares_accepted_order_storage_with(&checkpoint));
+    assert!(shared.shares_active_order_storage_with(&checkpoint));
+    assert!(shared.shares_history_storage_with(&checkpoint));
+    assert!(
+        shared.history()[0]
+            .report()
+            .events
+            .shares_storage_with(&checkpoint.history()[0].report().events)
+    );
+    drop(checkpoint);
+
+    let encoded = shared.encode().unwrap();
+    let decoded = CallAuctionCheckpoint::decode(&encoded).unwrap();
+    assert_eq!(decoded, shared);
+    assert!(!decoded.shares_accepted_order_storage_with(&shared));
+    assert!(!decoded.shares_active_order_storage_with(&shared));
+    assert!(!decoded.shares_history_storage_with(&shared));
     let mut invalid_boundary = encoded;
     invalid_boundary[8..16].copy_from_slice(&12_u64.to_le_bytes());
     assert!(matches!(
@@ -518,7 +537,7 @@ fn auction_checkpoint_has_stable_kind_codec_and_direct_restore() {
         Err(CodecError::InvalidAuctionCheckpoint(_))
     ));
 
-    let mut restored = CallAuctionEngine::from_checkpoint(checkpoint.clone()).unwrap();
+    let mut restored = CallAuctionEngine::from_checkpoint(&shared).unwrap();
     assert_eq!(restored.phase_snapshot(), engine.phase_snapshot());
     assert_eq!(restored.book().active_order_count(), 0);
     assert_eq!(restored.book().next_trade_id(), 2);
@@ -528,11 +547,37 @@ fn auction_checkpoint_has_stable_kind_codec_and_direct_restore() {
     let area = TestPath::directory("checkpoint-envelope");
     fs::create_dir_all(area.path()).unwrap();
     let snapshot = area.join("auction.qsnp");
-    SnapshotFile::write(&snapshot, &checkpoint, SnapshotOptions::default()).unwrap();
+    SnapshotFile::write(&snapshot, &shared, SnapshotOptions::default()).unwrap();
     let bytes = fs::read(snapshot).unwrap();
     assert_eq!(&bytes[0..4], b"QSNP");
     assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 4);
     assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 4);
+}
+
+#[test]
+fn auction_checkpoint_projection_is_independent_of_order_identity_order() {
+    let mut engine = CallAuctionEngine::try_new(definition()).unwrap();
+    for command in [
+        phase(1, 0, CallAuctionPhase::Collecting),
+        submit(2, order(30, 1, Side::Buy, 5)),
+        submit(3, order(10, 2, Side::Buy, 6)),
+        submit(4, order(20, 3, Side::Buy, 7)),
+    ] {
+        engine.submit(command).unwrap();
+    }
+
+    let checkpoint = engine.checkpoint(1, 9).unwrap();
+    assert_eq!(
+        checkpoint
+            .active_orders()
+            .iter()
+            .map(|order| order.order_id.get())
+            .collect::<Vec<_>>(),
+        vec![10, 20, 30]
+    );
+    let restored = CallAuctionEngine::from_checkpoint(&checkpoint).unwrap();
+    assert_eq!(restored.book().active_order_count(), 3);
+    restored.validate().unwrap();
 }
 
 #[test]
@@ -557,7 +602,7 @@ fn auction_checkpoint_projects_remainders_relative_to_each_uncross_cycle() {
     assert_eq!(engine.book().active_order_count(), 0);
     assert_eq!(engine.book().next_trade_id(), 3);
     let checkpoint = engine.checkpoint(1, 19).unwrap();
-    let restored = CallAuctionEngine::from_checkpoint(checkpoint).unwrap();
+    let restored = CallAuctionEngine::from_checkpoint(&checkpoint).unwrap();
     assert_eq!(restored.phase_snapshot(), engine.phase_snapshot());
     assert_eq!(restored.book().next_trade_id(), 3);
     restored.validate().unwrap();
@@ -569,12 +614,14 @@ fn auction_checkpoint_restore_enforces_current_resource_limits() {
         max_active_orders: 2,
         max_price_levels_per_side: 2,
         max_accepted_order_ids: 4,
+        max_prepared_uncrosses: 2,
     })
     .unwrap();
     let limits = CallAuctionEngineLimits::new(CallAuctionEngineLimitsSpec {
         book: book_limits,
         max_retained_commands: 8,
         terminal_command_reserve: 4,
+        max_retained_events: 14,
         max_report_events: 5,
     })
     .unwrap();
@@ -592,16 +639,18 @@ fn auction_checkpoint_restore_enforces_current_resource_limits() {
         max_active_orders: 1,
         max_price_levels_per_side: 1,
         max_accepted_order_ids: 4,
+        max_prepared_uncrosses: 2,
     })
     .unwrap();
     let smaller = CallAuctionEngineLimits::new(CallAuctionEngineLimitsSpec {
         book: smaller_book,
         max_retained_commands: 8,
         terminal_command_reserve: 3,
+        max_retained_events: 12,
         max_report_events: 3,
     })
     .unwrap();
-    let error = CallAuctionEngine::from_checkpoint_with_limits(checkpoint, smaller).unwrap_err();
+    let error = CallAuctionEngine::from_checkpoint_with_limits(&checkpoint, smaller).unwrap_err();
     assert_eq!(
         error.detail(),
         "auction checkpoint active orders exceed selected capacity"

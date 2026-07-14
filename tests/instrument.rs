@@ -214,7 +214,7 @@ fn partial_leaves_below_entry_minimum_survive_matching_checkpoint_round_trip() {
         5
     );
     let checkpoint = book.checkpoint(1, 5).unwrap();
-    let restored = OrderBook::from_checkpoint(checkpoint).unwrap();
+    let restored = OrderBook::from_checkpoint(&checkpoint).unwrap();
     assert_eq!(
         restored
             .order(OrderId::new(1).unwrap())

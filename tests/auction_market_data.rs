@@ -59,12 +59,14 @@ fn engine() -> CallAuctionEngine {
         max_active_orders: 16,
         max_price_levels_per_side: 16,
         max_accepted_order_ids: 64,
+        max_prepared_uncrosses: 2,
     })
     .unwrap();
     let limits = CallAuctionEngineLimits::new(CallAuctionEngineLimitsSpec {
         book,
         max_retained_commands: 64,
         terminal_command_reserve: 18,
+        max_retained_events: 98,
         max_report_events: 33,
     })
     .unwrap();
