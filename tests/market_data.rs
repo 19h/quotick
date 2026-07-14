@@ -12,8 +12,8 @@ use quotick::market_data::{
     MarketDataError, MarketDataKind, MarketDataPublisher, MarketDataReplica, MarketDataUpdate,
 };
 use quotick::matching::{
-    CancelOrder, Command, NewOrder, OrderBook, OrderType, ReplaceOrder, SelfTradePrevention,
-    TimeInForce,
+    AccountControl, AccountControlAction, CancelOrder, Command, NewOrder, OrderBook, OrderType,
+    ReplaceOrder, SelfTradePrevention, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -101,6 +101,23 @@ fn replace(command_id: u64, order_id: u64, account_id: u64, quantity: u64, price
         new_quantity: Quantity::new(quantity).expect("quantity"),
         new_price: Price::from_raw(price),
         new_display: quotick::matching::OrderDisplay::FullyDisplayed,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+fn account_control(
+    command_id: u64,
+    account_id: u64,
+    expected_revision: u64,
+    action: AccountControlAction,
+) -> Command {
+    Command::AccountControl(AccountControl {
+        command_id: CommandId::new(command_id).expect("command"),
+        account_id: AccountId::new(account_id).expect("account"),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        expected_revision,
+        action,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
@@ -195,6 +212,65 @@ fn incremental_updates_reconstruct_trades_replacements_and_cancellations() {
         .expect("publisher cross-audit passes");
     assert!(replica.depth(Side::Buy, 10).is_empty());
     assert!(replica.depth(Side::Sell, 10).is_empty());
+}
+
+#[test]
+fn account_control_cancellations_and_rejections_preserve_public_trace_continuity() {
+    let mut book = OrderBook::new(definition());
+    let mut publisher = MarketDataPublisher::from_book(&book).unwrap();
+    let mut replica = MarketDataReplica::new(instrument(), version());
+    replica.apply_snapshot(&publisher.snapshot()).unwrap();
+
+    for command in [
+        order(
+            1,
+            1,
+            7,
+            Side::Buy,
+            3,
+            99,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ),
+        order(
+            2,
+            2,
+            7,
+            Side::Sell,
+            5,
+            101,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ),
+    ] {
+        replica
+            .apply_batch(&publish(&mut book, &mut publisher, command))
+            .unwrap();
+    }
+
+    let stale = account_control(3, 7, 1, AccountControlAction::Enable);
+    let stale_batch = publish(&mut book, &mut publisher, stale);
+    assert_eq!(stale_batch.updates().len(), 1);
+    assert!(matches!(
+        stale_batch.updates()[0].kind(),
+        MarketDataKind::NoBookChange
+    ));
+    replica.apply_batch(&stale_batch).unwrap();
+
+    let block = account_control(4, 7, 0, AccountControlAction::BlockAndCancel);
+    let block_batch = publish(&mut book, &mut publisher, block);
+    assert_eq!(block_batch.updates().len(), 3);
+    replica.apply_batch(&block_batch).unwrap();
+    assert!(book.depth(Side::Buy, usize::MAX).is_empty());
+    assert!(book.depth(Side::Sell, usize::MAX).is_empty());
+    assert_mirrors(&book, &replica);
+    publisher.validate_against(&book).unwrap();
+
+    let retry = book.submit(block).unwrap();
+    assert!(retry.replayed);
+    let retry_batch = publisher.publish(block, &retry, &book).unwrap();
+    assert!(retry_batch.replayed());
+    assert!(retry_batch.updates().is_empty());
 }
 
 #[test]

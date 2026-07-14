@@ -3,9 +3,10 @@ use quotick::instrument::{
     QuantityRules, TradingState,
 };
 use quotick::matching::{
-    CancelOrder, Command, CommandOutcome, CommandPreparation, Event, EventKind, EventTrace,
-    MatchingError, NewOrder, OrderBook, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention,
-    TimeInForce, Trade,
+    AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
+    Command, CommandOutcome, CommandPreparation, Event, EventKind, EventTrace, MatchingError,
+    NewOrder, OrderBook, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce,
+    Trade,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -99,6 +100,23 @@ fn replace(command: u64, order: u64, owner: u64, quantity: u64, price: i64) -> C
     })
 }
 
+fn account_control(
+    command: u64,
+    owner: u64,
+    expected_revision: u64,
+    action: AccountControlAction,
+) -> Command {
+    Command::AccountControl(AccountControl {
+        command_id: CommandId::new(command).expect("non-zero command"),
+        account_id: account(owner),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        expected_revision,
+        action,
+        received_at: TimestampNs::from_unix_nanos(command),
+    })
+}
+
 fn trades(report: &quotick::matching::ExecutionReport) -> Vec<Trade> {
     report
         .events
@@ -129,6 +147,118 @@ fn event_trace_from_vec_retains_the_event_buffer() {
     let original_buffer = events.as_ptr();
     let trace = EventTrace::from(events);
     assert_eq!(trace.as_ptr(), original_buffer);
+}
+
+#[test]
+fn account_block_is_revision_checked_atomic_and_exactly_replayable() {
+    let mut book = OrderBook::new(definition());
+    for (command, order, side, price, quantity) in
+        [(1, 1, Side::Buy, 100, 3), (2, 2, Side::Sell, 110, 5)]
+    {
+        assert_eq!(
+            book.submit(limit_order(
+                command,
+                order,
+                11,
+                side,
+                quantity,
+                price,
+                TimeInForce::GoodTilCancelled,
+                SelfTradePrevention::CancelAggressor,
+            ))
+            .unwrap()
+            .outcome,
+            CommandOutcome::Accepted
+        );
+    }
+
+    let block = account_control(3, 11, 0, AccountControlAction::BlockAndCancel);
+    let report = book.submit(block).unwrap();
+    assert_eq!(report.outcome, CommandOutcome::Accepted);
+    assert_eq!(book.active_order_count(), 0);
+    assert_eq!(
+        book.account_control(account(11)).state(),
+        AccountAdmissionState::Blocked
+    );
+    assert_eq!(book.account_control(account(11)).revision(), 1);
+    assert!(report.events[..2].iter().all(|event| matches!(
+        event.kind,
+        EventKind::OrderCancelled {
+            reason: CancelReason::AccountControl,
+            ..
+        }
+    )));
+    assert!(matches!(
+        report.events[2].kind,
+        EventKind::AccountControlApplied {
+            account_id,
+            previous_state: AccountAdmissionState::Enabled,
+            current_state: AccountAdmissionState::Blocked,
+            revision: 1,
+            cancelled_order_count: 2,
+            cancelled_quantity_lots: 8,
+        } if account_id == account(11)
+    ));
+
+    let blocked = book
+        .submit(limit_order(
+            4,
+            3,
+            11,
+            Side::Buy,
+            1,
+            100,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ))
+        .unwrap();
+    assert_eq!(
+        blocked.outcome,
+        CommandOutcome::Rejected(RejectReason::AccountAdmissionBlocked)
+    );
+
+    let event_sequence = book.last_event_sequence();
+    let replay = book.submit(block).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(book.last_event_sequence(), event_sequence);
+    assert_eq!(book.account_control(account(11)).revision(), 1);
+
+    let stale = book
+        .submit(account_control(5, 11, 0, AccountControlAction::Enable))
+        .unwrap();
+    assert_eq!(
+        stale.outcome,
+        CommandOutcome::Rejected(RejectReason::AccountControlRevisionMismatch)
+    );
+    assert_eq!(book.account_control(account(11)).revision(), 1);
+
+    assert_eq!(
+        book.submit(account_control(6, 11, 1, AccountControlAction::Enable,))
+            .unwrap()
+            .outcome,
+        CommandOutcome::Accepted
+    );
+    assert_eq!(
+        book.account_control(account(11)).state(),
+        AccountAdmissionState::Enabled
+    );
+    assert_eq!(book.account_control(account(11)).revision(), 2);
+    assert_eq!(
+        book.submit(limit_order(
+            7,
+            4,
+            11,
+            Side::Buy,
+            1,
+            100,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ))
+        .unwrap()
+        .outcome,
+        CommandOutcome::Accepted
+    );
+    book.validate().unwrap();
 }
 
 #[test]
@@ -538,7 +668,7 @@ fn prepared_commands_are_generation_bound_and_exact_races_replay() {
     ));
     exact_race.validate().unwrap();
 
-    let mut source = OrderBook::new(definition());
+    let source = OrderBook::new(definition());
     let CommandPreparation::Ready(foreign) = source.prepare(command).unwrap() else {
         panic!("a unique command must produce a ready preparation")
     };

@@ -16,7 +16,7 @@ use crate::matching::OrderBookCheckpoint;
 use crate::risk::RiskManagedCheckpoint;
 
 const MAGIC: [u8; 4] = *b"QSNP";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const HEADER_LENGTH: usize = 28;
 const CHECKSUM_START: usize = 16;
 const CHECKSUM_END: usize = 20;
@@ -51,7 +51,7 @@ mod sealed {
 /// Typed semantic value with a crate-controlled stable snapshot-kind assignment.
 ///
 /// This trait is sealed so downstream implementations cannot claim an existing
-/// version-1 kind tag with a different codec.
+/// version-2 kind tag with a different codec.
 pub trait SnapshotPayload: BinaryCodec + sealed::SnapshotPayload {
     /// Stable envelope payload kind.
     const KIND: SnapshotKind;

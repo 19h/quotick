@@ -23,10 +23,11 @@ use crate::market_data::{
     TradePrint,
 };
 use crate::matching::{
-    CancelOrder, CancelReason, Command, CommandOutcome, CommandReportCheckpoint, Event, EventKind,
-    ExecutionReport, MassCancel, MassCancelScope, NewOrder, OrderBookCheckpoint,
-    OrderBookCheckpointError, OrderDisplay, OrderType, RejectReason, ReplaceOrder,
-    RestingOrderCheckpoint, SelfTradePrevention, TimeInForce, Trade,
+    AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
+    Command, CommandOutcome, CommandReportCheckpoint, Event, EventKind, ExecutionReport,
+    MassCancel, MassCancelScope, NewOrder, OrderBookCheckpoint, OrderBookCheckpointError,
+    OrderDisplay, OrderType, RejectReason, ReplaceOrder, RestingOrderCheckpoint,
+    SelfTradePrevention, TimeInForce, Trade,
 };
 use crate::risk::{
     AccountRiskDefinition, AccountRiskState, RiskAccountCheckpoint, RiskError, RiskLimitSpec,
@@ -449,6 +450,46 @@ fn decode_mass_cancel_scope(decoder: &mut Decoder<'_>) -> Result<MassCancelScope
     }
 }
 
+fn encode_account_admission_state(encoder: &mut Encoder, value: AccountAdmissionState) {
+    encoder.u8(match value {
+        AccountAdmissionState::Enabled => 0,
+        AccountAdmissionState::Blocked => 1,
+    });
+}
+
+fn decode_account_admission_state(
+    decoder: &mut Decoder<'_>,
+) -> Result<AccountAdmissionState, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(AccountAdmissionState::Enabled),
+        1 => Ok(AccountAdmissionState::Blocked),
+        tag => Err(CodecError::InvalidTag {
+            type_name: "AccountAdmissionState",
+            tag,
+        }),
+    }
+}
+
+fn encode_account_control_action(encoder: &mut Encoder, value: AccountControlAction) {
+    encoder.u8(match value {
+        AccountControlAction::BlockAndCancel => 0,
+        AccountControlAction::Enable => 1,
+    });
+}
+
+fn decode_account_control_action(
+    decoder: &mut Decoder<'_>,
+) -> Result<AccountControlAction, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(AccountControlAction::BlockAndCancel),
+        1 => Ok(AccountControlAction::Enable),
+        tag => Err(CodecError::InvalidTag {
+            type_name: "AccountControlAction",
+            tag,
+        }),
+    }
+}
+
 fn encode_time_in_force(encoder: &mut Encoder, value: TimeInForce) {
     encoder.u8(match value {
         TimeInForce::GoodTilCancelled => 0,
@@ -526,6 +567,9 @@ fn encode_reject_reason(encoder: &mut Encoder, value: RejectReason) {
         RejectReason::ReserveReplenishmentLimit => 28,
         RejectReason::ReserveOrderCannotBeImmediate => 29,
         RejectReason::OrderDisplayModeChangeNotAllowed => 30,
+        RejectReason::AccountAdmissionBlocked => 31,
+        RejectReason::AccountControlRevisionMismatch => 32,
+        RejectReason::AccountControlRevisionExhausted => 33,
     });
 }
 
@@ -562,6 +606,9 @@ fn decode_reject_reason(decoder: &mut Decoder<'_>) -> Result<RejectReason, Codec
         28 => Ok(RejectReason::ReserveReplenishmentLimit),
         29 => Ok(RejectReason::ReserveOrderCannotBeImmediate),
         30 => Ok(RejectReason::OrderDisplayModeChangeNotAllowed),
+        31 => Ok(RejectReason::AccountAdmissionBlocked),
+        32 => Ok(RejectReason::AccountControlRevisionMismatch),
+        33 => Ok(RejectReason::AccountControlRevisionExhausted),
         tag => Err(CodecError::InvalidTag {
             type_name: "RejectReason",
             tag,
@@ -576,6 +623,7 @@ fn encode_cancel_reason(encoder: &mut Encoder, value: CancelReason) {
         CancelReason::SelfTradeAggressor => 2,
         CancelReason::SelfTradeResting => 3,
         CancelReason::MassCancel => 4,
+        CancelReason::AccountControl => 5,
     });
 }
 
@@ -586,6 +634,7 @@ fn decode_cancel_reason(decoder: &mut Decoder<'_>) -> Result<CancelReason, Codec
         2 => Ok(CancelReason::SelfTradeAggressor),
         3 => Ok(CancelReason::SelfTradeResting),
         4 => Ok(CancelReason::MassCancel),
+        5 => Ok(CancelReason::AccountControl),
         tag => Err(CodecError::InvalidTag {
             type_name: "CancelReason",
             tag,
@@ -676,6 +725,16 @@ fn encode_command(encoder: &mut Encoder, command: Command) {
             encode_mass_cancel_scope(encoder, value.scope);
             encoder.u64(value.received_at.as_unix_nanos());
         }
+        Command::AccountControl(value) => {
+            encoder.u8(4);
+            encoder.u64(value.command_id.get());
+            encoder.u64(value.account_id.get());
+            encoder.u64(value.instrument_id.get());
+            encoder.u64(value.instrument_version.get());
+            encoder.u64(value.expected_revision);
+            encode_account_control_action(encoder, value.action);
+            encoder.u64(value.received_at.as_unix_nanos());
+        }
     }
 }
 
@@ -720,6 +779,15 @@ fn decode_command(decoder: &mut Decoder<'_>) -> Result<Command, CodecError> {
             instrument_id: instrument(decoder)?,
             instrument_version: instrument_version(decoder)?,
             scope: decode_mass_cancel_scope(decoder)?,
+            received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
+        })),
+        4 => Ok(Command::AccountControl(AccountControl {
+            command_id: command_id(decoder)?,
+            account_id: account(decoder)?,
+            instrument_id: instrument(decoder)?,
+            instrument_version: instrument_version(decoder)?,
+            expected_revision: decoder.u64()?,
+            action: decode_account_control_action(decoder)?,
             received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
         })),
         tag => Err(CodecError::InvalidTag {
@@ -1064,6 +1132,22 @@ fn encode_event_kind(encoder: &mut Encoder, kind: EventKind) {
             encoder.u64(cancelled_order_count);
             encoder.u128(cancelled_quantity_lots);
         }
+        EventKind::AccountControlApplied {
+            account_id,
+            previous_state,
+            current_state,
+            revision,
+            cancelled_order_count,
+            cancelled_quantity_lots,
+        } => {
+            encoder.u8(9);
+            encoder.u64(account_id.get());
+            encode_account_admission_state(encoder, previous_state);
+            encode_account_admission_state(encoder, current_state);
+            encoder.u64(revision);
+            encoder.u64(cancelled_order_count);
+            encoder.u128(cancelled_quantity_lots);
+        }
     }
 }
 
@@ -1112,6 +1196,14 @@ fn decode_event_kind(decoder: &mut Decoder<'_>) -> Result<EventKind, CodecError>
         8 => Ok(EventKind::MassCancelCompleted {
             account_id: account(decoder)?,
             scope: decode_mass_cancel_scope(decoder)?,
+            cancelled_order_count: decoder.u64()?,
+            cancelled_quantity_lots: decoder.u128()?,
+        }),
+        9 => Ok(EventKind::AccountControlApplied {
+            account_id: account(decoder)?,
+            previous_state: decode_account_admission_state(decoder)?,
+            current_state: decode_account_admission_state(decoder)?,
+            revision: decoder.u64()?,
             cancelled_order_count: decoder.u64()?,
             cancelled_quantity_lots: decoder.u128()?,
         }),

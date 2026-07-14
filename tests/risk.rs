@@ -3,11 +3,13 @@ use quotick::instrument::{
     QuantityRules, TradingState,
 };
 use quotick::matching::{
-    CancelOrder, Command, CommandOutcome, NewOrder, OrderType, RejectReason, ReplaceOrder,
-    SelfTradePrevention, TimeInForce,
+    AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, Command,
+    CommandOutcome, CommandPreparation, NewOrder, OrderBookLimits, OrderBookLimitsSpec, OrderType,
+    RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce,
 };
 use quotick::risk::{
-    AccountRiskState, RiskError, RiskLimitSpec, RiskLimits, RiskManagedOrderBook, RiskProfile,
+    AccountRiskState, RiskError, RiskHashIndex, RiskLimitSpec, RiskLimits, RiskManagedLimits,
+    RiskManagedLimitsError, RiskManagedLimitsSpec, RiskManagedOrderBook, RiskProfile,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -136,6 +138,350 @@ fn replace(command_id: u64, order_id: u64, owner: u64, quantity: u64, price: i64
         new_display: quotick::matching::OrderDisplay::FullyDisplayed,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
+}
+
+fn account_control(
+    command_id: u64,
+    owner: u64,
+    expected_revision: u64,
+    action: AccountControlAction,
+) -> Command {
+    Command::AccountControl(AccountControl {
+        command_id: CommandId::new(command_id).unwrap(),
+        account_id: account(owner),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        expected_revision,
+        action,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+fn prepare_read_only(
+    book: &RiskManagedOrderBook,
+    command: Command,
+) -> Result<CommandPreparation, quotick::matching::MatchingError> {
+    book.prepare(command)
+}
+
+fn managed_limits(matching: OrderBookLimits, maximum_accounts: usize) -> RiskManagedLimits {
+    RiskManagedLimits::new(RiskManagedLimitsSpec {
+        matching,
+        max_registered_accounts: maximum_accounts,
+    })
+    .unwrap()
+}
+
+#[test]
+fn managed_limits_reject_zero_profile_capacity() {
+    assert_eq!(
+        RiskManagedLimits::new(RiskManagedLimitsSpec {
+            matching: OrderBookLimits::default(),
+            max_registered_accounts: 0,
+        }),
+        Err(RiskManagedLimitsError::ZeroRegisteredAccounts)
+    );
+    let matching = OrderBookLimits::new(OrderBookLimitsSpec {
+        max_active_orders: 1,
+        max_active_accounts: 1,
+        max_price_levels_per_side: 1,
+        max_accepted_order_ids: 2,
+        max_account_controls: 1,
+        max_retained_commands: 3,
+        cancellation_reserve: 1,
+        max_report_events: 2,
+    })
+    .unwrap();
+    assert_eq!(
+        RiskManagedLimits::new(RiskManagedLimitsSpec {
+            matching,
+            max_registered_accounts: 2,
+        }),
+        Err(
+            RiskManagedLimitsError::AccountControlsBelowRegisteredAccounts {
+                account_controls: 1,
+                registered_accounts: 2,
+            }
+        )
+    );
+}
+
+#[test]
+fn risk_managed_account_control_requires_a_profile_and_releases_reservations() {
+    let mut book = RiskManagedOrderBook::new(definition());
+    book.register_account(account(11), profile(AccountRiskState::Active, 0))
+        .unwrap();
+    book.submit(limit_order(
+        1,
+        1,
+        11,
+        Side::Buy,
+        5,
+        100,
+        TimeInForce::GoodTilCancelled,
+    ))
+    .unwrap();
+    assert_eq!(book.risk().reservation_count(), 1);
+
+    let report = book
+        .submit(account_control(
+            2,
+            11,
+            0,
+            AccountControlAction::BlockAndCancel,
+        ))
+        .unwrap();
+    assert_eq!(report.outcome, CommandOutcome::Accepted);
+    assert_eq!(book.risk().reservation_count(), 0);
+    assert_eq!(book.risk().snapshot(account(11)).unwrap().open_orders(), 0);
+    assert_eq!(
+        book.book().account_control(account(11)).state(),
+        AccountAdmissionState::Blocked
+    );
+
+    let unknown = book
+        .submit(account_control(
+            3,
+            12,
+            0,
+            AccountControlAction::BlockAndCancel,
+        ))
+        .unwrap();
+    assert_eq!(
+        unknown.outcome,
+        CommandOutcome::Rejected(RejectReason::RiskProfileMissing)
+    );
+    assert_eq!(
+        book.book().account_control(account(12)).state(),
+        AccountAdmissionState::Enabled
+    );
+    assert_eq!(book.book().account_control(account(12)).revision(), 0);
+    book.validate().unwrap();
+}
+
+#[test]
+fn profile_registry_is_constructor_reserved_bounded_and_capacity_stable() {
+    let selected = managed_limits(OrderBookLimits::default(), 2);
+    let mut book = RiskManagedOrderBook::try_with_limits(definition(), selected).unwrap();
+    assert_eq!(book.limits(), selected);
+    let initial = book
+        .risk()
+        .hash_index_status(RiskHashIndex::AccountProfiles);
+    assert_eq!(initial.configured_entries, 2);
+    assert_eq!(initial.occupied_entries, 0);
+    assert!(initial.allocated_entries >= 2);
+
+    book.register_account(account(11), profile(AccountRiskState::Active, 0))
+        .unwrap();
+    book.register_account(account(12), profile(AccountRiskState::Blocked, 0))
+        .unwrap();
+    assert_eq!(
+        book.risk()
+            .hash_index_status(RiskHashIndex::AccountProfiles)
+            .allocated_entries,
+        initial.allocated_entries
+    );
+    assert_eq!(
+        book.register_account(account(12), profile(AccountRiskState::Blocked, 0)),
+        Err(RiskError::DuplicateProfile(account(12)))
+    );
+    assert_eq!(
+        book.register_account(account(13), profile(AccountRiskState::Active, 0)),
+        Err(RiskError::ProfileCapacityExhausted { maximum: 2 })
+    );
+    assert_eq!(
+        book.risk()
+            .hash_index_status(RiskHashIndex::AccountProfiles)
+            .occupied_entries,
+        2
+    );
+    book.submit(limit_order(
+        1,
+        1,
+        11,
+        Side::Buy,
+        1,
+        100,
+        TimeInForce::GoodTilCancelled,
+    ))
+    .unwrap();
+    assert_eq!(
+        book.risk()
+            .hash_index_status(RiskHashIndex::AccountProfiles)
+            .allocated_entries,
+        initial.allocated_entries
+    );
+    book.validate().unwrap();
+}
+
+#[test]
+fn unrepresentable_profile_registry_is_a_typed_constructor_failure() {
+    let base = OrderBookLimits::default();
+    let matching = OrderBookLimits::new(OrderBookLimitsSpec {
+        max_active_orders: base.max_active_orders(),
+        max_active_accounts: base.max_active_accounts(),
+        max_price_levels_per_side: base.max_price_levels_per_side(),
+        max_accepted_order_ids: base.max_accepted_order_ids(),
+        max_account_controls: usize::MAX,
+        max_retained_commands: base.max_retained_commands(),
+        cancellation_reserve: base.cancellation_reserve(),
+        max_report_events: base.max_report_events(),
+    })
+    .unwrap();
+    let selected = managed_limits(matching, usize::MAX);
+    assert_eq!(
+        RiskManagedOrderBook::try_with_limits(definition(), selected),
+        Err(quotick::matching::MatchingError::CapacityReservationFailed(
+            quotick::matching::MatchingCapacity::RiskAccounts
+        ))
+    );
+}
+
+#[test]
+fn checkpoint_restoration_enforces_selected_profile_capacity() {
+    let selected = managed_limits(OrderBookLimits::default(), 2);
+    let mut book = RiskManagedOrderBook::with_limits(definition(), selected);
+    for owner in [11, 12] {
+        book.register_account(account(owner), profile(AccountRiskState::Active, 0))
+            .unwrap();
+    }
+    let checkpoint = book.checkpoint(1, 3, 3).unwrap();
+    let insufficient = managed_limits(OrderBookLimits::default(), 1);
+    let error = RiskManagedOrderBook::from_checkpoint_with_limits(&checkpoint, insufficient)
+        .expect_err("two checkpoint profiles cannot fit one configured slot");
+    assert!(
+        error
+            .detail()
+            .contains("account count 2 exceeds selected capacity 1")
+    );
+
+    let restored =
+        RiskManagedOrderBook::from_checkpoint_with_limits(&checkpoint, selected).unwrap();
+    assert_eq!(
+        restored
+            .risk()
+            .hash_index_status(RiskHashIndex::AccountProfiles)
+            .occupied_entries,
+        2
+    );
+    restored.validate().unwrap();
+}
+
+#[test]
+fn profile_registry_locks_after_the_first_sequenced_command() {
+    let selected = managed_limits(OrderBookLimits::default(), 2);
+    let mut book = RiskManagedOrderBook::with_limits(definition(), selected);
+    book.register_account(account(11), profile(AccountRiskState::Active, 0))
+        .unwrap();
+    book.submit(limit_order(
+        1,
+        1,
+        11,
+        Side::Buy,
+        1,
+        100,
+        TimeInForce::ImmediateOrCancel,
+    ))
+    .unwrap();
+    assert_eq!(
+        book.register_account(account(12), profile(AccountRiskState::Active, 0)),
+        Err(RiskError::ProfileRegistryLocked)
+    );
+    assert!(book.risk().snapshot(account(12)).is_none());
+    book.validate().unwrap();
+}
+
+#[test]
+fn constructor_reserves_risk_headroom_before_profile_registration_and_commit() {
+    let mut book = RiskManagedOrderBook::new(definition());
+    let constructor_capacity = book.risk().reservation_capacity();
+    assert!(constructor_capacity >= book.book().limits().max_active_orders());
+    let command = limit_order(1, 1, 11, Side::Buy, 1, 100, TimeInForce::GoodTilCancelled);
+
+    let CommandPreparation::Ready(prepared) = prepare_read_only(&book, command).unwrap() else {
+        panic!("unique new order cannot be a replay")
+    };
+    assert_eq!(book.risk().reservation_capacity(), constructor_capacity);
+    assert_eq!(book.risk().reservation_count(), 0);
+    assert_eq!(book.book().active_order_count(), 0);
+
+    // Profile registration does not advance the matching generation. Reserving
+    // independently of the current risk result covers this split-API race.
+    book.register_account(account(11), profile(AccountRiskState::Active, 0))
+        .unwrap();
+    let prepared_capacity = book.risk().reservation_capacity();
+    let report = book.commit(prepared).unwrap();
+    assert_eq!(report.outcome, CommandOutcome::Accepted);
+    assert_eq!(book.risk().reservation_capacity(), prepared_capacity);
+    assert_eq!(book.risk().reservation_count(), 1);
+    assert_eq!(book.book().active_order_count(), 1);
+    book.validate().unwrap();
+}
+
+#[test]
+fn risk_reservation_capacity_is_constructor_reserved_and_reused_at_the_active_bound() {
+    let reserved_limits = OrderBookLimits::new(OrderBookLimitsSpec {
+        max_active_orders: 2,
+        max_active_accounts: 2,
+        max_price_levels_per_side: 2,
+        max_accepted_order_ids: 4,
+        max_account_controls: 4,
+        max_retained_commands: 6,
+        cancellation_reserve: 2,
+        max_report_events: 4,
+    })
+    .unwrap();
+    let reserved =
+        RiskManagedOrderBook::try_with_limits(definition(), managed_limits(reserved_limits, 2))
+            .unwrap();
+    assert_eq!(reserved.risk().reservation_limit(), 2);
+    assert!(reserved.risk().reservation_capacity() >= 2);
+
+    let boundary_limits = OrderBookLimits::new(OrderBookLimitsSpec {
+        max_active_orders: 1,
+        max_active_accounts: 1,
+        max_price_levels_per_side: 1,
+        max_accepted_order_ids: 4,
+        max_account_controls: 4,
+        max_retained_commands: 5,
+        cancellation_reserve: 1,
+        max_report_events: 4,
+    })
+    .unwrap();
+    let mut book =
+        RiskManagedOrderBook::with_limits(definition(), managed_limits(boundary_limits, 2));
+    for owner in [11, 12] {
+        book.register_account(account(owner), profile(AccountRiskState::Active, 0))
+            .unwrap();
+    }
+    book.submit(limit_order(
+        1,
+        1,
+        11,
+        Side::Sell,
+        1,
+        100,
+        TimeInForce::GoodTilCancelled,
+    ))
+    .unwrap();
+    let full_capacity = book.risk().reservation_capacity();
+
+    let replacement_owner = limit_order(2, 2, 12, Side::Buy, 2, 100, TimeInForce::GoodTilCancelled);
+    let CommandPreparation::Ready(prepared) = book.prepare(replacement_owner).unwrap() else {
+        panic!("unique new order cannot be a replay")
+    };
+    assert_eq!(book.risk().reservation_capacity(), full_capacity);
+    book.commit(prepared).unwrap();
+    assert_eq!(book.risk().reservation_capacity(), full_capacity);
+    assert!(book.risk().reservation(OrderId::new(1).unwrap()).is_none());
+    assert_eq!(
+        book.risk()
+            .reservation(OrderId::new(2).unwrap())
+            .unwrap()
+            .quantity_lots(),
+        1
+    );
+    book.validate().unwrap();
 }
 
 #[test]

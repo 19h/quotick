@@ -1,6 +1,6 @@
-# WAL Format Version 1
+# WAL Format Version 2
 
-This document is the authoritative byte-level schema for Quotick WAL version 1.
+This document is the authoritative byte-level schema for Quotick WAL version 2.
 All multibyte integers are little-endian. No Rust enum layout, padding, pointer,
 or platform ABI is persisted.
 
@@ -9,7 +9,7 @@ or platform ABI is persisted.
 | Offset (bytes) | Width (bytes) | Field |
 |---:|---:|---|
 | 0 | 4 | ASCII magic `QWAL` |
-| 4 | 2 | format version `1` |
+| 4 | 2 | format version `2` |
 | 6 | 2 | record kind: command `1`, execution report `2`, ledger entry `3`, instrument definition `4`, account risk definition `5`, ledger correction `6`, ledger batch `7` |
 | 8 | 4 | payload length |
 | 12 | 4 | CRC-32C |
@@ -100,7 +100,8 @@ these records in strictly increasing account-ID order.
 
 ## Command payload
 
-The first `u8` selects new `0`, cancel `1`, replace `2`, or mass cancel `3`.
+The first `u8` selects new `0`, cancel `1`, replace `2`, mass cancel `3`, or
+account control `4`.
 
 - New: command ID, order ID, account ID, instrument ID, instrument version,
   side, quantity, display policy, order type, time in force, self-trade policy,
@@ -111,6 +112,8 @@ The first `u8` selects new `0`, cancel `1`, replace `2`, or mass cancel `3`.
   new leaves quantity, new price, new display policy, receive timestamp.
 - Mass cancel: command ID, account ID, instrument ID, instrument version,
   selection scope, receive timestamp.
+- Account control: command ID, account ID, instrument ID, instrument version,
+  expected control revision `u64`, action, receive timestamp.
 
 Side tags are buy `0`, sell `1`. Order type tags are market `0`, limit `1`
 followed by price. Time-in-force tags are GTC `0`, IOC `1`, FOK `2`, post-only
@@ -127,10 +130,18 @@ Mass-cancel scope tags are all owned orders `0`, or one side `1` followed by a
 side tag. The command applies only within its instrument-version shard and is
 admitted in every trading state after identity validation.
 
+Account-control action tags are block-and-cancel `0` and enable `1`. An account
+without retained control state is enabled at revision zero. Acceptance requires
+the command's expected revision to equal current state and increments it by
+exactly one. Block-and-cancel closes the admission fence and cancels every
+resting order for the account in the same command transition. Enable reopens
+entry and cancels nothing. New orders and replacements for a blocked account
+are rejected; owner cancellations remain admitted.
+
 ## Matching capacity and WAL admission
 
 `OrderBookLimits` is finite operational process policy and is not encoded in
-version-1 financial metadata. It does not change the interpretation of an
+version-2 financial metadata. It does not change the interpretation of an
 existing frame. Durable matching and risk wrappers prepare matching state
 before appending a command frame. A capacity failure therefore has no event
 sequence, report, or WAL representation and the command identifier remains
@@ -142,16 +153,22 @@ append `PreparedCommand.command()` and then commit the same token, so capacity,
 identifier-space, FOK, and core business checks are not repeated after WAL
 append. Commit rejects foreign or stale tokens before mutation; recovery never
 serializes a token and instead prepares the persisted command against recovered
-state. Preparation may increase allocator capacity without changing semantic
-book state: it fallibly reserves every matching hash insertion required by the
-command, the complete report vector, and the exact `K`-identifier mass-cancel
-selection vector. Those structures cannot grow or rehash during matching commit.
-Ordered-tree nodes, Arc control blocks, and coupled risk reservation storage are
-not covered by this operational guarantee.
+state. Both stable-slot price-level AVL arenas, all five matching hash indexes,
+and the complete coupled-risk profile and reservation indexes are fallibly
+reserved to their configured maxima when the shard is constructed. Preparation therefore borrows
+matching/risk state immutably and fallibly reserves only the complete report
+vector and exact `K`-identifier mass-cancel or block-and-cancel selection
+vector. These structures
+cannot grow or rehash during commit; level insertion/deletion and account
+membership allocate no node. Arc control blocks and unrelated codec/checkpoint
+buffers are not covered by this operational guarantee. AVL topology, vacant-slot links,
+and account/side membership links are derived in-memory state: they are absent
+from WAL/checkpoint bytes and are rebuilt and independently audited during
+recovery.
 
 `EventTrace` is an in-memory immutable shared representation only. WAL report
 encoding still serializes the same event count and ordered event values; `Arc`
-identity, ownership count, and copy-on-write state are absent from version-1
+identity, ownership count, and copy-on-write state are absent from version-2
 bytes. Decoding constructs a new vector event buffer plus shared-owner control
 block, retains that vector buffer without a final event copy, and applies the
 same semantic report validation.
@@ -166,8 +183,9 @@ opposite-side matching. All three limits are decided before WAL append.
 
 Retained command history has an ordinary prefix and a protected cancellation
 tail. Once the ordinary prefix fills, new and replace commands fail preflight.
-Only a cancel or mass-cancel that currently passes core instrument, identity,
-ownership, and active-state checks may enter the tail; exact cached retries do
+Only a cancel, mass cancel, or block-and-cancel account control that currently
+passes core instrument, identity, ownership/revision, and active-state checks
+may enter the tail. Enable controls remain ordinary admission commands. Exact cached retries do
 not append frames and remain available at total exhaustion. The configured tail
 is at least the maximum active-order count, permitting one valid individual
 cancel for every maximally populated order when the reserve has not already
@@ -191,9 +209,11 @@ order-notional limit `19`, risk open-order-count limit `20`, risk open-quantity
 limit `21`, risk open-notional limit `22`, risk position limit `23`, and risk
 arithmetic overflow `24`, reserve unsupported `25`, display quantity off grid
 `26`, display quantity not smaller than total `27`, reserve replenishment limit
-`28`, reserve cannot be immediate `29`, and display-mode conversion forbidden
-`30`. Cancellation-reason tags are user request `0`,
-unfilled remainder `1`, STP aggressor `2`, STP resting `3`, and mass cancel `4`.
+`28`, reserve cannot be immediate `29`, display-mode conversion forbidden
+`30`, account admission blocked `31`, account-control revision mismatch `32`,
+and account-control revision exhausted `33`. Cancellation-reason tags are user
+request `0`, unfilled remainder `1`, STP aggressor `2`, STP resting `3`, mass
+cancel `4`, and account control `5`.
 
 ## Execution-report payload
 
@@ -213,6 +233,7 @@ event-kind union:
 | 6 | command rejected: reason |
 | 7 | reserve refreshed: order ID, price, displayed quantity, total leaves quantity |
 | 8 | mass cancel completed: account ID, scope, cancelled order count `u64`, total cancelled leaves `u128` |
+| 9 | account control applied: account ID, previous/current admission-state tags, revision `u64`, cancelled order count `u64`, total cancelled leaves `u128` |
 
 Decoding requires non-empty, contiguous events correlated to the report command.
 Accepted reports cannot contain rejection events; rejected reports contain
@@ -229,10 +250,17 @@ by exactly one tag-`8` completion. The completion count and `u128` quantity sum
 must equal those preceding cancellation events. An empty selection emits only
 the zero-valued completion.
 
-Under assumption A37, these display fields, mass-cancel command tag `3`, and
-event tags `7`–`8` are part of the first deployable version-1 matching schema.
-Pre-deployment development payloads that omit them are not backward-compatible
-and are not assigned inferred semantics.
+A block-and-cancel account control emits one tag-`3` cancellation with reason
+`5` per selected order in strictly ascending order ID, then one tag-`9`
+completion. The completion aggregates equal the preceding cancellations. An
+enable control emits only tag `9` with zero cancellation aggregates. Admission
+state tags are enabled `0` and blocked `1`; the completion revision equals
+`expected revision + 1` and carries the exact prior and resulting state.
+
+Under assumptions A15 and A57, account-control command tag `4`, event tag `9`,
+rejection tags `31`–`33`, and cancellation tag `5` establish version 2. Version
+1 development artifacts are rejected as unsupported; absent control fields are
+never assigned inferred semantics.
 
 ## Ledger-entry payload
 
@@ -364,11 +392,11 @@ record kind `3`; indivisible reversal-plus-replacement events use ledger-
 correction kind `6`; generalized multi-entry events use ledger-batch kind `7`.
 Matching, coupled risk/matching, and ledger checkpoints are separate `QSNP`
 files described by
-[Semantic snapshot format version 1](snapshot-v1.md).
+[Semantic snapshot format version 2](snapshot-v2.md).
 Checkpoint-assisted open still scans every WAL frame and requires the
 checkpoint's complete command/report or ledger-record sequence to equal the
 exact WAL prefix before applying the remaining suffix. A matching checkpoint
-boundary is always a completed execution-report frame. Version 1 does not
+boundary is always a completed execution-report frame. Version 2 does not
 truncate or retire either prefix.
 
 A risk-managed matching journal inserts zero or more account-risk-definition
@@ -376,6 +404,10 @@ records between the instrument definition and the first command. The complete
 canonical profile set must equal the requested set. If the file ends during
 metadata initialization, recovery may append only the missing suffix of an
 exact profile prefix; metadata drift or metadata after a command is rejected.
+The requested count must fit `RiskManagedLimits`; count rejection and fallible
+canonical-vector reservation occur before the WAL path is created or opened.
+The in-memory profile index has complete constructor-owned headroom and becomes
+locked when the first command is sequenced.
 Commands and reports then follow the same alternating grammar, but replay uses
 the coupled matching/risk state machine so risk rejections, positions, and
 reservations are reconstructed deterministically.

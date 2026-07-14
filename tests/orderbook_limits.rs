@@ -4,12 +4,14 @@ use quotick::instrument::{
 };
 use quotick::journal::{Durability, JournalOptions};
 use quotick::matching::{
-    CancelOrder, Command, CommandOutcome, MassCancel, MassCancelScope, MatchingCapacity,
-    MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsError, OrderBookLimitsSpec,
-    OrderDisplay, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce,
+    AccountControl, AccountControlAction, CancelOrder, Command, CommandOutcome, CommandPreparation,
+    MassCancel, MassCancelScope, MatchingCapacity, MatchingError, MatchingHashIndex, NewOrder,
+    OrderBook, OrderBookLimits, OrderBookLimitsError, OrderBookLimitsSpec, OrderDisplay, OrderType,
+    RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce,
 };
 use quotick::risk::{
-    AccountRiskState, RiskLimitSpec, RiskLimits, RiskManagedOrderBook, RiskProfile,
+    AccountRiskState, RiskLimitSpec, RiskLimits, RiskManagedLimits, RiskManagedLimitsSpec,
+    RiskManagedOrderBook, RiskProfile,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -81,10 +83,35 @@ fn limits(
         max_active_accounts: accounts,
         max_price_levels_per_side: levels,
         max_accepted_order_ids: accepted_ids,
+        max_account_controls: accepted_ids,
         max_retained_commands: history,
         cancellation_reserve,
         max_report_events: 64,
-        preallocate: false,
+    })
+    .unwrap()
+}
+
+fn account_control(
+    command_id: u64,
+    owner: u64,
+    expected_revision: u64,
+    action: AccountControlAction,
+) -> Command {
+    Command::AccountControl(AccountControl {
+        command_id: CommandId::new(command_id).unwrap(),
+        account_id: AccountId::new(owner).unwrap(),
+        instrument_id: InstrumentId::new(1).unwrap(),
+        instrument_version: InstrumentVersion::new(1).unwrap(),
+        expected_revision,
+        action,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+fn coupled_limits(matching: OrderBookLimits, max_registered_accounts: usize) -> RiskManagedLimits {
+    RiskManagedLimits::new(RiskManagedLimitsSpec {
+        matching,
+        max_registered_accounts,
     })
     .unwrap()
 }
@@ -201,6 +228,201 @@ fn replace(command_id: u64, order_id: u64, account_id: u64, price: i64) -> Comma
     })
 }
 
+fn prepare_read_only(
+    book: &OrderBook,
+    command: Command,
+) -> Result<CommandPreparation, MatchingError> {
+    book.prepare(command)
+}
+
+#[test]
+fn complete_hash_headroom_exists_at_construction_and_never_changes_on_commit() {
+    let selected = limits(2, 2, 2, 8, 8, 2);
+    let mut book = OrderBook::try_with_limits(definition(), selected).unwrap();
+    let indexes = [
+        MatchingHashIndex::ActiveOrders,
+        MatchingHashIndex::ActiveAccounts,
+        MatchingHashIndex::AcceptedOrderIds,
+        MatchingHashIndex::AccountControls,
+        MatchingHashIndex::CommandHistory,
+    ];
+    let initial = indexes.map(|index| book.hash_index_status(index));
+    for status in initial {
+        assert_eq!(status.occupied_entries, 0);
+        assert!(status.allocated_entries >= status.configured_entries);
+    }
+
+    let CommandPreparation::Ready(prepared) =
+        prepare_read_only(&book, resting(1, 1, 11, Side::Buy, 100)).unwrap()
+    else {
+        panic!("a fresh command cannot be a replay")
+    };
+    assert_eq!(
+        indexes.map(|index| book.hash_index_status(index).allocated_entries),
+        initial.map(|status| status.allocated_entries)
+    );
+    book.commit(prepared).unwrap();
+    assert_eq!(
+        indexes.map(|index| book.hash_index_status(index).allocated_entries),
+        initial.map(|status| status.allocated_entries)
+    );
+    assert_eq!(
+        indexes.map(|index| book.hash_index_status(index).occupied_entries),
+        [1, 1, 1, 0, 1]
+    );
+
+    book.submit(cancel(2, 1, 11)).unwrap();
+    book.submit(resting(3, 2, 12, Side::Sell, 101)).unwrap();
+    assert_eq!(
+        indexes.map(|index| book.hash_index_status(index).allocated_entries),
+        initial.map(|status| status.allocated_entries)
+    );
+    assert_eq!(
+        indexes.map(|index| book.hash_index_status(index).occupied_entries),
+        [1, 1, 2, 0, 3]
+    );
+    book.submit(account_control(4, 11, 0, AccountControlAction::Enable))
+        .unwrap();
+    assert_eq!(
+        indexes.map(|index| book.hash_index_status(index).allocated_entries),
+        initial.map(|status| status.allocated_entries)
+    );
+    assert_eq!(
+        indexes.map(|index| book.hash_index_status(index).occupied_entries),
+        [1, 1, 2, 1, 4]
+    );
+    book.validate().unwrap();
+}
+
+#[test]
+fn account_control_capacity_is_exact_never_evicted_and_updates_existing_accounts_when_full() {
+    let selected = OrderBookLimits::new(OrderBookLimitsSpec {
+        max_active_orders: 1,
+        max_active_accounts: 1,
+        max_price_levels_per_side: 1,
+        max_accepted_order_ids: 4,
+        max_account_controls: 1,
+        max_retained_commands: 6,
+        cancellation_reserve: 1,
+        max_report_events: 2,
+    })
+    .unwrap();
+    let mut book = OrderBook::with_limits(definition(), selected);
+    let allocated = book
+        .hash_index_status(MatchingHashIndex::AccountControls)
+        .allocated_entries;
+    let first = account_control(1, 11, 0, AccountControlAction::Enable);
+    assert_eq!(
+        book.submit(first).unwrap().outcome,
+        CommandOutcome::Accepted
+    );
+    assert!(book.submit(first).unwrap().replayed);
+    assert_eq!(
+        book.submit(account_control(2, 12, 0, AccountControlAction::Enable,)),
+        Err(MatchingError::CapacityExhausted(
+            MatchingCapacity::AccountControls
+        ))
+    );
+    assert_eq!(
+        book.account_control(AccountId::new(12).unwrap()).revision(),
+        0
+    );
+    assert_eq!(
+        book.submit(account_control(
+            3,
+            11,
+            1,
+            AccountControlAction::BlockAndCancel,
+        ))
+        .unwrap()
+        .outcome,
+        CommandOutcome::Accepted
+    );
+    let status = book.hash_index_status(MatchingHashIndex::AccountControls);
+    assert_eq!(status.configured_entries, 1);
+    assert_eq!(status.occupied_entries, 1);
+    assert_eq!(status.allocated_entries, allocated);
+    assert_eq!(
+        book.account_control(AccountId::new(11).unwrap()).revision(),
+        2
+    );
+    book.validate().unwrap();
+}
+
+#[test]
+fn checkpoint_restoration_enforces_the_selected_account_control_capacity() {
+    let mut book = OrderBook::new(definition());
+    for (command_id, owner) in [(1, 11), (2, 12)] {
+        book.submit(account_control(
+            command_id,
+            owner,
+            0,
+            AccountControlAction::Enable,
+        ))
+        .unwrap();
+    }
+    let checkpoint = book.checkpoint(1, 5).unwrap();
+    let base = OrderBookLimits::default();
+    let insufficient = OrderBookLimits::new(OrderBookLimitsSpec {
+        max_active_orders: base.max_active_orders(),
+        max_active_accounts: base.max_active_accounts(),
+        max_price_levels_per_side: base.max_price_levels_per_side(),
+        max_accepted_order_ids: base.max_accepted_order_ids(),
+        max_account_controls: 1,
+        max_retained_commands: base.max_retained_commands(),
+        cancellation_reserve: base.cancellation_reserve(),
+        max_report_events: base.max_report_events(),
+    })
+    .unwrap();
+    let error = OrderBook::from_checkpoint_with_limits(checkpoint, insufficient).unwrap_err();
+    assert!(
+        error
+            .detail()
+            .contains("account-control capacity is insufficient")
+    );
+}
+
+#[test]
+fn block_and_cancel_uses_the_protected_history_lane_but_enable_does_not() {
+    let selected = OrderBookLimits::new(OrderBookLimitsSpec {
+        max_active_orders: 1,
+        max_active_accounts: 1,
+        max_price_levels_per_side: 1,
+        max_accepted_order_ids: 4,
+        max_account_controls: 2,
+        max_retained_commands: 3,
+        cancellation_reserve: 1,
+        max_report_events: 2,
+    })
+    .unwrap();
+    let mut book = OrderBook::with_limits(definition(), selected);
+    book.submit(resting(1, 1, 11, Side::Buy, 100)).unwrap();
+    assert_eq!(
+        book.submit(resting(2, 1, 11, Side::Buy, 100))
+            .unwrap()
+            .outcome,
+        CommandOutcome::Rejected(RejectReason::DuplicateOrder)
+    );
+    assert_eq!(
+        book.submit(account_control(3, 11, 0, AccountControlAction::Enable,)),
+        Err(MatchingError::CapacityExhausted(
+            MatchingCapacity::AdmissionCommandHistory
+        ))
+    );
+    let blocked = book
+        .submit(account_control(
+            3,
+            11,
+            0,
+            AccountControlAction::BlockAndCancel,
+        ))
+        .unwrap();
+    assert_eq!(blocked.outcome, CommandOutcome::Accepted);
+    assert_eq!(book.active_order_count(), 0);
+    assert_eq!(book.retained_command_count(), 3);
+    book.validate().unwrap();
+}
+
 #[test]
 fn limit_spec_rejects_zero_incoherent_and_under_reserved_configurations() {
     let base = OrderBookLimitsSpec {
@@ -208,10 +430,10 @@ fn limit_spec_rejects_zero_incoherent_and_under_reserved_configurations() {
         max_active_accounts: 2,
         max_price_levels_per_side: 2,
         max_accepted_order_ids: 8,
+        max_account_controls: 8,
         max_retained_commands: 8,
         cancellation_reserve: 2,
         max_report_events: 3,
-        preallocate: false,
     };
     assert_eq!(
         OrderBookLimits::new(base)
@@ -249,6 +471,13 @@ fn limit_spec_rejects_zero_incoherent_and_under_reserved_configurations() {
     );
     assert_eq!(
         OrderBookLimits::new(OrderBookLimitsSpec {
+            max_account_controls: 0,
+            ..base
+        }),
+        Err(OrderBookLimitsError::ZeroAccountControls)
+    );
+    assert_eq!(
+        OrderBookLimits::new(OrderBookLimitsSpec {
             max_report_events: 0,
             ..base
         }),
@@ -261,19 +490,27 @@ fn limit_spec_rejects_zero_incoherent_and_under_reserved_configurations() {
         }),
         Err(OrderBookLimitsError::ReportEventsBelowMassCancelMaximum)
     );
-    let preallocated = OrderBookLimits::new(OrderBookLimitsSpec {
-        preallocate: true,
-        ..base
-    })
-    .unwrap();
-    assert!(preallocated.preallocates());
+    let bounded = OrderBookLimits::new(base).unwrap();
     assert_eq!(
-        OrderBook::with_limits(definition(), preallocated).limits(),
-        preallocated
+        OrderBook::with_limits(definition(), bounded).limits(),
+        bounded
     );
+}
+
+#[test]
+fn constructor_reservation_failures_name_the_exact_resource() {
+    let base = OrderBookLimitsSpec {
+        max_active_orders: 2,
+        max_active_accounts: 2,
+        max_price_levels_per_side: 2,
+        max_accepted_order_ids: 8,
+        max_account_controls: 8,
+        max_retained_commands: 8,
+        cancellation_reserve: 2,
+        max_report_events: 3,
+    };
     let impossible_reservation = OrderBookLimits::new(OrderBookLimitsSpec {
         max_accepted_order_ids: usize::MAX,
-        preallocate: true,
         ..base
     })
     .unwrap();
@@ -281,6 +518,67 @@ fn limit_spec_rejects_zero_incoherent_and_under_reserved_configurations() {
         OrderBook::try_with_limits(definition(), impossible_reservation),
         Err(MatchingError::CapacityReservationFailed(
             MatchingCapacity::AcceptedOrderIds
+        ))
+    );
+
+    let impossible_history = OrderBookLimits::new(OrderBookLimitsSpec {
+        max_retained_commands: usize::MAX,
+        ..base
+    })
+    .unwrap();
+    assert_eq!(
+        OrderBook::try_with_limits(definition(), impossible_history),
+        Err(MatchingError::CapacityReservationFailed(
+            MatchingCapacity::CommandHistory
+        ))
+    );
+
+    let impossible_controls = OrderBookLimits::new(OrderBookLimitsSpec {
+        max_account_controls: usize::MAX,
+        ..base
+    })
+    .unwrap();
+    assert_eq!(
+        OrderBook::try_with_limits(definition(), impossible_controls),
+        Err(MatchingError::CapacityReservationFailed(
+            MatchingCapacity::AccountControls
+        ))
+    );
+
+    let arena_bound = (usize::MAX - 1) / 2;
+    let impossible_active_hash = OrderBookLimits::new(OrderBookLimitsSpec {
+        max_active_orders: arena_bound,
+        max_active_accounts: 1,
+        max_price_levels_per_side: 1,
+        max_accepted_order_ids: arena_bound,
+        max_account_controls: 1,
+        max_retained_commands: usize::MAX,
+        cancellation_reserve: arena_bound,
+        max_report_events: arena_bound + 1,
+    })
+    .unwrap();
+    assert_eq!(
+        OrderBook::try_with_limits(definition(), impossible_active_hash),
+        Err(MatchingError::CapacityReservationFailed(
+            MatchingCapacity::ActiveOrders
+        ))
+    );
+
+    let impossible_price_arena = OrderBookLimits::new(OrderBookLimitsSpec {
+        max_active_orders: arena_bound,
+        max_active_accounts: 1,
+        max_price_levels_per_side: arena_bound,
+        max_accepted_order_ids: arena_bound,
+        max_account_controls: 1,
+        max_retained_commands: usize::MAX,
+        cancellation_reserve: arena_bound,
+        max_report_events: arena_bound + 1,
+    })
+    .unwrap();
+    assert_eq!(
+        OrderBook::try_with_limits(definition(), impossible_price_arena),
+        Err(MatchingError::CapacityReservationFailed(
+            MatchingCapacity::BidPriceLevels
         ))
     );
 }
@@ -292,10 +590,10 @@ fn report_event_capacity_fails_before_matching_mutation() {
         max_active_accounts: 1,
         max_price_levels_per_side: 1,
         max_accepted_order_ids: 4,
+        max_account_controls: 4,
         max_retained_commands: 8,
         cancellation_reserve: 1,
         max_report_events: 2,
-        preallocate: false,
     })
     .unwrap();
     let mut book = OrderBook::with_limits(definition(), constrained);
@@ -328,10 +626,10 @@ fn durable_report_event_capacity_failure_precedes_command_append() {
         max_active_accounts: 1,
         max_price_levels_per_side: 1,
         max_accepted_order_ids: 4,
+        max_account_controls: 4,
         max_retained_commands: 8,
         cancellation_reserve: 1,
         max_report_events: 2,
-        preallocate: false,
     })
     .unwrap();
     let mut durable = DurableOrderBook::open_with_limits(
@@ -724,10 +1022,10 @@ fn checkpoint_and_wal_recovery_reject_a_lower_report_event_limit() {
         max_active_accounts: 1,
         max_price_levels_per_side: 1,
         max_accepted_order_ids: 4,
+        max_account_controls: 4,
         max_retained_commands: 8,
         cancellation_reserve: 1,
         max_report_events: 2,
-        preallocate: false,
     })
     .unwrap();
     let error = OrderBook::from_checkpoint_with_limits(checkpoint, lower_limit).unwrap_err();
@@ -843,7 +1141,8 @@ fn risk_checkpoint_preserves_exact_final_replacement_level_admission() {
     })
     .unwrap();
     let profile = RiskProfile::new(AccountRiskState::Active, 0, risk_limits).unwrap();
-    let mut managed = RiskManagedOrderBook::with_limits(definition(), selected);
+    let selected_risk = coupled_limits(selected, 2);
+    let mut managed = RiskManagedOrderBook::with_limits(definition(), selected_risk);
     managed
         .register_account(AccountId::new(11).unwrap(), profile)
         .unwrap();
@@ -860,7 +1159,7 @@ fn risk_checkpoint_preserves_exact_final_replacement_level_admission() {
 
     let checkpoint = managed.checkpoint(1, 3, 11).unwrap();
     let mut restored =
-        RiskManagedOrderBook::from_checkpoint_with_limits(&checkpoint, selected).unwrap();
+        RiskManagedOrderBook::from_checkpoint_with_limits(&checkpoint, selected_risk).unwrap();
     let replay = restored.submit(replacement).unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.events, committed.events);
@@ -872,8 +1171,19 @@ fn risk_checkpoint_preserves_exact_final_replacement_level_admission() {
 
 #[test]
 fn coupled_risk_checkpoint_restores_under_the_selected_matching_limits() {
-    let selected = limits(1, 1, 1, 4, 8, 1);
-    let mut managed = RiskManagedOrderBook::with_limits(definition(), selected);
+    let selected = OrderBookLimits::new(OrderBookLimitsSpec {
+        max_active_orders: 1,
+        max_active_accounts: 1,
+        max_price_levels_per_side: 1,
+        max_accepted_order_ids: 4,
+        max_account_controls: 4,
+        max_retained_commands: 8,
+        cancellation_reserve: 1,
+        max_report_events: 64,
+    })
+    .unwrap();
+    let selected_risk = coupled_limits(selected, 1);
+    let mut managed = RiskManagedOrderBook::with_limits(definition(), selected_risk);
     assert_eq!(
         managed
             .submit(ioc(1, 1, 11, Side::Buy, 100))
@@ -883,8 +1193,9 @@ fn coupled_risk_checkpoint_restores_under_the_selected_matching_limits() {
     );
     let checkpoint = managed.checkpoint(1, 1, 3).unwrap();
     let restored =
-        RiskManagedOrderBook::from_checkpoint_with_limits(&checkpoint, selected).unwrap();
+        RiskManagedOrderBook::from_checkpoint_with_limits(&checkpoint, selected_risk).unwrap();
     assert_eq!(restored.book().limits(), selected);
+    assert!(restored.risk().reservation_capacity() >= selected.max_active_orders());
     restored.validate().unwrap();
 }
 use std::fs;

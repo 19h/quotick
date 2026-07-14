@@ -34,7 +34,7 @@ pub use crate::segmented_journal::{
 };
 
 const MAGIC: [u8; 4] = *b"QWAL";
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION: u16 = 2;
 pub(crate) const HEADER_LENGTH: usize = 24;
 const CHECKSUM_START: usize = 12;
 const CHECKSUM_END: usize = 16;

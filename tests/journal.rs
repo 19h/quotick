@@ -94,6 +94,10 @@ fn append_reopen_and_typed_decode_preserve_sequence_and_payload() {
     journal.sync_data().expect("explicit durability barrier");
     drop(journal);
 
+    let bytes = fs::read(file.path()).expect("journal bytes read");
+    assert_eq!(&bytes[..4], b"QWAL");
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 2);
+
     let frames = read_frames(file.path());
     assert_eq!(frames.len(), 2);
     assert_eq!(frames[0].sequence(), 1);
@@ -110,6 +114,29 @@ fn append_reopen_and_typed_decode_preserve_sequence_and_payload() {
     let reopened = Journal::open(file.path(), buffered_options()).expect("journal reopens");
     assert_eq!(reopened.recovery().last_sequence, Some(2));
     assert_eq!(reopened.next_sequence(), 3);
+}
+
+#[test]
+fn expired_version_one_wal_is_rejected_explicitly() {
+    let file = TestFile::new("expired-v1");
+    let mut journal = Journal::open(file.path(), buffered_options()).unwrap();
+    journal.append(&command(1, 1)).unwrap();
+    journal.close().unwrap();
+    let mut bytes = fs::read(file.path()).unwrap();
+    bytes[4..6].copy_from_slice(&1_u16.to_le_bytes());
+    fs::write(file.path(), bytes).unwrap();
+    let error = JournalReader::open(file.path(), buffered_options())
+        .unwrap()
+        .next()
+        .expect("one frame exists")
+        .expect_err("version one is not interpreted as version two");
+    assert!(matches!(
+        error,
+        JournalError::UnsupportedVersion {
+            offset: 0,
+            version: 1
+        }
+    ));
 }
 
 #[test]

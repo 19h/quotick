@@ -10,9 +10,10 @@ use std::fmt;
 use crate::domain::{AccountId, OrderId, Price, Side};
 use crate::instrument::InstrumentDefinition;
 use crate::matching::{
-    Command, CommandOutcome, CommandPreparation, EventKind, ExecutionReport, MatchingError,
-    NewOrder, OrderBook, OrderBookCheckpoint, OrderBookCheckpointError, OrderBookLimits, OrderType,
-    PreparedCommand, RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce, Trade,
+    Command, CommandOutcome, CommandPreparation, EventKind, ExecutionReport, MatchingCapacity,
+    MatchingError, NewOrder, OrderBook, OrderBookCheckpoint, OrderBookCheckpointError,
+    OrderBookLimits, OrderBookLimitsSpec, OrderType, PreparedCommand, RejectReason, ReplaceOrder,
+    SelfTradePrevention, TimeInForce, Trade,
 };
 
 /// Account-level order-entry state.
@@ -120,6 +121,121 @@ impl RiskLimits {
     }
 }
 
+/// Raw finite resource policy for one coupled matching/risk shard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RiskManagedLimitsSpec {
+    /// Independently validated matching-engine resource policy.
+    pub matching: OrderBookLimits,
+    /// Maximum immutable account profiles registered in this shard.
+    pub max_registered_accounts: usize,
+}
+
+/// Invalid coupled matching/risk resource policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RiskManagedLimitsError {
+    /// The shard could not register any risk profile.
+    ZeroRegisteredAccounts,
+    /// Matching cannot retain one control revision for every registered profile.
+    AccountControlsBelowRegisteredAccounts {
+        /// Matching account-control maximum.
+        account_controls: usize,
+        /// Coupled registered-profile maximum.
+        registered_accounts: usize,
+    },
+}
+
+impl fmt::Display for RiskManagedLimitsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroRegisteredAccounts => {
+                formatter.write_str("registered risk-account limit is zero")
+            }
+            Self::AccountControlsBelowRegisteredAccounts {
+                account_controls,
+                registered_accounts,
+            } => write!(
+                formatter,
+                "account-control capacity {account_controls} is below registered risk-account capacity {registered_accounts}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RiskManagedLimitsError {}
+
+/// Validated finite resources for one coupled matching/risk shard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RiskManagedLimits {
+    matching: OrderBookLimits,
+    max_registered_accounts: usize,
+}
+
+impl RiskManagedLimits {
+    /// Default maximum immutable account profiles in one shard.
+    pub const DEFAULT_MAX_REGISTERED_ACCOUNTS: usize = 65_536;
+
+    /// Validates a coupled resource policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiskManagedLimitsError::ZeroRegisteredAccounts`] for a zero
+    /// profile-registry bound.
+    pub const fn new(spec: RiskManagedLimitsSpec) -> Result<Self, RiskManagedLimitsError> {
+        if spec.max_registered_accounts == 0 {
+            return Err(RiskManagedLimitsError::ZeroRegisteredAccounts);
+        }
+        if spec.matching.max_account_controls() < spec.max_registered_accounts {
+            return Err(
+                RiskManagedLimitsError::AccountControlsBelowRegisteredAccounts {
+                    account_controls: spec.matching.max_account_controls(),
+                    registered_accounts: spec.max_registered_accounts,
+                },
+            );
+        }
+        Ok(Self {
+            matching: spec.matching,
+            max_registered_accounts: spec.max_registered_accounts,
+        })
+    }
+
+    /// Returns the embedded matching-engine resource policy.
+    #[must_use]
+    pub const fn matching(self) -> OrderBookLimits {
+        self.matching
+    }
+
+    /// Returns the maximum registered account profiles.
+    #[must_use]
+    pub const fn max_registered_accounts(self) -> usize {
+        self.max_registered_accounts
+    }
+}
+
+impl Default for RiskManagedLimits {
+    fn default() -> Self {
+        Self::new(RiskManagedLimitsSpec {
+            matching: OrderBookLimits::default(),
+            max_registered_accounts: Self::DEFAULT_MAX_REGISTERED_ACCOUNTS,
+        })
+        .expect("built-in coupled risk limits are valid")
+    }
+}
+
+fn checkpoint_validation_matching_limits(max_account_controls: usize) -> OrderBookLimits {
+    let base = OrderBookLimits::default();
+    OrderBookLimits::new(OrderBookLimitsSpec {
+        max_active_orders: base.max_active_orders(),
+        max_active_accounts: base.max_active_accounts(),
+        max_price_levels_per_side: base.max_price_levels_per_side(),
+        max_accepted_order_ids: base.max_accepted_order_ids(),
+        max_account_controls,
+        max_retained_commands: base.max_retained_commands(),
+        cancellation_reserve: base.cancellation_reserve(),
+        max_report_events: base.max_report_events(),
+    })
+    .expect("checkpoint validation matching limits are coherent")
+}
+
 /// Immutable account configuration for one risk-managed book.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RiskProfile {
@@ -208,6 +324,13 @@ pub enum RiskError {
     InitialPositionOutsideLimits,
     /// An account profile was registered more than once.
     DuplicateProfile(AccountId),
+    /// The finite immutable profile registry is full.
+    ProfileCapacityExhausted {
+        /// Configured maximum registered profiles.
+        maximum: usize,
+    },
+    /// Profile metadata was already frozen by the first sequenced command.
+    ProfileRegistryLocked,
 }
 
 impl fmt::Display for RiskError {
@@ -222,6 +345,15 @@ impl fmt::Display for RiskError {
                     formatter,
                     "risk profile for account {account_id} already exists"
                 )
+            }
+            Self::ProfileCapacityExhausted { maximum } => {
+                write!(
+                    formatter,
+                    "registered risk-account capacity {maximum} is exhausted"
+                )
+            }
+            Self::ProfileRegistryLocked => {
+                formatter.write_str("risk-profile registry is locked after command sequencing")
             }
         }
     }
@@ -402,8 +534,18 @@ impl RiskManagedCheckpoint {
             }
         }
 
-        let direct = self.restore_direct()?;
-        let mut replay = RiskManagedOrderBook::new(self.matching.definition());
+        let maximum_accounts = self
+            .accounts
+            .len()
+            .max(RiskManagedLimits::DEFAULT_MAX_REGISTERED_ACCOUNTS);
+        let validation_limits = RiskManagedLimits::new(RiskManagedLimitsSpec {
+            matching: checkpoint_validation_matching_limits(maximum_accounts),
+            max_registered_accounts: maximum_accounts,
+        })
+        .expect("checkpoint validation profile capacity is non-zero");
+        let direct = self.restore_direct_with_limits(validation_limits)?;
+        let mut replay =
+            RiskManagedOrderBook::with_limits(self.matching.definition(), validation_limits);
         for account in &self.accounts {
             replay.register_account(account.account_id, account.profile)?;
         }
@@ -428,15 +570,28 @@ impl RiskManagedCheckpoint {
     }
 
     fn restore_direct(&self) -> Result<RiskManagedOrderBook, RiskManagedCheckpointError> {
-        self.restore_direct_with_limits(OrderBookLimits::default())
+        self.restore_direct_with_limits(RiskManagedLimits::default())
     }
 
     fn restore_direct_with_limits(
         &self,
-        limits: OrderBookLimits,
+        limits: RiskManagedLimits,
     ) -> Result<RiskManagedOrderBook, RiskManagedCheckpointError> {
-        let book = OrderBook::from_checkpoint_with_limits(self.matching.clone(), limits)?;
-        let mut risk = RiskEngine::new(self.matching.definition());
+        if self.accounts.len() > limits.max_registered_accounts() {
+            return Err(RiskManagedCheckpointError::new(format!(
+                "risk checkpoint account count {} exceeds selected capacity {}",
+                self.accounts.len(),
+                limits.max_registered_accounts()
+            )));
+        }
+        let book =
+            OrderBook::from_checkpoint_with_limits(self.matching.clone(), limits.matching())?;
+        let mut risk =
+            RiskEngine::try_with_limits(self.matching.definition(), limits).map_err(|error| {
+                RiskManagedCheckpointError::new(format!(
+                    "risk checkpoint capacity reservation failed: {error}"
+                ))
+            })?;
         for account in &self.accounts {
             risk.register_account(account.account_id, account.profile)?;
             risk.accounts
@@ -538,6 +693,29 @@ struct RiskAccount {
     exposure: RiskSnapshot,
 }
 
+/// One constructor-reserved coupled-risk hash index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RiskHashIndex {
+    /// Immutable account profile and exposure registry.
+    AccountProfiles,
+    /// Active resting-order reservations.
+    ActiveReservations,
+}
+
+/// Process-local allocation state of one coupled-risk hash index.
+///
+/// These counters are operational telemetry and are excluded from financial
+/// semantics, equality, checkpoints, and WAL encoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RiskHashIndexStatus {
+    /// Configured maximum simultaneously retained entries.
+    pub configured_entries: usize,
+    /// Entry capacity available without growing or rehashing.
+    pub allocated_entries: usize,
+    /// Entries currently present in the index.
+    pub occupied_entries: usize,
+}
+
 /// Read-only reservation state for one resting order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReservationSnapshot {
@@ -586,22 +764,73 @@ pub struct RiskEngine {
     definition: InstrumentDefinition,
     accounts: HashMap<AccountId, RiskAccount>,
     reservations: HashMap<OrderId, ReservationSnapshot>,
+    maximum_accounts: usize,
+    maximum_reservations: usize,
+}
+
+fn try_reserve_risk_accounts(
+    accounts: &mut HashMap<AccountId, RiskAccount>,
+    additional: usize,
+) -> Result<(), MatchingError> {
+    accounts
+        .try_reserve(additional)
+        .map_err(|_| MatchingError::CapacityReservationFailed(MatchingCapacity::RiskAccounts))
+}
+
+fn try_reserve_risk_reservations(
+    reservations: &mut HashMap<OrderId, ReservationSnapshot>,
+    additional: usize,
+) -> Result<(), MatchingError> {
+    reservations
+        .try_reserve(additional)
+        .map_err(|_| MatchingError::CapacityReservationFailed(MatchingCapacity::RiskReservations))
 }
 
 impl RiskEngine {
-    fn new(definition: InstrumentDefinition) -> Self {
+    fn new(
+        definition: InstrumentDefinition,
+        maximum_accounts: usize,
+        maximum_reservations: usize,
+    ) -> Self {
         Self {
             definition,
             accounts: HashMap::new(),
             reservations: HashMap::new(),
+            maximum_accounts,
+            maximum_reservations,
         }
+    }
+
+    fn try_with_limits(
+        definition: InstrumentDefinition,
+        limits: RiskManagedLimits,
+    ) -> Result<Self, MatchingError> {
+        let mut risk = Self::new(
+            definition,
+            limits.max_registered_accounts(),
+            limits.matching().max_active_orders(),
+        );
+        try_reserve_risk_accounts(&mut risk.accounts, limits.max_registered_accounts())?;
+        risk.reserve_additional_reservations(limits.matching().max_active_orders())?;
+        Ok(risk)
+    }
+
+    fn reserve_additional_reservations(&mut self, additional: usize) -> Result<(), MatchingError> {
+        try_reserve_risk_reservations(&mut self.reservations, additional)
     }
 
     /// Registers one immutable account profile.
     ///
     /// # Errors
     ///
-    /// Returns [`RiskError::DuplicateProfile`] when the account already exists.
+    /// Returns [`RiskError::DuplicateProfile`] when the account already exists,
+    /// or [`RiskError::ProfileCapacityExhausted`] when the constructor-owned
+    /// registry is full.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if private structural corruption removed constructor-owned
+    /// hash headroom without changing the configured bound.
     pub fn register_account(
         &mut self,
         account_id: AccountId,
@@ -610,20 +839,53 @@ impl RiskEngine {
         if self.accounts.contains_key(&account_id) {
             return Err(RiskError::DuplicateProfile(account_id));
         }
-        self.accounts.insert(
-            account_id,
-            RiskAccount {
-                profile,
-                exposure: RiskSnapshot {
-                    position_lots: profile.initial_position_lots,
-                    open_buy_lots: 0,
-                    open_sell_lots: 0,
-                    open_notional: 0,
-                    open_orders: 0,
-                },
-            },
+        if self.accounts.len() >= self.maximum_accounts {
+            return Err(RiskError::ProfileCapacityExhausted {
+                maximum: self.maximum_accounts,
+            });
+        }
+        let allocated = self.accounts.capacity();
+        assert!(
+            self.accounts.len() < allocated,
+            "risk construction must reserve profile insertion headroom"
         );
+        assert!(
+            self.accounts
+                .insert(
+                    account_id,
+                    RiskAccount {
+                        profile,
+                        exposure: RiskSnapshot {
+                            position_lots: profile.initial_position_lots,
+                            open_buy_lots: 0,
+                            open_sell_lots: 0,
+                            open_notional: 0,
+                            open_orders: 0,
+                        },
+                    },
+                )
+                .is_none(),
+            "duplicate profile was rejected before insertion"
+        );
+        debug_assert_eq!(self.accounts.capacity(), allocated);
         Ok(())
+    }
+
+    /// Returns allocation telemetry for one constructor-reserved risk index.
+    #[must_use]
+    pub fn hash_index_status(&self, index: RiskHashIndex) -> RiskHashIndexStatus {
+        match index {
+            RiskHashIndex::AccountProfiles => RiskHashIndexStatus {
+                configured_entries: self.maximum_accounts,
+                allocated_entries: self.accounts.capacity(),
+                occupied_entries: self.accounts.len(),
+            },
+            RiskHashIndex::ActiveReservations => RiskHashIndexStatus {
+                configured_entries: self.maximum_reservations,
+                allocated_entries: self.reservations.capacity(),
+                occupied_entries: self.reservations.len(),
+            },
+        }
     }
 
     /// Returns one account's current position and reservations.
@@ -644,11 +906,31 @@ impl RiskEngine {
         self.reservations.len()
     }
 
+    /// Returns the configured maximum active-order reservations.
+    #[must_use]
+    pub const fn reservation_limit(&self) -> usize {
+        self.maximum_reservations
+    }
+
+    /// Returns allocation capacity of the active-order reservation index.
+    ///
+    /// This operational metric can exceed [`Self::reservation_count`] and has
+    /// no effect on deterministic risk semantics or persistence.
+    #[must_use]
+    pub fn reservation_capacity(&self) -> usize {
+        self.reservations.capacity()
+    }
+
     fn authorize(&self, command: Command) -> Result<(), RejectReason> {
         match command {
             Command::New(order) => self.authorize_new(order),
             Command::Cancel(_) | Command::MassCancel(_) => Ok(()),
             Command::Replace(order) => self.authorize_replace(order),
+            Command::AccountControl(control) => self
+                .accounts
+                .contains_key(&control.account_id)
+                .then_some(())
+                .ok_or(RejectReason::RiskProfileMissing),
         }
     }
 
@@ -852,6 +1134,7 @@ impl RiskEngine {
                 }
             }
             Command::Cancel(_) | Command::MassCancel(_) => {}
+            Command::AccountControl(_) => {}
             Command::Replace(order) => {
                 if replacement_retained_priority(report, order.order_id) {
                     self.insert_reservation(
@@ -905,6 +1188,11 @@ impl RiskEngine {
         price: Price,
         quantity_lots: u64,
     ) {
+        let prepared_capacity = self.reservations.capacity();
+        assert!(
+            self.reservations.len() < prepared_capacity,
+            "risk construction/restoration must reserve insertion headroom"
+        );
         let notional = absolute_notional(price, quantity_lots)
             .expect("pre-trade notional capacity must cover resting leaves");
         let reservation = ReservationSnapshot {
@@ -915,6 +1203,7 @@ impl RiskEngine {
             notional,
         };
         assert!(self.reservations.insert(order_id, reservation).is_none());
+        debug_assert_eq!(self.reservations.capacity(), prepared_capacity);
         let exposure = &mut self
             .accounts
             .get_mut(&account_id)
@@ -983,6 +1272,34 @@ impl RiskEngine {
     }
 
     fn validate(&self) -> Result<(), RiskInvariantViolation> {
+        if self.accounts.capacity() < self.maximum_accounts {
+            return Err(RiskInvariantViolation::new(format!(
+                "risk-account hash capacity {} is below its constructor reservation {}",
+                self.accounts.capacity(),
+                self.maximum_accounts
+            )));
+        }
+        if self.accounts.len() > self.maximum_accounts {
+            return Err(RiskInvariantViolation::new(format!(
+                "risk-account cardinality {} exceeds configured capacity {}",
+                self.accounts.len(),
+                self.maximum_accounts
+            )));
+        }
+        if self.reservations.capacity() < self.maximum_reservations {
+            return Err(RiskInvariantViolation::new(format!(
+                "risk-reservation hash capacity {} is below its constructor reservation {}",
+                self.reservations.capacity(),
+                self.maximum_reservations
+            )));
+        }
+        if self.reservations.len() > self.maximum_reservations {
+            return Err(RiskInvariantViolation::new(format!(
+                "risk-reservation cardinality {} exceeds configured capacity {}",
+                self.reservations.len(),
+                self.maximum_reservations
+            )));
+        }
         let mut calculated: HashMap<AccountId, (u128, u128, u128, u64)> = HashMap::new();
         for (&order_id, reservation) in &self.reservations {
             let expected_notional = absolute_notional(reservation.price, reservation.quantity_lots)
@@ -1078,50 +1395,58 @@ impl RiskManagedOrderBook {
     /// Creates an empty risk-managed book for one immutable definition.
     #[must_use]
     pub fn new(definition: InstrumentDefinition) -> Self {
-        Self::with_limits(definition, OrderBookLimits::default())
+        Self::with_limits(definition, RiskManagedLimits::default())
     }
 
-    /// Creates an empty risk-managed book under explicit matching limits.
+    /// Creates an empty risk-managed book under explicit coupled resource limits.
     ///
     /// # Panics
     ///
-    /// Panics when requested constructor-time matching hash reservation or
+    /// Panics when requested constructor-time matching/risk hash reservation or
     /// process-local book identity allocation fails.
     #[must_use]
-    pub fn with_limits(definition: InstrumentDefinition, limits: OrderBookLimits) -> Self {
+    pub fn with_limits(definition: InstrumentDefinition, limits: RiskManagedLimits) -> Self {
         Self::try_with_limits(definition, limits)
-            .expect("matching capacity reservation must succeed under A12")
+            .expect("matching/risk capacity reservation must succeed under A12")
     }
 
-    /// Creates an empty risk-managed book with fallible matching preallocation.
+    /// Creates an empty risk-managed book with fallible complete matching/risk reservation.
     ///
     /// # Errors
     ///
     /// Returns [`MatchingError::CapacityReservationFailed`] when a configured
-    /// matching hash reservation cannot be represented or allocated, or
+    /// matching, profile, or risk-reservation hash capacity cannot be represented or allocated, or
     /// [`MatchingError::BookInstanceIdExhausted`] when process-local book
     /// identity is exhausted.
     pub fn try_with_limits(
         definition: InstrumentDefinition,
-        limits: OrderBookLimits,
+        limits: RiskManagedLimits,
     ) -> Result<Self, MatchingError> {
-        let book = OrderBook::try_with_limits(definition, limits)?;
-        Ok(Self {
-            book,
-            risk: RiskEngine::new(definition),
-        })
+        let risk = RiskEngine::try_with_limits(definition, limits)?;
+        let book = OrderBook::try_with_limits(definition, limits.matching())?;
+        Ok(Self { book, risk })
     }
 
     /// Registers an account before it enters orders.
     ///
     /// # Errors
     ///
-    /// Returns [`RiskError::DuplicateProfile`] for a repeated account.
+    /// Returns [`RiskError::ProfileRegistryLocked`] after the first sequenced
+    /// command, [`RiskError::DuplicateProfile`] for a repeated account, or
+    /// [`RiskError::ProfileCapacityExhausted`] when the registry is full.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if private risk-index corruption contradicts the successful
+    /// constructor reservation.
     pub fn register_account(
         &mut self,
         account_id: AccountId,
         profile: RiskProfile,
     ) -> Result<(), RiskError> {
+        if self.book.retained_command_count() != 0 {
+            return Err(RiskError::ProfileRegistryLocked);
+        }
         self.risk.register_account(account_id, profile)
     }
 
@@ -1141,14 +1466,22 @@ impl RiskManagedOrderBook {
         }
     }
 
-    /// Prepares matching operational and core business checks exactly once.
+    /// Prepares matching operational/core checks against immutable coupled state.
     ///
     /// # Errors
     ///
     /// Returns [`MatchingError`] for command collision, configured matching
     /// capacity, or exhausted sequence capacity.
-    pub fn prepare(&mut self, command: Command) -> Result<CommandPreparation, MatchingError> {
-        self.book.prepare(command)
+    pub fn prepare(&self, command: Command) -> Result<CommandPreparation, MatchingError> {
+        let preparation = self.book.prepare(command)?;
+        if matches!(&preparation, CommandPreparation::Ready(_)) {
+            debug_assert_eq!(
+                self.risk.reservation_count(),
+                self.book.active_order_count(),
+                "coupled preparation requires matching/risk cardinality parity"
+            );
+        }
+        Ok(preparation)
     }
 
     /// Applies risk authorization and commits one generation-bound command.
@@ -1206,7 +1539,7 @@ impl RiskManagedOrderBook {
             .collect();
         accounts.sort_unstable_by_key(|value| value.account_id);
         let checkpoint = RiskManagedCheckpoint::from_parts(wal_first_sequence, matching, accounts)?;
-        let restored = checkpoint.restore_direct_with_limits(self.book.limits())?;
+        let restored = checkpoint.restore_direct_with_limits(self.limits())?;
         if restored != *self {
             return Err(RiskManagedCheckpointError::new(
                 "risk checkpoint direct state differs from live coupled state",
@@ -1227,15 +1560,15 @@ impl RiskManagedOrderBook {
         checkpoint.restore_direct()
     }
 
-    /// Restores coupled matching/risk state under explicit current matching limits.
+    /// Restores coupled matching/risk state under explicit current resource limits.
     ///
     /// # Errors
     ///
     /// Returns [`RiskManagedCheckpointError`] when semantic state is invalid or
-    /// any recovered matching cardinality exceeds the selected limits.
+    /// any recovered matching or profile cardinality exceeds the selected limits.
     pub fn from_checkpoint_with_limits(
         checkpoint: &RiskManagedCheckpoint,
-        limits: OrderBookLimits,
+        limits: RiskManagedLimits,
     ) -> Result<Self, RiskManagedCheckpointError> {
         checkpoint.restore_direct_with_limits(limits)
     }
@@ -1250,6 +1583,15 @@ impl RiskManagedOrderBook {
     #[must_use]
     pub const fn risk(&self) -> &RiskEngine {
         &self.risk
+    }
+
+    /// Returns the complete current coupled resource policy.
+    #[must_use]
+    pub const fn limits(&self) -> RiskManagedLimits {
+        RiskManagedLimits {
+            matching: self.book.limits(),
+            max_registered_accounts: self.risk.maximum_accounts,
+        }
     }
 
     /// Cross-checks matching structure, every reservation, and account aggregates.
@@ -1390,4 +1732,97 @@ fn checked_audit_add(current: u128, quantity: u64) -> Result<u128, RiskInvariant
     current
         .checked_add(u128::from(quantity))
         .ok_or_else(|| RiskInvariantViolation::new("aggregate reservation quantity overflow"))
+}
+
+#[cfg(test)]
+mod reservation_capacity_tests {
+    use std::collections::HashMap;
+
+    use super::{
+        MatchingCapacity, MatchingError, RiskEngine, RiskManagedLimits, RiskManagedLimitsSpec,
+        try_reserve_risk_accounts, try_reserve_risk_reservations,
+    };
+    use crate::instrument::{
+        InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
+        QuantityRules, ReserveOrderRules, TradingState,
+    };
+    use crate::matching::OrderBookLimits;
+    use crate::{AssetId, InstrumentId, InstrumentVersion, Price, TimestampNs};
+
+    fn definition() -> InstrumentDefinition {
+        InstrumentDefinition::new(InstrumentSpec {
+            instrument_id: InstrumentId::new(1).unwrap(),
+            version: InstrumentVersion::new(1).unwrap(),
+            effective_from: TimestampNs::from_unix_nanos(0),
+            symbol: InstrumentSymbol::new("RISK-CAPACITY").unwrap(),
+            kind: InstrumentKind::Spot,
+            base_asset_id: AssetId::new(1).unwrap(),
+            quote_asset_id: AssetId::new(2).unwrap(),
+            price: PriceRules::new(0, 1, Price::from_raw(1), Price::from_raw(1_000)).unwrap(),
+            quantity: QuantityRules::new(1, 1, 1_000).unwrap(),
+            reserve: ReserveOrderRules::disabled(),
+            base_units_per_lot: 1,
+            quote_units_per_price_unit: 1,
+            trading_state: TradingState::Open,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn unrepresentable_reservation_capacity_is_a_typed_failure() {
+        let mut reservations = HashMap::new();
+        assert!(matches!(
+            try_reserve_risk_reservations(&mut reservations, usize::MAX),
+            Err(MatchingError::CapacityReservationFailed(
+                MatchingCapacity::RiskReservations
+            ))
+        ));
+        assert!(reservations.is_empty());
+        assert_eq!(reservations.capacity(), 0);
+    }
+
+    #[test]
+    fn unrepresentable_account_capacity_is_a_typed_failure() {
+        let mut accounts = HashMap::new();
+        assert!(matches!(
+            try_reserve_risk_accounts(&mut accounts, usize::MAX),
+            Err(MatchingError::CapacityReservationFailed(
+                MatchingCapacity::RiskAccounts
+            ))
+        ));
+        assert!(accounts.is_empty());
+        assert_eq!(accounts.capacity(), 0);
+    }
+
+    #[test]
+    fn invariant_validation_rejects_lost_reservation_headroom() {
+        let limits = OrderBookLimits::default();
+        let coupled = RiskManagedLimits::new(RiskManagedLimitsSpec {
+            matching: limits,
+            max_registered_accounts: 1,
+        })
+        .unwrap();
+        let mut risk = RiskEngine::try_with_limits(definition(), coupled).unwrap();
+        assert!(risk.reservations.capacity() >= limits.max_active_orders());
+        risk.reservations.shrink_to_fit();
+        let error = risk
+            .validate()
+            .expect_err("reservation capacity below its constructor bound is invalid");
+        assert!(error.detail().contains("risk-reservation hash capacity"));
+    }
+
+    #[test]
+    fn invariant_validation_rejects_lost_account_headroom() {
+        let coupled = RiskManagedLimits::new(RiskManagedLimitsSpec {
+            matching: OrderBookLimits::default(),
+            max_registered_accounts: 2,
+        })
+        .unwrap();
+        let mut risk = RiskEngine::try_with_limits(definition(), coupled).unwrap();
+        risk.accounts.shrink_to_fit();
+        let error = risk
+            .validate()
+            .expect_err("account capacity below its constructor bound is invalid");
+        assert!(error.detail().contains("risk-account hash capacity"));
+    }
 }

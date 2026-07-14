@@ -80,7 +80,7 @@ fn snapshot_round_trip_has_stable_header_and_detects_corruption() {
         receipt.payload_length() + 28
     );
     assert_eq!(&bytes[0..4], b"QSNP");
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 1);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 2);
     assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 1);
     assert_eq!(
         u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
@@ -90,6 +90,15 @@ fn snapshot_round_trip_has_stable_header_and_detects_corruption() {
         SnapshotFile::read::<LedgerCheckpoint>(&path, SnapshotOptions::default()).unwrap(),
         checkpoint
     );
+
+    let legacy_path = directory.join("expired-v1.qsnp");
+    let mut legacy = bytes.clone();
+    legacy[4..6].copy_from_slice(&1_u16.to_le_bytes());
+    fs::write(&legacy_path, legacy).unwrap();
+    assert!(matches!(
+        SnapshotFile::read::<LedgerCheckpoint>(&legacy_path, SnapshotOptions::default()),
+        Err(SnapshotError::UnsupportedVersion(1))
+    ));
 
     let last = bytes.len() - 1;
     let mut corrupt = bytes;

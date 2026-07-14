@@ -690,6 +690,9 @@ impl InstrumentDefinition {
             Command::MassCancel(value) => {
                 self.validate_identity(value.instrument_id, value.instrument_version)
             }
+            Command::AccountControl(value) => {
+                self.validate_identity(value.instrument_id, value.instrument_version)
+            }
         }
     }
 

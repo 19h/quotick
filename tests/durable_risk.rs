@@ -9,12 +9,13 @@ use quotick::instrument::{
 };
 use quotick::journal::{Durability, Journal, JournalOptions, JournalReader, RecordKind};
 use quotick::matching::{
-    Command, CommandOutcome, MatchingCapacity, MatchingError, NewOrder, OrderBookLimits,
-    OrderBookLimitsSpec, OrderType, RejectReason, SelfTradePrevention, TimeInForce,
+    AccountAdmissionState, AccountControl, AccountControlAction, Command, CommandOutcome,
+    MatchingCapacity, MatchingError, NewOrder, OrderBookLimits, OrderBookLimitsSpec, OrderType,
+    RejectReason, SelfTradePrevention, TimeInForce,
 };
 use quotick::risk::{
-    AccountRiskDefinition, AccountRiskState, RiskLimitSpec, RiskLimits, RiskManagedOrderBook,
-    RiskProfile,
+    AccountRiskDefinition, AccountRiskState, RiskError, RiskLimitSpec, RiskLimits,
+    RiskManagedLimits, RiskManagedLimitsSpec, RiskManagedOrderBook, RiskProfile,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -112,6 +113,23 @@ fn command(command_id: u64, order_id: u64, owner: u64, quantity: u64) -> Command
     })
 }
 
+fn account_control(
+    command_id: u64,
+    owner: u64,
+    expected_revision: u64,
+    action: AccountControlAction,
+) -> Command {
+    Command::AccountControl(AccountControl {
+        command_id: CommandId::new(command_id).unwrap(),
+        account_id: account(owner),
+        instrument_id: InstrumentId::new(1).unwrap(),
+        instrument_version: InstrumentVersion::new(1).unwrap(),
+        expected_revision,
+        action,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
 fn options() -> JournalOptions {
     JournalOptions {
         durability: Durability::Buffered,
@@ -119,11 +137,37 @@ fn options() -> JournalOptions {
     }
 }
 
+fn managed_limits(matching: OrderBookLimits, max_registered_accounts: usize) -> RiskManagedLimits {
+    RiskManagedLimits::new(RiskManagedLimitsSpec {
+        matching,
+        max_registered_accounts,
+    })
+    .unwrap()
+}
+
 fn frames(path: &Path) -> Vec<quotick::journal::JournalFrame> {
     JournalReader::open(path, options())
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
+}
+
+#[test]
+fn profile_capacity_failure_precedes_wal_creation() {
+    let file = TestFile::new("profile-capacity");
+    let error = DurableRiskOrderBook::open_with_limits(
+        file.path(),
+        definition(),
+        &profiles(),
+        managed_limits(OrderBookLimits::default(), 1),
+        options(),
+    )
+    .expect_err("two profiles cannot fit one configured registry slot");
+    assert!(matches!(
+        error,
+        DurableRiskError::Risk(RiskError::ProfileCapacityExhausted { maximum: 1 })
+    ));
+    assert!(!file.path().exists());
 }
 
 #[test]
@@ -182,6 +226,32 @@ fn durable_risk_round_trip_binds_sorted_profiles_and_restores_reservations() {
 }
 
 #[test]
+fn durable_account_control_recovers_the_fence_revision_and_atomic_cancellation() {
+    let file = TestFile::new("account-control");
+    let block = account_control(2, 11, 0, AccountControlAction::BlockAndCancel);
+    let mut durable =
+        DurableRiskOrderBook::open(file.path(), definition(), &profiles(), options()).unwrap();
+    durable.submit(command(1, 1, 11, 5)).unwrap();
+    assert_eq!(
+        durable.submit(block).unwrap().outcome,
+        CommandOutcome::Accepted
+    );
+    assert_eq!(durable.managed().risk().reservation_count(), 0);
+    let frame_count = frames(file.path()).len();
+    durable.close().unwrap();
+
+    let mut recovered =
+        DurableRiskOrderBook::open(file.path(), definition(), &profiles(), options()).unwrap();
+    let control = recovered.managed().book().account_control(account(11));
+    assert_eq!(control.state(), AccountAdmissionState::Blocked);
+    assert_eq!(control.revision(), 1);
+    assert_eq!(recovered.managed().risk().reservation_count(), 0);
+    assert!(recovered.submit(block).unwrap().replayed);
+    assert_eq!(frames(file.path()).len(), frame_count);
+    recovered.managed().validate().unwrap();
+}
+
+#[test]
 fn report_event_capacity_failure_precedes_durable_risk_command_append() {
     let file = TestFile::new("report-events");
     let limits = OrderBookLimits::new(OrderBookLimitsSpec {
@@ -189,17 +259,17 @@ fn report_event_capacity_failure_precedes_durable_risk_command_append() {
         max_active_accounts: 1,
         max_price_levels_per_side: 1,
         max_accepted_order_ids: 4,
+        max_account_controls: 4,
         max_retained_commands: 8,
         cancellation_reserve: 1,
         max_report_events: 2,
-        preallocate: false,
     })
     .unwrap();
     let mut durable = DurableRiskOrderBook::open_with_limits(
         file.path(),
         definition(),
         &profiles(),
-        limits,
+        managed_limits(limits, 2),
         options(),
     )
     .unwrap();
@@ -282,6 +352,48 @@ fn recovery_completes_profile_prefix_and_dangling_command() {
     assert!(recovered.recovery().completed_dangling_command);
     assert_eq!(frames(dangling_file.path()).len(), 5);
     assert_eq!(recovered.managed().book().active_order_count(), 1);
+    recovered.managed().validate().unwrap();
+}
+
+#[test]
+fn recovery_completes_a_dangling_account_control_without_exposure_drift() {
+    let file = TestFile::new("dangling-account-control");
+    let mut canonical = profiles();
+    canonical.sort_unstable_by_key(|value| value.account_id());
+    let resting = command(1, 1, 11, 5);
+    let block = account_control(2, 11, 0, AccountControlAction::BlockAndCancel);
+    let mut direct = RiskManagedOrderBook::new(definition());
+    for profile in &canonical {
+        direct
+            .register_account(profile.account_id(), profile.profile())
+            .unwrap();
+    }
+    let resting_report = direct.submit(resting).unwrap();
+
+    let mut journal = Journal::open(file.path(), options()).unwrap();
+    journal.append(&definition()).unwrap();
+    for profile in &canonical {
+        journal.append(profile).unwrap();
+    }
+    journal.append(&resting).unwrap();
+    journal.append(&resting_report).unwrap();
+    journal.append(&block).unwrap();
+    drop(journal);
+
+    let recovered =
+        DurableRiskOrderBook::open(file.path(), definition(), &profiles(), options()).unwrap();
+    assert!(recovered.recovery().completed_dangling_command);
+    assert_eq!(frames(file.path()).len(), 7);
+    assert_eq!(recovered.managed().book().active_order_count(), 0);
+    assert_eq!(recovered.managed().risk().reservation_count(), 0);
+    assert_eq!(
+        recovered
+            .managed()
+            .book()
+            .account_control(account(11))
+            .revision(),
+        1
+    );
     recovered.managed().validate().unwrap();
 }
 

@@ -14,6 +14,7 @@ pub mod durable;
 pub mod durable_ledger;
 pub mod durable_risk;
 mod durable_storage;
+mod indexed_avl;
 pub mod instrument;
 pub mod journal;
 pub mod ledger;

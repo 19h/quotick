@@ -10,8 +10,9 @@ use quotick::instrument::{
 };
 use quotick::journal::{Durability, JournalOptions, SegmentedJournalOptions};
 use quotick::matching::{
-    CancelReason, Command, EventKind, NewOrder, OrderBook, OrderBookCheckpoint, OrderDisplay,
-    OrderType, ReplaceOrder, SelfTradePrevention, TimeInForce,
+    AccountAdmissionState, AccountControl, AccountControlAction, CancelReason, Command, EventKind,
+    NewOrder, OrderBook, OrderBookCheckpoint, OrderDisplay, OrderType, ReplaceOrder,
+    SelfTradePrevention, TimeInForce,
 };
 use quotick::snapshot::{SnapshotFile, SnapshotOptions};
 use quotick::{
@@ -110,6 +111,23 @@ fn resting(command_id: u64, order_id: u64, quantity: u64) -> Command {
     )
 }
 
+fn account_control(
+    command_id: u64,
+    account_id: u64,
+    expected_revision: u64,
+    action: AccountControlAction,
+) -> Command {
+    Command::AccountControl(AccountControl {
+        command_id: CommandId::new(command_id).unwrap(),
+        account_id: AccountId::new(account_id).unwrap(),
+        instrument_id: InstrumentId::new(1).unwrap(),
+        instrument_version: InstrumentVersion::new(1).unwrap(),
+        expected_revision,
+        action,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
 fn journal_options() -> JournalOptions {
     JournalOptions {
         durability: Durability::Buffered,
@@ -130,6 +148,55 @@ fn write_one_command_checkpoint(
     let checkpoint = SnapshotFile::read(snapshot, SnapshotOptions::default()).unwrap();
     durable.close().unwrap();
     checkpoint
+}
+
+#[test]
+fn checkpoint_restores_account_fence_revision_and_atomic_cancellation() {
+    let area = TestArea::new("account-control");
+    let wal = area.join("matching.wal");
+    let snapshot = area.join("matching.qsnp");
+    let block = account_control(2, 101, 0, AccountControlAction::BlockAndCancel);
+    let mut durable = DurableOrderBook::open(&wal, definition(), journal_options()).unwrap();
+    durable.submit(resting(1, 1, 5)).unwrap();
+    durable.submit(block).unwrap();
+    durable
+        .write_checkpoint(&snapshot, SnapshotOptions::default())
+        .unwrap();
+    durable.close().unwrap();
+
+    let checkpoint: OrderBookCheckpoint =
+        SnapshotFile::read(&snapshot, SnapshotOptions::default()).unwrap();
+    let direct = OrderBook::from_checkpoint(checkpoint).unwrap();
+    assert_eq!(direct.active_order_count(), 0);
+    assert_eq!(
+        direct.account_control(AccountId::new(101).unwrap()).state(),
+        AccountAdmissionState::Blocked
+    );
+    assert_eq!(
+        direct
+            .account_control(AccountId::new(101).unwrap())
+            .revision(),
+        1
+    );
+    direct.validate().unwrap();
+
+    let recovered = DurableOrderBook::open_with_checkpoint(
+        &wal,
+        &snapshot,
+        definition(),
+        journal_options(),
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().checkpointed_commands, 2);
+    assert_eq!(
+        recovered
+            .book()
+            .account_control(AccountId::new(101).unwrap())
+            .revision(),
+        1
+    );
+    recovered.book().validate().unwrap();
 }
 
 #[test]

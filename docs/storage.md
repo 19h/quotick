@@ -169,7 +169,7 @@ malformed pending content, and preserves both files on divergence or invalid
 current state. A pending file rejected only because its version/kind is
 unsupported or its size exceeds the caller's configured limit is preserved.
 The complete wire and decision contract is
-[Semantic snapshot format version 1](snapshot-v1.md).
+[Semantic snapshot format version 2](snapshot-v2.md).
 
 Direct users must dedicate the target and its two sidecars to snapshots.
 `DurableOrderBook`, `DurableRiskOrderBook`, and `DurableLedger` additionally

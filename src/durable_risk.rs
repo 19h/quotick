@@ -14,12 +14,10 @@ use crate::journal::{
     Journal, JournalError, JournalFrame, JournalLayout, JournalOptions, RecordKind,
     SegmentedJournalError, SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
 };
-use crate::matching::{
-    Command, CommandPreparation, ExecutionReport, MatchingError, OrderBookLimits,
-};
+use crate::matching::{Command, CommandPreparation, ExecutionReport, MatchingError};
 use crate::risk::{
     AccountRiskDefinition, RiskError, RiskInvariantViolation, RiskManagedCheckpoint,
-    RiskManagedCheckpointError, RiskManagedOrderBook,
+    RiskManagedCheckpointError, RiskManagedLimits, RiskManagedOrderBook,
 };
 use crate::snapshot::{SnapshotError, SnapshotFile, SnapshotOptions, SnapshotReceipt};
 
@@ -355,23 +353,23 @@ impl DurableRiskOrderBook {
             path.as_ref(),
             definition,
             profiles,
-            OrderBookLimits::default(),
+            RiskManagedLimits::default(),
             StorageOptions::Single(options),
             None,
         )
     }
 
-    /// Opens and replays a risk-managed WAL under explicit matching limits.
+    /// Opens and replays a risk-managed WAL under explicit coupled resource limits.
     ///
     /// # Errors
     ///
     /// Returns [`DurableRiskError`] for metadata/storage/replay failure or
-    /// matching limits insufficient for recovered state.
+    /// matching/profile limits insufficient for recovered state.
     pub fn open_with_limits(
         path: impl AsRef<Path>,
         definition: InstrumentDefinition,
         profiles: &[AccountRiskDefinition],
-        limits: OrderBookLimits,
+        limits: RiskManagedLimits,
         options: JournalOptions,
     ) -> Result<Self, DurableRiskError> {
         Self::open_storage(
@@ -403,24 +401,24 @@ impl DurableRiskOrderBook {
             path.as_ref(),
             definition,
             profiles,
-            OrderBookLimits::default(),
+            RiskManagedLimits::default(),
             StorageOptions::Single(options),
             Some((checkpoint_path.as_ref(), snapshot_options)),
         )
     }
 
-    /// Opens a risk-managed WAL and checkpoint under explicit matching limits.
+    /// Opens a risk-managed WAL and checkpoint under explicit coupled resource limits.
     ///
     /// # Errors
     ///
     /// Returns [`DurableRiskError`] for snapshot/metadata/storage/replay failure
-    /// or matching limits insufficient for recovered state.
+    /// or matching/profile limits insufficient for recovered state.
     pub fn open_with_checkpoint_and_limits(
         path: impl AsRef<Path>,
         checkpoint_path: impl AsRef<Path>,
         definition: InstrumentDefinition,
         profiles: &[AccountRiskDefinition],
-        limits: OrderBookLimits,
+        limits: RiskManagedLimits,
         options: JournalOptions,
         snapshot_options: SnapshotOptions,
     ) -> Result<Self, DurableRiskError> {
@@ -450,13 +448,13 @@ impl DurableRiskOrderBook {
             directory.as_ref(),
             definition,
             profiles,
-            OrderBookLimits::default(),
+            RiskManagedLimits::default(),
             StorageOptions::Segmented(options),
             None,
         )
     }
 
-    /// Opens segmented risk-managed storage under explicit matching limits.
+    /// Opens segmented risk-managed storage under explicit coupled resource limits.
     ///
     /// # Errors
     ///
@@ -465,7 +463,7 @@ impl DurableRiskOrderBook {
         directory: impl AsRef<Path>,
         definition: InstrumentDefinition,
         profiles: &[AccountRiskDefinition],
-        limits: OrderBookLimits,
+        limits: RiskManagedLimits,
         options: SegmentedJournalOptions,
     ) -> Result<Self, DurableRiskError> {
         Self::open_storage(
@@ -496,24 +494,24 @@ impl DurableRiskOrderBook {
             directory.as_ref(),
             definition,
             profiles,
-            OrderBookLimits::default(),
+            RiskManagedLimits::default(),
             StorageOptions::Segmented(options),
             Some((checkpoint_path.as_ref(), snapshot_options)),
         )
     }
 
-    /// Opens segmented risk storage and a checkpoint under explicit matching limits.
+    /// Opens segmented risk storage and a checkpoint under explicit coupled resource limits.
     ///
     /// # Errors
     ///
     /// Returns [`DurableRiskError`] for snapshot/storage/replay failure or
-    /// matching limits insufficient for recovered state.
+    /// matching/profile limits insufficient for recovered state.
     pub fn open_segmented_with_checkpoint_and_limits(
         directory: impl AsRef<Path>,
         checkpoint_path: impl AsRef<Path>,
         definition: InstrumentDefinition,
         profiles: &[AccountRiskDefinition],
-        limits: OrderBookLimits,
+        limits: RiskManagedLimits,
         options: SegmentedJournalOptions,
         snapshot_options: SnapshotOptions,
     ) -> Result<Self, DurableRiskError> {
@@ -531,10 +529,17 @@ impl DurableRiskOrderBook {
         path: &Path,
         definition: InstrumentDefinition,
         profiles: &[AccountRiskDefinition],
-        limits: OrderBookLimits,
+        limits: RiskManagedLimits,
         options: StorageOptions,
         checkpoint_source: Option<(&Path, SnapshotOptions)>,
     ) -> Result<Self, DurableRiskError> {
+        if profiles.len() > limits.max_registered_accounts() {
+            return Err(DurableRiskError::Risk(
+                RiskError::ProfileCapacityExhausted {
+                    maximum: limits.max_registered_accounts(),
+                },
+            ));
+        }
         let profiles = canonical_profiles(profiles)?;
         if let Some((checkpoint_path, _)) = checkpoint_source {
             validate_checkpoint_path(path, storage_layout(options), checkpoint_path)?;
@@ -844,7 +849,7 @@ fn replay_risk_suffix(
     definition: InstrumentDefinition,
     profiles: &[AccountRiskDefinition],
     mut checkpoint: Option<RiskManagedCheckpoint>,
-    limits: OrderBookLimits,
+    limits: RiskManagedLimits,
     wal_metadata_sequence: u64,
 ) -> Result<RiskReplay, DurableRiskError> {
     let checkpointed_commands = checkpoint
@@ -1013,12 +1018,20 @@ fn validate_checkpoint_prefix_frame(
 
 fn canonical_profiles(
     profiles: &[AccountRiskDefinition],
-) -> Result<Vec<AccountRiskDefinition>, RiskError> {
-    let mut canonical = profiles.to_vec();
+) -> Result<Vec<AccountRiskDefinition>, DurableRiskError> {
+    let mut canonical = Vec::new();
+    canonical.try_reserve_exact(profiles.len()).map_err(|_| {
+        DurableRiskError::Matching(MatchingError::CapacityReservationFailed(
+            crate::matching::MatchingCapacity::RiskAccounts,
+        ))
+    })?;
+    canonical.extend_from_slice(profiles);
     canonical.sort_unstable_by_key(|value| value.account_id());
     for pair in canonical.windows(2) {
         if pair[0].account_id() == pair[1].account_id() {
-            return Err(RiskError::DuplicateProfile(pair[0].account_id()));
+            return Err(DurableRiskError::Risk(RiskError::DuplicateProfile(
+                pair[0].account_id(),
+            )));
         }
     }
     Ok(canonical)

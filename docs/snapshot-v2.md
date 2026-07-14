@@ -1,7 +1,7 @@
-# Semantic snapshot format version 1
+# Semantic snapshot format version 2
 
 `SnapshotFile` stores a complete typed semantic value in a bounded, versioned,
-CRC-32C envelope. Version 1 assigns payload kind `1` to `LedgerCheckpoint`,
+CRC-32C envelope. Version 2 assigns payload kind `1` to `LedgerCheckpoint`,
 kind `2` to `OrderBookCheckpoint`, and kind `3` to
 `RiskManagedCheckpoint`. The payload trait is sealed, so downstream codecs
 cannot claim a reserved kind. All integers are little-endian.
@@ -13,7 +13,7 @@ The fixed header is 28 B:
 | Offset (B) | Width (B) | Field |
 |---:|---:|---|
 | 0 | 4 | ASCII magic `QSNP` |
-| 4 | 2 | envelope version `1` |
+| 4 | 2 | envelope version `2` |
 | 6 | 2 | typed payload kind: ledger checkpoint `1`, matching checkpoint `2`, coupled risk checkpoint `3` |
 | 8 | 8 | payload length `u64` |
 | 16 | 4 | CRC-32C `u32` |
@@ -47,7 +47,7 @@ nanoseconds, posting count and postings, followed by lifecycle kind, optional
 related transaction, and optional signed epoch-day period boundary. Financial
 entries contain at least two postings; period close/reopen controls contain
 zero. The complete byte schema and lifecycle tags are defined in
-[WAL format version 1](wal-v1.md).
+[WAL format version 2](wal-v2.md).
 
 Record tag `0` contains one `JournalEntry`. Record tag `1` contains one
 `LedgerCorrection`: reversal length `u32` and entry payload, followed by
@@ -85,7 +85,7 @@ The matching payload is:
 Display policy is fully displayed tag `0` with no value or reserve tag `1`
 followed by peak lots `u64`. The order sizes above therefore differ by 8 B.
 Command, report, event, display, side, and STP fields use the exact tags in
-[WAL format version 1](wal-v1.md).
+[WAL format version 2](wal-v2.md).
 
 Active orders are canonicalized as all buys then all sells, with ascending raw
 price within each side and FIFO order within a price. This storage order is not
@@ -94,6 +94,13 @@ not persisted: restoration reconstructs them and audits the resulting book.
 Every private field required by future matching is retained, including hidden
 total leaves, the current displayed slice, reserve peak, owner, and the resting
 STP policy used by replacement.
+
+Revisioned account admission controls are derived from accepted command/report
+history and are not duplicated as a separate checkpoint collection. Validation
+requires each accepted control's expected revision to equal its account's prior
+revision, the final completion event to carry the exact prior/resulting states
+and incremented revision, and block-and-cancel aggregates to equal its ordered
+cancellation events. A reconstructed blocked account cannot retain an order.
 
 The metadata boundary is followed by exactly one command frame and one report
 frame per retained history entry, so a valid stable boundary satisfies
@@ -186,7 +193,7 @@ A matching checkpoint is accepted structurally only when:
 7. reconstruction produces valid FIFO links, price-level aggregates, accepted-
    order membership, and an uncrossed book.
 8. restoration under caller-selected `OrderBookLimits` proves retained command,
-   accepted-ID, active-order, active-account, and per-side occupied-level
+   accepted-ID, account-control, active-order, active-account, and per-side occupied-level
    cardinalities fit before allocating live indexes.
 
 `OrderBook::checkpoint` first audits the live structure, captures the image,
@@ -198,10 +205,11 @@ repeat prefix matching. The envelope checksum detects accidental image changes.
 An actor able to rewrite both image and checksum remains outside the authenticity
 model under A14, A39, and A40.
 
-Matching limits are operational process policy, not financial snapshot payload,
-and are therefore not encoded in snapshot kind `2` or `3`. A restore API must
-select validated finite limits. Equal or larger limits preserve current state;
-insufficient limits fail restoration explicitly. A checkpoint can bypass
+Matching and registered-risk-profile limits are operational process policy, not
+financial snapshot payload, and are therefore not encoded in snapshot kind `2`
+or `3`. A kind-3 restore selects `RiskManagedLimits`, which embeds matching
+limits and independently bounds canonical profiles. Equal or larger limits
+preserve current state; insufficient limits fail restoration explicitly. A checkpoint can bypass
 historical matching transitions, so only retained/current checkpoint
 cardinalities are tested; raw WAL replay additionally exercises every retained
 historical peak under the selected policy.
@@ -336,7 +344,8 @@ exact live-state image. `open_with_checkpoint` and
 4. stream the verified WAL and compare every checkpoint command/report with
    the exact frame at its global sequence;
 5. reject kind/content divergence or a checkpoint ahead of the WAL;
-6. reconstruct matching indices, FIFO/reserve/STP state, profiles, executed
+6. prove the canonical profile count and matching cardinalities fit the selected
+   coupled resource policy, then reconstruct matching indices, FIFO/reserve/STP state, profiles, executed
    positions, total-leaves reservations, exposure aggregates, and retry caches;
 7. replay only complete coupled command/report pairs after `G`;
 8. complete at most one final command lacking its report; and
@@ -377,7 +386,7 @@ linear in retained balances and record/entry/posting history, apart from
 logarithmic ordered-map/set factors inside accounting validation.
 
 No WAL cutover, truncation, segment retention, bounded-memory, or bounded-
-restart claim follows from version 1. All three checkpoint kinds retain complete
+restart claim follows from version 2. All three checkpoint kinds retain complete
 history and durable open scans the complete WAL. Those properties require a
 fenced cutover protocol that proves the checkpoint generation, preserves or
 externally anchors required audit/idempotency history, and prevents a retired

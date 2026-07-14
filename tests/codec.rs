@@ -11,9 +11,9 @@ use quotick::market_data::{
     MarketDataError, MarketDataPublisher, MarketDataReplica, MarketDataSnapshot, MarketDataUpdate,
 };
 use quotick::matching::{
-    CancelOrder, CancelReason, Command, CommandOutcome, Event, EventKind, ExecutionReport,
-    MassCancel, MassCancelScope, NewOrder, OrderBook, OrderDisplay, OrderType, RejectReason,
-    ReplaceOrder, SelfTradePrevention, TimeInForce, Trade,
+    AccountControl, AccountControlAction, CancelOrder, CancelReason, Command, CommandOutcome,
+    Event, EventKind, ExecutionReport, MassCancel, MassCancelScope, NewOrder, OrderBook,
+    OrderDisplay, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce, Trade,
 };
 use quotick::risk::{
     AccountRiskDefinition, AccountRiskState, RiskError, RiskLimitSpec, RiskLimits, RiskProfile,
@@ -112,6 +112,30 @@ fn mass_cancel_codec_has_a_stable_little_endian_layout() {
     expected.push(1);
     expected.push(1);
     expected.extend_from_slice(&7_u64.to_le_bytes());
+    assert_eq!(encoded, expected);
+    assert_eq!(Command::decode(&encoded).unwrap(), value);
+}
+
+#[test]
+fn account_control_codec_has_a_stable_little_endian_layout() {
+    let value = Command::AccountControl(AccountControl {
+        command_id: id(CommandId::new(7)),
+        account_id: id(AccountId::new(8)),
+        instrument_id: id(InstrumentId::new(4)),
+        instrument_version: version(),
+        expected_revision: 9,
+        action: AccountControlAction::BlockAndCancel,
+        received_at: TimestampNs::from_unix_nanos(10),
+    });
+    let encoded = value.encode().unwrap();
+    let mut expected = vec![4];
+    expected.extend_from_slice(&7_u64.to_le_bytes());
+    expected.extend_from_slice(&8_u64.to_le_bytes());
+    expected.extend_from_slice(&4_u64.to_le_bytes());
+    expected.extend_from_slice(&1_u64.to_le_bytes());
+    expected.extend_from_slice(&9_u64.to_le_bytes());
+    expected.push(0);
+    expected.extend_from_slice(&10_u64.to_le_bytes());
     assert_eq!(encoded, expected);
     assert_eq!(Command::decode(&encoded).unwrap(), value);
 }

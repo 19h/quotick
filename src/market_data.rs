@@ -13,8 +13,9 @@ use crate::domain::{
     TimestampNs, TradeId,
 };
 use crate::matching::{
-    CancelReason, Command, CommandOutcome, Event, EventKind, ExecutionReport, LevelSnapshot,
-    MassCancelScope, OrderBook, OrderDisplay, OrderType, SelfTradePrevention, Trade,
+    AccountAdmissionState, AccountControlAction, AccountControlSnapshot, CancelReason, Command,
+    CommandOutcome, Event, EventKind, ExecutionReport, LevelSnapshot, MassCancelScope, OrderBook,
+    OrderDisplay, OrderType, SelfTradePrevention, Trade,
 };
 
 /// An absolute aggregate state for one publicly visible price level.
@@ -401,6 +402,7 @@ pub struct MarketDataPublisher {
     bids: BTreeMap<Price, Aggregate>,
     asks: BTreeMap<Price, Aggregate>,
     orders: HashMap<OrderId, TrackedOrder>,
+    account_controls: HashMap<AccountId, AccountControlSnapshot>,
     last_sequence: u64,
     last_trade_id: Option<TradeId>,
     poisoned: bool,
@@ -444,6 +446,7 @@ impl MarketDataPublisher {
             bids,
             asks,
             orders,
+            account_controls: book.account_controls().collect(),
             last_sequence: book.last_event_sequence(),
             last_trade_id: book.last_trade_id(),
             poisoned: false,
@@ -575,9 +578,11 @@ impl MarketDataPublisher {
             });
             self.last_sequence = event.sequence;
         }
-        if matches!(command, Command::MassCancel(_)) != mass_cancel_progress.completed {
+        let requires_completion = report.outcome == CommandOutcome::Accepted
+            && matches!(command, Command::MassCancel(_) | Command::AccountControl(_));
+        if requires_completion != mass_cancel_progress.completed {
             return self.fail(MarketDataError::TraceMismatch(
-                "mass-cancel command and completion event disagree",
+                "aggregate cancellation/control command and completion event disagree",
             ));
         }
         if let Err(error) = self.validate_publication(&updates, book) {
@@ -614,6 +619,15 @@ impl MarketDataPublisher {
         if self.orders.len() != book.active_order_count() {
             return Err(MarketDataError::SourceDivergence(
                 "publisher active-order count differs from the matching book",
+            ));
+        }
+        if self.account_controls.len() != book.account_controls().len()
+            || book.account_controls().any(|(account_id, snapshot)| {
+                self.account_controls.get(&account_id) != Some(&snapshot)
+            })
+        {
+            return Err(MarketDataError::SourceDivergence(
+                "publisher account-control mirror differs from the matching book",
             ));
         }
         let active_orders = book.active_orders().map_err(|_| {
@@ -726,6 +740,23 @@ impl MarketDataPublisher {
                 command,
                 account_id,
                 scope,
+                cancelled_order_count,
+                cancelled_quantity_lots,
+                mass_cancel_progress,
+            ),
+            EventKind::AccountControlApplied {
+                account_id,
+                previous_state,
+                current_state,
+                revision,
+                cancelled_order_count,
+                cancelled_quantity_lots,
+            } => self.handle_account_control_applied(
+                command,
+                account_id,
+                previous_state,
+                current_state,
+                revision,
                 cancelled_order_count,
                 cancelled_quantity_lots,
                 mass_cancel_progress,
@@ -960,6 +991,33 @@ impl MarketDataPublisher {
                         .ok_or(MarketDataError::ArithmeticOverflow)?;
                     mass_cancel_progress.last_order_id = Some(order_id);
                 }
+                CancelReason::AccountControl => {
+                    let Command::AccountControl(control) = command else {
+                        return Err(MarketDataError::TraceMismatch(
+                            "non-control command emitted an account-control cancellation",
+                        ));
+                    };
+                    if control.action != AccountControlAction::BlockAndCancel
+                        || mass_cancel_progress.completed
+                        || control.account_id != order.account_id
+                        || mass_cancel_progress
+                            .last_order_id
+                            .is_some_and(|previous| order_id <= previous)
+                    {
+                        return Err(MarketDataError::TraceMismatch(
+                            "account control targeted an order outside its account",
+                        ));
+                    }
+                    mass_cancel_progress.order_count = mass_cancel_progress
+                        .order_count
+                        .checked_add(1)
+                        .ok_or(MarketDataError::ArithmeticOverflow)?;
+                    mass_cancel_progress.quantity_lots = mass_cancel_progress
+                        .quantity_lots
+                        .checked_add(u128::from(quantity.lots()))
+                        .ok_or(MarketDataError::ArithmeticOverflow)?;
+                    mass_cancel_progress.last_order_id = Some(order_id);
+                }
                 CancelReason::UnfilledRemainder | CancelReason::SelfTradeAggressor => {
                     return Err(MarketDataError::TraceMismatch(
                         "an incoming-only cancellation targeted a resting order",
@@ -1005,6 +1063,62 @@ impl MarketDataPublisher {
                 "MassCancelCompleted contradicts its command or cancellations",
             ));
         }
+        progress.completed = true;
+        Ok(MarketDataKind::NoBookChange)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the account-control completion event is a fixed audit record"
+    )]
+    fn handle_account_control_applied(
+        &mut self,
+        command: Command,
+        account_id: AccountId,
+        previous_state: AccountAdmissionState,
+        current_state: AccountAdmissionState,
+        revision: u64,
+        cancelled_order_count: u64,
+        cancelled_quantity_lots: u128,
+        progress: &mut MassCancelProgress,
+    ) -> Result<MarketDataKind, MarketDataError> {
+        let Command::AccountControl(control) = command else {
+            return Err(MarketDataError::TraceMismatch(
+                "non-control command emitted AccountControlApplied",
+            ));
+        };
+        let expected_revision = control
+            .expected_revision
+            .checked_add(1)
+            .ok_or(MarketDataError::ArithmeticOverflow)?;
+        let expected_state = match control.action {
+            AccountControlAction::BlockAndCancel => AccountAdmissionState::Blocked,
+            AccountControlAction::Enable => AccountAdmissionState::Enabled,
+        };
+        let previous = self
+            .account_controls
+            .get(&account_id)
+            .copied()
+            .unwrap_or_default();
+        if progress.completed
+            || control.account_id != account_id
+            || previous.state() != previous_state
+            || previous.revision() != control.expected_revision
+            || current_state != expected_state
+            || revision != expected_revision
+            || progress.order_count != cancelled_order_count
+            || progress.quantity_lots != cancelled_quantity_lots
+            || (control.action == AccountControlAction::Enable
+                && (cancelled_order_count != 0 || cancelled_quantity_lots != 0))
+        {
+            return Err(MarketDataError::TraceMismatch(
+                "AccountControlApplied contradicts its command or cancellations",
+            ));
+        }
+        self.account_controls.insert(
+            account_id,
+            AccountControlSnapshot::from_parts(current_state, revision),
+        );
         progress.completed = true;
         Ok(MarketDataKind::NoBookChange)
     }
@@ -1709,6 +1823,7 @@ const fn command_id(command: Command) -> CommandId {
         Command::Cancel(value) => value.command_id,
         Command::Replace(value) => value.command_id,
         Command::MassCancel(value) => value.command_id,
+        Command::AccountControl(value) => value.command_id,
     }
 }
 
@@ -1718,6 +1833,7 @@ const fn command_order_id(command: Command) -> Option<OrderId> {
         Command::Cancel(value) => Some(value.order_id),
         Command::Replace(value) => Some(value.order_id),
         Command::MassCancel(_) => None,
+        Command::AccountControl(_) => None,
     }
 }
 
@@ -1727,6 +1843,7 @@ const fn command_account_id(command: Command) -> AccountId {
         Command::Cancel(value) => value.account_id,
         Command::Replace(value) => value.account_id,
         Command::MassCancel(value) => value.account_id,
+        Command::AccountControl(value) => value.account_id,
     }
 }
 
@@ -1736,6 +1853,7 @@ const fn command_instrument(command: Command) -> InstrumentId {
         Command::Cancel(value) => value.instrument_id,
         Command::Replace(value) => value.instrument_id,
         Command::MassCancel(value) => value.instrument_id,
+        Command::AccountControl(value) => value.instrument_id,
     }
 }
 
@@ -1745,6 +1863,7 @@ const fn command_version(command: Command) -> InstrumentVersion {
         Command::Cancel(value) => value.instrument_version,
         Command::Replace(value) => value.instrument_version,
         Command::MassCancel(value) => value.instrument_version,
+        Command::AccountControl(value) => value.instrument_version,
     }
 }
 
@@ -1754,6 +1873,7 @@ const fn command_time(command: Command) -> TimestampNs {
         Command::Cancel(value) => value.received_at,
         Command::Replace(value) => value.received_at,
         Command::MassCancel(value) => value.received_at,
+        Command::AccountControl(value) => value.received_at,
     }
 }
 

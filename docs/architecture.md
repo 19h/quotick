@@ -92,18 +92,23 @@ gateway -> authentication -> portfolio/collateral risk -> replicated sequencer a
     and a mass-cancel reason. A final completion event reports the exact `u64`
     order count and `u128` total cancelled lots; an empty selection still emits
     one completion event.
-22. Every active order appears exactly once in the ordered account/side index.
-    Reserve FIFO-tail refresh preserves that membership without index churn.
+22. Every active order appears exactly once in an intrusive account/side list,
+    with consistent head, tail, forward, backward, count, and event-work state.
+    Reserve FIFO-tail refresh preserves those links without membership churn.
     Mass-cancel preparation determines `K` and fallibly reserves capacity for
     `K` canonical IDs and `K + 1` events before durable command append or book
-    mutation. Commit then detaches the selected side or account index atomically.
-    Neither vector grows during cancellation; execution traverses only selected
+    mutation. Commit traverses exactly `K` members into that buffer, sorts the
+    unique IDs in place, then detaches the selected side or account index.
+    Neither vector grows during cancellation; execution removes only selected
     order IDs in ascending order and never scans unrelated active orders.
-23. Each side caches its complete best `PriceLevel`. The cached price, FIFO
-    head/tail, displayed-lot sum, and visible order count equal the corresponding
-    extremal entry in the authoritative ordered price map. Every level aggregate
-    mutation refreshes the cache when it targets the current best; deletion of
-    the best recomputes the new extremum before control returns to matching.
+23. Each side stores occupied prices in a finitely bounded stable-slot AVL arena
+    and caches its complete best `PriceLevel`. Strict key ordering, cached node
+    heights, balance factors in `[-1, 1]`, occupied reachability, and the
+    intrusive vacant-slot free list are independently audited. The cached price,
+    FIFO head/tail, displayed-lot sum, and visible order count equal the
+    corresponding extremal AVL entry. Every level aggregate mutation refreshes
+    the cache when it targets the current best; deletion of the best recomputes
+    the new extremum before control returns to matching.
 24. FOK inspection never mutates state or materializes reserve slices. At a
     crossed price without self liquidity, every external total leaf is eligible.
     Cancel-resting excludes self orders and retains all external total leaves.
@@ -112,26 +117,30 @@ gateway -> authentication -> portfolio/collateral risk -> replicated sequencer a
     slices rejoin at the tail. The scan visits each inspected active order at
     most once and uses constant auxiliary space.
 25. Every book has finite validated maxima for active orders, active accounts,
-    occupied prices per side, accepted order IDs, retained commands, and events
+    occupied prices per side, accepted order IDs, retained account controls,
+    retained commands, and events
     per execution report. Active accounts and per-side levels cannot exceed
     active-order capacity; accepted identity and ordinary history can establish
     every maximum active order. Report capacity is at least
     `max_active_orders + 1`, so one maximum-size mass cancellation always fits.
 26. The tail of retained-command capacity reserves at least one slot per maximum
     active order. Once ordinary history fills, new and replace commands stop.
-    Only a cancel or mass-cancel that passes current core business validation may
-    enter the reserve; malformed, unknown, wrong-owner, or wrong-instrument
+    Only a cancel, mass cancel, or revision-valid block-and-cancel account
+    control that passes current core business validation may enter the reserve;
+    enable remains ordinary admission; malformed, unknown, wrong-owner, or wrong-instrument
     controls cannot consume it. Exact cached retries remain available even at
     total exhaustion.
-27. Capacity checks, required matching hash-table `try_reserve` calls, and
-    fallible event/mass-cancel vector reservations precede the first matching
-    mutation. `PreparedCommand` owns the unique empty vectors; mutable
-    preparation may increase hash capacity but changes no semantic state.
-    Durable wrappers run the same preflight before appending a command frame, so
-    these reservation failures are unsequenced operational results and cannot
-    leave a dangling WAL command. Ordered price/account tree nodes remain outside
-    this recoverable boundary.
-28. Checkpoint restoration rejects current cardinalities or retained report
+27. Construction fallibly reserves both price-level AVL arenas, all five
+    matching hash indexes, and the coupled-risk profile and reservation indexes
+    through their complete configured maxima. `PreparedCommand` owns the fallibly reserved
+    unique event and optional mass-cancel/account-control vectors; preparation borrows matching
+    and coupled-risk state immutably and cannot change semantic or allocator
+    state. Durable wrappers complete that preflight before appending a command
+    frame, so per-command vector failures are unsequenced operational results and
+    cannot leave a dangling WAL command. Commit cannot grow or rehash a matching
+    profile, reservation, or matching index, and price-level/account membership mutation allocates
+    no node after construction.
+28. Checkpoint restoration rejects current matching, account-control, or retained report
     event counts above selected limits. Raw WAL replay reconstructs under the
     selected limits and fails explicitly if any retained historical transition
     exceeds them. Limits may be enlarged at restart; lowering them is valid only
@@ -159,7 +168,16 @@ gateway -> authentication -> portfolio/collateral risk -> replicated sequencer a
     durable, and durable-risk submission consume this token without repeating
     capacity, identifier, FOK, core business, or report-buffer preparation.
     Durable paths append the token's command only after the buffer exists.
-31. Every completed report owns an immutable `EventTrace`. The first response,
+31. An account without retained administrative state is enabled at revision
+    zero. Account control uses compare-and-increment revision semantics. A stale
+    or exhausted revision is a nonmutating sequenced rejection. Block-and-cancel
+    closes entry and cancels all account orders in ascending `OrderId` order in
+    one command/report; enable reopens entry without cancellation. New and
+    replace commands observe the fence, owner cancellation remains available,
+    and exact retries cannot advance revision twice. The never-evicted control
+    hash is constructor-reserved, finite, checkpoint-derived from history, and
+    included in structural and market-data publisher cross-audits.
+32. Every completed report owns an immutable `EventTrace`. The first response,
     retained idempotency entry, exact retries, and in-memory checkpoint copies
     share one `Arc<Vec<Event>>` owner and its event buffer; cloning is `O(1)`.
     Preparation allocates the Arc control block and fallibly reserves the
@@ -169,7 +187,7 @@ gateway -> authentication -> portfolio/collateral risk -> replicated sequencer a
     copy-on-write and cannot modify cached history. Equality, validation, and
     encoding depend only on ordered event values, so pointer identity and spare
     vector capacity never enter replay or wire semantics.
-32. Every resting order contributes mutation-maintained future event work. A
+33. Every resting order contributes mutation-maintained future event work. A
     fully displayed order contributes one unit. A reserve order with leaves
     `L`, displayed leaves `D`, and peak `p` has
     `s = 1 + ceil((L - D) / p)` remaining slices and contributes `2s - 1`
@@ -183,18 +201,26 @@ gateway -> authentication -> portfolio/collateral risk -> replicated sequencer a
     uncrossed prices and may therefore overestimate storage and reject earlier
     near sequence exhaustion, but cannot underestimate execution.
 
-The book wraps each `BTreeMap<Price, PriceLevel>` in a side-aware index with a
-mutation-maintained complete best-level cache. This provides `O(1)` best-price,
-best-FIFO-head, and best-snapshot discovery while preserving deterministic
-ordered traversal. It uses `HashMap<OrderId, RestingOrder>` for direct lookup,
-`HashMap<AccountId, AccountOrderIndex>` containing side-specific
-`BTreeSet<OrderId>` values for canonical account selection, and doubly linked
-order identifiers for FIFO removal without scanning a level or book.
-`OrderBookLimits` bounds all monotonic and active matching indexes. Optional
-construction-time hash reservation covers active orders, active accounts,
-accepted IDs, and retained reports; ordered price/account trees remain bounded
-but allocate nodes on demand. Fallible construction and durable recovery use
-`try_reserve` and report the first failed hash resource before state exists.
+The book stores each side in a stable-slot indexed AVL arena with a
+mutation-maintained complete best-level cache. The arena is fallibly reserved to
+`max_price_levels_per_side` before the book exists; deletion links its slot into
+an intrusive free list, and insertion reuses that slot without allocation. This
+provides worst-case `O(log P)` lookup/insertion/deletion/successor/predecessor,
+`O(P)` deterministic ordered traversal, and `O(1)` best-price, best-FIFO-head,
+and best-snapshot discovery. It uses `HashMap<OrderId, RestingOrder>` for direct lookup,
+`HashMap<AccountId, AccountOrderIndex>` containing side-specific intrusive
+head/tail/count/aggregate state, and two independent pairs of doubly linked
+order identifiers: price FIFO links and account/side membership links. Ordinary
+account insertion/removal is `O(1)`; canonical account selection traverses the
+selected links and sorts unique `OrderId` values in the already-prepared vector.
+`OrderBookLimits` bounds all monotonic and active matching indexes;
+`RiskManagedLimits` independently adds the registered-profile maximum. Mandatory
+construction-time reservation covers both complete price arenas, active orders,
+active accounts, accepted IDs, retained account controls, retained reports, registered profiles, and
+coupled-risk reservations.
+Fallible construction and durable recovery report the first failed arena/hash
+resource before state exists. Read-only `hash_index_status` telemetry exposes
+each matching index's configured, allocated, and occupied entry counts.
 Normal capacity preflight is expected `O(1)`. Only at a full resting bound—or
 the equivalent full same-side-level replacement boundary—does the residual
 preview inspect `O_c` orders in `P_c` crossed levels in
@@ -366,8 +392,9 @@ collateral from ledger balances.
    under decrement-and-cancel STP. Reserve risk and notional are based on total
    leaves; replenishing a displayed slice has no independent risk effect.
    Trades update buyer/seller positions once.
-10. Single-order and mass cancellation bypass entry limits after instrument
-    identity validation. Each mass-cancelled order releases its complete total-
+10. Single-order, mass, and accepted block-and-cancel account controls bypass
+    numerical entry limits after instrument identity validation. Each cancelled
+    order releases its complete total-
     leaves reservation exactly once before the completion summary is ignored by
     risk state.
 11. Exact command retries do not apply risk state twice. Risk rejections are
@@ -376,7 +403,33 @@ collateral from ledger balances.
     one-to-one structural match with every active book order.
 13. A durable risk shard binds the complete instrument definition followed by
     account-ID-sorted immutable profiles. Recovery completes only an exact
-    metadata prefix before the first command.
+    metadata prefix before the first command. The supplied profile count must fit
+    `RiskManagedLimits` before a WAL path is created or opened.
+14. Construction and restoration fallibly reserve the complete
+    `max_active_orders` risk-reservation index. Preparation is read-only even if
+    profile registration occurs between split preparation and commit.
+    Replacement and partial-decrement paths remove before reinsertion. At a full
+    active-order bound, an admitted residual has already removed at least one
+    maker reservation, so the constructor-owned capacity is reused. Validation
+    rejects reservation cardinality or allocation capacity inconsistent with
+    the configured maximum.
+15. Construction fallibly reserves the complete registered-account profile
+    index. Duplicate identity is checked before capacity, insertion cannot
+    rehash, and registration becomes unavailable after the first sequenced
+    command freezes the metadata set. Direct split preparation may register a
+    missing profile before the first commit because no command has yet been
+    sequenced; the constructor-owned reservation index already covers either
+    authorization result. Checkpoint restoration rejects a selected profile
+    bound below the canonical account count. Structural validation audits both
+    configured cardinality and retained allocation capacity. `RiskHashIndex`
+    telemetry exposes configured, allocated, and occupied counts for profiles
+    and reservations.
+16. `RiskManagedLimits` requires matching account-control capacity to be at
+    least registered-profile capacity, so every profiled account can retain one
+    never-evicted fence revision. Coupled risk rejects a control for an
+    unprofiled account before matching mutation. An accepted control releases
+    reservations from its ordinary cancellation trace; the final control event
+    has no second exposure effect.
 
 ## Market-data publication invariants
 
@@ -385,7 +438,7 @@ collateral from ledger balances.
    sequence hole.
 2. Public updates contain instrument ID and immutable definition version. They
    contain no account, order, or command identifiers.
-3. Events without a public depth or trade effect emit `NoBookChange`; version 1
+3. Events without a public depth or trade effect emit `NoBookChange`; market-data version 1
    performs no conflation or sequence renumbering.
 4. Level updates contain absolute post-event aggregate quantity and order count,
    not relative deltas. Both fields are zero only for level deletion.
@@ -403,18 +456,23 @@ collateral from ledger balances.
    Publisher validation proves account/scope membership, ascending order-ID
    trace order, and exact count/total agreement without exposing those private
    fields publicly.
-8. Exact command retries produce no second public update.
-9. Publisher bootstrap from a live or WAL-recovered book captures all active
+8. Account-control cancellations use the same level transition as ordinary
+   cancellation. The publisher privately mirrors prior/current fence state and
+   revision, validates ordered cancellation aggregates and the final control
+   event, emits `NoBookChange` for the completion, and cross-audits its control
+   mirror against the authoritative book.
+9. Exact command retries produce no second public update.
+10. Publisher bootstrap from a live or WAL-recovered book captures all active
    orders, depth, final event sequence, and final trade ID, then cross-audits
    the private and public aggregates.
-10. A full-depth snapshot contains occupied bids in descending price order and
+11. A full-depth snapshot contains occupied bids in descending price order and
    asks in ascending price order at one source sequence. Locked or crossed
    snapshots are invalid.
-11. A replica rejects a missing, duplicated, or reordered sequence before
+12. A replica rejects a missing, duplicated, or reordered sequence before
     mutating depth. A non-stale full-depth snapshot resets the recovery boundary.
-12. Trace or structural failures after incremental mutation poison publisher or
+13. Trace or structural failures after incremental mutation poison publisher or
     replica state; a fresh authoritative bootstrap/snapshot is required.
-13. The stable complete-value schema is
+14. The stable complete-value schema is
     [Market-data payload format version 1](market-data-v1.md). Network framing,
     fanout, entitlement, and retransmission sessions are outside this boundary.
 
@@ -500,7 +558,7 @@ collateral from ledger balances.
    bound are preserved for a compatible recovery process.
 8. CRC-32C is an accidental-corruption detector, not an authenticity proof.
 9. Ledger, matching, and coupled risk checkpoints retain complete history, and
-   durable recovery still scans the complete WAL to prove the prefix. Version 1
+   durable recovery still scans the complete WAL to prove the prefix. Version 2
    performs no WAL cutover, compaction, retention, bounded-memory, or bounded-
    restart protocol.
 10. Matching capture independently replays complete command/report history and
@@ -514,9 +572,9 @@ collateral from ledger balances.
     state machine before publication. Recovery applies state transitions only
     after the checkpoint generation.
 
-The authoritative version-1 framing and payload schema is
-[WAL format version 1](wal-v1.md) and
-[Semantic snapshot format version 1](snapshot-v1.md). Filesystem and device
+The authoritative version-2 framing and payload schema is
+[WAL format version 2](wal-v2.md) and
+[Semantic snapshot format version 2](snapshot-v2.md). Filesystem and device
 assumptions are bounded by the [Local storage contract](storage.md).
 
 ## Failure model
@@ -534,19 +592,31 @@ cross-audit tests exercise these paths. Reserve tests additionally cover
 admission bounds, FIFO-tail refresh, repeated slices in one match, hidden-aware
 FOK, STP, total-leaves risk, displayed-only publication, and WAL recovery.
 Mass-cancel tests cover empty and side-scoped selection, canonical audit order,
-large-book sparse-account selection, index continuity across reserve refresh,
+large-book sparse-account selection, intrusive-link continuity across reserve refresh,
 replacement and execution, hidden-total risk release, displayed-depth
 publication, malformed summaries, exact replay, and WAL reconstruction.
+Account-control tests cover stale/exhausted revisions, exact retry, atomic
+canonical cancellation, admission fencing, re-enable, protected-history use,
+constructor capacity stability/exhaustion, unprofiled risk rejection,
+reservation release, market-data validation, direct and durable checkpoint
+restoration, interrupted-report completion, and version-1 artifact rejection.
+Invariant tests additionally inject an account-link break and require the
+independent ownership/side/head/tail/count/cycle/bidirectional audit to reject it.
 Best-level index tests cover bid/ask extrema, better/worse insertion, non-best
 and repeated best deletion, deliberate cached-price and cached-aggregate
 corruption, repricing, full execution, STP removal, empty-side transitions, and
 direct checkpoint reconstruction.
+Indexed-AVL tests cover all four rotation shapes, forward/reverse traversal,
+leaf/one-child/two-child deletion, slot reuse without capacity growth,
+topology-independent equality, tree/free-list corruption, unrepresentable arena
+reservation, and 20,000 generated operations differentially checked against
+`BTreeMap` after every mutation.
 FOK tests cover hidden total-leaves eligibility, same-price self barriers,
 cancel-resting across self orders, better-price reserve exhaustion before a
 worse self barrier, all supported FOK STP policies, and allocation-free/model
 equivalence against literal FIFO-tail reserve requeue across 20,000 generated
 books.
-Capacity tests cover invalid policies, every active/account/side-level/identity
+Capacity tests cover invalid policies, every active/account/control/side-level/identity
 boundary, ordinary-history exhaustion, invalid-control reserve protection,
 valid individual and mass cancellation, exact retry at exhaustion, released
 level accounting during replace, insufficient/sufficient checkpoint limits,
@@ -632,7 +702,7 @@ qualified storage-device power-loss behavior.
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
 | High | Instrument lifecycle expansion | trading calendars, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
-| High | Coordinated kill controls | authenticated firm/session/account ownership; atomic admission fence; cross-shard fanout; completion aggregation; cancel-on-behalf audit evidence |
+| High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |
 | High | Clearing lifecycle | novation/allocation, fees, settlement dates, fails, corrections, busts, and reconciliation |
 | High | Security boundary | authenticated principals, authorization policy, secret management, audit export, and abuse controls |
 | Medium | Gateways and schemas | versioned binary protocol, FIX adapter, backpressure, session recovery, and conformance fixtures |

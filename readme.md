@@ -74,7 +74,10 @@ recovery.
   links.
 - Mutation-maintained complete best-level caches providing allocation-free
   constant-time best price, FIFO head, displayed quantity, and order-count reads,
-  with independent ordered-map cross-audit.
+  with independent indexed-AVL cross-audit.
+- Finitely bounded stable-slot AVL price arenas reserved before a book exists,
+  with allocation-free `O(log P)` level mutation, intrusive vacant-slot reuse,
+  full structural auditing, and per-side allocation/high-water telemetry.
 - Instrument-gated native reserve orders with fixed displayed peaks, hidden
   total leaves, bounded replenishment, and FIFO-tail priority on refresh.
 - Market and limit orders with GTC, IOC, FOK, and post-only behavior.
@@ -83,6 +86,10 @@ recovery.
 - Account-scoped mass cancellation across all active orders or one side, selected
   through mutation-maintained account/side indexes and emitted in ascending
   `OrderId` order with exact final order-count and cancelled-lot totals.
+- Revision-checked account admission controls: block-and-cancel atomically
+  closes entry and removes all resting orders in canonical order; enable reopens
+  entry. Exact retries preserve the committed revision and stale revisions are
+  sequenced rejections.
 - Cancel-aggressor, cancel-resting, cancel-both, and decrement-and-cancel
   self-trade prevention.
 - Atomic FOK preflight, exact-command idempotency, collision detection, and
@@ -91,21 +98,23 @@ recovery.
   reachable and current displayed slices before an aggressor-blocking self-order
   barrier, without constructing replenishment queues.
 - Validated finite matching limits for active orders/accounts, occupied levels,
-  accepted identifiers, retained reports, and events per report; optional
-  constructor-time hash reservation prevents index growth/rehash through the
-  selected maxima.
+  accepted identifiers, retained account controls, reports, and events per report; mandatory
+  constructor-time reservation prevents every matching and coupled-risk hash
+  index from growing or rehashing through the selected maxima.
 - A protected retained-history tail sized to at least the maximum active-order
   population. Ordinary admission closes first; only currently valid cancel and
-  mass-cancel controls may consume the reserve, and exact retries bypass all
-  capacity gates.
+  mass-cancel and block-and-cancel controls may consume the reserve; enable
+  remains ordinary admission, and exact retries bypass all capacity gates.
 - Residual-aware capacity admission for GTC/post-only orders. A boundary scan
   proves whether fills or self-trade prevention leave anything to rest, without
   mutating the book or materializing reserve replenishment slices, and accounts
   exactly for maker-order and complete-account capacity released before append.
 - Opaque generation-bound command preparation shared by direct matching, risk,
   and durable orchestration. Capacity, identifier, FOK, and core business checks
-  execute once; the token owns the fallibly reserved report buffer, and durable
-  paths append the prepared command only after that reservation succeeds.
+  execute once against an immutable book borrow; the token owns fallibly reserved
+  report/mass-cancel-or-control buffers, all hash headroom already belongs to the constructed
+  shard, and durable paths append the prepared command only after per-command
+  reservations succeed.
 - Immutable `EventTrace` storage shared in `O(1)` across the returned report,
   idempotency cache, exact retries, and in-memory checkpoints. Diagnostic trace
   mutation is explicit copy-on-write and cannot alter cached history.
@@ -118,14 +127,21 @@ recovery.
 
 ### Pre-trade risk
 
+- Independent `RiskManagedLimits` policy with a finite registered-account
+  maximum, complete constructor-time profile/reservation hash headroom, and
+  per-index configured/allocated/occupied telemetry.
+- Immutable profile bootstrap remains open only before the first sequenced
+  command; subsequent registration fails without changing state.
 - Immutable account profiles with active, reduce-only, and blocked states.
+- Mutable shard-local entry fences are sequenced independently of immutable
+  numerical profiles; coupled risk accepts controls only for registered accounts.
 - Per-order quantity and notional limits.
 - Aggregate resting-order count, quantity, and notional limits.
 - Worst-case long and short position limits across open exposure.
 - Conservative reachable-price notional for positive, zero-crossing, and
   negative price collars.
-- Trace-driven reservation release across fills, individual and mass
-  cancellation, replacement, and self-trade prevention.
+- Trace-driven reservation release across fills, individual, mass, and atomic
+  account-control cancellation, replacement, and self-trade prevention.
 - Cross-audits between active orders, reservations, aggregates, and positions.
 
 ### Market-data publication and recovery
@@ -210,8 +226,8 @@ The exact invariants and environmental assumptions are documented in:
 - [Architecture](docs/architecture.md)
 - [Assumption register](docs/assumptions.md)
 - [Local storage contract](docs/storage.md)
-- [WAL format version 1](docs/wal-v1.md)
-- [Semantic snapshot format version 1](docs/snapshot-v1.md)
+- [WAL format version 2](docs/wal-v2.md)
+- [Semantic snapshot format version 2](docs/snapshot-v2.md)
 - [Market-data payload format version 1](docs/market-data-v1.md)
 
 ## Build and verify
@@ -229,8 +245,8 @@ The test suites cover:
 
 - **Matching and risk:** financial-domain boundaries, price/FIFO priority,
   reserve admission and replenishment, hidden-versus-displayed quantity,
-  canonical mass cancellation, every self-trade policy, risk rejection, and
-  reservation release.
+  canonical mass cancellation, revisioned account fencing and atomic kill
+  cancellation, every self-trade policy, risk rejection, and reservation release.
 - **Market data and accounting:** displayed-depth reconstruction, settlement,
   arithmetic rollback, exact reversal and reinstatement chains, indivisible
   reversal-plus-replacement corrections, generalized multi-entry netting,
@@ -256,16 +272,19 @@ level insertion, deletion, and next-worse traversal are `O(log P)`; execution is
 `O((E + 1) log P)`. The cache removes one ordered-tree traversal from each
 best-maker selection, while the authoritative level aggregate update remains
 `O(log P)`. A reserve order can contribute more than one interaction through
-replenishment. FIFO append and removal maintain one account/side `BTreeSet`,
-giving `O(log P + log K_a)` work for an account with `K_a` active orders.
-Reserve refresh preserves account membership and avoids that index churn. For
-`K` selected orders, a mass cancel detaches the ordered set in `O(K)`, emits
-already-canonical IDs without sorting, and performs `K` price-level removals in
-`O(K log P)`, independent of total active-order count `O`. Active matching state
-uses `O(O + P + C)` memory for `O` resting orders and `C` retained idempotency
-reports; account indexing adds one ordered membership per active order within
-the same `O(O)` bound, while the two complete best-level caches add `O(1)`
-space.
+replenishment. FIFO append and removal also maintain intrusive
+per-account/per-side links, so account membership changes add `O(1)` work and no
+membership-node allocation to the `O(log P)` price-level operation. Reserve
+refresh preserves both account links and membership. For `K` selected orders, a
+mass cancel traverses exactly `K` linked members, sorts their unique identifiers
+in place in `O(K log K)`, and performs `K` price-level removals in `O(K log P)`,
+independent of total active-order count `O`. Total time is
+`O(K(log K + log P))` with `O(K)` prepared scratch space. Block-and-cancel has
+the identical bound; enable is expected `O(1)`. Active matching state uses
+`O(O + P + C + T)` memory for `O` resting orders, `C` retained idempotency
+reports, and `T` never-evicted controlled accounts; account indexing adds two links per active order plus fixed
+head/tail/count/aggregate state per active account, within the same `O(O)`
+bound. The two complete best-level caches add `O(1)` space.
 
 FOK preflight over `O_c` active orders in `P_c` crossed levels is
 `O(O_c + P_c log P)` time and `O(1)` auxiliary space. Each inspected order is
@@ -273,19 +292,26 @@ visited at most once; complexity is independent of the number of reserve slices
 that subsequent execution emits.
 
 Default matching limits are 4,096 active orders, 4,096 active accounts, 4,096
-occupied prices per side, 65,536 accepted order IDs, 65,536 retained commands,
-and 65,536 events per report, with the final 4,096 history slots reserved for
+occupied prices per side, 65,536 accepted order IDs, 65,536 controlled accounts,
+65,536 retained commands, and 65,536 events per report, with the final 4,096 history slots reserved for
 valid cancellation controls. The report limit must be at least
 `max_active_orders + 1`, preserving one cancellation event per maximally active
-order plus the mass-cancel completion event. Defaults are finite but do not
-preallocate; production constructors accept an explicit `OrderBookLimits`, and
-`preallocate=true` reserves all four hash indexes to their maxima.
-`try_with_limits` reports the exact hash resource when a requested reservation
-cannot be represented or allocated. Even when construction does not preallocate,
-command preparation fallibly reserves the hash headroom needed for retained
-history, a newly accepted identity, and any possible new active order/account;
-it also reserves the complete event buffer and `K`-identifier mass-cancel
-selection buffer before durable command append. Capacity preflight is expected
+order plus the mass-cancel completion event. A coupled shard requests hash entry
+headroom
+`H = 2 O_max + A_max + I_max + T_max + C_max + R_max`
+`= 2(4,096) + 4,096 + 4(65,536) = 274,432`
+entries at the defaults: active matching orders plus equally bounded risk
+reservations, active matching accounts, accepted IDs, retained account controls,
+retained commands, and registered risk accounts. This is an entry-capacity calculation, not a byte-size
+claim; allocator rounding and the standard-library bucket layout are target
+dependent. Every constructor fallibly reserves
+two stable-slot indexed AVL arenas, all five matching hash indexes, and the
+coupled-risk profile and reservation indexes to their complete applicable bounds.
+`try_with_limits` reports the exact price arena or hash resource when a requested
+reservation cannot be represented or allocated. Command preparation therefore
+borrows matching and coupled-risk state immutably; it fallibly reserves only the
+complete event buffer and exact `K`-identifier mass-cancel or block-and-cancel selection buffer before
+durable command append. Capacity preflight is expected
 `O(1)` on the normal path, except for
 validating a reserve-lane control through the ordinary core lookup. If an
 active-order, active-account, or same-side price-level bound
@@ -304,12 +330,15 @@ errors are not sequenced and durable wrappers reject them before WAL append.
 IOC, FOK, and market orders do not consume a resting-capacity gate.
 One `PreparedCommand` carries the completed operational/core proof through risk
 authorization and WAL append, together with the already-reserved unique report
-buffer and optional mass-cancel selection buffer. Matching hash-table insertion
-cannot rehash after command persistence. Commit validates book identity and
+buffer and optional mass-cancel/account-control selection buffer. Matching hash-table insertion
+cannot rehash after construction. Commit validates book identity and
 retained-command generation in expected `O(1)` time; foreign and stale tokens
-cannot mutate state. Ordered price/account tree nodes, the Arc control block,
-and coupled risk reservation insertion remain outside this fallible preparation
-boundary.
+cannot mutate state. The complete risk-reservation index is constructor-owned,
+so profile registration between split preparation and commit cannot introduce
+reservation-map growth. Price-level AVL nodes and account memberships allocate
+nothing during commit: price slots are reserved at book construction and removed
+slots are reused through an intrusive free list. The Arc control block and
+unrelated codec/checkpoint allocations remain outside this fallible preparation boundary.
 For `E` report events, construction and encoding are `O(E)`, while Arc-backed
 builder finalization is `O(1)` and retains the original vector event buffer
 without allocation or event copy. Cache, retry, and checkpoint trace clones are
@@ -321,13 +350,16 @@ transition, so report insertion cannot reallocate. The bound includes uncrossed
 opposite-side work and may retain unused capacity.
 
 Risk authorization and trace application are expected `O(1)` per order event.
-A complete risk cross-audit is `O(O + A)` for `A` registered accounts, and risk
-state uses `O(O + A)` memory.
+Profile and reservation insertion cannot rehash after shard construction.
+A complete risk cross-audit is `O(O + A)` for `A <= R_max` registered accounts,
+and risk state uses `O(O + A)` memory. Profile registration is expected `O(1)`,
+allocation-free within the constructor-owned bound, and disabled after the first
+sequenced command.
 
 Market-data trace and replica application are `O(log P)` for level-changing
-events and `O(1)` for no-change events. Publisher bootstrap is `O(O log O + P)`,
+events and `O(1)` for no-change events. Publisher bootstrap is `O(O log O + P + T)`,
 a full-depth snapshot is `O(P)`, and a complete publisher cross-audit is
-`O(O log O + P)`.
+`O(O log O + P + T)`.
 
 WAL scanning is `O(B + S)` for `B` persisted bytes across `S` physical segments.
 A segmented reader retains `O(S)` descriptors and one bounded payload rather
