@@ -13,7 +13,7 @@ listed falsification probe.
 | A6 | Negative account balances are valid general-ledger state; the order-risk layer is separate from ledger posting and does not make ledger acceptance imply credit authorization. | Atomic posting, settlement, and risk/ledger separation. | Add a blocking balance policy in the posting path. If ledger acceptance begins to imply credit authorization, A6 is no longer valid. |
 | A7 | Negative and zero prices are valid for some instruments. | Price type range and settlement cash-flow direction. | Execute zero and negative boundary prices and reconcile all per-asset sums to zero. A hard positive-price assertion falsifies A7. |
 | A8 | Durable matching, durable risk, and durable ledger guarantees are scoped to one local single-file or marker-bound segmented WAL and the selected acknowledgement policy; `SyncAll` is the default. | Command/report/profile recovery after process termination and across segment boundaries. | Inject process termination, torn frames, delayed writes, rotation at every boundary, power loss, filesystem remount, and device-cache reordering. Loss or duplication of an acknowledged frame falsifies the storage assumptions behind A8. |
-| A9 | Retaining every processed command report is acceptable only for bounded test/runtime horizons. | Exact replay response, memory complexity `O(C)`. | Run a production-duration command-volume soak under a fixed memory limit. Unbounded growth falsifies A9 and requires durable deduplication plus eviction watermarks. |
+| A9 | Every shard has a validated finite `OrderBookLimits` policy. Retained command reports and accepted order identifiers do not evict within one shard generation; ordinary admission stops before a cancellation reserve and total exhaustion requires a fenced generation rollover. | Exact replay response, bounded history/identity cardinality, cancellation headroom, and memory complexity `O(min(C, C_max))`. | Run beyond ordinary and total history boundaries; flood new/replace, unknown/wrong-owner cancel, valid cancel, empty mass-cancel, and exact retries; restart from WAL/checkpoint under equal, larger, and insufficient limits. Growth past a bound, a valid control denied while reserved capacity remains, an invalid control consuming reserve, or silent identity eviction falsifies A9. |
 | A10 | Hash iteration order is never externally observable; all exposed ordered data comes from price trees, FIFO links, or journal vectors. | Deterministic public outputs across process seeds. | Replay identical command streams under varied hash seeds and byte-compare reports, depth, and journal order. Any difference falsifies A10. |
 | A11 | A trade is durably settled once using a caller-supplied globally unique transaction ID and the definition-correlated settlement path; the lower-level convention API is not an authorization boundary. | Delivery-versus-payment balances, WAL reconstruction, and retry behavior. | Submit exact retries, transaction collisions, mismatched instrument versions, and terminate between WAL append and balance commit. Any mismatched-version posting, duplicate economic effect, or lost acknowledged entry falsifies A11. |
 | A12 | Allocator failure and process abort are outside the current recoverable error model. | Fallible business/arithmetic paths; no crash-safety claim. | Inject allocation failure at each allocation site. Any requirement for continued in-process service falsifies A12 and requires bounded/preallocated structures. |
@@ -49,6 +49,8 @@ listed falsification probe.
 | A42 | A `LedgerBatch` is an already-authorized ordered accounting instruction containing at least two canonical entries. Declared order is authoritative for time, period controls, and reversal lineage; balances expose only `b + Σδᵢ`. Every member is stored in one CRC-protected WAL frame and one ledger record. | Ordered in-batch lifecycle visibility, direct final-balance arithmetic, shared event sequence, exact grouped replay, all-or-neither crash recovery, and checkpoint lineage. | Permute members; target a later transaction; combine close/reopen with dated entries; repeat/reuse transaction IDs; separately commit none/some/all members; force stale preparation; exercise cancelling deltas at `i128` boundaries; tear/corrupt every frame byte; rotate segments; and restore checkpoint plus suffix. Any visible prefix, order-insensitive lifecycle result, artificial intermediate overflow, accepted partial/wrong grouping, second effect, or replay divergence falsifies A42. |
 | A43 | Individual posting and account-balance amounts remain signed `i128`, but no fixed-width ceiling is imposed on the exact positive or negative aggregate across accounts. `LedgerMagnitude` may allocate only after a side exceeds `u128::MAX`; allocator failure remains under A12. | Acceptance of mathematically balanced large-leg entries, trial-balance completeness, reconciliation validation, invariant audits, exact unbalanced diagnostics, and checkpoint replay beyond `u128` aggregate totals. | Cross `u128::MAX` with one entry and with separately committed entries; vary canonical leg order; compare independently calculated decimal totals; add after spill; exercise balanced/unbalanced reconciliation, checkpoint encode/decode, replay, and maximum configured account/leg volumes. Any false arithmetic rejection, truncation, unequal reconstructed total, fixed-width wrap, or audit failure on valid committed state falsifies A43. |
 | A44 | Each side's ordered price map is authoritative and its cached best `(price, head, tail, displayed quantity, order count)` is redundant derived state updated through the sole level insert, update, and remove boundary. No caller obtains unrestricted mutable level access. | Allocation-free `O(1)` best-price, best-order, and best-level snapshot discovery; one fewer ordered-tree traversal per maker-slice selection; deterministic checkpoint reconstruction. | Exercise empty/non-empty transitions, better/worse/equal-price insertion, best/non-best deletion, partial/full fill, retained/lost-priority replace, all STP modes, reserve refresh, mass cancel, and checkpoint/WAL reconstruction in both side directions. Deliberately corrupt cached price or any cached level field and run the independent ordered-map audit. Any undetected divergence or best lookup inconsistent with the map falsifies A44. |
+| A45 | For FOK eligibility, reserve replenishment changes execution order but not total fillable external leaves at a price unless a cancel-aggressor/cancel-both self order is encountered. The first such self order is a FIFO barrier: reserve replenishments from earlier orders rejoin behind it, so only their current displayed slices are executable before the barrier. Cancel-resting removes self orders and leaves every external total leaf eligible. Decrement-and-cancel remains inadmissible for FOK. | Allocation-free FOK preflight with `O(1)` auxiliary space and one visit per active order in crossed levels; exact hidden-liquidity and STP behavior without materialized slice queues. | Differentially compare against an independent literal slice/requeue simulation across generated levels, FIFO ownership patterns, partial reserve slices, quantities, prices, and every supported FOK STP mode; retain explicit same-price barrier, better-price hidden exhaustion, cancel-resting, insufficient-liquidity, and execution-trace fixtures. Any eligibility or trace disagreement falsifies A45. |
+| A46 | The caller-selected finite matching limits are authoritative operational policy for the current shard process. Capacity failures are unsequenced operational errors: exact command retries bypass gates, and only a currently business-valid cancel or mass-cancel may enter the reserved history lane. `cancellation_reserve >= max_active_orders`; hash preallocation is optional and does not preallocate ordered-tree nodes or event vectors. Limits are not financial WAL/snapshot payload semantics and may change at restart only when recovered current state and replayed historical peaks fit. | Mutation-free and pre-WAL exhaustion, bounded active/account/level/identity/history cardinalities, one individual-cancel slot per maximum active order, deterministic recovery, and optional no-rehash hash-index operation through configured maxima. Fallible construction/durable recovery identify an unrepresentable or unavailable hash reservation before state exists. | Exercise every bound at `N-1`, `N`, and `N+1`; fill ordinary history with accepted and rejected commands; inject unknown/wrong-owner/wrong-instrument controls; perform individual and mass cancellation through the reserve; exact-retry at total exhaustion; recover raw/segmented WAL and checkpoints with equal/larger/smaller limits; request `usize::MAX` preallocation; inspect hash capacities under valid preallocation; inject historical peaks above a lowered recovery policy. Any mutation/WAL frame on capacity failure, reserve erosion by an invalid control, cardinality excess, accepted undersized restoration, unidentified reservation failure, or replay divergence falsifies A46. |
 
 ## Bounded scope expansion
 
@@ -93,9 +95,12 @@ listed falsification probe.
   ledger-backed available funds, cross-instrument portfolio netting,
   margin/scenario models, busts, transfers, and replicated ownership remain
   outside the boundary.
-- **Medium impact:** a bounded idempotency index is required to make memory use
-  stable under continuous operation. Matching checkpoints preserve the current
-  `O(C)` exact-retry history rather than concealing this limit.
+- **High impact:** finite matching cardinalities and a protected cancellation
+  history lane are implemented, but no fenced generation rollover, durable
+  idempotency watermark, or history eviction exists. Ordinary admission stops
+  before the reserve; once total history or accepted-identity capacity is
+  exhausted, supervisory cutover is required. Checkpoints preserve complete
+  exact-retry lineage and do not conceal this lifecycle boundary.
 - **Medium impact:** atomic ledger-batch preparation is independent of unrelated
   ledger balances but retains one signed delta term per posting, plus per-entry
   lifecycle/idempotency overlays, until commit. Default WAL payload bounds cap
@@ -121,6 +126,28 @@ listed falsification probe.
   Remaining per-fill level aggregate mutation and next-worse traversal are
   `O(log P)`. Pinned-hardware branch/cache-miss and p50/p99.9 latency deltas are
   unknown.
+- **Medium impact:** FOK preflight now allocates no queue and scans each active
+  order in crossed levels at most once. For `O_c` inspected orders and `P_c`
+  crossed levels, time is `O(O_c + P_c log P)` and auxiliary space is `O(1)`,
+  independent of reserve replenishment count. A 20,000-case deterministic
+  differential test matches the prior literal slice/requeue model. Maximum-book
+  scan latency and interaction with CPU cache residency remain unknown until
+  measured on declared production capacities and hardware.
+- **Medium impact:** `preallocate=true` reserves the four hash-based matching
+  indexes to their declared maxima, preventing their rehash/growth before those
+  bounds. `BTreeMap` price levels, per-account `BTreeSet` memberships, report
+  event vectors, checkpoint buffers, and diagnostic audits still allocate under
+  A12. Full arena/pool allocation and allocation-failure continuation remain
+  incomplete. `try_with_limits` and durable recovery report constructor-time
+  hash reservation failure, but subsequent ordered-node/event allocation still
+  follows A12.
+- **Medium impact:** a unique resting-capable new limit order requires vacant
+  active/account/new-price capacity before matching begins. This deliberately
+  treats a marketable GTC order as potentially resting and can return an
+  operational capacity error even when a full execution would have left no
+  residual. IOC, FOK, and market orders bypass resting-capacity gates. Exact
+  final-state admission would require an allocation-free dry-run proving the
+  complete active/account/level delta under fills and every STP policy.
 - **Medium impact:** formal state-machine/model-based tests are required for the
   combinatorial interaction of TIF, replacement, and self-trade policies.
 - **Medium impact:** local level-2 incrementals, full-depth images, stable

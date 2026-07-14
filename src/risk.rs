@@ -11,8 +11,8 @@ use crate::domain::{AccountId, OrderId, Price, Side};
 use crate::instrument::InstrumentDefinition;
 use crate::matching::{
     Command, CommandOutcome, EventKind, ExecutionReport, MatchingError, NewOrder, OrderBook,
-    OrderBookCheckpoint, OrderBookCheckpointError, OrderType, RejectReason, ReplaceOrder,
-    SelfTradePrevention, TimeInForce, Trade,
+    OrderBookCheckpoint, OrderBookCheckpointError, OrderBookLimits, OrderType, RejectReason,
+    ReplaceOrder, SelfTradePrevention, TimeInForce, Trade,
 };
 
 /// Account-level order-entry state.
@@ -428,7 +428,14 @@ impl RiskManagedCheckpoint {
     }
 
     fn restore_direct(&self) -> Result<RiskManagedOrderBook, RiskManagedCheckpointError> {
-        let book = OrderBook::from_checkpoint(self.matching.clone())?;
+        self.restore_direct_with_limits(OrderBookLimits::default())
+    }
+
+    fn restore_direct_with_limits(
+        &self,
+        limits: OrderBookLimits,
+    ) -> Result<RiskManagedOrderBook, RiskManagedCheckpointError> {
+        let book = OrderBook::from_checkpoint_with_limits(self.matching.clone(), limits)?;
         let mut risk = RiskEngine::new(self.matching.definition());
         for account in &self.accounts {
             risk.register_account(account.account_id, account.profile)?;
@@ -1071,10 +1078,35 @@ impl RiskManagedOrderBook {
     /// Creates an empty risk-managed book for one immutable definition.
     #[must_use]
     pub fn new(definition: InstrumentDefinition) -> Self {
-        Self {
-            book: OrderBook::new(definition),
+        Self::with_limits(definition, OrderBookLimits::default())
+    }
+
+    /// Creates an empty risk-managed book under explicit matching limits.
+    ///
+    /// # Panics
+    ///
+    /// Panics when requested constructor-time matching hash reservation fails.
+    #[must_use]
+    pub fn with_limits(definition: InstrumentDefinition, limits: OrderBookLimits) -> Self {
+        Self::try_with_limits(definition, limits)
+            .expect("matching capacity reservation must succeed under A12")
+    }
+
+    /// Creates an empty risk-managed book with fallible matching preallocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MatchingError::CapacityReservationFailed`] when a configured
+    /// matching hash reservation cannot be represented or allocated.
+    pub fn try_with_limits(
+        definition: InstrumentDefinition,
+        limits: OrderBookLimits,
+    ) -> Result<Self, MatchingError> {
+        let book = OrderBook::try_with_limits(definition, limits)?;
+        Ok(Self {
+            book,
             risk: RiskEngine::new(definition),
-        }
+        })
     }
 
     /// Registers an account before it enters orders.
@@ -1097,7 +1129,8 @@ impl RiskManagedOrderBook {
     ///
     /// # Errors
     ///
-    /// Returns [`MatchingError`] for command collisions or sequence/identifier exhaustion.
+    /// Returns [`MatchingError`] for command collision, matching capacity, or
+    /// sequence/identifier exhaustion.
     pub fn submit(&mut self, command: Command) -> Result<ExecutionReport, MatchingError> {
         if let Some(report) = self.book.preflight(command)? {
             return Ok(report);
@@ -1118,8 +1151,8 @@ impl RiskManagedOrderBook {
     ///
     /// # Errors
     ///
-    /// Returns [`MatchingError`] for a command collision or exhausted matching
-    /// sequence capacity.
+    /// Returns [`MatchingError`] for command collision, configured matching
+    /// capacity, or exhausted sequence capacity.
     pub fn preflight(&self, command: Command) -> Result<Option<ExecutionReport>, MatchingError> {
         self.book.preflight(command)
     }
@@ -1153,7 +1186,7 @@ impl RiskManagedOrderBook {
             .collect();
         accounts.sort_unstable_by_key(|value| value.account_id);
         let checkpoint = RiskManagedCheckpoint::from_parts(wal_first_sequence, matching, accounts)?;
-        let restored = checkpoint.restore_direct()?;
+        let restored = checkpoint.restore_direct_with_limits(self.book.limits())?;
         if restored != *self {
             return Err(RiskManagedCheckpointError::new(
                 "risk checkpoint direct state differs from live coupled state",
@@ -1172,6 +1205,19 @@ impl RiskManagedOrderBook {
         checkpoint: &RiskManagedCheckpoint,
     ) -> Result<Self, RiskManagedCheckpointError> {
         checkpoint.restore_direct()
+    }
+
+    /// Restores coupled matching/risk state under explicit current matching limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiskManagedCheckpointError`] when semantic state is invalid or
+    /// any recovered matching cardinality exceeds the selected limits.
+    pub fn from_checkpoint_with_limits(
+        checkpoint: &RiskManagedCheckpoint,
+        limits: OrderBookLimits,
+    ) -> Result<Self, RiskManagedCheckpointError> {
+        checkpoint.restore_direct_with_limits(limits)
     }
 
     /// Returns the underlying read-only order book.

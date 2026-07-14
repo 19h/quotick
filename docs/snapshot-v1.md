@@ -185,6 +185,9 @@ A matching checkpoint is accepted structurally only when:
    definition-valid prices and leaves, and coherent displayed/reserve state;
 7. reconstruction produces valid FIFO links, price-level aggregates, accepted-
    order membership, and an uncrossed book.
+8. restoration under caller-selected `OrderBookLimits` proves retained command,
+   accepted-ID, active-order, active-account, and per-side occupied-level
+   cardinalities fit before allocating live indexes.
 
 `OrderBook::checkpoint` first audits the live structure, captures the image,
 then independently replays every retained command and requires every report and
@@ -194,6 +197,14 @@ history. Read-time decoding performs the structural checks above; it does not
 repeat prefix matching. The envelope checksum detects accidental image changes.
 An actor able to rewrite both image and checksum remains outside the authenticity
 model under A14, A39, and A40.
+
+Matching limits are operational process policy, not financial snapshot payload,
+and are therefore not encoded in snapshot kind `2` or `3`. A restore API must
+select validated finite limits. Equal or larger limits preserve current state;
+insufficient limits fail restoration explicitly. A checkpoint can bypass
+historical matching transitions, so only retained/current checkpoint
+cardinalities are tested; raw WAL replay additionally exercises every retained
+historical peak under the selected policy.
 
 Matching snapshot lineage requires identical `M` (and therefore `F` for kind
 `2`) and definition plus exact chronological command/report-prefix equality. A
@@ -290,7 +301,8 @@ then publishes the snapshot. `open_with_checkpoint` and
 4. stream the complete verified WAL and compare each retained command/report
    with the exact frame at that global sequence;
 5. reject any kind/content divergence or a checkpoint ahead of the WAL;
-6. reconstruct active indices, FIFO links, counters, accepted-order membership,
+6. prove retained/current cardinalities fit the selected matching limits, then
+   reconstruct active indices, FIFO links, counters, accepted-order membership,
    and the exact retry cache directly from the checkpoint;
 7. deterministically replay only complete command/report pairs after `G`;
 8. complete at most one final command lacking its report; and
@@ -299,9 +311,10 @@ then publishes the snapshot. `open_with_checkpoint` and
 For `W` verified WAL bytes across `S` segments, `C` retained checkpoint
 commands, `O` active orders over `P` price levels, and `N` suffix commands, open
 uses `O(W + C + O log P + suffix matching work)` time. It does not perform the
-matching transitions for the first `C` commands. Memory remains `O(C + O + P +
-S)` because exact retries and never-reusable accepted order IDs retain complete
-history under A9/A39. Capture performs one independent complete-history replay
+matching transitions for the first `C` commands. Memory remains
+`O(min(C,C_max) + O + P + S)` because exact retries and never-reusable accepted
+order IDs retain complete history only through the finite generation bounds
+under A9/A39/A46. Capture performs one independent complete-history replay
 plus `O(O + P)` structural audit synchronously under exclusive shard ownership.
 These are cold-path costs, but they create an `O(C)` capture pause until a
 generation-fenced immutable/COW handoff is implemented and verified.

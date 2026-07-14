@@ -416,6 +416,159 @@ fn fok_preflight_simulates_reserve_requeue_before_self_trade_barriers() {
 }
 
 #[test]
+fn fok_cancel_resting_counts_all_external_hidden_liquidity_across_self_orders() {
+    let mut book = OrderBook::new(definition(ReserveOrderRules::new(16).unwrap()));
+    for command in [
+        new_order(
+            1,
+            1,
+            11,
+            Side::Sell,
+            30,
+            reserve(10),
+            OrderType::Limit(Price::from_raw(100)),
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ),
+        new_order(
+            2,
+            2,
+            12,
+            Side::Sell,
+            5,
+            OrderDisplay::FullyDisplayed,
+            OrderType::Limit(Price::from_raw(100)),
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ),
+        new_order(
+            3,
+            3,
+            13,
+            Side::Sell,
+            20,
+            reserve(5),
+            OrderType::Limit(Price::from_raw(100)),
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ),
+    ] {
+        book.submit(command).unwrap();
+    }
+
+    let report = book
+        .submit(new_order(
+            4,
+            4,
+            12,
+            Side::Buy,
+            45,
+            OrderDisplay::FullyDisplayed,
+            OrderType::Limit(Price::from_raw(100)),
+            TimeInForce::FillOrKill,
+            SelfTradePrevention::CancelResting,
+        ))
+        .unwrap();
+
+    assert_eq!(report.outcome, CommandOutcome::Accepted);
+    assert!(report.events.iter().any(|event| matches!(
+        event.kind,
+        EventKind::OrderCancelled {
+            order_id,
+            reason: CancelReason::SelfTradeResting,
+            ..
+        } if order_id == OrderId::new(2).unwrap()
+    )));
+    assert_eq!(
+        maker_trades(&report)
+            .iter()
+            .map(|(_, quantity)| quantity)
+            .sum::<u64>(),
+        45
+    );
+    assert!(book.order(OrderId::new(2).unwrap()).is_none());
+    assert_eq!(
+        book.active_orders()
+            .unwrap()
+            .iter()
+            .map(|order| order.leaves_quantity.lots())
+            .sum::<u64>(),
+        5
+    );
+    book.validate().unwrap();
+}
+
+#[test]
+fn fok_exhausts_hidden_liquidity_at_a_better_price_before_a_worse_self_barrier() {
+    for policy in [
+        SelfTradePrevention::CancelAggressor,
+        SelfTradePrevention::CancelBoth,
+    ] {
+        let mut book = OrderBook::new(definition(ReserveOrderRules::new(16).unwrap()));
+        book.submit(new_order(
+            1,
+            1,
+            11,
+            Side::Sell,
+            30,
+            reserve(10),
+            OrderType::Limit(Price::from_raw(99)),
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ))
+        .unwrap();
+        book.submit(new_order(
+            2,
+            2,
+            12,
+            Side::Sell,
+            5,
+            OrderDisplay::FullyDisplayed,
+            OrderType::Limit(Price::from_raw(100)),
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ))
+        .unwrap();
+
+        let rejected = book
+            .submit(new_order(
+                3,
+                3,
+                12,
+                Side::Buy,
+                35,
+                OrderDisplay::FullyDisplayed,
+                OrderType::Limit(Price::from_raw(100)),
+                TimeInForce::FillOrKill,
+                policy,
+            ))
+            .unwrap();
+        assert_eq!(
+            rejected.outcome,
+            CommandOutcome::Rejected(RejectReason::InsufficientLiquidity)
+        );
+
+        let accepted = book
+            .submit(new_order(
+                4,
+                4,
+                12,
+                Side::Buy,
+                30,
+                OrderDisplay::FullyDisplayed,
+                OrderType::Limit(Price::from_raw(100)),
+                TimeInForce::FillOrKill,
+                policy,
+            ))
+            .unwrap();
+        assert_eq!(accepted.outcome, CommandOutcome::Accepted);
+        assert_eq!(maker_trades(&accepted), vec![(1, 10), (1, 10), (1, 10)]);
+        assert!(book.order(OrderId::new(2).unwrap()).is_some());
+        book.validate().unwrap();
+    }
+}
+
+#[test]
 fn cancellation_and_replacement_operate_on_total_leaves_and_display_mode_is_stable() {
     let mut book = OrderBook::new(definition(ReserveOrderRules::new(16).unwrap()));
     book.submit(new_order(

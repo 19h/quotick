@@ -18,7 +18,7 @@ use crate::journal::{
 };
 use crate::matching::{
     Command, ExecutionReport, InvariantViolation, MatchingError, OrderBook, OrderBookCheckpoint,
-    OrderBookCheckpointError,
+    OrderBookCheckpointError, OrderBookLimits,
 };
 use crate::snapshot::{SnapshotError, SnapshotFile, SnapshotOptions, SnapshotReceipt};
 
@@ -288,6 +288,28 @@ impl DurableOrderBook {
         Self::open_storage(
             path.as_ref(),
             definition,
+            OrderBookLimits::default(),
+            StorageOptions::Single(options),
+            None,
+        )
+    }
+
+    /// Opens and replays a matching WAL under explicit finite matching limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] when storage/replay is invalid or recovered
+    /// state exceeds the selected limits.
+    pub fn open_with_limits(
+        path: impl AsRef<Path>,
+        definition: InstrumentDefinition,
+        limits: OrderBookLimits,
+        options: JournalOptions,
+    ) -> Result<Self, DurableError> {
+        Self::open_storage(
+            path.as_ref(),
+            definition,
+            limits,
             StorageOptions::Single(options),
             None,
         )
@@ -311,6 +333,30 @@ impl DurableOrderBook {
         Self::open_storage(
             path.as_ref(),
             definition,
+            OrderBookLimits::default(),
+            StorageOptions::Single(options),
+            Some((checkpoint_path.as_ref(), snapshot_options)),
+        )
+    }
+
+    /// Opens a matching WAL and checkpoint under explicit finite matching limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] for snapshot/storage/replay failure or selected
+    /// limits insufficient for recovered state.
+    pub fn open_with_checkpoint_and_limits(
+        path: impl AsRef<Path>,
+        checkpoint_path: impl AsRef<Path>,
+        definition: InstrumentDefinition,
+        limits: OrderBookLimits,
+        options: JournalOptions,
+        snapshot_options: SnapshotOptions,
+    ) -> Result<Self, DurableError> {
+        Self::open_storage(
+            path.as_ref(),
+            definition,
+            limits,
             StorageOptions::Single(options),
             Some((checkpoint_path.as_ref(), snapshot_options)),
         )
@@ -333,6 +379,27 @@ impl DurableOrderBook {
         Self::open_storage(
             directory.as_ref(),
             definition,
+            OrderBookLimits::default(),
+            StorageOptions::Segmented(options),
+            None,
+        )
+    }
+
+    /// Opens a segmented matching WAL under explicit finite matching limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] for storage/replay failure or insufficient limits.
+    pub fn open_segmented_with_limits(
+        directory: impl AsRef<Path>,
+        definition: InstrumentDefinition,
+        limits: OrderBookLimits,
+        options: SegmentedJournalOptions,
+    ) -> Result<Self, DurableError> {
+        Self::open_storage(
+            directory.as_ref(),
+            definition,
+            limits,
             StorageOptions::Segmented(options),
             None,
         )
@@ -355,6 +422,30 @@ impl DurableOrderBook {
         Self::open_storage(
             directory.as_ref(),
             definition,
+            OrderBookLimits::default(),
+            StorageOptions::Segmented(options),
+            Some((checkpoint_path.as_ref(), snapshot_options)),
+        )
+    }
+
+    /// Opens segmented matching storage and a checkpoint under explicit limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] for snapshot/storage/replay failure or selected
+    /// limits insufficient for recovered state.
+    pub fn open_segmented_with_checkpoint_and_limits(
+        directory: impl AsRef<Path>,
+        checkpoint_path: impl AsRef<Path>,
+        definition: InstrumentDefinition,
+        limits: OrderBookLimits,
+        options: SegmentedJournalOptions,
+        snapshot_options: SnapshotOptions,
+    ) -> Result<Self, DurableError> {
+        Self::open_storage(
+            directory.as_ref(),
+            definition,
+            limits,
             StorageOptions::Segmented(options),
             Some((checkpoint_path.as_ref(), snapshot_options)),
         )
@@ -363,6 +454,7 @@ impl DurableOrderBook {
     fn open_storage(
         path: &Path,
         definition: InstrumentDefinition,
+        limits: OrderBookLimits,
         options: StorageOptions,
         checkpoint_source: Option<(&Path, SnapshotOptions)>,
     ) -> Result<Self, DurableError> {
@@ -372,6 +464,7 @@ impl DurableOrderBook {
             opened.reader,
             opened.checkpoint,
             definition,
+            limits,
             opened.wal_first_sequence,
         )?;
         let mut book = replay.book;
@@ -598,6 +691,7 @@ fn replay_matching_suffix(
     reader: StorageReader,
     mut checkpoint: Option<OrderBookCheckpoint>,
     definition: InstrumentDefinition,
+    limits: OrderBookLimits,
     wal_first_sequence: u64,
 ) -> Result<MatchingReplay, DurableError> {
     let checkpointed_commands = checkpoint
@@ -606,7 +700,11 @@ fn replay_matching_suffix(
         .transpose()
         .map_err(|_| MatchingError::SequenceExhausted)?
         .unwrap_or(0);
-    let mut book = checkpoint.is_none().then(|| OrderBook::new(definition));
+    let mut book = if checkpoint.is_none() {
+        Some(OrderBook::try_with_limits(definition, limits)?)
+    } else {
+        None
+    };
     let mut pending = None;
     let mut replayed_commands = 0_u64;
     let mut last_wal_sequence = wal_first_sequence;
@@ -624,10 +722,11 @@ fn replay_matching_suffix(
             continue;
         }
         if book.is_none() {
-            book = Some(OrderBook::from_checkpoint(
+            book = Some(OrderBook::from_checkpoint_with_limits(
                 checkpoint
                     .take()
                     .expect("first suffix frame follows a checkpoint"),
+                limits,
             )?);
         }
         if replay_matching_frame(
@@ -648,7 +747,7 @@ fn replay_matching_suffix(
                 wal_last_sequence: Some(last_wal_sequence),
             });
         }
-        book = Some(OrderBook::from_checkpoint(value)?);
+        book = Some(OrderBook::from_checkpoint_with_limits(value, limits)?);
     }
     Ok(MatchingReplay {
         book: book.expect("book exists after WAL/checkpoint recovery"),

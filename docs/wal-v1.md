@@ -127,6 +127,31 @@ Mass-cancel scope tags are all owned orders `0`, or one side `1` followed by a
 side tag. The command applies only within its instrument-version shard and is
 admitted in every trading state after identity validation.
 
+## Matching capacity and WAL admission
+
+`OrderBookLimits` is finite operational process policy and is not encoded in
+version-1 financial metadata. It does not change the interpretation of an
+existing frame. Durable matching and risk wrappers execute matching preflight
+before appending a command frame. A capacity failure therefore has no event
+sequence, report, or WAL representation and the command identifier remains
+unused.
+
+Retained command history has an ordinary prefix and a protected cancellation
+tail. Once the ordinary prefix fills, new and replace commands fail preflight.
+Only a cancel or mass-cancel that currently passes core instrument, identity,
+ownership, and active-state checks may enter the tail; exact cached retries do
+not append frames and remain available at total exhaustion. The configured tail
+is at least the maximum active-order count, permitting one valid individual
+cancel for every maximally populated order when the reserve has not already
+been consumed by valid controls.
+
+Recovery APIs select limits explicitly or use finite defaults. Raw WAL replay
+fails if a retained historical transition exceeds the selected policy.
+Checkpoint-assisted recovery first verifies the complete WAL prefix, then
+requires retained/current checkpoint cardinalities and every replayed suffix
+transition to fit. Operational limit changes require no wire-format migration
+but may require larger recovery limits or a fenced generation rollover.
+
 Rejection-reason tags are wrong instrument `0`, duplicate order `1`, unknown
 order `2`, not owner `3`, market cannot rest `4`, market cannot post `5`,
 unsupported FOK/STP combination `6`, insufficient liquidity `7`, post-only

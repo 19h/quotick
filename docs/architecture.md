@@ -102,6 +102,30 @@ gateway -> authentication -> portfolio/collateral risk -> replicated sequencer a
     extremal entry in the authoritative ordered price map. Every level aggregate
     mutation refreshes the cache when it targets the current best; deletion of
     the best recomputes the new extremum before control returns to matching.
+24. FOK inspection never mutates state or materializes reserve slices. At a
+    crossed price without self liquidity, every external total leaf is eligible.
+    Cancel-resting excludes self orders and retains all external total leaves.
+    For cancel-aggressor and cancel-both, the first self order is a FIFO barrier:
+    only current displayed slices of earlier orders precede it because refreshed
+    slices rejoin at the tail. The scan visits each inspected active order at
+    most once and uses constant auxiliary space.
+25. Every book has finite validated maxima for active orders, active accounts,
+    occupied prices per side, accepted order IDs, and retained commands. Active
+    accounts and per-side levels cannot exceed active-order capacity; accepted
+    identity and ordinary history can establish every maximum active order.
+26. The tail of retained-command capacity reserves at least one slot per maximum
+    active order. Once ordinary history fills, new and replace commands stop.
+    Only a cancel or mass-cancel that passes current core business validation may
+    enter the reserve; malformed, unknown, wrong-owner, or wrong-instrument
+    controls cannot consume it. Exact cached retries remain available even at
+    total exhaustion.
+27. Capacity checks precede the first matching mutation. Durable wrappers run
+    the same preflight before appending a command frame, so capacity failure is
+    an unsequenced operational result and cannot leave a dangling WAL command.
+28. Checkpoint restoration rejects current cardinalities above selected limits.
+    Raw WAL replay reconstructs under the selected limits and fails explicitly
+    if any retained historical transition exceeds them. Limits may be enlarged
+    at restart; lowering them is valid only when the selected recovery path fits.
 
 The book wraps each `BTreeMap<Price, PriceLevel>` in a side-aware index with a
 mutation-maintained complete best-level cache. This provides `O(1)` best-price,
@@ -110,6 +134,11 @@ ordered traversal. It uses `HashMap<OrderId, RestingOrder>` for direct lookup,
 `HashMap<AccountId, AccountOrderIndex>` containing side-specific
 `BTreeSet<OrderId>` values for canonical account selection, and doubly linked
 order identifiers for FIFO removal without scanning a level or book.
+`OrderBookLimits` bounds all monotonic and active matching indexes. Optional
+construction-time hash reservation covers active orders, active accounts,
+accepted IDs, and retained reports; ordered price/account trees remain bounded
+but allocate nodes on demand. Fallible construction and durable recovery use
+`try_reserve` and report the first failed hash resource before state exists.
 
 ## Instrument invariants
 
@@ -438,6 +467,16 @@ Best-level index tests cover bid/ask extrema, better/worse insertion, non-best
 and repeated best deletion, deliberate cached-price and cached-aggregate
 corruption, repricing, full execution, STP removal, empty-side transitions, and
 direct checkpoint reconstruction.
+FOK tests cover hidden total-leaves eligibility, same-price self barriers,
+cancel-resting across self orders, better-price reserve exhaustion before a
+worse self barrier, all supported FOK STP policies, and allocation-free/model
+equivalence against literal FIFO-tail reserve requeue across 20,000 generated
+books.
+Capacity tests cover invalid policies, every active/account/side-level/identity
+boundary, ordinary-history exhaustion, invalid-control reserve protection,
+valid individual and mass cancellation, exact retry at exhaustion, released
+level accounting during replace, insufficient/sufficient checkpoint limits,
+pre-WAL rejection, durable recovery, and post-recovery retry.
 Matching checkpoint tests cover capture-time replay audit, FIFO-tail reserve
 state, resting STP, exact retry, stable kind/codec, semantic corruption,
 non-default WAL origins, lineage forks, WAL-prefix divergence, ahead-of-WAL

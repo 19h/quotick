@@ -87,6 +87,16 @@ recovery.
   self-trade prevention.
 - Atomic FOK preflight, exact-command idempotency, collision detection, and
   monotonic event and trade sequences.
+- Allocation-free FOK liquidity inspection that uses total reserve leaves where
+  reachable and current displayed slices before an aggressor-blocking self-order
+  barrier, without constructing replenishment queues.
+- Validated finite matching limits for active orders/accounts, occupied levels,
+  accepted identifiers, and retained reports; optional constructor-time hash
+  reservation prevents index growth/rehash through the selected maxima.
+- A protected retained-history tail sized to at least the maximum active-order
+  population. Ordinary admission closes first; only currently valid cancel and
+  mass-cancel controls may consume the reserve, and exact retries bypass all
+  capacity gates.
 - Complete execution traces suitable for replay, downstream publication, and
   risk reconstruction.
 
@@ -139,8 +149,8 @@ recovery.
 ### Accounting and settlement
 
 - Atomic, balanced multi-asset journal entries with canonical leg order and
-  exact per-asset side magnitudes that cannot fail from fixed-width aggregate
-  overflow or leg ordering.
+  exact, order-independent per-asset side totals beyond fixed-width aggregate
+  limits.
 - Explicit signed epoch-day effective dates and nondecreasing UTC nanosecond
   booking timestamps on every financial journal event.
 - Delivery-versus-payment trade settlement bound to the exact instrument
@@ -160,9 +170,9 @@ recovery.
 - Idempotent zero-posting period close/reopen controls with an inclusive dated
   posting fence reconstructed by WAL and checkpoint replay.
 - Full balance reconstruction from the canonical journal sequence.
-- Independent journal/index replay and arbitrary-magnitude per-asset trial-
-  balance audits, using allocation-free inline `u128` totals until a side
-  exceeds that range.
+- Independent journal/index replay and arbitrary-magnitude per-asset
+  trial-balance audits, retaining totals inline through `u128::MAX` and spilling
+  to canonical `u64` limbs only when required.
 - Exact-generation reconciliation against canonical complete external balance
   statements, including deterministic external-minus-ledger break reports.
 - Canonical non-zero balance checkpoints retaining complete transaction
@@ -208,9 +218,9 @@ The test suites cover:
 - **Market data and accounting:** displayed-depth reconstruction, settlement,
   arithmetic rollback, exact reversal and reinstatement chains, indivisible
   reversal-plus-replacement corrections, generalized multi-entry netting,
-  ordered in-batch period/reversal transitions, grouped replay and partial-
-  commitment rejection, period controls, external-statement reconciliation,
-  and signed `i128` boundaries.
+  ordered in-batch period/reversal transitions, grouped replay and
+  partial-commitment rejection, period controls, external-statement
+  reconciliation, and signed `i128` boundaries.
 - **Storage and recovery:** stable wire layouts, record and whole-batch segment
   rotation, cross-segment matching/risk/ledger replay, strict closed-segment
   corruption handling, active-tail repair, concurrent-writer exclusion,
@@ -240,6 +250,24 @@ uses `O(O + P + C)` memory for `O` resting orders and `C` retained idempotency
 reports; account indexing adds one ordered membership per active order within
 the same `O(O)` bound, while the two complete best-level caches add `O(1)`
 space.
+
+FOK preflight over `O_c` active orders in `P_c` crossed levels is
+`O(O_c + P_c log P)` time and `O(1)` auxiliary space. Each inspected order is
+visited at most once; complexity is independent of the number of reserve slices
+that subsequent execution emits.
+
+Default matching limits are 4,096 active orders, 4,096 active accounts, 4,096
+occupied prices per side, 65,536 accepted order IDs, and 65,536 retained
+commands, with the final 4,096 history slots reserved for valid cancellation
+controls. Defaults are finite but do not preallocate; production constructors
+accept an explicit `OrderBookLimits`, and `preallocate=true` reserves all four
+hash indexes to their maxima. `try_with_limits` reports the exact hash resource
+when a requested reservation cannot be represented or allocated; durable
+recovery uses this fallible path. Capacity preflight is `O(1)` expected time except
+for validating a reserve-lane control through the ordinary core lookup. Capacity
+errors are not sequenced and durable wrappers reject them before WAL append.
+A unique GTC/post-only limit order reserves potential resting capacity before
+matching; IOC, FOK, and market orders do not consume that gate.
 
 Risk authorization and trace application are expected `O(1)` per order event.
 A complete risk cross-audit is `O(O + A)` for `A` registered accounts, and risk
