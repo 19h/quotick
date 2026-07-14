@@ -8,7 +8,10 @@ use quotick::instrument::{
     InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
     QuantityRules, ReserveOrderRules, TradingState,
 };
-use quotick::journal::{Durability, Journal, JournalOptions, SegmentedJournalOptions};
+use quotick::journal::{
+    Durability, Journal, JournalOptions, JournalReader, RecordKind, SegmentedJournal,
+    SegmentedJournalOptions, SegmentedJournalReader,
+};
 use quotick::matching::{
     Command, CommandOutcome, NewOrder, OrderDisplay, OrderType, RejectReason, SelfTradePrevention,
     TimeInForce,
@@ -17,7 +20,7 @@ use quotick::risk::{
     AccountRiskDefinition, AccountRiskState, RiskLimitSpec, RiskLimits, RiskManagedCheckpoint,
     RiskManagedOrderBook, RiskProfile,
 };
-use quotick::snapshot::{SnapshotFile, SnapshotOptions};
+use quotick::snapshot::{CheckpointSlot, SnapshotFile, SnapshotOptions};
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
     TimestampNs,
@@ -463,6 +466,11 @@ fn risk_checkpoint_output_cannot_alias_wal_storage() {
         durable.write_checkpoint(&wal, SnapshotOptions::default()),
         Err(DurableRiskError::CheckpointPathConflictsWithWal { .. })
     ));
+    let cutover_pending = Journal::cutover_pending_path(&wal).unwrap();
+    assert!(matches!(
+        durable.write_checkpoint(&cutover_pending, SnapshotOptions::default()),
+        Err(DurableRiskError::CheckpointPathConflictsWithWal { .. })
+    ));
 
     let segments = area.join("segments");
     let options = SegmentedJournalOptions {
@@ -476,6 +484,146 @@ fn risk_checkpoint_output_cannot_alias_wal_storage() {
         segmented.write_checkpoint(segments.join("risk.qsnp"), SnapshotOptions::default()),
         Err(DurableRiskError::CheckpointPathConflictsWithWal { .. })
     ));
+}
+
+#[test]
+fn risk_checkpoint_cutover_preserves_profiles_positions_reservations_and_suffix() {
+    let area = TestArea::new("single-cutover");
+    let wal = area.join("risk.wal");
+    let checkpoint_base = area.join("risk.qsnp");
+    let profile_values = profiles(40);
+    let first = resting(1, 1, 11, 5);
+    let suffix = resting(2, 2, 12, 7);
+    let mut durable =
+        DurableRiskOrderBook::open(&wal, definition(), &profile_values, journal_options()).unwrap();
+    durable.submit(first).unwrap();
+    let cutover = durable
+        .compact_to_checkpoint(&checkpoint_base, SnapshotOptions::default())
+        .unwrap();
+    assert_eq!(cutover.slot(), CheckpointSlot::A);
+    assert_eq!(cutover.snapshot().generation(), 5);
+    let anchor = JournalReader::open(&wal, journal_options())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(anchor.kind(), RecordKind::CheckpointAnchor);
+    assert_eq!(anchor.sequence(), 5);
+    durable.submit(suffix).unwrap();
+    durable.close().unwrap();
+
+    assert!(matches!(
+        DurableRiskOrderBook::open(&wal, definition(), &profile_values, journal_options()),
+        Err(DurableRiskError::CheckpointRequiredForCompactedWal { sequence: 5 })
+    ));
+    let mut recovered = DurableRiskOrderBook::open_with_checkpoint(
+        &wal,
+        &checkpoint_base,
+        definition(),
+        &profile_values,
+        journal_options(),
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().checkpointed_commands, 1);
+    assert_eq!(recovered.recovery().replayed_commands, 1);
+    assert_eq!(recovered.managed().risk().reservation_count(), 2);
+    assert!(recovered.submit(first).unwrap().replayed);
+    recovered.managed().validate().unwrap();
+
+    let second = recovered
+        .compact_to_checkpoint(&checkpoint_base, SnapshotOptions::default())
+        .unwrap();
+    assert_eq!(second.slot(), CheckpointSlot::B);
+    assert_eq!(second.snapshot().generation(), 7);
+    recovered.close().unwrap();
+
+    let final_state = DurableRiskOrderBook::open_with_checkpoint(
+        &wal,
+        &checkpoint_base,
+        definition(),
+        &profile_values,
+        journal_options(),
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(final_state.recovery().checkpointed_commands, 2);
+    assert_eq!(final_state.recovery().replayed_commands, 0);
+    assert_eq!(final_state.managed().risk().reservation_count(), 2);
+    final_state.managed().validate().unwrap();
+}
+
+#[test]
+fn segmented_risk_cutover_preserves_metadata_state_and_generation_selection() {
+    let area = TestArea::new("segmented-cutover");
+    let segments = area.join("segments");
+    let checkpoint_base = area.join("risk.qsnp");
+    let profile_values = profiles(40);
+    let options = SegmentedJournalOptions {
+        maximum_segment_bytes: 512,
+        journal: journal_options(),
+    };
+    let first = resting(1, 1, 11, 5);
+    let suffix = resting(2, 2, 12, 7);
+    let mut durable =
+        DurableRiskOrderBook::open_segmented(&segments, definition(), &profile_values, options)
+            .unwrap();
+    durable.submit(first).unwrap();
+    let cutover = durable
+        .compact_to_checkpoint(&checkpoint_base, SnapshotOptions::default())
+        .unwrap();
+    assert_eq!(cutover.slot(), CheckpointSlot::A);
+    assert_eq!(cutover.snapshot().generation(), 5);
+    durable.submit(suffix).unwrap();
+    durable.close().unwrap();
+
+    let frames = SegmentedJournalReader::open(&segments, options)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(frames[0].kind(), RecordKind::CheckpointAnchor);
+    assert_eq!(frames.len(), 3);
+    let mut recovered = DurableRiskOrderBook::open_segmented_with_checkpoint(
+        &segments,
+        &checkpoint_base,
+        definition(),
+        &profile_values,
+        options,
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().checkpointed_commands, 1);
+    assert_eq!(recovered.recovery().replayed_commands, 1);
+    assert_eq!(recovered.managed().risk().reservation_count(), 2);
+    assert!(recovered.submit(first).unwrap().replayed);
+    let second = recovered
+        .compact_to_checkpoint(&checkpoint_base, SnapshotOptions::default())
+        .unwrap();
+    assert_eq!(second.slot(), CheckpointSlot::B);
+    recovered.close().unwrap();
+
+    let manager = SegmentedJournal::open(&segments, options).unwrap();
+    assert_eq!(manager.recovery().active_generation, 3);
+    assert!(
+        manager
+            .segments()
+            .iter()
+            .all(|segment| segment.generation() == 3)
+    );
+    manager.close().unwrap();
+    let final_state = DurableRiskOrderBook::open_segmented_with_checkpoint(
+        &segments,
+        &checkpoint_base,
+        definition(),
+        &profile_values,
+        options,
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(final_state.recovery().checkpointed_commands, 2);
+    assert_eq!(final_state.recovery().replayed_commands, 0);
+    assert_eq!(final_state.managed().risk().reservation_count(), 2);
+    final_state.managed().validate().unwrap();
 }
 
 #[test]

@@ -38,6 +38,48 @@ impl SnapshotKind {
     const fn wire(self) -> u16 {
         self as u16
     }
+
+    pub(crate) const fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::LedgerCheckpoint),
+            2 => Some(Self::MatchingCheckpoint),
+            3 => Some(Self::RiskManagedCheckpoint),
+            _ => None,
+        }
+    }
+}
+
+/// One of two deterministic checkpoint files used by crash-safe WAL cutover.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointSlot {
+    /// First alternating checkpoint file.
+    A,
+    /// Second alternating checkpoint file.
+    B,
+}
+
+impl CheckpointSlot {
+    pub(crate) const fn wire(self) -> u8 {
+        match self {
+            Self::A => 0,
+            Self::B => 1,
+        }
+    }
+
+    pub(crate) const fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::A),
+            1 => Some(Self::B),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn alternate(self) -> Self {
+        match self {
+            Self::A => Self::B,
+            Self::B => Self::A,
+        }
+    }
 }
 
 mod sealed {
@@ -139,6 +181,139 @@ impl SnapshotReceipt {
     #[must_use]
     pub const fn checksum(self) -> u32 {
         self.checksum
+    }
+}
+
+/// Identity of one synchronized semantic checkpoint embedded in a compacted WAL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointAnchor {
+    kind: SnapshotKind,
+    slot: CheckpointSlot,
+    generation: u64,
+    wal_sequence: u64,
+    payload_length: u64,
+    checksum: u32,
+}
+
+impl CheckpointAnchor {
+    /// Constructs an anchor from the exact receipt returned after snapshot synchronization.
+    #[must_use]
+    pub const fn new(
+        kind: SnapshotKind,
+        slot: CheckpointSlot,
+        receipt: SnapshotReceipt,
+        wal_sequence: u64,
+    ) -> Self {
+        Self {
+            kind,
+            slot,
+            generation: receipt.generation,
+            wal_sequence,
+            payload_length: receipt.payload_length,
+            checksum: receipt.checksum,
+        }
+    }
+
+    /// Returns the anchored semantic payload kind.
+    #[must_use]
+    pub const fn kind(self) -> SnapshotKind {
+        self.kind
+    }
+
+    /// Returns the alternating checkpoint slot selected by this WAL generation.
+    #[must_use]
+    pub const fn slot(self) -> CheckpointSlot {
+        self.slot
+    }
+
+    /// Returns the semantic checkpoint generation.
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    /// Returns the physical sequence assigned to the anchor frame.
+    #[must_use]
+    pub const fn wal_sequence(self) -> u64 {
+        self.wal_sequence
+    }
+
+    /// Returns the anchored encoded semantic payload length.
+    #[must_use]
+    pub const fn payload_length(self) -> u64 {
+        self.payload_length
+    }
+
+    /// Returns the anchored complete snapshot-envelope CRC-32C.
+    #[must_use]
+    pub const fn checksum(self) -> u32 {
+        self.checksum
+    }
+
+    /// Returns whether a read snapshot receipt exactly matches this anchor.
+    #[must_use]
+    pub const fn matches_receipt(self, receipt: SnapshotReceipt) -> bool {
+        self.generation == receipt.generation
+            && self.payload_length == receipt.payload_length
+            && self.checksum == receipt.checksum
+    }
+
+    pub(crate) const fn from_parts(
+        kind: SnapshotKind,
+        slot: CheckpointSlot,
+        generation: u64,
+        wal_sequence: u64,
+        payload_length: u64,
+        checksum: u32,
+    ) -> Self {
+        Self {
+            kind,
+            slot,
+            generation,
+            wal_sequence,
+            payload_length,
+            checksum,
+        }
+    }
+}
+
+/// Successful two-slot checkpoint and physical WAL cutover.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointCutoverReceipt {
+    snapshot: SnapshotReceipt,
+    slot: CheckpointSlot,
+    wal_first_sequence: u64,
+}
+
+impl CheckpointCutoverReceipt {
+    pub(crate) const fn new(
+        snapshot: SnapshotReceipt,
+        slot: CheckpointSlot,
+        wal_first_sequence: u64,
+    ) -> Self {
+        Self {
+            snapshot,
+            slot,
+            wal_first_sequence,
+        }
+    }
+
+    /// Returns the synchronized checkpoint receipt.
+    #[must_use]
+    pub const fn snapshot(self) -> SnapshotReceipt {
+        self.snapshot
+    }
+
+    /// Returns the checkpoint slot selected by the new WAL anchor.
+    #[must_use]
+    pub const fn slot(self) -> CheckpointSlot {
+        self.slot
+    }
+
+    /// Returns the first sequence retained by the replacement WAL.
+    #[must_use]
+    pub const fn wal_first_sequence(self) -> u64 {
+        self.wal_first_sequence
     }
 }
 
@@ -365,6 +540,17 @@ struct LoadedSnapshot<T> {
 pub struct SnapshotFile;
 
 impl SnapshotFile {
+    /// Derives one of the two checkpoint-slot paths from an operator-selected base path.
+    #[must_use]
+    pub fn slot_path(path: impl AsRef<Path>, slot: CheckpointSlot) -> PathBuf {
+        let mut value: OsString = path.as_ref().as_os_str().to_os_string();
+        value.push(match slot {
+            CheckpointSlot::A => ".cutover-a",
+            CheckpointSlot::B => ".cutover-b",
+        });
+        PathBuf::from(value)
+    }
+
     /// Fully writes and synchronizes `<path>.pending`, atomically renames it to
     /// `path`, synchronizes the parent directory, and releases writer ownership.
     ///
@@ -453,6 +639,14 @@ impl SnapshotFile {
         options: SnapshotOptions,
     ) -> Result<T, SnapshotError> {
         Ok(read_loaded::<T>(path.as_ref(), options)?.value)
+    }
+
+    pub(crate) fn read_with_receipt<T: SnapshotPayload>(
+        path: impl AsRef<Path>,
+        options: SnapshotOptions,
+    ) -> Result<(T, SnapshotReceipt), SnapshotError> {
+        let loaded = read_loaded::<T>(path.as_ref(), options)?;
+        Ok((loaded.value, loaded.receipt))
     }
 
     /// Resolves an abandoned `.pending` file under exclusive snapshot ownership.

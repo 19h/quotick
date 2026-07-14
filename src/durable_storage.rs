@@ -7,6 +7,7 @@ use crate::journal::{
     JournalReader, SegmentedJournal, SegmentedJournalError, SegmentedJournalOptions,
     SegmentedJournalReader, StorageRecoveryReport,
 };
+use crate::snapshot::CheckpointAnchor;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum StorageOptions {
@@ -26,19 +27,23 @@ pub(crate) enum StorageWriter {
         journal: Journal,
         initial_sequence: u64,
     },
-    Segmented(SegmentedJournal),
+    Segmented(Box<SegmentedJournal>),
 }
 
 impl StorageWriter {
     pub(crate) fn open(path: &Path, options: StorageOptions) -> Result<Self, StorageError> {
         match options {
             StorageOptions::Single(options) => Journal::open(path, options)
-                .map(|journal| Self::Single {
-                    journal,
-                    initial_sequence: options.initial_sequence,
+                .map(|journal| {
+                    let initial_sequence = journal.initial_sequence();
+                    Self::Single {
+                        journal,
+                        initial_sequence,
+                    }
                 })
                 .map_err(StorageError::Journal),
             StorageOptions::Segmented(options) => SegmentedJournal::open(path, options)
+                .map(Box::new)
                 .map(Self::Segmented)
                 .map_err(StorageError::Segmented),
         }
@@ -90,10 +95,6 @@ impl StorageWriter {
         }
     }
 
-    pub(crate) fn first_sequence(&self) -> u64 {
-        self.recovery().first_sequence
-    }
-
     pub(crate) fn next_sequence(&self) -> u64 {
         match self {
             Self::Single { journal, .. } => journal.next_sequence(),
@@ -128,10 +129,31 @@ impl StorageWriter {
         }
     }
 
+    pub(crate) fn replace_with_checkpoint_anchor(
+        &mut self,
+        anchor: CheckpointAnchor,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Single {
+                journal,
+                initial_sequence,
+            } => {
+                journal
+                    .replace_with_checkpoint_anchor(anchor)
+                    .map_err(StorageError::Journal)?;
+                *initial_sequence = anchor.wal_sequence();
+                Ok(())
+            }
+            Self::Segmented(journal) => journal
+                .replace_with_checkpoint_anchor(anchor)
+                .map_err(StorageError::Segmented),
+        }
+    }
+
     pub(crate) fn close(self) -> Result<(), StorageError> {
         match self {
             Self::Single { journal, .. } => journal.close().map_err(StorageError::Journal),
-            Self::Segmented(journal) => journal.close().map_err(StorageError::Segmented),
+            Self::Segmented(journal) => (*journal).close().map_err(StorageError::Segmented),
         }
     }
 }

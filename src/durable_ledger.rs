@@ -7,8 +7,8 @@ use crate::domain::{AccountingDate, TimestampNs, TransactionId};
 use crate::durable_storage::{StorageError, StorageOptions, StorageReader, StorageWriter};
 use crate::instrument::InstrumentDefinition;
 use crate::journal::{
-    Journal, JournalError, JournalLayout, JournalOptions, RecordKind, SegmentedJournalError,
-    SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
+    Journal, JournalError, JournalFrame, JournalLayout, JournalOptions, RecordKind,
+    SegmentedJournalError, SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
 };
 use crate::ledger::{
     BatchPreparation, BatchReceipt, CorrectionPreparation, CorrectionReceipt, JournalEntry, Ledger,
@@ -16,7 +16,10 @@ use crate::ledger::{
     LedgerInvariantViolation, LedgerRecord, PostReceipt, PostingPreparation, SettlementConvention,
 };
 use crate::matching::Trade;
-use crate::snapshot::{SnapshotError, SnapshotFile, SnapshotOptions, SnapshotReceipt};
+use crate::snapshot::{
+    CheckpointAnchor, CheckpointCutoverReceipt, CheckpointSlot, SnapshotError, SnapshotFile,
+    SnapshotKind, SnapshotOptions, SnapshotReceipt,
+};
 
 /// Result of reconstructing a durable ledger.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,6 +75,25 @@ pub enum DurableLedgerError {
         /// Complete ledger-event frames present in the WAL.
         wal_records: u64,
     },
+    /// A compacted ledger WAL requires its anchor-selected checkpoint base path.
+    CheckpointRequiredForCompactedWal {
+        /// Physical sequence of the checkpoint anchor.
+        sequence: u64,
+    },
+    /// A compacted ledger WAL anchor names another checkpoint kind.
+    CheckpointAnchorKindMismatch {
+        /// Kind stored in the anchor.
+        actual: SnapshotKind,
+    },
+    /// The selected ledger checkpoint does not equal the anchor identity.
+    CheckpointAnchorMismatch {
+        /// Anchored semantic ledger generation.
+        generation: u64,
+        /// Selected alternating checkpoint slot.
+        slot: CheckpointSlot,
+    },
+    /// An empty ledger has no durable frame boundary to replace with an anchor.
+    CompactionRequiresNonEmptyLedger,
     /// Snapshot output aliases a WAL file, lease, pending path, or managed directory.
     CheckpointPathConflictsWithWal {
         /// Conflicting canonical path.
@@ -117,6 +139,21 @@ impl fmt::Display for DurableLedgerError {
                 formatter,
                 "ledger checkpoint covers {checkpoint_records} records but WAL has {wal_records}"
             ),
+            Self::CheckpointRequiredForCompactedWal { sequence } => write!(
+                formatter,
+                "ledger WAL begins with checkpoint anchor {sequence}; a checkpoint base path is required"
+            ),
+            Self::CheckpointAnchorKindMismatch { actual } => write!(
+                formatter,
+                "ledger WAL anchor references incompatible snapshot kind {actual:?}"
+            ),
+            Self::CheckpointAnchorMismatch { generation, slot } => write!(
+                formatter,
+                "ledger WAL anchor for semantic generation {generation} does not match checkpoint slot {slot:?}"
+            ),
+            Self::CompactionRequiresNonEmptyLedger => {
+                formatter.write_str("an empty ledger has no WAL prefix to compact")
+            }
             Self::CheckpointPathConflictsWithWal { path } => write!(
                 formatter,
                 "checkpoint path {} conflicts with WAL storage",
@@ -193,6 +230,7 @@ impl From<SnapshotError> for DurableLedgerError {
 pub struct DurableLedger {
     ledger: Ledger,
     journal: StorageWriter,
+    checkpoint_slot: Option<CheckpointSlot>,
     recovery: DurableLedgerRecoveryReport,
     poisoned: bool,
 }
@@ -265,6 +303,10 @@ impl DurableLedger {
         )
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one recovery audit keeps anchor selection, prefix proof, suffix application, and final invariant validation contiguous"
+    )]
     fn open_storage(
         path: &Path,
         options: StorageOptions,
@@ -275,32 +317,77 @@ impl DurableLedger {
         }
         let journal = StorageWriter::open(path, options)?;
         let journal_recovery = journal.recovery();
-        let checkpoint = checkpoint_source
-            .map(|(checkpoint_path, snapshot_options)| {
-                SnapshotFile::read::<LedgerCheckpoint>(checkpoint_path, snapshot_options)
-            })
-            .transpose()?;
-        let reader = StorageReader::open(path, options)?;
+        let mut reader = StorageReader::open(path, options)?;
+        let first_frame = reader.next().transpose()?;
+        let (checkpoint, checkpoint_slot, mut next_frame, compacted) = if let Some(frame) =
+            first_frame
+        {
+            if frame.kind() == RecordKind::CheckpointAnchor {
+                let anchor: CheckpointAnchor = frame.decode()?;
+                if anchor.kind() != SnapshotKind::LedgerCheckpoint {
+                    return Err(DurableLedgerError::CheckpointAnchorKindMismatch {
+                        actual: anchor.kind(),
+                    });
+                }
+                let Some((checkpoint_base, snapshot_options)) = checkpoint_source else {
+                    return Err(DurableLedgerError::CheckpointRequiredForCompactedWal {
+                        sequence: frame.sequence(),
+                    });
+                };
+                if frame.sequence() != anchor.wal_sequence() {
+                    return Err(DurableLedgerError::CheckpointAnchorMismatch {
+                        generation: anchor.generation(),
+                        slot: anchor.slot(),
+                    });
+                }
+                let slot_path = SnapshotFile::slot_path(checkpoint_base, anchor.slot());
+                validate_checkpoint_path(path, storage_layout(options), &slot_path)?;
+                let (checkpoint, receipt) = SnapshotFile::read_with_receipt::<LedgerCheckpoint>(
+                    &slot_path,
+                    snapshot_options,
+                )?;
+                if !anchor.matches_receipt(receipt)
+                    || checkpoint.generation() != anchor.generation()
+                {
+                    return Err(DurableLedgerError::CheckpointAnchorMismatch {
+                        generation: anchor.generation(),
+                        slot: anchor.slot(),
+                    });
+                }
+                (Some(checkpoint), Some(anchor.slot()), None, true)
+            } else {
+                let checkpoint = checkpoint_source
+                    .map(|(checkpoint_path, snapshot_options)| {
+                        SnapshotFile::read::<LedgerCheckpoint>(checkpoint_path, snapshot_options)
+                    })
+                    .transpose()?;
+                (checkpoint, None, Some(frame), false)
+            }
+        } else {
+            let checkpoint = checkpoint_source
+                .map(|(checkpoint_path, snapshot_options)| {
+                    SnapshotFile::read::<LedgerCheckpoint>(checkpoint_path, snapshot_options)
+                })
+                .transpose()?;
+            (checkpoint, None, None, false)
+        };
         let checkpointed_records = checkpoint.as_ref().map_or(0, LedgerCheckpoint::generation);
         let mut ledger = checkpoint
             .map(Ledger::from_checkpoint)
             .transpose()?
             .unwrap_or_default();
         let mut replayed_records = 0_u64;
-        let mut wal_records = 0_u64;
-        for frame_result in reader {
-            let frame = frame_result?;
-            let record = match frame.kind() {
-                RecordKind::LedgerEntry => LedgerRecord::Entry(frame.decode()?),
-                RecordKind::LedgerCorrection => LedgerRecord::Correction(frame.decode()?),
-                RecordKind::LedgerBatch => LedgerRecord::Batch(frame.decode()?),
-                kind => {
-                    return Err(DurableLedgerError::UnexpectedRecord {
-                        sequence: frame.sequence(),
-                        kind,
-                    });
-                }
+        let mut wal_records = if compacted { checkpointed_records } else { 0 };
+        loop {
+            let frame = if let Some(frame) = next_frame.take() {
+                frame
+            } else {
+                let Some(frame) = reader.next().transpose()? else {
+                    break;
+                };
+                frame
             };
+            let record = decode_ledger_record(&frame)?;
             if wal_records < checkpointed_records {
                 let checkpoint_sequence = wal_records
                     .checked_add(1)
@@ -348,6 +435,7 @@ impl DurableLedger {
                 checkpointed_records,
                 replayed_records,
             },
+            checkpoint_slot,
             poisoned: false,
         })
     }
@@ -597,6 +685,53 @@ impl DurableLedger {
         SnapshotFile::write(path, &checkpoint, options).map_err(Into::into)
     }
 
+    /// Writes the inactive ledger checkpoint slot and atomically retires the
+    /// selected WAL prefix behind an anchor that separately binds semantic
+    /// record generation and physical WAL sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableLedgerError`] for empty storage, poison, path conflict,
+    /// ledger audit, snapshot persistence, or physical cutover failure.
+    pub fn compact_to_checkpoint(
+        &mut self,
+        checkpoint_base: impl AsRef<Path>,
+        options: SnapshotOptions,
+    ) -> Result<CheckpointCutoverReceipt, DurableLedgerError> {
+        if self.poisoned {
+            return Err(DurableLedgerError::Poisoned);
+        }
+        if self.ledger.record_count() == 0 {
+            return Err(DurableLedgerError::CompactionRequiresNonEmptyLedger);
+        }
+        validate_checkpoint_path(
+            self.journal.path(),
+            self.journal.layout(),
+            checkpoint_base.as_ref(),
+        )?;
+        self.sync_all()?;
+        let wal_sequence = self
+            .journal
+            .next_sequence()
+            .checked_sub(1)
+            .ok_or(LedgerError::ArithmeticOverflow)?;
+        let checkpoint = self.ledger.checkpoint()?;
+        let slot = self
+            .checkpoint_slot
+            .map_or(CheckpointSlot::A, CheckpointSlot::alternate);
+        let slot_path = SnapshotFile::slot_path(checkpoint_base, slot);
+        validate_checkpoint_path(self.journal.path(), self.journal.layout(), &slot_path)?;
+        let snapshot = SnapshotFile::write(&slot_path, &checkpoint, options)?;
+        let anchor =
+            CheckpointAnchor::new(SnapshotKind::LedgerCheckpoint, slot, snapshot, wal_sequence);
+        if let Err(error) = self.journal.replace_with_checkpoint_anchor(anchor) {
+            self.poisoned = self.journal.is_poisoned();
+            return Err(error.into());
+        }
+        self.checkpoint_slot = Some(slot);
+        Ok(CheckpointCutoverReceipt::new(snapshot, slot, wal_sequence))
+    }
+
     /// Synchronizes ledger WAL data and metadata.
     ///
     /// # Errors
@@ -625,6 +760,18 @@ impl DurableLedger {
             return Err(DurableLedgerError::Poisoned);
         }
         self.journal.close().map_err(Into::into)
+    }
+}
+
+fn decode_ledger_record(frame: &JournalFrame) -> Result<LedgerRecord, DurableLedgerError> {
+    match frame.kind() {
+        RecordKind::LedgerEntry => Ok(LedgerRecord::Entry(frame.decode()?)),
+        RecordKind::LedgerCorrection => Ok(LedgerRecord::Correction(frame.decode()?)),
+        RecordKind::LedgerBatch => Ok(LedgerRecord::Batch(frame.decode()?)),
+        kind => Err(DurableLedgerError::UnexpectedRecord {
+            sequence: frame.sequence(),
+            kind,
+        }),
     }
 }
 
@@ -659,7 +806,8 @@ fn validate_checkpoint_path(
         }
         JournalLayout::SingleFile => {
             let storage_lease = Journal::writer_lease_path(&storage_path)?;
-            let storage_paths = [&storage_path, &storage_lease];
+            let storage_cutover = Journal::cutover_pending_path(&storage_path)?;
+            let storage_paths = [&storage_path, &storage_lease, &storage_cutover];
             if let Some(conflict) = snapshot_mutations
                 .into_iter()
                 .find(|snapshot| storage_paths.contains(snapshot))

@@ -1832,8 +1832,7 @@ const fn command_order_id(command: Command) -> Option<OrderId> {
         Command::New(value) => Some(value.order_id),
         Command::Cancel(value) => Some(value.order_id),
         Command::Replace(value) => Some(value.order_id),
-        Command::MassCancel(_) => None,
-        Command::AccountControl(_) => None,
+        Command::MassCancel(_) | Command::AccountControl(_) => None,
     }
 }
 

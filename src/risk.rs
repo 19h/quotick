@@ -1133,8 +1133,7 @@ impl RiskEngine {
                     );
                 }
             }
-            Command::Cancel(_) | Command::MassCancel(_) => {}
-            Command::AccountControl(_) => {}
+            Command::Cancel(_) | Command::MassCancel(_) | Command::AccountControl(_) => {}
             Command::Replace(order) => {
                 if replacement_retained_priority(report, order.order_id) {
                     self.insert_reservation(

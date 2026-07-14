@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.85"
 readme = "readme.md"
 description = "Deterministic, auditable financial market infrastructure."
+documentation = "https://docs.rs/quotick"
+homepage = "https://github.com/19h/quotick"
+repository = "https://github.com/19h/quotick"
 license-file = "license.txt"
 autobins = false
 

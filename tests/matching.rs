@@ -150,6 +150,10 @@ fn event_trace_from_vec_retains_the_event_buffer() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one state-machine fixture proves atomic block, retry, stale revision, enable, and renewed admission"
+)]
 fn account_block_is_revision_checked_atomic_and_exactly_replayable() {
     let mut book = OrderBook::new(definition());
     for (command, order, side, price, quantity) in

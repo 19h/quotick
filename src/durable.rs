@@ -20,7 +20,10 @@ use crate::matching::{
     Command, CommandPreparation, ExecutionReport, InvariantViolation, MatchingError, OrderBook,
     OrderBookCheckpoint, OrderBookCheckpointError, OrderBookLimits,
 };
-use crate::snapshot::{SnapshotError, SnapshotFile, SnapshotOptions, SnapshotReceipt};
+use crate::snapshot::{
+    CheckpointAnchor, CheckpointCutoverReceipt, CheckpointSlot, SnapshotError, SnapshotFile,
+    SnapshotKind, SnapshotOptions, SnapshotReceipt,
+};
 
 /// Result of reconstructing a durable matching shard.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,6 +120,23 @@ pub enum DurableError {
         /// Last complete physical frame in the WAL.
         wal_last_sequence: Option<u64>,
     },
+    /// A compacted WAL cannot be opened without its anchor-selected checkpoint base path.
+    CheckpointRequiredForCompactedWal {
+        /// Physical sequence of the checkpoint anchor.
+        sequence: u64,
+    },
+    /// A compacted WAL anchor names another semantic checkpoint type.
+    CheckpointAnchorKindMismatch {
+        /// Kind stored in the anchor.
+        actual: SnapshotKind,
+    },
+    /// The selected checkpoint bytes do not equal the identity embedded in the WAL anchor.
+    CheckpointAnchorMismatch {
+        /// Anchored semantic generation.
+        generation: u64,
+        /// Anchored alternating slot.
+        slot: CheckpointSlot,
+    },
     /// Snapshot output aliases WAL storage or its ownership namespace.
     CheckpointPathConflictsWithWal {
         /// Conflicting canonical path.
@@ -198,6 +218,18 @@ impl fmt::Display for DurableError {
                 formatter,
                 "matching checkpoint covers WAL sequence {checkpoint_sequence}, but verified WAL ends at {wal_last_sequence:?}"
             ),
+            Self::CheckpointRequiredForCompactedWal { sequence } => write!(
+                formatter,
+                "matching WAL begins with checkpoint anchor {sequence}; a checkpoint base path is required"
+            ),
+            Self::CheckpointAnchorKindMismatch { actual } => write!(
+                formatter,
+                "matching WAL anchor references incompatible snapshot kind {actual:?}"
+            ),
+            Self::CheckpointAnchorMismatch { generation, slot } => write!(
+                formatter,
+                "matching WAL anchor at generation {generation} does not match checkpoint slot {slot:?}"
+            ),
             Self::CheckpointPathConflictsWithWal { path } => write!(
                 formatter,
                 "matching checkpoint path {} conflicts with WAL storage",
@@ -267,6 +299,8 @@ impl From<SnapshotError> for DurableError {
 pub struct DurableOrderBook {
     book: OrderBook,
     journal: StorageWriter,
+    wal_metadata_sequence: u64,
+    checkpoint_slot: Option<CheckpointSlot>,
     recovery: DurableRecoveryReport,
     poisoned: bool,
 }
@@ -479,6 +513,8 @@ impl DurableOrderBook {
         Ok(Self {
             book,
             journal,
+            wal_metadata_sequence: opened.wal_metadata_sequence,
+            checkpoint_slot: opened.checkpoint_slot,
             recovery: DurableRecoveryReport {
                 journal: opened.recovery,
                 checkpointed_commands: replay.checkpointed_commands,
@@ -565,7 +601,7 @@ impl DurableOrderBook {
             .ok_or(MatchingError::SequenceExhausted)?;
         let checkpoint = match self
             .book
-            .checkpoint(self.journal.first_sequence(), wal_sequence)
+            .checkpoint(self.wal_metadata_sequence, wal_sequence)
         {
             Ok(value) => value,
             Err(error) => {
@@ -574,6 +610,67 @@ impl DurableOrderBook {
             }
         };
         SnapshotFile::write(path, &checkpoint, options).map_err(Into::into)
+    }
+
+    /// Writes the inactive checkpoint slot, synchronizes it, and atomically
+    /// retires the selected WAL prefix behind an exact checkpoint anchor.
+    ///
+    /// Slot A/B alternation keeps the checkpoint referenced by the current WAL
+    /// intact until the layout-specific WAL selector and its directory barrier
+    /// complete. The resulting WAL retains the retired physical boundary as its
+    /// anchor sequence and appends the next command at `anchor sequence + 1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] for poison, path conflict, WAL/checkpoint
+    /// validation, snapshot persistence, or physical cutover failure.
+    pub fn compact_to_checkpoint(
+        &mut self,
+        checkpoint_base: impl AsRef<Path>,
+        options: SnapshotOptions,
+    ) -> Result<CheckpointCutoverReceipt, DurableError> {
+        if self.poisoned {
+            return Err(DurableError::Poisoned);
+        }
+        validate_checkpoint_path(
+            self.journal.path(),
+            self.journal.layout(),
+            checkpoint_base.as_ref(),
+        )?;
+        self.sync_all()?;
+        let wal_sequence = self
+            .journal
+            .next_sequence()
+            .checked_sub(1)
+            .ok_or(MatchingError::SequenceExhausted)?;
+        let checkpoint = match self
+            .book
+            .checkpoint(self.wal_metadata_sequence, wal_sequence)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                self.poisoned = true;
+                return Err(DurableError::Checkpoint(error));
+            }
+        };
+        let slot = self
+            .checkpoint_slot
+            .map_or(CheckpointSlot::A, CheckpointSlot::alternate);
+        let slot_path = SnapshotFile::slot_path(checkpoint_base, slot);
+        validate_checkpoint_path(self.journal.path(), self.journal.layout(), &slot_path)?;
+        let snapshot = SnapshotFile::write(&slot_path, &checkpoint, options)?;
+        let anchor = CheckpointAnchor::new(
+            SnapshotKind::MatchingCheckpoint,
+            slot,
+            snapshot,
+            wal_sequence,
+        );
+        if let Err(error) = self.journal.replace_with_checkpoint_anchor(anchor) {
+            self.poisoned = self.journal.is_poisoned();
+            return Err(error.into());
+        }
+        self.checkpoint_slot = Some(slot);
+        Ok(CheckpointCutoverReceipt::new(snapshot, slot, wal_sequence))
     }
 
     /// Synchronizes journal data and metadata.
@@ -613,6 +710,8 @@ struct OpenedMatchingJournal {
     recovery: StorageRecoveryReport,
     checkpoint: Option<OrderBookCheckpoint>,
     wal_first_sequence: u64,
+    wal_metadata_sequence: u64,
+    checkpoint_slot: Option<CheckpointSlot>,
 }
 
 fn open_matching_journal(
@@ -629,33 +728,82 @@ fn open_matching_journal(
     if recovery.last_sequence.is_none() {
         journal.append(&definition)?;
     }
-    let checkpoint = checkpoint_source
-        .map(|(checkpoint_path, snapshot_options)| {
-            SnapshotFile::read::<OrderBookCheckpoint>(checkpoint_path, snapshot_options)
-        })
-        .transpose()?;
     let mut reader = StorageReader::open(path, options)?;
-    let Some(definition_frame) = reader.next().transpose()? else {
+    let Some(first_frame) = reader.next().transpose()? else {
         return Err(DurableError::DefinitionRecordMissing);
     };
-    validate_definition_frame(&definition_frame, definition)?;
-    if let Some(value) = &checkpoint {
-        if value.wal_metadata_sequence() != definition_frame.sequence() {
-            return Err(DurableError::CheckpointWalLineageMismatch {
-                checkpoint_first_sequence: value.wal_metadata_sequence(),
-                wal_first_sequence: definition_frame.sequence(),
+    let (checkpoint, wal_metadata_sequence, checkpoint_slot) = match first_frame.kind() {
+        RecordKind::InstrumentDefinition => {
+            validate_definition_frame(&first_frame, definition)?;
+            let checkpoint = checkpoint_source
+                .map(|(checkpoint_path, snapshot_options)| {
+                    SnapshotFile::read::<OrderBookCheckpoint>(checkpoint_path, snapshot_options)
+                })
+                .transpose()?;
+            if let Some(value) = &checkpoint {
+                if value.wal_metadata_sequence() != first_frame.sequence() {
+                    return Err(DurableError::CheckpointWalLineageMismatch {
+                        checkpoint_first_sequence: value.wal_metadata_sequence(),
+                        wal_first_sequence: first_frame.sequence(),
+                    });
+                }
+                if value.definition() != definition {
+                    return Err(DurableError::CheckpointDefinitionMismatch);
+                }
+            }
+            (checkpoint, first_frame.sequence(), None)
+        }
+        RecordKind::CheckpointAnchor => {
+            let anchor: CheckpointAnchor = first_frame.decode()?;
+            if anchor.kind() != SnapshotKind::MatchingCheckpoint {
+                return Err(DurableError::CheckpointAnchorKindMismatch {
+                    actual: anchor.kind(),
+                });
+            }
+            let Some((checkpoint_base, snapshot_options)) = checkpoint_source else {
+                return Err(DurableError::CheckpointRequiredForCompactedWal {
+                    sequence: first_frame.sequence(),
+                });
+            };
+            if first_frame.sequence() != anchor.wal_sequence() {
+                return Err(DurableError::CheckpointAnchorMismatch {
+                    generation: anchor.generation(),
+                    slot: anchor.slot(),
+                });
+            }
+            let slot_path = SnapshotFile::slot_path(checkpoint_base, anchor.slot());
+            validate_checkpoint_path(path, storage_layout(options), &slot_path)?;
+            let (checkpoint, receipt) = SnapshotFile::read_with_receipt::<OrderBookCheckpoint>(
+                &slot_path,
+                snapshot_options,
+            )?;
+            if !anchor.matches_receipt(receipt)
+                || checkpoint.generation() != anchor.generation()
+                || checkpoint.definition() != definition
+            {
+                return Err(DurableError::CheckpointAnchorMismatch {
+                    generation: anchor.generation(),
+                    slot: anchor.slot(),
+                });
+            }
+            let wal_metadata_sequence = checkpoint.wal_metadata_sequence();
+            (Some(checkpoint), wal_metadata_sequence, Some(anchor.slot()))
+        }
+        actual => {
+            return Err(DurableError::DefinitionRecordRequired {
+                sequence: first_frame.sequence(),
+                actual,
             });
         }
-        if value.definition() != definition {
-            return Err(DurableError::CheckpointDefinitionMismatch);
-        }
-    }
+    };
     Ok(OpenedMatchingJournal {
         journal,
         reader,
         recovery,
         checkpoint,
-        wal_first_sequence: definition_frame.sequence(),
+        wal_first_sequence: first_frame.sequence(),
+        wal_metadata_sequence,
+        checkpoint_slot,
     })
 }
 
@@ -794,7 +942,8 @@ fn replay_matching_frame(
         | RecordKind::InstrumentDefinition
         | RecordKind::AccountRiskDefinition
         | RecordKind::LedgerCorrection
-        | RecordKind::LedgerBatch => Err(DurableError::UnexpectedRecord {
+        | RecordKind::LedgerBatch
+        | RecordKind::CheckpointAnchor => Err(DurableError::UnexpectedRecord {
             sequence: frame.sequence(),
             kind: frame.kind(),
         }),
@@ -876,7 +1025,8 @@ fn validate_checkpoint_path(
         }
         JournalLayout::SingleFile => {
             let storage_lease = Journal::writer_lease_path(&storage_path)?;
-            let storage_paths = [&storage_path, &storage_lease];
+            let storage_cutover = Journal::cutover_pending_path(&storage_path)?;
+            let storage_paths = [&storage_path, &storage_lease, &storage_cutover];
             if let Some(conflict) = snapshot_mutations
                 .into_iter()
                 .find(|snapshot| storage_paths.contains(snapshot))

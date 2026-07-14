@@ -27,6 +27,7 @@ use crate::instrument::InstrumentDefinition;
 use crate::ledger::{JournalEntry, LedgerBatch, LedgerCorrection};
 use crate::matching::{Command, ExecutionReport};
 use crate::risk::AccountRiskDefinition;
+use crate::snapshot::CheckpointAnchor;
 
 pub use crate::segmented_journal::{
     SegmentDescriptor, SegmentedAppendReceipt, SegmentedJournal, SegmentedJournalError,
@@ -34,7 +35,7 @@ pub use crate::segmented_journal::{
 };
 
 const MAGIC: [u8; 4] = *b"QWAL";
-const FORMAT_VERSION: u16 = 2;
+const FORMAT_VERSION: u16 = 3;
 pub(crate) const HEADER_LENGTH: usize = 24;
 const CHECKSUM_START: usize = 12;
 const CHECKSUM_END: usize = 16;
@@ -64,6 +65,8 @@ pub enum RecordKind {
     LedgerCorrection,
     /// One atomic ordered group of ledger entries.
     LedgerBatch,
+    /// Identity of a synchronized semantic checkpoint replacing an older WAL prefix.
+    CheckpointAnchor,
 }
 
 impl RecordKind {
@@ -76,6 +79,7 @@ impl RecordKind {
             Self::AccountRiskDefinition => 5,
             Self::LedgerCorrection => 6,
             Self::LedgerBatch => 7,
+            Self::CheckpointAnchor => 8,
         }
     }
 
@@ -88,6 +92,7 @@ impl RecordKind {
             5 => Ok(Self::AccountRiskDefinition),
             6 => Ok(Self::LedgerCorrection),
             7 => Ok(Self::LedgerBatch),
+            8 => Ok(Self::CheckpointAnchor),
             _ => Err(JournalError::UnknownRecordKind { offset, value }),
         }
     }
@@ -127,6 +132,10 @@ impl DurableRecord for LedgerBatch {
     const KIND: RecordKind = RecordKind::LedgerBatch;
 }
 
+impl DurableRecord for CheckpointAnchor {
+    const KIND: RecordKind = RecordKind::CheckpointAnchor;
+}
+
 /// A decoded known payload from a journal frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KnownRecord {
@@ -144,6 +153,8 @@ pub enum KnownRecord {
     LedgerCorrection(LedgerCorrection),
     /// Atomic ordered accounting batch.
     LedgerBatch(LedgerBatch),
+    /// Synchronized checkpoint identity at a compacted physical WAL origin.
+    CheckpointAnchor(CheckpointAnchor),
 }
 
 /// Acknowledgement policy for successful appends.
@@ -249,7 +260,7 @@ pub enum JournalLayout {
 pub struct StorageRecoveryReport {
     /// Physical storage layout opened by the runtime.
     pub layout: JournalLayout,
-    /// First configured global frame sequence.
+    /// First retained global frame sequence in the selected physical layout.
     pub first_sequence: u64,
     /// Last verified global frame sequence, or `None` for empty storage.
     pub last_sequence: Option<u64>,
@@ -442,6 +453,7 @@ impl JournalFrame {
             }
             RecordKind::LedgerCorrection => self.decode().map(KnownRecord::LedgerCorrection),
             RecordKind::LedgerBatch => self.decode().map(KnownRecord::LedgerBatch),
+            RecordKind::CheckpointAnchor => self.decode().map(KnownRecord::CheckpointAnchor),
         }
     }
 }
@@ -487,6 +499,23 @@ pub enum JournalError {
     SequenceExhausted,
     /// Header-plus-payload or file offset arithmetic exceeded its representation.
     FrameLengthOverflow,
+    /// A checkpoint anchor does not describe the current complete WAL boundary.
+    CheckpointAnchorSequenceMismatch {
+        /// Last sequence in the current WAL.
+        current: Option<u64>,
+        /// Generation claimed by the replacement anchor.
+        proposed: u64,
+    },
+    /// A prior interrupted cutover left the deterministic replacement path occupied.
+    CutoverPendingExists {
+        /// Path requiring explicit recovery or removal after provenance checks.
+        path: PathBuf,
+    },
+    /// No abandoned checkpoint-cutover pending file exists at the derived path.
+    CutoverPendingMissing {
+        /// Derived path that was absent.
+        path: PathBuf,
+    },
     /// Payload exceeded the configured frame limit.
     PayloadTooLarge {
         /// Requested payload bytes.
@@ -589,6 +618,20 @@ impl fmt::Display for JournalError {
             }
             Self::SequenceExhausted => formatter.write_str("journal sequence exhausted"),
             Self::FrameLengthOverflow => formatter.write_str("journal frame length overflow"),
+            Self::CheckpointAnchorSequenceMismatch { current, proposed } => write!(
+                formatter,
+                "checkpoint anchor sequence {proposed} does not equal current WAL boundary {current:?}"
+            ),
+            Self::CutoverPendingExists { path } => write!(
+                formatter,
+                "checkpoint cutover pending file {} already exists",
+                path.display()
+            ),
+            Self::CutoverPendingMissing { path } => write!(
+                formatter,
+                "checkpoint cutover pending file {} does not exist",
+                path.display()
+            ),
             Self::PayloadTooLarge { length, maximum } => {
                 write!(
                     formatter,
@@ -852,6 +895,7 @@ pub struct Journal {
 enum InjectedFault {
     PartialWrite(usize),
     DurabilityBarrier,
+    CutoverDirectoryBarrier,
     SyncAll,
     SyncData,
 }
@@ -911,6 +955,10 @@ impl Journal {
             file.sync_all()?;
             sync_parent(&path)?;
         }
+        let mut options = options;
+        let file_length = file.metadata()?.len();
+        options.initial_sequence =
+            effective_initial_sequence(&mut file, file_length, options.initial_sequence)?;
         let recovery = scan_and_recover(&mut file, options)?;
         let next_sequence = match recovery.last_sequence {
             Some(last) => last.checked_add(1).ok_or(JournalError::SequenceExhausted)?,
@@ -961,6 +1009,16 @@ impl Journal {
     pub fn writer_lease_path(path: impl AsRef<Path>) -> Result<PathBuf, JournalError> {
         let journal_path = normalize_journal_path(path.as_ref())?;
         Ok(writer_lease_path(&journal_path))
+    }
+
+    /// Resolves the deterministic staging path used for WAL prefix replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Io`] when the journal path cannot be normalized.
+    pub fn cutover_pending_path(path: impl AsRef<Path>) -> Result<PathBuf, JournalError> {
+        let journal_path = normalize_journal_path(path.as_ref())?;
+        Ok(cutover_pending_path(&journal_path))
     }
 
     /// Removes an abandoned writer lease only when its on-disk identity still
@@ -1017,6 +1075,36 @@ impl Journal {
         Ok(())
     }
 
+    /// Discards a staging file left before an interrupted WAL cutover rename.
+    ///
+    /// The caller must first prove the prior writer cannot resume and recover
+    /// its abandoned lease. This operation acquires a new writer lease, requires
+    /// the authoritative WAL path to remain present, removes only the derived
+    /// staging path, synchronizes the parent directory, and releases ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::WriterLeaseHeld`] while any writer lease remains,
+    /// [`JournalError::CutoverPendingMissing`] when no staging file exists, or
+    /// [`JournalError::Io`] for filesystem failure.
+    pub fn recover_abandoned_cutover_pending(path: impl AsRef<Path>) -> Result<(), JournalError> {
+        let journal_path = normalize_journal_path(path.as_ref())?;
+        fs::metadata(&journal_path)?;
+        let mut writer_lease = WriterLease::acquire(&journal_path)?;
+        let pending_path = cutover_pending_path(&journal_path);
+        match fs::remove_file(&pending_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                writer_lease.release()?;
+                return Err(JournalError::CutoverPendingMissing { path: pending_path });
+            }
+            Err(error) => return Err(JournalError::Io(error)),
+        }
+        sync_parent(&pending_path)?;
+        writer_lease.release()?;
+        Ok(())
+    }
+
     /// Returns the verified recovery outcome from open.
     #[must_use]
     pub const fn recovery(&self) -> RecoveryReport {
@@ -1027,6 +1115,10 @@ impl Journal {
     #[must_use]
     pub const fn next_sequence(&self) -> u64 {
         self.next_sequence
+    }
+
+    pub(crate) const fn initial_sequence(&self) -> u64 {
+        self.options.initial_sequence
     }
 
     /// Returns whether an ambiguous write or synchronization failure has made
@@ -1178,6 +1270,85 @@ impl Journal {
         Ok(receipts)
     }
 
+    pub(crate) fn replace_with_checkpoint_anchor(
+        &mut self,
+        anchor: CheckpointAnchor,
+    ) -> Result<(), JournalError> {
+        self.ensure_healthy()?;
+        let current = if self.offset == 0 {
+            None
+        } else {
+            Some(
+                self.next_sequence
+                    .checked_sub(1)
+                    .ok_or(JournalError::SequenceExhausted)?,
+            )
+        };
+        if current != Some(anchor.wal_sequence()) {
+            return Err(JournalError::CheckpointAnchorSequenceMismatch {
+                current,
+                proposed: anchor.wal_sequence(),
+            });
+        }
+        let payload = anchor.encode().map_err(JournalError::Codec)?;
+        self.validate_payload(&payload)?;
+        let payload_length =
+            u32::try_from(payload.len()).map_err(|_| JournalError::PayloadTooLarge {
+                length: payload.len(),
+                maximum: self.options.max_payload_length,
+            })?;
+        let frame = encode_frame(
+            RecordKind::CheckpointAnchor,
+            anchor.wal_sequence(),
+            payload_length,
+            &payload,
+        );
+        let frame_length =
+            u64::try_from(frame.len()).map_err(|_| JournalError::FrameLengthOverflow)?;
+        let next_sequence = anchor
+            .wal_sequence()
+            .checked_add(1)
+            .ok_or(JournalError::SequenceExhausted)?;
+        let pending_path = cutover_pending_path(&self.path);
+        let mut replacement = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&pending_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(JournalError::CutoverPendingExists { path: pending_path });
+            }
+            Err(error) => return Err(JournalError::Io(error)),
+        };
+        replacement.write_all(&frame)?;
+        replacement.sync_all()?;
+        fs::rename(&pending_path, &self.path)?;
+        #[cfg(test)]
+        if self.injected_fault == Some(InjectedFault::CutoverDirectoryBarrier) {
+            self.injected_fault = None;
+            self.poisoned = true;
+            return Err(JournalError::Io(injected_io_error(
+                "checkpoint-cutover directory barrier",
+            )));
+        }
+        if let Err(error) = sync_parent(&self.path) {
+            self.poisoned = true;
+            return Err(JournalError::Io(error));
+        }
+        self.file = replacement;
+        self.options.initial_sequence = anchor.wal_sequence();
+        self.recovery = RecoveryReport {
+            last_sequence: Some(anchor.wal_sequence()),
+            valid_bytes: frame_length,
+            truncated_bytes: 0,
+        };
+        self.next_sequence = next_sequence;
+        self.offset = self.recovery.valid_bytes;
+        Ok(())
+    }
+
     /// Establishes a data-and-metadata durability barrier for all prior appends.
     ///
     /// # Errors
@@ -1313,17 +1484,51 @@ impl JournalReader {
         if options.initial_sequence == 0 {
             return Err(JournalError::InvalidInitialSequence);
         }
-        let file = File::open(path)?;
+        let mut file = File::open(path)?;
         let file_length = file.metadata()?.len();
+        let initial_sequence =
+            effective_initial_sequence(&mut file, file_length, options.initial_sequence)?;
         Ok(Self {
             file,
             file_length,
             offset: 0,
-            expected_sequence: options.initial_sequence,
+            expected_sequence: initial_sequence,
             maximum_payload_length: options.max_payload_length,
             finished: false,
         })
     }
+}
+
+fn effective_initial_sequence(
+    file: &mut File,
+    file_length: u64,
+    configured: u64,
+) -> Result<u64, JournalError> {
+    if file_length < u64::try_from(HEADER_LENGTH).expect("header length fits u64") {
+        return Ok(configured);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = [0_u8; HEADER_LENGTH];
+    file.read_exact(&mut header)?;
+    if header[0..4] == MAGIC
+        && u16::from_le_bytes(header[4..6].try_into().expect("version width")) == FORMAT_VERSION
+        && u16::from_le_bytes(header[6..8].try_into().expect("kind width"))
+            == RecordKind::CheckpointAnchor.wire()
+    {
+        let sequence = u64::from_le_bytes(header[16..24].try_into().expect("sequence width"));
+        if sequence == 0 {
+            return Err(JournalError::InvalidInitialSequence);
+        }
+        Ok(sequence)
+    } else {
+        Ok(configured)
+    }
+}
+
+fn cutover_pending_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".cutover.pending");
+    PathBuf::from(value)
 }
 
 impl Iterator for JournalReader {
@@ -1590,8 +1795,11 @@ mod tests {
 
     use super::{
         CRC32C_TABLE, Durability, HEADER_LENGTH, InjectedFault, Journal, JournalBatch,
-        JournalError, JournalOptions, RecordKind, RecoveryMode, update_crc32c,
+        JournalError, JournalOptions, JournalReader, RecordKind, RecoveryMode,
+        cutover_pending_path, update_crc32c,
     };
+    use crate::codec::BinaryCodec;
+    use crate::snapshot::{CheckpointAnchor, CheckpointSlot, SnapshotKind};
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
 
@@ -1622,6 +1830,139 @@ mod tests {
         let checksum = !update_crc32c(u32::MAX, b"123456789");
         assert_eq!(checksum, 0xE306_9283);
         assert_ne!(CRC32C_TABLE[1], 0);
+    }
+
+    #[test]
+    fn checkpoint_cutover_replaces_the_file_without_releasing_writer_ownership() {
+        let path = test_path("checkpoint-cutover");
+        remove_test_files(&path);
+        let mut journal = Journal::open(&path, buffered_options()).unwrap();
+        journal.append_raw(RecordKind::Command, &[1]).unwrap();
+        let owner = journal.writer_lease_owner();
+        let anchor = CheckpointAnchor::from_parts(
+            SnapshotKind::MatchingCheckpoint,
+            CheckpointSlot::A,
+            1,
+            1,
+            99,
+            0x1234_5678,
+        );
+        let mut expected_anchor = vec![2, 0];
+        expected_anchor.extend_from_slice(&1_u64.to_le_bytes());
+        expected_anchor.extend_from_slice(&1_u64.to_le_bytes());
+        expected_anchor.extend_from_slice(&99_u64.to_le_bytes());
+        expected_anchor.extend_from_slice(&0x1234_5678_u32.to_le_bytes());
+        assert_eq!(anchor.encode().unwrap(), expected_anchor);
+        journal.replace_with_checkpoint_anchor(anchor).unwrap();
+        assert_eq!(journal.writer_lease_owner(), owner);
+        assert_eq!(journal.initial_sequence(), 1);
+        assert_eq!(journal.next_sequence(), 2);
+        journal.append_raw(RecordKind::Command, &[2]).unwrap();
+        journal.close().unwrap();
+
+        let frames = JournalReader::open(&path, buffered_options())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].sequence(), 1);
+        assert_eq!(frames[0].decode::<CheckpointAnchor>().unwrap(), anchor);
+        assert_eq!(frames[1].sequence(), 2);
+        remove_test_files(&path);
+    }
+
+    #[test]
+    fn checkpoint_anchor_rejects_zero_semantic_or_physical_sequences() {
+        let zero_generation = CheckpointAnchor::from_parts(
+            SnapshotKind::MatchingCheckpoint,
+            CheckpointSlot::A,
+            0,
+            1,
+            99,
+            0x1234_5678,
+        );
+        assert!(matches!(
+            zero_generation.encode(),
+            Err(crate::codec::CodecError::InvalidValue(
+                "checkpoint anchor generation is zero"
+            ))
+        ));
+        let zero_wal_sequence = CheckpointAnchor::from_parts(
+            SnapshotKind::MatchingCheckpoint,
+            CheckpointSlot::A,
+            1,
+            0,
+            99,
+            0x1234_5678,
+        );
+        assert!(matches!(
+            zero_wal_sequence.encode(),
+            Err(crate::codec::CodecError::InvalidValue(
+                "checkpoint anchor WAL sequence is zero"
+            ))
+        ));
+    }
+
+    #[test]
+    fn occupied_cutover_pending_path_is_nonmutating_and_typed() {
+        let path = test_path("checkpoint-cutover-pending");
+        remove_test_files(&path);
+        let mut journal = Journal::open(&path, buffered_options()).unwrap();
+        journal.append_raw(RecordKind::Command, &[1]).unwrap();
+        let pending = cutover_pending_path(journal.path());
+        fs::write(&pending, b"abandoned").unwrap();
+        let anchor = CheckpointAnchor::from_parts(
+            SnapshotKind::MatchingCheckpoint,
+            CheckpointSlot::A,
+            1,
+            1,
+            99,
+            0x1234_5678,
+        );
+        assert!(matches!(
+            journal.replace_with_checkpoint_anchor(anchor),
+            Err(JournalError::CutoverPendingExists { path: actual }) if actual == pending
+        ));
+        assert_eq!(journal.next_sequence(), 2);
+        assert!(!journal.is_poisoned());
+        fs::remove_file(pending).unwrap();
+        journal.close().unwrap();
+        remove_test_files(&path);
+    }
+
+    #[test]
+    fn cutover_directory_barrier_failure_reopens_the_complete_anchor() {
+        let path = test_path("checkpoint-cutover-directory-barrier");
+        remove_test_files(&path);
+        let mut journal = Journal::open(&path, buffered_options()).unwrap();
+        journal.append_raw(RecordKind::Command, &[1]).unwrap();
+        let anchor = CheckpointAnchor::from_parts(
+            SnapshotKind::MatchingCheckpoint,
+            CheckpointSlot::A,
+            1,
+            1,
+            99,
+            0x1234_5678,
+        );
+        journal.injected_fault = Some(InjectedFault::CutoverDirectoryBarrier);
+        assert!(matches!(
+            journal.replace_with_checkpoint_anchor(anchor),
+            Err(JournalError::Io(_))
+        ));
+        assert!(journal.is_poisoned());
+        drop(journal);
+
+        let recovered = Journal::open(&path, buffered_options()).unwrap();
+        assert_eq!(recovered.initial_sequence(), 1);
+        assert_eq!(recovered.next_sequence(), 2);
+        let frame = JournalReader::open(&path, buffered_options())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.decode::<CheckpointAnchor>().unwrap(), anchor);
+        recovered.close().unwrap();
+        remove_test_files(&path);
     }
 
     #[test]

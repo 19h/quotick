@@ -4,9 +4,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use quotick::codec::BinaryCodec;
 use quotick::durable_ledger::{DurableLedger, DurableLedgerError};
-use quotick::journal::{Durability, JournalOptions, SegmentedJournalOptions};
+use quotick::journal::{
+    Durability, Journal, JournalOptions, JournalReader, RecordKind, SegmentedJournal,
+    SegmentedJournalOptions, SegmentedJournalReader,
+};
 use quotick::ledger::{JournalEntry, Ledger, Posting};
-use quotick::snapshot::{SnapshotFile, SnapshotOptions};
+use quotick::snapshot::{CheckpointSlot, SnapshotFile, SnapshotOptions};
 use quotick::{AccountId, AccountingDate, AssetId, TimestampNs, TransactionId};
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
@@ -201,6 +204,11 @@ fn checkpoint_output_cannot_alias_wal_storage() {
         single.write_checkpoint(&wal, SnapshotOptions::default()),
         Err(DurableLedgerError::CheckpointPathConflictsWithWal { .. })
     ));
+    let cutover_pending = Journal::cutover_pending_path(&wal).unwrap();
+    assert!(matches!(
+        single.write_checkpoint(&cutover_pending, SnapshotOptions::default()),
+        Err(DurableLedgerError::CheckpointPathConflictsWithWal { .. })
+    ));
     single.close().unwrap();
 
     let segments = area.join("segments");
@@ -211,4 +219,136 @@ fn checkpoint_output_cannot_alias_wal_storage() {
         segmented.write_checkpoint(segments.join("checkpoint.qsnp"), SnapshotOptions::default()),
         Err(DurableLedgerError::CheckpointPathConflictsWithWal { .. })
     ));
+}
+
+#[test]
+fn ledger_checkpoint_cutover_separates_semantic_generation_from_physical_sequence() {
+    let area = TestArea::new("single-cutover");
+    let wal = area.join("ledger.qwal");
+    let checkpoint_base = area.join("ledger.qsnp");
+    let non_genesis = JournalOptions {
+        initial_sequence: 10_000,
+        ..journal_options()
+    };
+    let first = entry(1, 10);
+    let second = entry(2, 20);
+    let third = entry(3, 30);
+    let mut durable = DurableLedger::open(&wal, non_genesis).unwrap();
+    durable.post(first.clone()).unwrap();
+    durable.post(second).unwrap();
+    let first_cutover = durable
+        .compact_to_checkpoint(&checkpoint_base, SnapshotOptions::default())
+        .unwrap();
+    assert_eq!(first_cutover.slot(), CheckpointSlot::A);
+    assert_eq!(first_cutover.snapshot().generation(), 2);
+    assert_eq!(first_cutover.wal_first_sequence(), 10_001);
+    let anchor = JournalReader::open(&wal, non_genesis)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(anchor.kind(), RecordKind::CheckpointAnchor);
+    assert_eq!(anchor.sequence(), 10_001);
+    durable.post(third).unwrap();
+    durable.close().unwrap();
+
+    assert!(matches!(
+        DurableLedger::open(&wal, non_genesis),
+        Err(DurableLedgerError::CheckpointRequiredForCompactedWal { sequence: 10_001 })
+    ));
+    let mut recovered = DurableLedger::open_with_checkpoint(
+        &wal,
+        &checkpoint_base,
+        non_genesis,
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().checkpointed_records, 2);
+    assert_eq!(recovered.recovery().replayed_records, 1);
+    assert_eq!(recovered.ledger().balance(account(1), asset()), 60);
+    assert!(recovered.post(first).unwrap().replayed);
+
+    let second_cutover = recovered
+        .compact_to_checkpoint(&checkpoint_base, SnapshotOptions::default())
+        .unwrap();
+    assert_eq!(second_cutover.slot(), CheckpointSlot::B);
+    assert_eq!(second_cutover.snapshot().generation(), 3);
+    assert_eq!(second_cutover.wal_first_sequence(), 10_002);
+    recovered.close().unwrap();
+
+    let final_state = DurableLedger::open_with_checkpoint(
+        &wal,
+        &checkpoint_base,
+        non_genesis,
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(final_state.recovery().checkpointed_records, 3);
+    assert_eq!(final_state.recovery().replayed_records, 0);
+    assert_eq!(final_state.ledger().balance(account(1), asset()), 60);
+}
+
+#[test]
+fn ledger_cutover_rejects_empty_storage_and_replaces_a_segment_generation() {
+    let area = TestArea::new("cutover-boundary");
+    let wal = area.join("ledger.qwal");
+    let checkpoint = area.join("ledger.qsnp");
+    let mut empty = DurableLedger::open(&wal, journal_options()).unwrap();
+    assert!(matches!(
+        empty.compact_to_checkpoint(&checkpoint, SnapshotOptions::default()),
+        Err(DurableLedgerError::CompactionRequiresNonEmptyLedger)
+    ));
+    assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
+    empty.close().unwrap();
+
+    let segments = area.join("segments-cutover");
+    let value = entry(1, 1);
+    let mut segmented =
+        DurableLedger::open_segmented(&segments, segmented_options(&value)).unwrap();
+    segmented.post(value.clone()).unwrap();
+    let cutover = segmented
+        .compact_to_checkpoint(&checkpoint, SnapshotOptions::default())
+        .unwrap();
+    assert_eq!(cutover.slot(), CheckpointSlot::A);
+    assert_eq!(cutover.snapshot().generation(), 1);
+    segmented.post(entry(2, 2)).unwrap();
+    segmented.close().unwrap();
+
+    let frames = SegmentedJournalReader::open(&segments, segmented_options(&value))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(frames[0].kind(), RecordKind::CheckpointAnchor);
+    assert_eq!(frames.len(), 2);
+    let manager = SegmentedJournal::open(&segments, segmented_options(&value)).unwrap();
+    assert_eq!(manager.recovery().active_generation, 2);
+    assert!(
+        manager
+            .segments()
+            .iter()
+            .all(|segment| segment.generation() == 2)
+    );
+    manager.close().unwrap();
+
+    let mut recovered = DurableLedger::open_segmented_with_checkpoint(
+        &segments,
+        &checkpoint,
+        segmented_options(&value),
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().checkpointed_records, 1);
+    assert_eq!(recovered.recovery().replayed_records, 1);
+    assert_eq!(recovered.ledger().balance(account(1), asset()), 3);
+    let second = recovered
+        .compact_to_checkpoint(&checkpoint, SnapshotOptions::default())
+        .unwrap();
+    assert_eq!(second.slot(), CheckpointSlot::B);
+    assert_eq!(second.snapshot().generation(), 2);
+    recovered.close().unwrap();
+    let manager = SegmentedJournal::open(&segments, segmented_options(&value)).unwrap();
+    assert_eq!(manager.recovery().active_generation, 3);
+    assert_eq!(manager.segments().len(), 1);
+    assert_eq!(manager.segments()[0].generation(), 3);
+    manager.close().unwrap();
 }

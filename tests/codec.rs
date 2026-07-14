@@ -11,9 +11,10 @@ use quotick::market_data::{
     MarketDataError, MarketDataPublisher, MarketDataReplica, MarketDataSnapshot, MarketDataUpdate,
 };
 use quotick::matching::{
-    AccountControl, AccountControlAction, CancelOrder, CancelReason, Command, CommandOutcome,
-    Event, EventKind, ExecutionReport, MassCancel, MassCancelScope, NewOrder, OrderBook,
-    OrderDisplay, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce, Trade,
+    AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
+    Command, CommandOutcome, Event, EventKind, ExecutionReport, MassCancel, MassCancelScope,
+    NewOrder, OrderBook, OrderDisplay, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention,
+    TimeInForce, Trade,
 };
 use quotick::risk::{
     AccountRiskDefinition, AccountRiskState, RiskError, RiskLimitSpec, RiskLimits, RiskProfile,
@@ -520,6 +521,9 @@ fn every_rejection_reason_has_a_stable_round_trip() {
         RejectReason::RiskOpenNotionalLimit,
         RejectReason::RiskPositionLimit,
         RejectReason::RiskArithmeticOverflow,
+        RejectReason::AccountAdmissionBlocked,
+        RejectReason::AccountControlRevisionMismatch,
+        RejectReason::AccountControlRevisionExhausted,
     ];
     for (index, reason) in reasons.into_iter().enumerate() {
         let command_id = id(CommandId::new(
@@ -612,6 +616,14 @@ fn every_event_variant_round_trips() {
         EventKind::MassCancelCompleted {
             account_id,
             scope: MassCancelScope::Side(Side::Sell),
+            cancelled_order_count: 2,
+            cancelled_quantity_lots: 26,
+        },
+        EventKind::AccountControlApplied {
+            account_id,
+            previous_state: AccountAdmissionState::Enabled,
+            current_state: AccountAdmissionState::Blocked,
+            revision: 1,
             cancelled_order_count: 2,
             cancelled_quantity_lots: 26,
         },

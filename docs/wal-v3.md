@@ -1,6 +1,6 @@
-# WAL Format Version 2
+# WAL Format Version 3
 
-This document is the authoritative byte-level schema for Quotick WAL version 2.
+This document is the authoritative byte-level schema for Quotick WAL version 3.
 All multibyte integers are little-endian. No Rust enum layout, padding, pointer,
 or platform ABI is persisted.
 
@@ -9,8 +9,8 @@ or platform ABI is persisted.
 | Offset (bytes) | Width (bytes) | Field |
 |---:|---:|---|
 | 0 | 4 | ASCII magic `QWAL` |
-| 4 | 2 | format version `2` |
-| 6 | 2 | record kind: command `1`, execution report `2`, ledger entry `3`, instrument definition `4`, account risk definition `5`, ledger correction `6`, ledger batch `7` |
+| 4 | 2 | format version `3` |
+| 6 | 2 | record kind: command `1`, execution report `2`, ledger entry `3`, instrument definition `4`, account risk definition `5`, ledger correction `6`, ledger batch `7`, checkpoint anchor `8` |
 | 8 | 4 | payload length |
 | 12 | 4 | CRC-32C |
 | 16 | 8 | contiguous journal sequence |
@@ -20,31 +20,41 @@ CRC-32C uses the reflected Castagnoli polynomial `0x82F63B78`, initial state
 `0xFFFFFFFF`, and final XOR `0xFFFFFFFF`. The checksum covers the complete
 header with bytes 12–15 set to zero, followed by the payload.
 
-## Segmented-directory marker version 1
+## Segmented-directory marker version 2
 
 Segmentation does not alter `QWAL` frames or their global sequence. A segmented
 WAL is a dedicated directory containing `format.qseg` and canonical files named
-`segment-SSSSSSSSSSSSSSSSSSSS.qwal`, where the 20 decimal digits encode the
-first frame sequence assigned to that file.
+`segment-GGGGGGGGGGGGGGGGGGGG-SSSSSSSSSSSSSSSSSSSS.qwal`. `G` is the
+zero-padded 20-digit physical inventory generation and `S` is the zero-padded
+20-digit first frame sequence assigned to that file. Both are non-zero `u64`
+values.
 
-The 26-byte `format.qseg` marker is:
+The 46-byte `format.qseg` marker is:
 
 | Offset (bytes) | Width (bytes) | Field |
 |---:|---:|---|
 | 0 | 4 | ASCII magic `QSEG` |
-| 4 | 2 | marker version `1` |
+| 4 | 2 | marker version `2` |
 | 6 | 8 | maximum segment bytes `u64` |
-| 14 | 8 | initial global sequence `u64` |
+| 14 | 8 | immutable lineage-origin sequence `u64` |
 | 22 | 4 | maximum payload bytes `u32` |
+| 26 | 8 | marker-selected active physical generation `u64` |
+| 34 | 8 | first sequence retained by that generation `u64` |
+| 42 | 4 | CRC-32C over the complete marker with this field zeroed |
 
-All marker integers are little-endian. These three configuration values are
-immutable for the directory. The active acknowledgement policy and recovery
-mode are intentionally not persisted because they do not change frame or
-segment interpretation.
+All marker integers are little-endian. Capacity, lineage origin, and payload
+maximum are immutable for the directory. The active generation and its first
+sequence advance only through checkpoint cutover. The initial generation is
+`1`. Readers select exactly the named generation and ignore recognized staged
+or non-selected generation files. A writer validates the complete selected
+generation before synchronously removing those inactive artifacts. The active
+acknowledgement policy and recovery mode are not persisted because they do not
+change frame or segment interpretation.
 
-An invalid partial marker is recoverable only while no segment or unknown
-directory entry exists. A valid marker is never removed by incomplete-
-initialization recovery.
+An invalid partial/checksum-failing marker is recoverable only while no segment
+or unknown directory entry exists. A valid marker is never removed by
+incomplete-initialization recovery. CRC-32C detects accidental selector or
+configuration corruption; it is not an authentication mechanism.
 
 ## Scalar notation
 
@@ -141,7 +151,7 @@ are rejected; owner cancellations remain admitted.
 ## Matching capacity and WAL admission
 
 `OrderBookLimits` is finite operational process policy and is not encoded in
-version-2 financial metadata. It does not change the interpretation of an
+version-3 financial metadata. It does not change the interpretation of an
 existing frame. Durable matching and risk wrappers prepare matching state
 before appending a command frame. A capacity failure therefore has no event
 sequence, report, or WAL representation and the command identifier remains
@@ -168,7 +178,7 @@ recovery.
 
 `EventTrace` is an in-memory immutable shared representation only. WAL report
 encoding still serializes the same event count and ordered event values; `Arc`
-identity, ownership count, and copy-on-write state are absent from version-2
+identity, ownership count, and copy-on-write state are absent from version-3
 bytes. Decoding constructs a new vector event buffer plus shared-owner control
 block, retains that vector buffer without a final event copy, and applies the
 same semantic report validation.
@@ -192,9 +202,11 @@ cancel for every maximally populated order when the reserve has not already
 been consumed by valid controls.
 
 Recovery APIs select limits explicitly or use finite defaults. Raw WAL replay
-fails if a retained historical transition exceeds the selected policy.
-Checkpoint-assisted recovery first verifies the complete WAL prefix, then
-requires retained/current checkpoint cardinalities and every replayed suffix
+fails if a retained historical transition exceeds the selected policy. For an
+uncut or segmented WAL, checkpoint-assisted recovery first verifies the
+complete WAL prefix. For an anchored WAL in either physical layout, it verifies
+the selected checkpoint against the anchor and reads only the physical suffix. Both paths
+require retained/current checkpoint cardinalities and every replayed suffix
 transition to fit. Operational limit changes require no wire-format migration
 but may require larger recovery limits or a fenced generation rollover.
 
@@ -258,9 +270,9 @@ state tags are enabled `0` and blocked `1`; the completion revision equals
 `expected revision + 1` and carries the exact prior and resulting state.
 
 Under assumptions A15 and A57, account-control command tag `4`, event tag `9`,
-rejection tags `31`–`33`, and cancellation tag `5` establish version 2. Version
-1 development artifacts are rejected as unsupported; absent control fields are
-never assigned inferred semantics.
+rejection tags `31`–`33`, and cancellation tag `5` remain unchanged in version
+3. Version-1 and version-2 WAL artifacts are rejected as unsupported; absent
+control or cutover fields are never assigned inferred semantics.
 
 ## Ledger-entry payload
 
@@ -387,17 +399,97 @@ its first frame is rejected. Recovery compares the complete persisted
 definition with the requested definition before replay. A ledger journal
 accepts ledger-entry, ledger-correction, and ledger-batch records only.
 
-Semantic checkpoints are not WAL frames. Period controls use ledger-entry
+Semantic checkpoint payloads are not embedded in WAL frames. Period controls use ledger-entry
 record kind `3`; indivisible reversal-plus-replacement events use ledger-
 correction kind `6`; generalized multi-entry events use ledger-batch kind `7`.
 Matching, coupled risk/matching, and ledger checkpoints are separate `QSNP`
 files described by
 [Semantic snapshot format version 2](snapshot-v2.md).
-Checkpoint-assisted open still scans every WAL frame and requires the
+An uncut WAL uses prefix-proving recovery: open scans every frame, requires the
 checkpoint's complete command/report or ledger-record sequence to equal the
-exact WAL prefix before applying the remaining suffix. A matching checkpoint
-boundary is always a completed execution-report frame. Version 2 does not
-truncate or retire either prefix.
+exact WAL prefix, then applies the remaining suffix. A matching checkpoint
+boundary is always a completed execution-report frame.
+
+### Checkpoint-anchor payload and WAL cutover
+
+Record kind `8` is exactly 30 bytes:
+
+| Order | Width | Field |
+|---:|---:|---|
+| 1 | 1 | snapshot kind: ledger `1`, matching `2`, coupled risk/matching `3` |
+| 2 | 1 | checkpoint slot: A `0`, B `1` |
+| 3 | 8 | semantic snapshot generation |
+| 4 | 8 | physical WAL sequence of this anchor frame |
+| 5 | 8 | encoded semantic snapshot payload length |
+| 6 | 4 | exact complete `QSNP` envelope CRC-32C from the synchronized snapshot receipt |
+
+Both sequence values are non-zero. Matching and coupled-risk checkpoint
+generation equals the last completed report sequence. Ledger generation counts
+semantic ledger records and is independent of a non-default physical WAL
+origin; the separate anchor sequence prevents those domains from being
+conflated.
+
+A compacted WAL contains the anchor as the first physical frame in its selected
+file or segment generation. The frame sequence equals the anchor's physical
+sequence, which is also the last sequence of the retired WAL prefix; the next
+appended business frame uses `anchor sequence + 1`. Open without a checkpoint
+base fails explicitly. Checkpoint-assisted open derives the selected file by
+appending `.cutover-a` or `.cutover-b` to that base, verifies the normal `QSNP`
+envelope and semantic payload, then requires kind, slot, semantic generation,
+payload length, and checksum to equal the anchor before replaying the WAL
+suffix.
+
+Every cutover first alternates two immutable checkpoint slots:
+
+1. synchronize every prior WAL append;
+2. construct and independently audit the current semantic checkpoint;
+3. write and directory-synchronize the inactive A/B snapshot slot using the
+   normal pending-file protocol;
+4. publish the layout-specific physical anchor described below.
+
+For a single-file WAL, physical publication then:
+
+1. creates `<wal>.cutover.pending` exclusively, writes one anchor frame, and
+   synchronizes the complete file;
+2. atomically renames that file over the WAL and synchronizes the parent
+   directory while retaining the same writer lease;
+3. appends subsequent records to the replacement file.
+
+Before the WAL rename, the prior WAL and its selected checkpoint remain authoritative;
+the newly written inactive slot is harmless. After the synchronized rename,
+the new WAL selects the new slot and the old slot remains a fallback artifact.
+A crash before rename can leave `<wal>.cutover.pending`; it is discarded only
+by `recover_abandoned_cutover_pending` after prior-writer liveness has been
+independently disproved, its lease recovered, and a new exclusive writer lease
+acquired. A crash after rename may expose the old or new name binding until the
+qualified directory barrier is known durable; either pair is complete. CRC-32C
+detects accidental corruption but is not an authenticity proof under A14.
+
+For a segmented WAL, physical publication instead:
+
+1. increments the non-zero marker generation without wrap;
+2. exclusively creates `.quotick-segments.cutover.pending`, writes and
+   synchronizes one anchor frame, then renames it to
+   `segment-<next-generation>-<anchor-sequence>.qwal` and synchronizes the
+   directory;
+3. exclusively creates and synchronizes `format.qseg.pending` containing the
+   next generation and anchor sequence, atomically renames it over
+   `format.qseg`, and synchronizes the directory;
+4. opens the marker-selected anchor segment, removes all recognized
+   non-selected generations/staging files, synchronizes those removals, and
+   appends subsequent records in the selected generation.
+
+Before the marker rename, the prior generation is authoritative and the new
+generation is ignored. After the marker rename, the new generation is
+authoritative and prior generation files are ignored even if cleanup was
+interrupted. A reader never combines generations. A new manager validates the
+complete selected generation before removing inactive files. A marker rename
+whose directory barrier fails is ambiguous; reopening accepts whichever
+CRC-valid marker generation survived, and both corresponding physical
+generations were synchronized before the selector change.
+
+Matching, coupled risk/matching, and ledger runtimes implement both physical
+cutover layouts.
 
 A risk-managed matching journal inserts zero or more account-risk-definition
 records between the instrument definition and the first command. The complete

@@ -173,10 +173,15 @@ recovery.
 - Versioned, bounded `QSNP` semantic snapshots with CRC-32C, monotonic
   exact-prefix lineage, synchronized same-filesystem replacement, and explicit
   abandoned-pending recovery.
+- Crash-safe two-slot checkpoint cutover for single-file and segmented matching,
+  coupled risk/matching, and ledger WALs. A versioned anchor binds the selected
+  checkpoint kind, generation, payload length, CRC-32C, and retired physical
+  sequence; segmented storage publishes it through a checksummed generation
+  selector before suffix appends continue under the same manager lease.
 - Definition-bound matching replay, direct matching-state checkpoint recovery,
   profile-bound coupled risk-state checkpoint recovery, interrupted report
-  completion, exact WAL-prefix proof, suffix-only state transitions, and
-  divergence detection.
+  completion, exact uncut-WAL prefix proof, anchor-bound compacted-WAL recovery,
+  suffix-only state transitions, and divergence detection.
 
 ### Accounting and settlement
 
@@ -208,8 +213,9 @@ recovery.
 - Exact-generation reconciliation against canonical complete external balance
   statements, including deterministic external-minus-ledger break reports.
 - Canonical non-zero balance checkpoints retaining complete transaction
-  history, plus durable recovery that proves the checkpoint against the exact
-  WAL prefix and replays only its suffix.
+  history, plus durable recovery that proves an uncut checkpoint against the
+  exact WAL prefix or a compacted checkpoint against its anchor, then replays
+  only the suffix.
 
 The crate forbids `unsafe` code and has no runtime dependencies.
 
@@ -226,7 +232,7 @@ The exact invariants and environmental assumptions are documented in:
 - [Architecture](docs/architecture.md)
 - [Assumption register](docs/assumptions.md)
 - [Local storage contract](docs/storage.md)
-- [WAL format version 2](docs/wal-v2.md)
+- [WAL format version 3](docs/wal-v3.md)
 - [Semantic snapshot format version 2](docs/snapshot-v2.md)
 - [Market-data payload format version 1](docs/market-data-v1.md)
 
@@ -256,13 +262,15 @@ The test suites cover:
 - **Storage and recovery:** stable wire layouts, record and whole-batch segment
   rotation, cross-segment matching/risk/ledger replay, strict closed-segment
   corruption handling, active-tail repair, concurrent-writer exclusion,
-  injected write and barrier failures, forced termination, and replay-divergence
-  detection.
+  injected write, acknowledgement, and cutover-directory barrier failures,
+  explicit abandoned-cutover staging recovery, forced termination, and
+  replay-divergence detection.
 - **Checkpoints:** canonical matching FIFO/reserve/STP state, coupled risk
   positions and total-leaves reservations, independent replay audits, stable
   snapshot framing, semantic corruption, immutable-profile binding, WAL-prefix
-  divergence, generation forks, pending-file recovery, exact retries, and
-  suffix replay across segment boundaries.
+  divergence, generation forks, pending-file recovery, exact retries, A/B anchor
+  identity, repeated cutover in both physical layouts, generation-selection
+  failure recovery, and suffix replay across segment boundaries.
 
 ## Complexity
 
@@ -371,27 +379,31 @@ exclusive file creation, and a parent-directory barrier at a size boundary.
 For `C` retained matching commands, `O` active orders, and `P` price levels, a
 matching checkpoint retains `O(C + O + P)` state. Capture performs one
 independent full-history matching replay plus structural audit synchronously
-under exclusive shard access. Checkpoint-assisted open still scans all WAL
-bytes and decodes the exact command/report prefix, but
-reconstructs indices in `O(O log P)` and executes matching transitions only for
-the suffix. It does not bound memory, WAL scan time, or authorize prefix
-retention.
+under exclusive shard access. Uncut checkpoint open scans every WAL byte and
+decodes the exact command/report prefix. Anchored open in either physical layout
+instead validates the selected A/B checkpoint and scans only current anchor and
+suffix bytes, then reconstructs indices in `O(O log P)` and executes matching
+transitions only for the suffix. Cutover bounds physical WAL-prefix storage and
+scan work per cutover; retained history and capture pause remain `O(C)`.
 
 For `C` retained risk-managed commands, `O` active orders, `P` price levels,
 and `A` accounts, a coupled risk checkpoint retains `O(C + O + P + A)` state.
 Capture independently replays the complete coupled history and audits derived
 total-leaves reservations and redundant exposure synchronously under exclusive
-shard access. Checkpoint-assisted open still scans every WAL byte for exact
-metadata/command/report lineage but executes matching/risk transitions only for
-the suffix. It does not bound capture pause, memory, WAL scan time, or authorize
-prefix retention.
+shard access. Uncut checkpoint open scans every WAL byte for exact
+metadata/command/report lineage. Anchored open in either physical layout validates the
+checkpoint-bound original metadata and scans only the anchor and suffix, then
+executes matching/risk transitions only for the suffix. It does not bound the
+`O(C)` capture pause, retained memory, or generation lifetime.
 
 For `R` retained ledger records, `E` contained transaction entries, `L` posting
 legs, and `A` non-zero account balances, checkpoint capture/validation is linear
 in `R + E + L + A` apart from ordered validation-map factors, and retained
 checkpoint state is `O(R + E + L + A)`. Checkpoint-assisted durable open still
-scans all `B` WAL bytes to prove the exact prefix; it does not yet bound restart
-time or authorize WAL retention.
+scans all `B` WAL bytes for an uncut log. Anchored open in either physical layout
+scans only the compacted anchor and suffix after validating the selected A/B
+checkpoint. Physical WAL-prefix storage is retired, but complete checkpoint
+history and its validation remain `O(R + E + L + A)`.
 
 Reversal validation is `O(L)` for the target entry's posting legs plus expected
 `O(1)` transaction/reversal-index access. Correction balance preparation is

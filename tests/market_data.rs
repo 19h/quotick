@@ -12,8 +12,8 @@ use quotick::market_data::{
     MarketDataError, MarketDataKind, MarketDataPublisher, MarketDataReplica, MarketDataUpdate,
 };
 use quotick::matching::{
-    AccountControl, AccountControlAction, CancelOrder, Command, NewOrder, OrderBook, OrderType,
-    ReplaceOrder, SelfTradePrevention, TimeInForce,
+    AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, Command, EventKind,
+    NewOrder, OrderBook, OrderType, ReplaceOrder, SelfTradePrevention, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -271,6 +271,38 @@ fn account_control_cancellations_and_rejections_preserve_public_trace_continuity
     let retry_batch = publisher.publish(block, &retry, &book).unwrap();
     assert!(retry_batch.replayed());
     assert!(retry_batch.updates().is_empty());
+}
+
+#[test]
+fn account_control_prior_state_corruption_poison_publisher() {
+    let mut book = OrderBook::new(definition());
+    let resting = order(
+        1,
+        1,
+        7,
+        Side::Buy,
+        3,
+        99,
+        TimeInForce::GoodTilCancelled,
+        SelfTradePrevention::CancelAggressor,
+    );
+    book.submit(resting).unwrap();
+    let mut publisher = MarketDataPublisher::from_book(&book).unwrap();
+    let control = account_control(2, 7, 0, AccountControlAction::BlockAndCancel);
+    let mut report = book.submit(control).unwrap();
+    let completion = report.events.make_mut().last_mut().unwrap();
+    let EventKind::AccountControlApplied { previous_state, .. } = &mut completion.kind else {
+        panic!("control report must end in its completion event");
+    };
+    *previous_state = AccountAdmissionState::Blocked;
+
+    assert_eq!(
+        publisher.publish(control, &report, &book),
+        Err(MarketDataError::TraceMismatch(
+            "AccountControlApplied contradicts its command or cancellations"
+        ))
+    );
+    assert!(publisher.is_poisoned());
 }
 
 #[test]

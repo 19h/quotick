@@ -294,8 +294,10 @@ uncrossed opposite prices can retain unused vector capacity.
 14. Durable checkpoint publication follows a successful WAL `sync_all` barrier
     and a successful live-ledger invariant audit.
 15. Checkpoint-assisted recovery accepts the checkpoint only when its complete
-    record history equals the exact WAL prefix. It then applies only the suffix
-    and reruns the complete live-ledger audit.
+    record history equals the exact prefix of an uncut WAL, or when a compacted
+    WAL anchor in either physical layout exactly binds its A/B slot, kind,
+    semantic generation, physical sequence, payload length, and checksum. It
+    then applies only the suffix and reruns the complete live-ledger audit.
 16. Every entry carries an immutable lifecycle kind. A reversal names one
     preceding transaction and its postings must be the exact signed inverse of
     that target in the same canonical key order.
@@ -516,12 +518,14 @@ collateral from ledger balances.
 15. The default append acknowledgement is `SyncAll`. Partial writes, failed
     barriers, and failed explicit synchronization poison the writer; injected
     failures verify complete-prefix recovery and ambiguous complete-frame replay.
-16. A segmented directory has one versioned `QSEG` marker binding capacity,
-    initial sequence, and payload limit; one canonical manager lease excludes
-    other managers and raw member-file writers.
+16. A segmented directory has one CRC-32C-protected version-2 `QSEG` marker. It
+    binds immutable capacity, lineage origin, and payload limit and selects one
+    active physical generation plus its first retained sequence. One canonical
+    manager lease excludes other managers and raw member-file writers.
 17. Rotation completes encoding, capacity, length, and sequence-space preflight
     before closing the active file. A frame or batch is placed wholly in one
-    segment and names the next segment by its first global sequence.
+    segment; every canonical filename includes its marker generation and first
+    global sequence.
 18. Every closed segment is nonempty and scanned strictly. Only the final
     segment can be empty or can repair a physically incomplete tail; no closed
     corruption is repaired or skipped.
@@ -531,7 +535,21 @@ collateral from ledger balances.
     while applying the same logical record grammars as single-file recovery.
 21. Explicit incomplete-initialization recovery removes an invalid `QSEG`
     marker only under manager ownership and only when no segment or unknown
-    persistent entry exists; a valid marker is immutable.
+    persistent entry exists. Normal cutover changes only its checksummed active
+    generation and first-retained-sequence selector after the new generation is
+    synchronized.
+22. Matching, coupled risk, and ledger cutover publishes an inactive A/B
+    checkpoint slot before publishing one synchronized version-3 anchor frame.
+    Single-file storage atomically renames that frame over the WAL. Segmented
+    storage first synchronizes a next-generation anchor segment, then atomically
+    replaces and directory-synchronizes the `QSEG` selector. The active slot is
+    never overwritten before the physical layout selects its successor.
+23. A compacted WAL cannot open without its checkpoint base. Recovery derives
+    the anchor-selected slot and never guesses the alternate slot. Abandoned
+    single-file pre-rename staging is discarded only through an explicit newly
+    leased recovery operation after prior-writer liveness is disproved.
+    Segmented readers ignore non-selected generations and deterministic staging;
+    a manager validates the complete selected generation before removing them.
 
 ## Semantic snapshot invariants
 
@@ -557,10 +575,12 @@ collateral from ledger balances.
    Unsupported versions/kinds and values exceeding the caller's configured
    bound are preserved for a compatible recovery process.
 8. CRC-32C is an accidental-corruption detector, not an authenticity proof.
-9. Ledger, matching, and coupled risk checkpoints retain complete history, and
-   durable recovery still scans the complete WAL to prove the prefix. Version 2
-   performs no WAL cutover, compaction, retention, bounded-memory, or bounded-
-   restart protocol.
+9. Ledger, matching, and coupled risk checkpoints retain complete semantic
+   history. Uncut recovery scans the complete WAL to prove the prefix. Version-3
+   cutover in either physical layout replaces that prefix with an anchor bound
+   to one version-2 A/B snapshot slot, so reopen scans only the anchor and
+   suffix. This does not bound checkpoint memory, capture pause, retained
+   idempotency/audit history, or semantic shard-generation lifetime.
 10. Matching capture independently replays complete command/report history and
     requires exact live-state equality before publication. Recovery reconstructs
     FIFO/reserve/STP state and exact-retry caches directly, then applies only the
@@ -572,8 +592,8 @@ collateral from ledger balances.
     state machine before publication. Recovery applies state transitions only
     after the checkpoint generation.
 
-The authoritative version-2 framing and payload schema is
-[WAL format version 2](wal-v2.md) and
+The authoritative persisted framing and payload schemas are
+[WAL format version 3](wal-v3.md) and
 [Semantic snapshot format version 2](snapshot-v2.md). Filesystem and device
 assumptions are bounded by the [Local storage contract](storage.md).
 
@@ -641,8 +661,11 @@ Coupled risk-checkpoint tests cover sequenced risk rejection, executed position,
 hidden total-leaves reservation, exact retry, malformed owner/exposure state,
 profile and same-generation lineage drift, non-default WAL origins, exact WAL-
 prefix proof, ahead-of-WAL rejection, path aliasing, and single/segmented suffix
-replay. There is no claim of replicated durability, remote consensus, WAL
-cutover or retention, bounded restart, durable external-statement anchoring, or
+replay. Single-file cutover tests cover A/B alternation, anchor binding,
+non-default physical origins, suffix continuation, corrupt/wrong slots,
+abandoned staging, and a failed post-rename directory barrier. There is no
+claim of replicated durability, remote consensus, segmented retention,
+checkpoint-memory-bounded restart, durable external-statement anchoring, or
 qualified storage-device power-loss behavior.
 
 ## Standards and primary-source provenance
@@ -695,9 +718,9 @@ qualified storage-device power-loss behavior.
 
 | Impact | Capability | Evidence required for completion |
 |---|---|---|
-| High | Durable storage completion | segment retention/archival with deletion fencing; kernel inode locking or qualified alias exclusion; forced-power-loss filesystem/device evidence |
+| High | Durable storage completion | externally coordinated retired-generation archival/handoff; kernel inode locking or qualified alias exclusion; forced-power-loss filesystem/device evidence |
 | High | Ledger lifecycle completion | controller authorization; versioned calendar ingestion; durable external-statement evidence; externally anchored cutoff proofs; allocation/fee/settlement workflow adapters over atomic batches |
-| High | Snapshots and compaction | fenced matching/risk/ledger WAL cutover, bounded restart time/memory, segment retention, and externally retained audit/idempotency proofs |
+| High | Snapshots and compaction | single-file and segmented matching/risk/ledger WAL cutover are implemented; remaining evidence is bounded checkpoint memory/capture pause, semantic generation rollover, and externally retained audit/idempotency proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
 | High | Instrument lifecycle expansion | trading calendars, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |

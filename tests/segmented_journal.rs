@@ -107,12 +107,65 @@ fn rotates_at_exact_capacity_and_reads_one_global_sequence() {
         vec![1, 3, 5]
     );
     assert_eq!(journal.next_sequence(), 6);
+    assert_eq!(journal.recovery().active_generation, 1);
+    assert!(
+        journal
+            .segments()
+            .iter()
+            .all(|segment| segment.generation() == 1)
+    );
+    assert!(
+        journal.segments()[0]
+            .path()
+            .ends_with("segment-00000000000000000001-00000000000000000001.qwal")
+    );
+    let marker = fs::read(directory.path().join("format.qseg")).unwrap();
+    assert_eq!(marker.len(), 46);
+    assert_eq!(&marker[0..4], b"QSEG");
+    assert_eq!(u16::from_le_bytes(marker[4..6].try_into().unwrap()), 2);
+    assert_eq!(u64::from_le_bytes(marker[26..34].try_into().unwrap()), 1);
+    assert_eq!(u64::from_le_bytes(marker[34..42].try_into().unwrap()), 1);
     journal.close().expect("journal closes");
 
     assert_eq!(
         read_commands(directory.path(), options).expect("segments read"),
         (1..=5).map(command).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn marker_checksum_rejects_an_accidentally_changed_generation_selector() {
+    let directory = TestDirectory::new("marker-checksum");
+    let options = options(frame_length());
+    SegmentedJournal::open(directory.path(), options)
+        .unwrap()
+        .close()
+        .unwrap();
+    let marker_path = directory.path().join("format.qseg");
+    let mut marker = fs::read(&marker_path).unwrap();
+    marker[26] ^= 0x02;
+    fs::write(&marker_path, marker).unwrap();
+    assert!(matches!(
+        SegmentedJournal::open(directory.path(), options),
+        Err(SegmentedJournalError::MarkerChecksumMismatch { .. })
+    ));
+}
+
+#[test]
+fn non_ascii_fixed_width_segment_name_fails_without_string_boundary_assumptions() {
+    let directory = TestDirectory::new("non-ascii-name");
+    let options = options(frame_length());
+    SegmentedJournal::open(directory.path(), options)
+        .unwrap()
+        .close()
+        .unwrap();
+    let name = format!("segment-{}é{}.qwal", "0".repeat(19), "0".repeat(20));
+    assert_eq!(name.len(), 54);
+    fs::write(directory.path().join(name), []).unwrap();
+    assert!(matches!(
+        SegmentedJournal::open(directory.path(), options),
+        Err(SegmentedJournalError::InvalidSegmentName(_))
+    ));
 }
 
 #[test]
@@ -270,7 +323,9 @@ fn empty_final_segment_from_interrupted_rotation_is_valid_and_reused() {
     let mut journal = SegmentedJournal::open(directory.path(), options).expect("journal opens");
     journal.append(&command(1)).expect("first segment");
     journal.close().expect("journal closes");
-    let empty_path = directory.path().join("segment-00000000000000000002.qwal");
+    let empty_path = directory
+        .path()
+        .join("segment-00000000000000000001-00000000000000000002.qwal");
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -330,6 +385,68 @@ fn malformed_abandoned_manager_lease_has_explicit_recovery() {
 }
 
 #[test]
+fn reader_ignores_and_validated_writer_cleans_nonselected_generation_artifacts() {
+    let directory = TestDirectory::new("inactive-generation-cleanup");
+    let options = options(frame_length());
+    let mut journal = SegmentedJournal::open(directory.path(), options).unwrap();
+    journal.append(&command(1)).unwrap();
+    let active = journal.segments()[0].path().to_path_buf();
+    journal.close().unwrap();
+
+    let inactive = directory
+        .path()
+        .join("segment-00000000000000000002-00000000000000000001.qwal");
+    fs::copy(&active, &inactive).unwrap();
+    let marker_pending = directory.path().join("format.qseg.pending");
+    let cutover_pending = directory.path().join(".quotick-segments.cutover.pending");
+    fs::write(&marker_pending, b"abandoned marker").unwrap();
+    fs::write(&cutover_pending, b"abandoned anchor").unwrap();
+
+    assert_eq!(
+        read_commands(directory.path(), options).unwrap(),
+        vec![command(1)]
+    );
+    assert!(inactive.exists());
+    let recovered = SegmentedJournal::open(directory.path(), options).unwrap();
+    assert_eq!(recovered.recovery().active_generation, 1);
+    assert_eq!(recovered.segments().len(), 1);
+    assert!(!inactive.exists());
+    assert!(!marker_pending.exists());
+    assert!(!cutover_pending.exists());
+    recovered.close().unwrap();
+}
+
+#[test]
+fn invalid_selected_generation_preserves_nonselected_files_for_diagnosis() {
+    let directory = TestDirectory::new("invalid-active-preserves-inactive");
+    let options = options(frame_length());
+    let mut journal = SegmentedJournal::open(directory.path(), options).unwrap();
+    journal.append(&command(1)).unwrap();
+    let active = journal.segments()[0].path().to_path_buf();
+    journal.close().unwrap();
+    let inactive = directory
+        .path()
+        .join("segment-00000000000000000002-00000000000000000001.qwal");
+    fs::copy(&active, &inactive).unwrap();
+    let length = fs::metadata(&active).unwrap().len();
+    OpenOptions::new()
+        .write(true)
+        .open(&active)
+        .unwrap()
+        .set_len(length - 1)
+        .unwrap();
+
+    assert!(matches!(
+        SegmentedJournal::open(directory.path(), options),
+        Err(SegmentedJournalError::Segment {
+            error: JournalError::TruncatedFrame { .. },
+            ..
+        })
+    ));
+    assert!(inactive.exists());
+}
+
+#[test]
 fn incomplete_marker_recovery_is_limited_to_pre_segment_initialization() {
     let directory = TestDirectory::new("invalid-marker");
     fs::create_dir(directory.path()).expect("directory creates");
@@ -355,7 +472,7 @@ fn incomplete_marker_recovery_is_limited_to_pre_segment_initialization() {
     fs::write(
         unsafe_directory
             .path()
-            .join("segment-00000000000000000001.qwal"),
+            .join("segment-00000000000000000001-00000000000000000001.qwal"),
         [],
     )
     .expect("segment evidence writes");

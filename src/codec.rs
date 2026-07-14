@@ -33,6 +33,7 @@ use crate::risk::{
     AccountRiskDefinition, AccountRiskState, RiskAccountCheckpoint, RiskError, RiskLimitSpec,
     RiskLimits, RiskManagedCheckpoint, RiskManagedCheckpointError, RiskProfile, RiskSnapshot,
 };
+use crate::snapshot::{CheckpointAnchor, CheckpointSlot, SnapshotKind};
 
 /// A deterministic binary encoding or validation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -364,6 +365,70 @@ impl<'a> Decoder<'a> {
         } else {
             Err(CodecError::TrailingBytes(remaining))
         }
+    }
+}
+
+impl BinaryCodec for CheckpointAnchor {
+    fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        if self.generation() == 0 {
+            return Err(CodecError::InvalidValue(
+                "checkpoint anchor generation is zero",
+            ));
+        }
+        if self.wal_sequence() == 0 {
+            return Err(CodecError::InvalidValue(
+                "checkpoint anchor WAL sequence is zero",
+            ));
+        }
+        let mut encoder = Encoder::default();
+        encoder.u8(match self.kind() {
+            SnapshotKind::LedgerCheckpoint => 1,
+            SnapshotKind::MatchingCheckpoint => 2,
+            SnapshotKind::RiskManagedCheckpoint => 3,
+        });
+        encoder.u8(self.slot().wire());
+        encoder.u64(self.generation());
+        encoder.u64(self.wal_sequence());
+        encoder.u64(self.payload_length());
+        encoder.u32(self.checksum());
+        Ok(encoder.finish())
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut decoder = Decoder::new(bytes);
+        let kind_tag = decoder.u8()?;
+        let kind = SnapshotKind::from_wire(kind_tag).ok_or(CodecError::InvalidTag {
+            type_name: "snapshot kind",
+            tag: kind_tag,
+        })?;
+        let slot_tag = decoder.u8()?;
+        let slot = CheckpointSlot::from_wire(slot_tag).ok_or(CodecError::InvalidTag {
+            type_name: "checkpoint slot",
+            tag: slot_tag,
+        })?;
+        let generation = decoder.u64()?;
+        let wal_sequence = decoder.u64()?;
+        let payload_length = decoder.u64()?;
+        let checksum = decoder.u32()?;
+        decoder.finish()?;
+        if generation == 0 {
+            return Err(CodecError::InvalidValue(
+                "checkpoint anchor generation is zero",
+            ));
+        }
+        if wal_sequence == 0 {
+            return Err(CodecError::InvalidValue(
+                "checkpoint anchor WAL sequence is zero",
+            ));
+        }
+        Ok(Self::from_parts(
+            kind,
+            slot,
+            generation,
+            wal_sequence,
+            payload_length,
+            checksum,
+        ))
     }
 }
 
@@ -1034,6 +1099,42 @@ fn decode_trade(decoder: &mut Decoder<'_>) -> Result<Trade, CodecError> {
     })
 }
 
+fn encode_mass_cancel_completed(
+    encoder: &mut Encoder,
+    account_id: AccountId,
+    scope: MassCancelScope,
+    cancelled_order_count: u64,
+    cancelled_quantity_lots: u128,
+) {
+    encoder.u8(8);
+    encoder.u64(account_id.get());
+    encode_mass_cancel_scope(encoder, scope);
+    encoder.u64(cancelled_order_count);
+    encoder.u128(cancelled_quantity_lots);
+}
+
+fn encode_account_control_applied(
+    encoder: &mut Encoder,
+    account_id: AccountId,
+    previous_state: AccountAdmissionState,
+    current_state: AccountAdmissionState,
+    revision: u64,
+    cancelled_order_count: u64,
+    cancelled_quantity_lots: u128,
+) {
+    encoder.u8(9);
+    encoder.u64(account_id.get());
+    encode_account_admission_state(encoder, previous_state);
+    encode_account_admission_state(encoder, current_state);
+    encoder.u64(revision);
+    encoder.u64(cancelled_order_count);
+    encoder.u128(cancelled_quantity_lots);
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive wire-tag match keeps every event discriminator visible and auditable"
+)]
 fn encode_event_kind(encoder: &mut Encoder, kind: EventKind) {
     match kind {
         EventKind::OrderAccepted {
@@ -1125,13 +1226,13 @@ fn encode_event_kind(encoder: &mut Encoder, kind: EventKind) {
             scope,
             cancelled_order_count,
             cancelled_quantity_lots,
-        } => {
-            encoder.u8(8);
-            encoder.u64(account_id.get());
-            encode_mass_cancel_scope(encoder, scope);
-            encoder.u64(cancelled_order_count);
-            encoder.u128(cancelled_quantity_lots);
-        }
+        } => encode_mass_cancel_completed(
+            encoder,
+            account_id,
+            scope,
+            cancelled_order_count,
+            cancelled_quantity_lots,
+        ),
         EventKind::AccountControlApplied {
             account_id,
             previous_state,
@@ -1139,15 +1240,15 @@ fn encode_event_kind(encoder: &mut Encoder, kind: EventKind) {
             revision,
             cancelled_order_count,
             cancelled_quantity_lots,
-        } => {
-            encoder.u8(9);
-            encoder.u64(account_id.get());
-            encode_account_admission_state(encoder, previous_state);
-            encode_account_admission_state(encoder, current_state);
-            encoder.u64(revision);
-            encoder.u64(cancelled_order_count);
-            encoder.u128(cancelled_quantity_lots);
-        }
+        } => encode_account_control_applied(
+            encoder,
+            account_id,
+            previous_state,
+            current_state,
+            revision,
+            cancelled_order_count,
+            cancelled_quantity_lots,
+        ),
     }
 }
 

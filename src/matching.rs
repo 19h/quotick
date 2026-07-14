@@ -8,8 +8,8 @@
 //! deletion, and next-worse traversal remain `O(log P)`, where `P` is the number
 //! of occupied price levels. A command consuming `E` displayed maker slices is
 //! `O((E + 1) log P)`. A reserve maker can contribute multiple slices. Account
-//! mass-cancel selection visits `K` selected orders and canonically sorts them in
-//! `O(K log K)`. FOK inspection uses `O(1)` auxiliary space and visits each
+//! mass-cancel and block-and-cancel selection visit `K` selected orders and
+//! canonically sort them in `O(K log K)`. FOK inspection uses `O(1)` auxiliary space and visits each
 //! active order in crossed levels at most once; it never materializes reserve
 //! replenishment slices.
 
@@ -1040,6 +1040,10 @@ impl OrderBookCheckpoint {
         Ok(checkpoint)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one chronological audit keeps command, event, trade, identity, and control lineage coupled"
+    )]
     fn validate(&self) -> Result<(), OrderBookCheckpointError> {
         if self.wal_metadata_sequence == 0 {
             return Err(OrderBookCheckpointError::new(
@@ -2667,7 +2671,8 @@ impl OrderBook {
     ///
     /// Preparation checks idempotency, all operational capacity and identifier
     /// bounds, and core matching business rules exactly once. It also fallibly
-    /// reserves the complete report event buffer and mass-cancel selection buffer.
+    /// reserves the complete report event buffer and any mass-cancel or
+    /// block-and-cancel selection buffer.
     /// Every matching hash index already owns its complete configured headroom,
     /// so preparation is read-only with respect to the book. A ready token can be durably written
     /// through [`PreparedCommand::command`] and then applied with
@@ -3300,6 +3305,7 @@ impl OrderBook {
     }
 
     /// Iterates retained account-control state without allocation.
+    #[must_use]
     pub fn account_controls(
         &self,
     ) -> impl ExactSizeIterator<Item = (AccountId, AccountControlSnapshot)> + '_ {
@@ -5405,6 +5411,10 @@ mod price_level_index_tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one allocator invariant fixture compares every constructor-owned index and prepared buffer"
+    )]
     fn construction_owns_hash_headroom_and_preparation_owns_selection_storage() {
         let mut book = OrderBook::new(reserve_definition());
         let new = NewOrder {

@@ -8,13 +8,16 @@ use quotick::instrument::{
     InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
     QuantityRules, ReserveOrderRules, TradingState,
 };
-use quotick::journal::{Durability, JournalOptions, SegmentedJournalOptions};
+use quotick::journal::{
+    Durability, Journal, JournalOptions, JournalReader, RecordKind, SegmentedJournal,
+    SegmentedJournalOptions, SegmentedJournalReader,
+};
 use quotick::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelReason, Command, EventKind,
     NewOrder, OrderBook, OrderBookCheckpoint, OrderDisplay, OrderType, ReplaceOrder,
     SelfTradePrevention, TimeInForce,
 };
-use quotick::snapshot::{SnapshotFile, SnapshotOptions};
+use quotick::snapshot::{CheckpointSlot, SnapshotFile, SnapshotOptions};
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
     TimestampNs,
@@ -510,12 +513,90 @@ fn segmented_matching_checkpoint_recovers_across_physical_boundaries() {
 }
 
 #[test]
+fn segmented_matching_cutover_switches_generations_and_replays_only_the_suffix() {
+    let area = TestArea::new("segmented-cutover");
+    let segments = area.join("segments");
+    let checkpoint_base = area.join("matching.qsnp");
+    let options = SegmentedJournalOptions {
+        maximum_segment_bytes: 512,
+        journal: journal_options(),
+    };
+    let mut durable = DurableOrderBook::open_segmented(&segments, definition(), options).unwrap();
+    durable.submit(resting(1, 1, 5)).unwrap();
+    durable.submit(resting(2, 2, 7)).unwrap();
+    let first = durable
+        .compact_to_checkpoint(&checkpoint_base, SnapshotOptions::default())
+        .unwrap();
+    assert_eq!(first.slot(), CheckpointSlot::A);
+    assert_eq!(first.snapshot().generation(), 5);
+    durable.submit(resting(3, 3, 11)).unwrap();
+    durable.close().unwrap();
+
+    let frames = SegmentedJournalReader::open(&segments, options)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(frames[0].kind(), RecordKind::CheckpointAnchor);
+    assert_eq!(frames[0].sequence(), 5);
+    assert_eq!(frames.len(), 3);
+    assert!(matches!(
+        DurableOrderBook::open_segmented(&segments, definition(), options),
+        Err(DurableError::CheckpointRequiredForCompactedWal { sequence: 5 })
+    ));
+
+    let mut recovered = DurableOrderBook::open_segmented_with_checkpoint(
+        &segments,
+        &checkpoint_base,
+        definition(),
+        options,
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().checkpointed_commands, 2);
+    assert_eq!(recovered.recovery().replayed_commands, 1);
+    assert_eq!(recovered.book().active_order_count(), 3);
+    assert!(recovered.submit(resting(1, 1, 5)).unwrap().replayed);
+    let second = recovered
+        .compact_to_checkpoint(&checkpoint_base, SnapshotOptions::default())
+        .unwrap();
+    assert_eq!(second.slot(), CheckpointSlot::B);
+    assert_eq!(second.snapshot().generation(), 7);
+    recovered.close().unwrap();
+
+    let manager = SegmentedJournal::open(&segments, options).unwrap();
+    assert_eq!(manager.recovery().active_generation, 3);
+    assert!(
+        manager
+            .segments()
+            .iter()
+            .all(|segment| segment.generation() == 3)
+    );
+    manager.close().unwrap();
+    let final_state = DurableOrderBook::open_segmented_with_checkpoint(
+        &segments,
+        &checkpoint_base,
+        definition(),
+        options,
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(final_state.recovery().checkpointed_commands, 3);
+    assert_eq!(final_state.recovery().replayed_commands, 0);
+    assert_eq!(final_state.book().active_order_count(), 3);
+}
+
+#[test]
 fn matching_checkpoint_output_cannot_alias_wal_storage() {
     let area = TestArea::new("alias");
     let wal = area.join("matching.wal");
     let mut durable = DurableOrderBook::open(&wal, definition(), journal_options()).unwrap();
     assert!(matches!(
         durable.write_checkpoint(&wal, SnapshotOptions::default()),
+        Err(DurableError::CheckpointPathConflictsWithWal { .. })
+    ));
+    let cutover_pending = Journal::cutover_pending_path(&wal).unwrap();
+    assert!(matches!(
+        durable.write_checkpoint(&cutover_pending, SnapshotOptions::default()),
         Err(DurableError::CheckpointPathConflictsWithWal { .. })
     ));
 
@@ -528,5 +609,126 @@ fn matching_checkpoint_output_cannot_alias_wal_storage() {
     assert!(matches!(
         segmented.write_checkpoint(segments.join("matching.qsnp"), SnapshotOptions::default()),
         Err(DurableError::CheckpointPathConflictsWithWal { .. })
+    ));
+}
+
+#[test]
+fn single_file_checkpoint_cutover_replaces_the_wal_prefix_and_reopens_its_suffix() {
+    let area = TestArea::new("single-cutover");
+    let wal = area.join("matching.wal");
+    let checkpoint_base = area.join("matching.qsnp");
+    let mut durable = DurableOrderBook::open(&wal, definition(), journal_options()).unwrap();
+    durable.submit(resting(1, 1, 5)).unwrap();
+    durable.submit(resting(2, 2, 7)).unwrap();
+    let original_wal_bytes = fs::metadata(&wal).unwrap().len();
+
+    let first_cutover = durable
+        .compact_to_checkpoint(&checkpoint_base, SnapshotOptions::default())
+        .expect("first cutover persists a checkpoint before replacing the WAL");
+    assert_eq!(first_cutover.slot(), CheckpointSlot::A);
+    assert_eq!(first_cutover.snapshot().generation(), 5);
+    assert_eq!(first_cutover.wal_first_sequence(), 5);
+    assert!(SnapshotFile::slot_path(&checkpoint_base, CheckpointSlot::A).exists());
+    assert!(fs::metadata(&wal).unwrap().len() < original_wal_bytes);
+    let first_frame = JournalReader::open(&wal, journal_options())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_frame.kind(), RecordKind::CheckpointAnchor);
+    assert_eq!(first_frame.sequence(), 5);
+
+    durable.submit(resting(3, 3, 11)).unwrap();
+    durable.close().unwrap();
+    assert!(matches!(
+        DurableOrderBook::open(&wal, definition(), journal_options()),
+        Err(DurableError::CheckpointRequiredForCompactedWal { sequence: 5 })
+    ));
+
+    let mut recovered = DurableOrderBook::open_with_checkpoint(
+        &wal,
+        &checkpoint_base,
+        definition(),
+        journal_options(),
+        SnapshotOptions::default(),
+    )
+    .expect("anchor-selected checkpoint and suffix recover");
+    assert_eq!(recovered.recovery().checkpointed_commands, 2);
+    assert_eq!(recovered.recovery().replayed_commands, 1);
+    assert_eq!(recovered.book().active_order_count(), 3);
+    assert!(recovered.submit(resting(1, 1, 5)).unwrap().replayed);
+
+    let second_cutover = recovered
+        .compact_to_checkpoint(&checkpoint_base, SnapshotOptions::default())
+        .expect("a second cutover uses the inactive checkpoint slot");
+    assert_eq!(second_cutover.slot(), CheckpointSlot::B);
+    assert_eq!(second_cutover.snapshot().generation(), 7);
+    assert!(SnapshotFile::slot_path(&checkpoint_base, CheckpointSlot::A).exists());
+    assert!(SnapshotFile::slot_path(&checkpoint_base, CheckpointSlot::B).exists());
+    recovered.close().unwrap();
+
+    let twice_recovered = DurableOrderBook::open_with_checkpoint(
+        &wal,
+        &checkpoint_base,
+        definition(),
+        journal_options(),
+        SnapshotOptions::default(),
+    )
+    .expect("second anchor selects the second checkpoint slot");
+    assert_eq!(twice_recovered.recovery().checkpointed_commands, 3);
+    assert_eq!(twice_recovered.recovery().replayed_commands, 0);
+    assert_eq!(twice_recovered.book().active_order_count(), 3);
+}
+
+#[test]
+fn compacted_wal_rejects_a_corrupt_or_wrong_checkpoint_slot() {
+    let area = TestArea::new("cutover-binding");
+    let wal = area.join("matching.wal");
+    let checkpoint_base = area.join("matching.qsnp");
+    let mut durable = DurableOrderBook::open(&wal, definition(), journal_options()).unwrap();
+    durable.submit(resting(1, 1, 5)).unwrap();
+    durable
+        .compact_to_checkpoint(&checkpoint_base, SnapshotOptions::default())
+        .unwrap();
+    durable.close().unwrap();
+
+    let slot = SnapshotFile::slot_path(&checkpoint_base, CheckpointSlot::A);
+    let original = fs::read(&slot).unwrap();
+    let mut bytes = original.clone();
+    let final_byte = bytes.last_mut().unwrap();
+    *final_byte ^= 0x80;
+    fs::write(&slot, bytes).unwrap();
+    assert!(matches!(
+        DurableOrderBook::open_with_checkpoint(
+            &wal,
+            &checkpoint_base,
+            definition(),
+            journal_options(),
+            SnapshotOptions::default(),
+        ),
+        Err(DurableError::Snapshot(_))
+    ));
+
+    fs::write(&slot, original).unwrap();
+    let fork_wal = area.join("fork.wal");
+    let fork_snapshot = area.join("fork.qsnp");
+    let mut fork = DurableOrderBook::open(&fork_wal, definition(), journal_options()).unwrap();
+    fork.submit(resting(1, 1, 6)).unwrap();
+    fork.write_checkpoint(&fork_snapshot, SnapshotOptions::default())
+        .unwrap();
+    fork.close().unwrap();
+    fs::copy(fork_snapshot, &slot).unwrap();
+    assert!(matches!(
+        DurableOrderBook::open_with_checkpoint(
+            &wal,
+            &checkpoint_base,
+            definition(),
+            journal_options(),
+            SnapshotOptions::default(),
+        ),
+        Err(DurableError::CheckpointAnchorMismatch {
+            generation: 3,
+            slot: CheckpointSlot::A
+        })
     ));
 }

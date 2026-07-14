@@ -173,13 +173,15 @@ impl<K: Ord + Copy, V: Copy> IndexedAvlMap<K, V> {
         let mut free_seen = vec![false; self.slots.len()];
         let mut current = self.free_head;
         while let Some(index) = current {
-            if index >= self.slots.len() {
-                return Err("indexed AVL free list references an absent slot".to_owned());
-            }
+            let slot = self
+                .slots
+                .get(index)
+                .copied()
+                .ok_or_else(|| "indexed AVL free list references an absent slot".to_owned())?;
             if std::mem::replace(&mut free_seen[index], true) {
                 return Err("indexed AVL free list contains a cycle".to_owned());
             }
-            current = match self.slots[index] {
+            current = match slot {
                 Slot::Vacant { next } => next,
                 Slot::Occupied(_) => {
                     return Err("indexed AVL free list references an occupied slot".to_owned());
@@ -219,14 +221,16 @@ impl<K: Ord + Copy, V: Copy> IndexedAvlMap<K, V> {
         if depth >= MAX_AVL_HEIGHT {
             return Err("indexed AVL exceeds the addressable height bound".to_owned());
         }
-        if index >= self.slots.len() {
-            return Err("indexed AVL child references an absent slot".to_owned());
-        }
+        let slot = self
+            .slots
+            .get(index)
+            .copied()
+            .ok_or_else(|| "indexed AVL child references an absent slot".to_owned())?;
         if states[index] != 0 {
             return Err("indexed AVL contains a cycle or duplicate child".to_owned());
         }
         states[index] = 1;
-        let node = match self.slots[index] {
+        let node = match slot {
             Slot::Occupied(node) => node,
             Slot::Vacant { .. } => {
                 return Err("indexed AVL child references a vacant slot".to_owned());
@@ -440,9 +444,11 @@ impl<K: Ord + Copy, V: Copy> IndexedAvlMap<K, V> {
             height: 1,
         };
         if let Some(index) = self.free_head {
-            self.free_head = match self.slots[index] {
-                Slot::Vacant { next } => next,
-                Slot::Occupied(_) => unreachable!("AVL free head must reference a vacant slot"),
+            self.free_head = match self.slots.get(index).copied() {
+                Some(Slot::Vacant { next }) => next,
+                Some(Slot::Occupied(_)) | None => {
+                    unreachable!("AVL free head must reference a vacant slot")
+                }
             };
             self.slots[index] = Slot::Occupied(node);
             index

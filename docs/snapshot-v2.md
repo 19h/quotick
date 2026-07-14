@@ -47,7 +47,7 @@ nanoseconds, posting count and postings, followed by lifecycle kind, optional
 related transaction, and optional signed epoch-day period boundary. Financial
 entries contain at least two postings; period close/reopen controls contain
 zero. The complete byte schema and lifecycle tags are defined in
-[WAL format version 2](wal-v2.md).
+[WAL format version 3](wal-v3.md).
 
 Record tag `0` contains one `JournalEntry`. Record tag `1` contains one
 `LedgerCorrection`: reversal length `u32` and entry payload, followed by
@@ -85,7 +85,7 @@ The matching payload is:
 Display policy is fully displayed tag `0` with no value or reserve tag `1`
 followed by peak lots `u64`. The order sizes above therefore differ by 8 B.
 Command, report, event, display, side, and STP fields use the exact tags in
-[WAL format version 2](wal-v2.md).
+[WAL format version 3](wal-v3.md).
 
 Active orders are canonicalized as all buys then all sells, with ascending raw
 price within each side and FIFO order within a price. This storage order is not
@@ -267,8 +267,31 @@ A direct `SnapshotFile` caller must dedicate the target and its `.pending` and
 `.writer.lock` sidecars to snapshot use. `DurableOrderBook::write_checkpoint`,
 `DurableRiskOrderBook::write_checkpoint`, and
 `DurableLedger::write_checkpoint` additionally reject aliases of their single
-WAL and lease and reject every path inside their managed segmented-WAL
+WAL, lease, and `.cutover.pending` namespace and reject every path inside their managed segmented-WAL
 directory.
+
+## Two-slot WAL-cutover checkpoints
+
+`compact_to_checkpoint` derives `<base>.cutover-a` and
+`<base>.cutover-b`. It always writes the slot not referenced by the current
+WAL anchor. Each slot is an ordinary independently framed version-2
+`QSNP` file with its own `.pending` and writer-lease sidecars; no alternate
+snapshot envelope is introduced. The synchronized `SnapshotReceipt`
+generation, payload length, and complete envelope checksum are copied into the
+version-3 WAL anchor together with the selected slot and the independent
+physical WAL boundary.
+
+The inactive slot is published before the physical WAL selector changes. A
+single-file selector change renames the anchor file over the WAL; a segmented
+selector change renames a CRC-32C-protected next-generation marker after its
+anchor segment is synchronized. Therefore a crash before selection leaves the
+prior WAL/checkpoint pair authoritative, and a crash after a directory-
+synchronized selector change leaves the new pair authoritative. Repeated
+cutovers alternate slots, so the currently selected snapshot is never
+overwritten before the WAL selects its successor.
+Open reads only the slot named by the anchor and fails on missing, malformed,
+wrong-kind, wrong-generation, wrong-length, or wrong-checksum content. An
+unselected valid or invalid slot cannot influence recovery.
 
 ## Explicit pending recovery
 
@@ -299,7 +322,7 @@ an atomic compare-and-delete operation.
 
 `DurableOrderBook::write_checkpoint` rejects poisoned state and path conflicts,
 synchronizes the WAL, captures and independently replay-audits matching state,
-then publishes the snapshot. `open_with_checkpoint` and
+then publishes the snapshot. For an uncut WAL, `open_with_checkpoint` and
 `open_segmented_with_checkpoint`:
 
 1. acquire WAL ownership and complete physical recovery;
@@ -315,6 +338,13 @@ then publishes the snapshot. `open_with_checkpoint` and
 7. deterministically replay only complete command/report pairs after `G`;
 8. complete at most one final command lacking its report; and
 9. run the complete live-book invariant audit.
+
+For an anchored WAL in either physical layout, checkpoint-assisted open
+validates the first anchor against its selected A/B slot, restores the same
+fully audited checkpoint state, and replays only frames after the retired
+prefix boundary. A segmented open selects exactly the generation named by the
+CRC-valid directory marker. Opening an anchored WAL without a checkpoint base
+fails explicitly.
 
 For `W` verified WAL bytes across `S` segments, `C` retained checkpoint
 commands, `O` active orders over `P` price levels, and `N` suffix commands, open
@@ -333,7 +363,7 @@ generation-fenced immutable/COW handoff is implemented and verified.
 conflicts, synchronizes the WAL, captures canonical matching/account state,
 derives and cross-checks reservations, independently replays the complete
 history through the coupled risk/matching state machine, and publishes only an
-exact live-state image. `open_with_checkpoint` and
+exact live-state image. For an uncut WAL, `open_with_checkpoint` and
 `open_segmented_with_checkpoint`:
 
 1. acquire WAL ownership and complete physical recovery;
@@ -351,20 +381,28 @@ exact live-state image. `open_with_checkpoint` and
 8. complete at most one final command lacking its report; and
 9. run the complete matching/risk cross-audit.
 
+For an anchored risk WAL in either physical layout, the checkpoint itself supplies and is
+validated against the original `F`, metadata boundary `M`, immutable
+definition, and canonical profile set. Recovery then reads only the anchor and
+suffix frames. The A/B protocol never rewrites the slot selected by the current
+WAL.
+
 For `W` verified WAL bytes across `S` segments, `C` retained checkpoint
 commands, `O` active orders over `P` price levels, `A` accounts, and `N` suffix
 commands, open uses `O(W + C + O log P + A + suffix matching/risk work)` time
 and `O(C + O + P + A + S)` memory. Capture performs one complete coupled replay
 plus structural and exposure audits synchronously under exclusive shard
-ownership. It therefore has an `O(C)` admission pause, retains `O(C)` history,
-and still scans `O(W)` bytes on open. It does not establish bounded restart,
-bounded idempotency memory, or authority to retire the WAL prefix.
+ownership. It therefore has an `O(C)` admission pause and retains `O(C)`
+history. Uncut recovery scans `O(W)` bytes; anchored recovery in either physical
+layout replaces that term with the compacted suffix bytes. The finite
+matching limits bound current in-process history but no automatic shard
+generation rollover is established.
 
 ## Durable-ledger checkpoint recovery
 
 `DurableLedger::write_checkpoint` first rejects poisoned state and path
 conflicts, synchronizes the WAL with `sync_all`, audits the live ledger, and
-then publishes the snapshot. `open_with_checkpoint` and
+then publishes the snapshot. For an uncut WAL, `open_with_checkpoint` and
 `open_segmented_with_checkpoint`:
 
 1. acquire WAL writer ownership and complete ordinary WAL recovery;
@@ -376,7 +414,13 @@ then publishes the snapshot. `open_with_checkpoint` and
 6. apply only WAL records after the checkpoint generation; and
 7. run the complete live-ledger invariant audit.
 
-The current proof intentionally retains and scans the complete WAL. If `W` is
+For an anchored ledger WAL in either physical layout, the anchor independently stores
+semantic record generation and physical WAL sequence. Recovery restores the
+selected A/B checkpoint, initializes the verified record count from its
+semantic generation, then applies only suffix frames. This remains correct for
+a WAL whose configured first sequence is not `1`.
+
+Uncut recovery retains and scans the complete WAL. If `W` is
 verified WAL bytes, `S` physical segments, `R` checkpoint records, and `N` WAL
 records after the checkpoint, open remains `O(W + R + N)` time. The segmented
 reader uses `O(S)` descriptors and one bounded frame payload; the restored
@@ -385,12 +429,14 @@ and complete checkpoint history. Snapshot construction and validation are
 linear in retained balances and record/entry/posting history, apart from
 logarithmic ordered-map/set factors inside accounting validation.
 
-No WAL cutover, truncation, segment retention, bounded-memory, or bounded-
-restart claim follows from version 2. All three checkpoint kinds retain complete
-history and durable open scans the complete WAL. Those properties require a
-fenced cutover protocol that proves the checkpoint generation, preserves or
-externally anchors required audit/idempotency history, and prevents a retired
-WAL prefix from reappearing.
+Version 2 checkpoint payloads still retain complete semantic history. Version
+3 WAL cutover in either physical layout removes prefix bytes from subsequent
+WAL scans and disk occupancy while preserving that history in the selected checkpoint.
+Consequently this establishes bounded physical WAL suffix recovery only under
+the selected snapshot payload limit; it does not establish bounded ledger
+checkpoint memory, bounded retained audit/idempotency history, semantic
+generation rollover, or external archival continuity. Those require separately
+fenced lifecycle and external audit/idempotency proofs.
 
 ## Primary-source provenance
 

@@ -96,7 +96,7 @@ fn append_reopen_and_typed_decode_preserve_sequence_and_payload() {
 
     let bytes = fs::read(file.path()).expect("journal bytes read");
     assert_eq!(&bytes[..4], b"QWAL");
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 2);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 3);
 
     let frames = read_frames(file.path());
     assert_eq!(frames.len(), 2);
@@ -117,26 +117,28 @@ fn append_reopen_and_typed_decode_preserve_sequence_and_payload() {
 }
 
 #[test]
-fn expired_version_one_wal_is_rejected_explicitly() {
-    let file = TestFile::new("expired-v1");
-    let mut journal = Journal::open(file.path(), buffered_options()).unwrap();
-    journal.append(&command(1, 1)).unwrap();
-    journal.close().unwrap();
-    let mut bytes = fs::read(file.path()).unwrap();
-    bytes[4..6].copy_from_slice(&1_u16.to_le_bytes());
-    fs::write(file.path(), bytes).unwrap();
-    let error = JournalReader::open(file.path(), buffered_options())
-        .unwrap()
-        .next()
-        .expect("one frame exists")
-        .expect_err("version one is not interpreted as version two");
-    assert!(matches!(
-        error,
-        JournalError::UnsupportedVersion {
-            offset: 0,
-            version: 1
-        }
-    ));
+fn expired_wal_versions_are_rejected_explicitly() {
+    for version in [1_u16, 2] {
+        let file = TestFile::new("expired-version");
+        let mut journal = Journal::open(file.path(), buffered_options()).unwrap();
+        journal.append(&command(1, 1)).unwrap();
+        journal.close().unwrap();
+        let mut bytes = fs::read(file.path()).unwrap();
+        bytes[4..6].copy_from_slice(&version.to_le_bytes());
+        fs::write(file.path(), bytes).unwrap();
+        let error = JournalReader::open(file.path(), buffered_options())
+            .unwrap()
+            .next()
+            .expect("one frame exists")
+            .expect_err("expired WAL version is not interpreted as version three");
+        assert!(matches!(
+            error,
+            JournalError::UnsupportedVersion {
+                offset: 0,
+                version: actual
+            } if actual == version
+        ));
+    }
 }
 
 #[test]
@@ -197,6 +199,32 @@ fn malformed_writer_lease_fails_closed_and_is_never_reclaimed_implicitly() {
         .expect("invalid abandoned lease recovers explicitly");
     assert!(!lease_path.exists());
     Journal::open(file.path(), buffered_options()).expect("writer opens after recovery");
+}
+
+#[test]
+fn abandoned_cutover_staging_is_discarded_only_under_new_writer_ownership() {
+    let file = TestFile::new("abandoned-cutover");
+    let mut initialized = Journal::open(file.path(), buffered_options()).unwrap();
+    initialized.append(&command(1, 1)).unwrap();
+    initialized.close().unwrap();
+    let pending = Journal::cutover_pending_path(file.path()).unwrap();
+    fs::write(&pending, b"incomplete replacement").unwrap();
+
+    let live = Journal::open(file.path(), buffered_options()).unwrap();
+    assert!(matches!(
+        Journal::recover_abandoned_cutover_pending(file.path()),
+        Err(JournalError::WriterLeaseHeld { .. })
+    ));
+    assert!(pending.exists());
+    live.close().unwrap();
+
+    Journal::recover_abandoned_cutover_pending(file.path()).unwrap();
+    assert!(!pending.exists());
+    assert_eq!(read_frames(file.path()).len(), 1);
+    assert!(matches!(
+        Journal::recover_abandoned_cutover_pending(file.path()),
+        Err(JournalError::CutoverPendingMissing { .. })
+    ));
 }
 
 #[test]
