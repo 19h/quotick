@@ -1,5 +1,6 @@
 use quotick::ledger::{
-    JournalEntry, Ledger, LedgerError, Posting, PostingPreparation, SettlementConvention,
+    JournalEntry, Ledger, LedgerError, LedgerMagnitude, Posting, PostingPreparation,
+    SettlementConvention,
 };
 use quotick::matching::Trade;
 use quotick::{
@@ -68,7 +69,8 @@ fn unbalanced_entries_are_rejected_before_mutation() {
         error,
         LedgerError::Unbalanced {
             asset_id: asset(1),
-            residual: 1
+            positive_total: Box::new(LedgerMagnitude::from_u128(10)),
+            negative_total: Box::new(LedgerMagnitude::from_u128(9)),
         }
     );
 }

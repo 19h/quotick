@@ -51,12 +51,16 @@ zero. The complete byte schema and lifecycle tags are defined in
 
 Record tag `0` contains one `JournalEntry`. Record tag `1` contains one
 `LedgerCorrection`: reversal length `u32` and entry payload, followed by
-replacement length `u32` and entry payload. Unknown tags are invalid. For `B`
-non-zero balances, `S` single-entry records, `C` correction records, and `L`
-total posting legs across all contained entries, the ledger payload length is
+replacement length `u32` and entry payload. Record tag `2` contains one
+`LedgerBatch`: entry count `u32`, then one length-prefixed entry payload per
+member in authoritative order. Unknown tags are invalid. For `B` non-zero
+balances, `S` single-entry records, `C` correction records, `G` batch records,
+`E_G` entries inside batch records, and `L` total posting legs across all
+contained entries, the ledger payload length is
 
 ```text
-P = 16 B + 32 B × B + 52 B × S + 107 B × C + 32 B × L.
+P = 16 B + 32 B × B + 52 B × S + 107 B × C
+    + 9 B × G + 51 B × E_G + 32 B × L.
 ```
 
 The total snapshot length is `28 B + P`. Declared collection counts are checked
@@ -138,13 +142,16 @@ A ledger checkpoint is accepted only if all of the following hold:
 
 1. The envelope generation equals the payload generation.
 2. The generation equals the number of complete ledger records. A correction
-   is one record containing two transaction entries.
+   is one record containing two transaction entries; a batch is one record
+   containing at least two.
 3. Balances are non-zero and strictly ordered by `(asset ID, account ID)`;
    duplicate keys are therefore impossible.
-4. Every financial entry passes canonical double-entry validation; every
-   period control has the required zero-posting/absent-effective-date shape.
+4. Every financial entry passes canonical double-entry validation using exact
+   positive/negative per-asset magnitudes with no fixed-width aggregate ceiling;
+   every period control has the required zero-posting/absent-effective-date
+   shape.
 5. Replaying the complete record sequence succeeds without exact duplicate
-   records, transaction-ID collisions, a partial correction, timestamp
+   records, transaction-ID collisions, a partial correction/batch, timestamp
    regression, invalid reversal lineage, invalid close/reopen progression,
    closed-date posting, or arithmetic overflow.
 6. Balances independently reconstructed by replay equal the redundant balance
@@ -157,7 +164,8 @@ reversal, accounting-period, and last-recorded-time state.
 `Ledger::checkpoint` runs that audit before capture. Zero balances are omitted
 from the image, while the complete record sequence is retained to preserve
 correction grouping, exact transaction idempotency, and reconstruct the period
-fence.
+fence. Ordered batch grouping and all member transaction identifiers are
+retained by the same record history.
 
 For ledger snapshots, generation lineage is the exact ledger-record prefix
 relation. A generation `g₂` is a successor of `g₁` only when `g₂ ≥ g₁` and its

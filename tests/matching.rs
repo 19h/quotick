@@ -535,3 +535,86 @@ fn mixed_command_stream_preserves_all_structural_invariants() {
     .expect("sweep processed");
     book.validate().expect("invariants after sweep");
 }
+
+#[test]
+fn best_level_survives_creation_non_best_removal_reprice_fill_stp_and_restore() {
+    let mut book = OrderBook::new(definition());
+    for (command, order, owner, price) in [(1, 1, 11, 100), (2, 2, 12, 110), (3, 3, 13, 120)] {
+        book.submit(limit_order(
+            command,
+            order,
+            owner,
+            Side::Sell,
+            1,
+            price,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ))
+        .expect("ask accepted");
+    }
+    assert_eq!(book.best_ask().unwrap().price, Price::from_raw(100));
+
+    book.submit(cancel(4, 2, 12))
+        .expect("non-best cancellation accepted");
+    assert_eq!(book.best_ask().unwrap().price, Price::from_raw(100));
+    book.validate().expect("cache valid after non-best removal");
+
+    book.submit(replace(5, 1, 11, 1, 130))
+        .expect("best ask repriced");
+    assert_eq!(book.best_ask().unwrap().price, Price::from_raw(120));
+    book.validate().expect("cache valid after best reprice");
+
+    book.submit(limit_order(
+        6,
+        6,
+        20,
+        Side::Buy,
+        1,
+        120,
+        TimeInForce::ImmediateOrCancel,
+        SelfTradePrevention::CancelAggressor,
+    ))
+    .expect("best ask fully executed");
+    assert_eq!(book.best_ask().unwrap().price, Price::from_raw(130));
+    book.validate().expect("cache valid after full execution");
+
+    book.submit(limit_order(
+        7,
+        7,
+        11,
+        Side::Buy,
+        1,
+        130,
+        TimeInForce::ImmediateOrCancel,
+        SelfTradePrevention::CancelResting,
+    ))
+    .expect("self-trade prevention removed the final ask");
+    assert!(book.best_ask().is_none());
+    book.validate().expect("empty ask cache is valid");
+
+    for (command, order, owner, price) in [(8, 8, 18, 90), (9, 9, 19, 80), (10, 10, 20, 70)] {
+        book.submit(limit_order(
+            command,
+            order,
+            owner,
+            Side::Buy,
+            1,
+            price,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ))
+        .expect("bid accepted");
+    }
+    assert_eq!(book.best_bid().unwrap().price, Price::from_raw(90));
+    book.submit(cancel(11, 8, 18))
+        .expect("best bid cancellation accepted");
+    assert_eq!(book.best_bid().unwrap().price, Price::from_raw(80));
+
+    let checkpoint = book
+        .checkpoint(1, 23)
+        .expect("eleven commands terminate at the declared WAL boundary");
+    let restored = OrderBook::from_checkpoint(checkpoint).expect("checkpoint restores");
+    assert_eq!(restored.best_bid(), book.best_bid());
+    assert_eq!(restored.best_ask(), book.best_ask());
+    restored.validate().expect("restored extrema are valid");
+}

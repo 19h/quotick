@@ -45,12 +45,14 @@ validated command -> pre-trade risk -> WAL -> matching engine
                                                             |
                                          balanced multi-asset journal entry
                                                             |
-                                            durable ledger-event account balances
+                                                   ledger-event WAL
+                                                            |
+                                                  durable account balances
 ```
 
 An `OrderBook` represents one instrument-version shard and is mutated by one
 execution thread. Parallelism is obtained by running independent shards. The
-durable wrappers record commands or ledger entries before committing the
+durable wrappers record commands or ledger events before committing the
 corresponding in-memory transition, then verify deterministic results during
 recovery.
 
@@ -70,13 +72,17 @@ recovery.
 
 - Deterministic price-time priority with ordered price levels and intrusive FIFO
   links.
+- Mutation-maintained complete best-level caches providing allocation-free
+  constant-time best price, FIFO head, displayed quantity, and order-count reads,
+  with independent ordered-map cross-audit.
 - Instrument-gated native reserve orders with fixed displayed peaks, hidden
   total leaves, bounded replenishment, and FIFO-tail priority on refresh.
 - Market and limit orders with GTC, IOC, FOK, and post-only behavior.
 - Cancel and replace with ownership checks and explicit priority-retention
   rules.
-- Account-scoped mass cancellation across all orders or one side, with
-  canonical per-order audit events and an acknowledged aggregate completion.
+- Account-scoped mass cancellation across all active orders or one side, selected
+  through mutation-maintained account/side indexes and emitted in ascending
+  `OrderId` order with exact final order-count and cancelled-lot totals.
 - Cancel-aggressor, cancel-resting, cancel-both, and decrement-and-cancel
   self-trade prevention.
 - Atomic FOK preflight, exact-command idempotency, collision detection, and
@@ -92,16 +98,16 @@ recovery.
 - Worst-case long and short position limits across open exposure.
 - Conservative reachable-price notional for positive, zero-crossing, and
   negative price collars.
-- Trace-driven reservation release across fills, cancellation, replacement,
-  and self-trade prevention.
+- Trace-driven reservation release across fills, individual and mass
+  cancellation, replacement, and self-trade prevention.
 - Cross-audits between active orders, reservations, aggregates, and positions.
 
 ### Market-data publication and recovery
 
 - One public update for every non-replayed matching event, preserving the
   source sequence without exposing account, order, or command identifiers.
-- Absolute level-2 quantity and order-count updates plus anonymized trade
-  prints.
+- Absolute displayed level-2 quantity and order-count updates plus anonymized
+  trade prints; hidden reserve leaves are not published as depth.
 - Full-depth snapshots in canonical price order.
 - Exact-retry suppression and publisher-to-book cross-audits.
 - Consumer-side detection of missing, duplicated, and reordered updates.
@@ -110,8 +116,8 @@ recovery.
 ### Durability and codecs
 
 - Stable little-endian codecs for definitions, risk profiles, commands,
-  execution reports, market data, ledger entries, atomic corrections, and
-  matching and ledger checkpoints.
+  execution reports, market data, ledger entries, atomic corrections,
+  generalized ledger batches, and matching and ledger checkpoints.
 - Versioned CRC-32C WAL frames with bounded payloads and contiguous sequences.
 - Size-bounded physical WAL segments with automatic whole-frame and whole-batch
   rotation over one global logical sequence.
@@ -132,7 +138,9 @@ recovery.
 
 ### Accounting and settlement
 
-- Atomic, balanced multi-asset journal entries with canonical leg order.
+- Atomic, balanced multi-asset journal entries with canonical leg order and
+  exact per-asset side magnitudes that cannot fail from fixed-width aggregate
+  overflow or leg ordering.
 - Explicit signed epoch-day effective dates and nondecreasing UTC nanosecond
   booking timestamps on every financial journal event.
 - Delivery-versus-payment trade settlement bound to the exact instrument
@@ -145,10 +153,16 @@ recovery.
 - Atomic reversal-plus-replacement corrections with one event sequence, one
   CRC-protected WAL frame, direct final-balance arithmetic, exact retries, and
   all-or-neither torn-tail recovery.
+- Generalized ordered batches of two or more distinct entries with one event
+  sequence and WAL frame, lifecycle/reversal validation against an in-batch
+  overlay, direct aggregate final-balance arithmetic, exact grouped retries,
+  and all-or-neither single/segmented recovery.
 - Idempotent zero-posting period close/reopen controls with an inclusive dated
   posting fence reconstructed by WAL and checkpoint replay.
 - Full balance reconstruction from the canonical journal sequence.
-- Independent journal/index replay and per-asset trial-balance audits.
+- Independent journal/index replay and arbitrary-magnitude per-asset trial-
+  balance audits, using allocation-free inline `u128` totals until a side
+  exceeds that range.
 - Exact-generation reconciliation against canonical complete external balance
   statements, including deterministic external-minus-ledger break reports.
 - Canonical non-zero balance checkpoints retaining complete transaction
@@ -185,43 +199,47 @@ cargo clippy --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
-The test suites exercise financial-domain boundaries, price/FIFO priority,
-reserve admission and replenishment, hidden-versus-displayed quantity, order
-lifecycle behavior, canonical mass cancellation, all self-trade policies, risk
-rejection and reservation release, market-data reconstruction, settlement and
-arithmetic rollback, stable wire layouts, corruption and torn-tail handling, concurrent
-writer exclusion, injected write and barrier failures, forced process
-termination, recovery equivalence, and replay-divergence detection.
-Segmented-storage tests additionally force record-by-record and whole-batch
-rotation, cross-segment matching/risk/ledger replay, strict closed-segment
-corruption handling, active-tail repair, manager exclusion, and interrupted
-empty-segment recovery.
-Checkpoint tests additionally exercise canonical matching FIFO/reserve/STP
-state, coupled risk rejection/position/total-leaves reservation state,
-independent matching, risk, and ledger replay audits, stable snapshot framing,
-semantic corruption, immutable-profile binding, non-default WAL origins,
-generation forks, pending-file recovery, WAL-prefix divergence, path ownership,
-exact retry, and suffix replay across physical segment boundaries. Ledger-
-lifecycle tests cover exact reversal
-and reinstatement chains, indivisible reversal-plus-replacement corrections,
-torn correction frames, correction/checkpoint grouping, three-term `i128`
-boundaries, invalid/missing/already-reversed targets, durable lineage restoration,
-complete external statements, generation fencing, canonical breaks, and
-signed-difference overflow.
-Period-control tests cover inclusive close boundaries, backdated rejection,
-backward/full reopen, timestamp regression, nonfinancial reversal rejection,
-stable control-entry codecs, and checkpoint/WAL-suffix fence recovery.
+The test suites cover:
+
+- **Matching and risk:** financial-domain boundaries, price/FIFO priority,
+  reserve admission and replenishment, hidden-versus-displayed quantity,
+  canonical mass cancellation, every self-trade policy, risk rejection, and
+  reservation release.
+- **Market data and accounting:** displayed-depth reconstruction, settlement,
+  arithmetic rollback, exact reversal and reinstatement chains, indivisible
+  reversal-plus-replacement corrections, generalized multi-entry netting,
+  ordered in-batch period/reversal transitions, grouped replay and partial-
+  commitment rejection, period controls, external-statement reconciliation,
+  and signed `i128` boundaries.
+- **Storage and recovery:** stable wire layouts, record and whole-batch segment
+  rotation, cross-segment matching/risk/ledger replay, strict closed-segment
+  corruption handling, active-tail repair, concurrent-writer exclusion,
+  injected write and barrier failures, forced termination, and replay-divergence
+  detection.
+- **Checkpoints:** canonical matching FIFO/reserve/STP state, coupled risk
+  positions and total-leaves reservations, independent replay audits, stable
+  snapshot framing, semantic corruption, immutable-profile binding, WAL-prefix
+  divergence, generation forks, pending-file recovery, exact retries, and
+  suffix replay across segment boundaries.
 
 ## Complexity
 
-For `P` occupied price levels and `E` maker-slice interactions, price discovery
-is `O(log P)` and execution is `O((E + 1) log P)`. A reserve order can
-contribute more than one interaction through replenishment. FIFO append is
-`O(log P)`; cancellation is expected `O(1)` lookup plus `O(log P)` level
-maintenance. A mass cancel scans `O` orders, sorts `K` selected order IDs in
-`O(K log K)`, and performs `K` removals. Active matching state uses
-`O(O + P + C)` memory for `O` resting orders and `C` retained idempotency
-reports.
+For `P` occupied price levels and `E` maker-slice interactions, cached
+best-price, best-order, and best-level-snapshot discovery is `O(1)`. Ordered
+level insertion, deletion, and next-worse traversal are `O(log P)`; execution is
+`O((E + 1) log P)`. The cache removes one ordered-tree traversal from each
+best-maker selection, while the authoritative level aggregate update remains
+`O(log P)`. A reserve order can contribute more than one interaction through
+replenishment. FIFO append and removal maintain one account/side `BTreeSet`,
+giving `O(log P + log K_a)` work for an account with `K_a` active orders.
+Reserve refresh preserves account membership and avoids that index churn. For
+`K` selected orders, a mass cancel detaches the ordered set in `O(K)`, emits
+already-canonical IDs without sorting, and performs `K` price-level removals in
+`O(K log P)`, independent of total active-order count `O`. Active matching state
+uses `O(O + P + C)` memory for `O` resting orders and `C` retained idempotency
+reports; account indexing adds one ordered membership per active order within
+the same `O(O)` bound, while the two complete best-level caches add `O(1)`
+space.
 
 Risk authorization and trace application are expected `O(1)` per order event.
 A complete risk cross-audit is `O(O + A)` for `A` registered accounts, and risk
@@ -242,8 +260,8 @@ exclusive file creation, and a parent-directory barrier at a size boundary.
 For `C` retained matching commands, `O` active orders, and `P` price levels, a
 matching checkpoint retains `O(C + O + P)` state. Capture performs one
 independent full-history matching replay plus structural audit synchronously
-under exclusive shard access. Checkpoint open
-still scans all WAL bytes and decodes the exact command/report prefix, but
+under exclusive shard access. Checkpoint-assisted open still scans all WAL
+bytes and decodes the exact command/report prefix, but
 reconstructs indices in `O(O log P)` and executes matching transitions only for
 the suffix. It does not bound memory, WAL scan time, or authorize prefix
 retention.
@@ -267,8 +285,18 @@ time or authorize WAL retention.
 Reversal validation is `O(L)` for the target entry's posting legs plus expected
 `O(1)` transaction/reversal-index access. Correction balance preparation is
 `O(Lᵣ + Lₚ)` time and auxiliary state for the distinct posting keys in its
-reversal and replacement. For `A` internal non-zero balances,
-`S` external statement balances, and `D` reported breaks, reconciliation is
+reversal and replacement. For a batch with `N` entries, `L` posting legs, and
+`U` affected `(account, asset)` keys, construction proves unique transaction
+IDs in `O(N log N)` time and `O(N)` memory. Preparation is expected `O(N + L)`
+time after construction and uses `O(N + L + U)` auxiliary memory for lifecycle
+overlays, exact signed terms, and final balance updates; it is independent of
+unaffected ledger balances. Commit is expected `O(N + U)` time. For `A`
+internal non-zero balances, `V` asset denominations, and `W` spilled `u64`
+magnitude limbs, trial-balance construction is amortized `O(A log V)` time and
+`O(V + W)` memory. Magnitude addition is allocation-free through
+`u128::MAX`, amortized constant time after spill, and `O(W_v)` in a worst-case
+carry chain for one asset's `W_v` limbs. For `S` external statement balances
+and `D` reported breaks, reconciliation is
 `O(A log A + S)` time and `O(A + D)` auxiliary memory; output is canonical and
 contains no zero differences.
 Period close/reopen validation and the effective-date fence are `O(1)` time and

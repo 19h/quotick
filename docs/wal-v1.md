@@ -10,7 +10,7 @@ or platform ABI is persisted.
 |---:|---:|---|
 | 0 | 4 | ASCII magic `QWAL` |
 | 4 | 2 | format version `1` |
-| 6 | 2 | record kind: command `1`, execution report `2`, ledger entry `3`, instrument definition `4`, account risk definition `5`, ledger correction `6` |
+| 6 | 2 | record kind: command `1`, execution report `2`, ledger entry `3`, instrument definition `4`, account risk definition `5`, ledger correction `6`, ledger batch `7` |
 | 8 | 4 | payload length |
 | 12 | 4 | CRC-32C |
 | 16 | 8 | contiguous journal sequence |
@@ -202,8 +202,10 @@ Fields occur in this exact order:
 The fixed payload portion is 47 B and each posting is 32 B. Financial entries
 require an effective date. Their postings are strictly sorted by `(asset ID,
 account ID)`, contain no duplicate pair or zero amount, contain at least two
-legs, and balance independently to zero for every asset. Administrative period
-controls have no effective date and exactly zero postings. `recorded_at` is
+legs, and balance independently for every asset. Balance proof compares exact
+positive and negative magnitudes; it does not add signed legs in wire order and
+therefore has no `i128`/`u128` aggregate ceiling. Administrative period controls
+have no effective date and exactly zero postings. `recorded_at` is
 nondecreasing over accepted journal sequence; equal timestamps are permitted.
 
 | Tag | Meaning | Related transaction | Period boundary |
@@ -254,6 +256,33 @@ replay that event without a second effect. Because the complete pair occupies
 one CRC-protected frame, final-tail repair retains both entries or neither; it
 cannot retain only one correction member.
 
+## Ledger-batch payload
+
+A ledger batch is one record-kind `7` payload containing:
+
+1. entry count `u32`, which must be at least `2`;
+2. for every entry in authoritative order: payload length `u32`, then one
+   complete `JournalEntry` payload.
+
+For `N` entries and `L` total posting legs, its encoded length is
+`4 B + 51 B × N + 32 B × L`. The minimum is `106 B` for two zero-posting
+period controls; a two-member all-financial batch is at least `234 B`.
+Transaction identifiers must be distinct and `recorded_at` values must be
+nondecreasing in declared order.
+
+Admission evaluates period controls, transaction visibility, and reversal
+lineage sequentially over an overlay: effects introduced by an earlier member
+are visible to later members only. Balance effects are not applied
+sequentially. For each `(account, asset)` key, admission computes the directly
+representable final value `b + Σδᵢ`; failure of any member or final value leaves
+the ledger unchanged. Every member shares the one ledger-event sequence.
+
+An exact retry requires equal entry content and the identical ordered grouping.
+If only some members exist, or all exist under another event grouping, replay
+fails as partial prior commitment. The complete payload occupies one bounded,
+CRC-protected frame, so torn-tail repair and segment rotation retain every
+member or none.
+
 ## Recovery
 
 A frame is authoritative only after its header, declared payload, CRC-32C, and
@@ -275,12 +304,13 @@ most one final command lacking a report. An empty journal is initialized by
 appending the requested definition; a nonempty journal without definition as
 its first frame is rejected. Recovery compares the complete persisted
 definition with the requested definition before replay. A ledger journal
-accepts ledger-entry and ledger-correction records only.
+accepts ledger-entry, ledger-correction, and ledger-batch records only.
 
 Semantic checkpoints are not WAL frames. Period controls use ledger-entry
 record kind `3`; indivisible reversal-plus-replacement events use ledger-
-correction kind `6`. Matching, coupled risk/matching, and ledger checkpoints
-are separate `QSNP` files described by
+correction kind `6`; generalized multi-entry events use ledger-batch kind `7`.
+Matching, coupled risk/matching, and ledger checkpoints are separate `QSNP`
+files described by
 [Semantic snapshot format version 1](snapshot-v1.md).
 Checkpoint-assisted open still scans every WAL frame and requires the
 checkpoint's complete command/report or ledger-record sequence to equal the

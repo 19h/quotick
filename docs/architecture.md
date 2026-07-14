@@ -6,8 +6,8 @@ The implemented system is a deterministic state machine with local durable
 matching and ledger runtimes. One `OrderBook` owns one instrument and accepts
 commands from exactly one mutating thread. `DurableOrderBook` records each
 command before matching and records its trace afterward. `DurableLedger`
-records each prepared entry or indivisible correction before committing
-calculated balances.
+records each prepared entry, indivisible correction, or ordered multi-entry
+batch before committing calculated balances.
 
 ```text
 implemented
@@ -92,10 +92,24 @@ gateway -> authentication -> portfolio/collateral risk -> replicated sequencer a
     and a mass-cancel reason. A final completion event reports the exact `u64`
     order count and `u128` total cancelled lots; an empty selection still emits
     one completion event.
+22. Every active order appears exactly once in the ordered account/side index.
+    Reserve FIFO-tail refresh preserves that membership without index churn.
+    Mass cancellation detaches the selected side or account index atomically,
+    traverses only selected order IDs in ascending order, and never scans
+    unrelated active orders.
+23. Each side caches its complete best `PriceLevel`. The cached price, FIFO
+    head/tail, displayed-lot sum, and visible order count equal the corresponding
+    extremal entry in the authoritative ordered price map. Every level aggregate
+    mutation refreshes the cache when it targets the current best; deletion of
+    the best recomputes the new extremum before control returns to matching.
 
-The book uses `BTreeMap<Price, PriceLevel>` for deterministic ordered price
-discovery, `HashMap<OrderId, RestingOrder>` for direct lookup, and doubly linked
-order identifiers for FIFO removal without scanning a level.
+The book wraps each `BTreeMap<Price, PriceLevel>` in a side-aware index with a
+mutation-maintained complete best-level cache. This provides `O(1)` best-price,
+best-FIFO-head, and best-snapshot discovery while preserving deterministic
+ordered traversal. It uses `HashMap<OrderId, RestingOrder>` for direct lookup,
+`HashMap<AccountId, AccountOrderIndex>` containing side-specific
+`BTreeSet<OrderId>` values for canonical account selection, and doubly linked
+order identifiers for FIFO removal without scanning a level or book.
 
 ## Instrument invariants
 
@@ -121,7 +135,10 @@ order identifiers for FIFO removal without scanning a level.
 1. Every financial entry has an effective date and at least two non-zero legs;
    an administrative period control has no effective date and zero legs.
 2. A financial entry contains at most one leg per `(account, asset)` pair.
-3. Financial posting amounts sum to zero independently for every asset.
+3. Financial posting amounts balance independently for every asset by comparing
+   exact positive and negative magnitudes. Values through `u128::MAX` remain
+   inline; larger totals spill into canonical little-endian `u64` limbs.
+   Canonical posting order cannot cause a false intermediate overflow.
 4. Validation and all checked balance calculations complete before commit.
 5. Journal sequence, balances, idempotency index, and journal order change
    together after successful validation.
@@ -132,19 +149,19 @@ order identifiers for FIFO removal without scanning a level.
    identifiers are only local to one instrument shard.
 9. Preparation calculates every next balance without mutation and binds it to
    the current ledger generation.
-10. Durable posting writes the canonical entry or correction before committing
-    its prepared balances; stale preparations cannot commit.
-11. Recovery accepts only ledger-entry and ledger-correction records and
-    reconstructs every balance, reversal link, period boundary, and last
-    booking timestamp from the canonical WAL sequence.
+10. Durable posting writes the canonical entry, correction, or batch before
+    committing its prepared state; stale preparations cannot commit.
+11. Recovery accepts only ledger-entry, ledger-correction, and ledger-batch
+    records and reconstructs every balance, reversal link, period boundary, and
+    last booking timestamp from the canonical WAL sequence.
 12. A complete invariant audit cross-checks journal order and sequence,
     transaction index identity, deterministic entry replay, canonical balances,
-    and independently accumulated positive/negative totals per asset.
+    and independently accumulated exact positive/negative magnitudes per asset.
 13. A checkpoint contains all ledger records plus a redundant, strictly
     `(asset, account)`-ordered image of non-zero balances. Its generation equals
     its record count. Decoding rejects exact duplicate records, partial
-    corrections, or transaction collisions while replaying every record before
-    accepting that balance image.
+    corrections/batches, or transaction collisions while replaying every
+    record before accepting that balance image.
 14. Durable checkpoint publication follows a successful WAL `sync_all` barrier
     and a successful live-ledger invariant audit.
 15. Checkpoint-assisted recovery accepts the checkpoint only when its complete
@@ -166,7 +183,8 @@ order identifiers for FIFO removal without scanning a level.
     state.
 20. A reconciliation statement is a complete non-zero balance image at one
     exact ledger generation. It has unique `(asset, account)` keys and
-    independently equal positive/negative totals for every represented asset.
+    independently equal arbitrary-magnitude positive/negative totals for every
+    represented asset.
 21. Reconciliation rejects a stale/future generation and an observation time
     preceding that generation's last journal event before comparison; it emits
     only non-zero `external - internal` differences in canonical order.
@@ -182,6 +200,34 @@ order identifiers for FIFO removal without scanning a level.
     as financial postings.
 25. Checkpoint replay and WAL-suffix replay apply the same timestamp, dated-
     posting, close, and reopen rules, then cross-audit the reconstructed fence.
+26. A `LedgerBatch` contains at least two entries with distinct transaction
+    identifiers and nondecreasing booking timestamps. Its vector order is
+    authoritative; it is not sorted or inferred from identifiers.
+27. Batch validation uses an overlay over the committed ledger. An earlier
+    member's period transition, transaction, or reversal link is visible to
+    later members; a later member is not visible to an earlier one. Any failed
+    member leaves balances, indexes, lifecycle state, and event sequence
+    unchanged.
+28. For every affected `(account, asset)` key, batch admission computes the
+    single final value `b' = b + Σδᵢ`. While both signs remain, the accumulator
+    consumes a term opposite to its current sign; that addition cannot
+    overflow. Once one sign remains, the accumulator moves monotonically toward
+    `b'`. Therefore a checked overflow represents an unrepresentable final
+    `i128`, not an artifact of member order.
+29. Every batch member shares one ledger-event sequence. Exact replay requires
+    equal entry content, the same sequence for every transaction, and the same
+    ordered batch record. A subset committed separately, or the whole set
+    committed under another grouping, is a nonmutating partial-commit error.
+30. The complete batch occupies one bounded, CRC-protected WAL frame and one
+    checkpoint record. Torn-tail repair and segmented rotation therefore retain
+    every member or no member; replay never exposes a committed prefix of the
+    batch.
+31. `LedgerMagnitude` has no fixed numerical ceiling. Its inline `u128` state
+    is allocation-free; overflow spills once into an exact limb vector and
+    subsequent addition propagates carries without truncation. Trial balance,
+    entry validation, reconciliation, replay audit, and unbalanced diagnostics
+    use the same representation. Decimal rendering divides a diagnostic copy
+    into base-10¹⁹ chunks and never changes authoritative state.
 
 Signed balances are intentional accounting state. Credit limits, collateral,
 and margin are not inferred by the ledger. The implemented order risk layer
@@ -282,9 +328,10 @@ collateral from ledger balances.
    sequence discontinuity are non-repairable corruption.
 6. An ambiguous write or durability-barrier failure poisons the writer until
    reopen and recovery.
-7. A batch uses one write and barrier but is not a transactional frame; recovery
-   may retain its verified prefix. A ledger correction instead uses one typed
-   frame, so recovery retains both correction members or neither.
+7. A `JournalBatch` uses one write and barrier across multiple frames but is not
+   one transactional frame; recovery may retain its verified frame prefix. A
+   ledger correction or `LedgerBatch` instead uses one typed frame, so recovery
+   retains every contained entry or none.
 8. Typed codecs reject invalid identifiers, quantities, enum tags, booleans,
    lengths, trailing bytes, noncanonical postings, and contradictory reports.
 9. A plain matching journal begins with one complete instrument definition. A
@@ -384,8 +431,13 @@ cross-audit tests exercise these paths. Reserve tests additionally cover
 admission bounds, FIFO-tail refresh, repeated slices in one match, hidden-aware
 FOK, STP, total-leaves risk, displayed-only publication, and WAL recovery.
 Mass-cancel tests cover empty and side-scoped selection, canonical audit order,
-hidden-total risk release, displayed-depth publication, malformed summaries,
-exact replay, and WAL reconstruction.
+large-book sparse-account selection, index continuity across reserve refresh,
+replacement and execution, hidden-total risk release, displayed-depth
+publication, malformed summaries, exact replay, and WAL reconstruction.
+Best-level index tests cover bid/ask extrema, better/worse insertion, non-best
+and repeated best deletion, deliberate cached-price and cached-aggregate
+corruption, repricing, full execution, STP removal, empty-side transitions, and
+direct checkpoint reconstruction.
 Matching checkpoint tests cover capture-time replay audit, FIFO-tail reserve
 state, resting STP, exact retry, stable kind/codec, semantic corruption,
 non-default WAL origins, lineage forks, WAL-prefix divergence, ahead-of-WAL
@@ -394,9 +446,14 @@ framing, generation and lineage divergence, interrupted-pending recovery,
 independent trial balance,
 checkpoint/WAL prefix proof, segmented suffix replay, reversal lineage and
 reinstatement, indivisible correction replay and torn-tail repair, correction
-arithmetic boundaries, invalid reversal recovery, exact-generation external
-balance reconciliation, dated-entry fences, temporal regression, period
-close/reopen, and checkpoint-plus-WAL period reconstruction are also tested.
+arithmetic boundaries, generalized multi-entry netting, partial-group and
+collision rejection, ordered in-batch period/reversal transitions, stale
+preparation, single/segmented WAL grouping, batch torn-tail repair, batch
+checkpoint-prefix/suffix recovery, invalid reversal recovery, exact-generation
+external balance reconciliation, exact side totals crossing `u128`, wide
+unbalanced diagnostics, large-total checkpoint replay, dated-entry fences,
+temporal regression, period close/reopen, and checkpoint-plus-WAL period
+reconstruction are also tested.
 Coupled risk-checkpoint tests cover sequenced risk rejection, executed position,
 hidden total-leaves reservation, exact retry, malformed owner/exposure state,
 profile and same-generation lineage drift, non-default WAL origins, exact WAL-
@@ -456,7 +513,7 @@ qualified storage-device power-loss behavior.
 | Impact | Capability | Evidence required for completion |
 |---|---|---|
 | High | Durable storage completion | segment retention/archival with deletion fencing; kernel inode locking or qualified alias exclusion; forced-power-loss filesystem/device evidence |
-| High | Ledger lifecycle completion | controller authorization; versioned calendar ingestion; durable external-statement evidence; externally anchored cutoff proofs; generalized atomic multi-entry batches |
+| High | Ledger lifecycle completion | controller authorization; versioned calendar ingestion; durable external-statement evidence; externally anchored cutoff proofs; allocation/fee/settlement workflow adapters over atomic batches |
 | High | Snapshots and compaction | fenced matching/risk/ledger WAL cutover, bounded restart time/memory, segment retention, and externally retained audit/idempotency proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |

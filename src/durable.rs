@@ -693,7 +693,8 @@ fn replay_matching_frame(
         RecordKind::LedgerEntry
         | RecordKind::InstrumentDefinition
         | RecordKind::AccountRiskDefinition
-        | RecordKind::LedgerCorrection => Err(DurableError::UnexpectedRecord {
+        | RecordKind::LedgerCorrection
+        | RecordKind::LedgerBatch => Err(DurableError::UnexpectedRecord {
             sequence: frame.sequence(),
             kind: frame.kind(),
         }),

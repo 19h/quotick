@@ -9,6 +9,8 @@ use crate::domain::{
 use crate::instrument::InstrumentDefinition;
 use crate::matching::Trade;
 
+pub use crate::ledger_magnitude::LedgerMagnitude;
+
 /// One signed change to an account's balance in one asset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Posting {
@@ -66,6 +68,16 @@ pub struct LedgerCorrection {
     replacement: JournalEntry,
 }
 
+/// An ordered group of journal entries committed as one indivisible ledger event.
+///
+/// Entry order is authoritative for booking timestamps, accounting-period
+/// controls, and reversal lineage. Balance effects are observed only as the
+/// final aggregate image of the complete batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LedgerBatch {
+    entries: Vec<JournalEntry>,
+}
+
 /// One sequenced ledger event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LedgerRecord {
@@ -73,24 +85,28 @@ pub enum LedgerRecord {
     Entry(JournalEntry),
     /// One atomic reversal-plus-replacement correction.
     Correction(LedgerCorrection),
+    /// One atomic ordered group of two or more entries.
+    Batch(LedgerBatch),
 }
 
 impl LedgerRecord {
     /// Returns the number of transaction identifiers introduced by this event.
     #[must_use]
-    pub const fn transaction_count(&self) -> usize {
+    pub fn transaction_count(&self) -> usize {
         match self {
             Self::Entry(_) => 1,
             Self::Correction(_) => 2,
+            Self::Batch(batch) => batch.entries.len(),
         }
     }
 
     /// Returns the event's first transaction identifier.
     #[must_use]
-    pub const fn primary_transaction_id(&self) -> TransactionId {
+    pub fn primary_transaction_id(&self) -> TransactionId {
         match self {
             Self::Entry(entry) => entry.transaction_id,
             Self::Correction(correction) => correction.reversal.transaction_id,
+            Self::Batch(batch) => batch.entries[0].transaction_id,
         }
     }
 }
@@ -104,14 +120,16 @@ pub enum LedgerError {
     ZeroPosting,
     /// The same account and asset appeared more than once in an entry.
     DuplicateAccountAsset,
-    /// Posting sums for this asset were not zero.
+    /// Positive and negative posting totals for this asset differed.
     Unbalanced {
         /// Unbalanced asset.
         asset_id: AssetId,
-        /// Signed residual that must have been zero.
-        residual: i128,
+        /// Exact sum of positive posting amounts.
+        positive_total: Box<LedgerMagnitude>,
+        /// Exact absolute sum of negative posting amounts.
+        negative_total: Box<LedgerMagnitude>,
     },
-    /// A balance or validation sum overflowed `i128`.
+    /// An account balance or fixed-width settlement calculation overflowed.
     ArithmeticOverflow,
     /// A transaction identifier was reused for different content.
     TransactionIdCollision(TransactionId),
@@ -198,6 +216,12 @@ pub enum LedgerError {
     },
     /// One member of a correction was already committed outside that exact event.
     CorrectionAlreadyPartiallyCommitted(TransactionId),
+    /// An atomic batch contained fewer than two entries.
+    BatchTooFewEntries,
+    /// An atomic batch repeated one transaction identifier.
+    BatchDuplicateTransaction(TransactionId),
+    /// One member of a batch was already committed outside that exact event.
+    BatchAlreadyPartiallyCommitted(TransactionId),
 }
 
 impl fmt::Display for LedgerError {
@@ -210,12 +234,7 @@ impl fmt::Display for LedgerError {
             Self::DuplicateAccountAsset => {
                 formatter.write_str("an entry may contain only one posting per account and asset")
             }
-            Self::Unbalanced { asset_id, residual } => {
-                write!(
-                    formatter,
-                    "asset {asset_id} has unbalanced residual {residual}"
-                )
-            }
+            Self::Unbalanced { .. } => format_unbalanced_ledger_error(self, formatter),
             Self::ArithmeticOverflow => formatter.write_str("ledger arithmetic overflow"),
             Self::TransactionIdCollision(id) => {
                 write!(
@@ -278,6 +297,17 @@ impl fmt::Display for LedgerError {
             Self::CorrectionAlreadyPartiallyCommitted(transaction_id) => write!(
                 formatter,
                 "correction transaction {transaction_id} is already committed outside the exact correction event"
+            ),
+            Self::BatchTooFewEntries => {
+                formatter.write_str("ledger batch requires at least two entries")
+            }
+            Self::BatchDuplicateTransaction(transaction_id) => write!(
+                formatter,
+                "ledger batch repeats transaction identifier {transaction_id}"
+            ),
+            Self::BatchAlreadyPartiallyCommitted(transaction_id) => write!(
+                formatter,
+                "batch transaction {transaction_id} is already committed outside the exact batch event"
             ),
             period_error @ (Self::FinancialEntryMissingEffectiveDate
             | Self::ControlEntryHasEffectiveDate
@@ -354,13 +384,31 @@ fn format_accounting_period_error(
 
 impl std::error::Error for LedgerError {}
 
+fn format_unbalanced_ledger_error(
+    error: &LedgerError,
+    formatter: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    let LedgerError::Unbalanced {
+        asset_id,
+        positive_total,
+        negative_total,
+    } = error
+    else {
+        unreachable!("unbalanced formatter received another ledger error");
+    };
+    write!(
+        formatter,
+        "asset {asset_id} has positive total {positive_total} and negative total {negative_total}"
+    )
+}
+
 impl JournalEntry {
     /// Validates and constructs a balanced journal entry.
     ///
     /// # Errors
     ///
     /// Returns [`LedgerError`] when the entry is empty, contains zero or
-    /// duplicate legs, overflows during validation, or is not balanced by asset.
+    /// duplicate legs, or is not balanced by asset.
     pub fn new(
         transaction_id: TransactionId,
         reference: u64,
@@ -461,7 +509,12 @@ impl JournalEntry {
         )
     }
 
-    pub(crate) fn period_close(
+    /// Constructs an administrative period-close entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] if the control-entry shape cannot be established.
+    pub fn period_close(
         transaction_id: TransactionId,
         reference: u64,
         recorded_at: TimestampNs,
@@ -477,7 +530,12 @@ impl JournalEntry {
         )
     }
 
-    pub(crate) fn period_reopen(
+    /// Constructs an administrative period-reopen entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] if the control-entry shape cannot be established.
+    pub fn period_reopen(
         transaction_id: TransactionId,
         reference: u64,
         recorded_at: TimestampNs,
@@ -738,6 +796,52 @@ impl LedgerCorrection {
     }
 }
 
+impl LedgerBatch {
+    /// Constructs an ordered atomic group of two or more distinct entries.
+    ///
+    /// The declared order is retained exactly. Each member is already
+    /// canonical by construction; this boundary additionally proves unique
+    /// transaction identifiers and nondecreasing booking timestamps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] for insufficient cardinality, a repeated
+    /// transaction identifier, or a timestamp regression within the batch.
+    pub fn new(entries: Vec<JournalEntry>) -> Result<Self, LedgerError> {
+        if entries.len() < 2 {
+            return Err(LedgerError::BatchTooFewEntries);
+        }
+        let mut transaction_ids = BTreeSet::new();
+        for entry in &entries {
+            if !transaction_ids.insert(entry.transaction_id) {
+                return Err(LedgerError::BatchDuplicateTransaction(entry.transaction_id));
+            }
+        }
+        if let Some(pair) = entries
+            .windows(2)
+            .find(|pair| pair[1].recorded_at < pair[0].recorded_at)
+        {
+            return Err(LedgerError::RecordedTimestampRegression {
+                previous: pair[0].recorded_at,
+                proposed: pair[1].recorded_at,
+            });
+        }
+        Ok(Self { entries })
+    }
+
+    /// Returns entries in their authoritative application order.
+    #[must_use]
+    pub fn entries(&self) -> &[JournalEntry] {
+        &self.entries
+    }
+
+    /// Returns the first transaction identifier used as the event correlation key.
+    #[must_use]
+    pub fn primary_transaction_id(&self) -> TransactionId {
+        self.entries[0].transaction_id
+    }
+}
+
 /// Defines how an execution maps into base and quote ledger units.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SettlementConvention {
@@ -773,6 +877,17 @@ pub struct CorrectionReceipt {
     pub replacement_transaction_id: TransactionId,
 }
 
+/// Result of committing one indivisible multi-entry event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchReceipt {
+    /// Strictly increasing ledger-event sequence shared by every member.
+    pub sequence: u64,
+    /// True when this exact grouped event was already committed.
+    pub replayed: bool,
+    /// Number of transaction entries committed by the event.
+    pub transaction_count: usize,
+}
+
 /// Result of validating an entry against a specific ledger generation.
 #[derive(Debug)]
 pub enum PostingPreparation {
@@ -791,6 +906,15 @@ pub enum CorrectionPreparation {
     Ready(PreparedCorrection),
 }
 
+/// Result of validating a batch against a specific ledger generation.
+#[derive(Debug)]
+pub enum BatchPreparation {
+    /// The exact grouped event is already committed.
+    Replay(BatchReceipt),
+    /// The complete batch is valid and ready for one atomic commit.
+    Ready(PreparedBatch),
+}
+
 /// Validated balance changes for one ledger generation.
 #[derive(Debug)]
 pub struct PreparedPosting {
@@ -806,6 +930,17 @@ pub struct PreparedPosting {
 pub struct PreparedCorrection {
     correction: LedgerCorrection,
     next_balances: Vec<BalanceUpdate>,
+    expected_record_count: usize,
+    sequence: u64,
+}
+
+/// Validated final state for one atomic multi-entry event.
+#[derive(Debug)]
+pub struct PreparedBatch {
+    batch: LedgerBatch,
+    next_balances: Vec<BalanceUpdate>,
+    final_closed_through: Option<AccountingDate>,
+    new_reversals: Vec<(TransactionId, TransactionId)>,
     expected_record_count: usize,
     sequence: u64,
 }
@@ -833,23 +968,84 @@ impl PreparedCorrection {
     }
 }
 
+impl PreparedBatch {
+    /// Returns the immutable batch that must be durably recorded before commit.
+    #[must_use]
+    pub const fn batch(&self) -> &LedgerBatch {
+        &self.batch
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PostedEntry {
     entry: JournalEntry,
     sequence: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum LedgerRecordKey {
     Entry(TransactionId),
     Correction {
         reversal_transaction_id: TransactionId,
         replacement_transaction_id: TransactionId,
     },
+    Batch(Vec<TransactionId>),
+}
+
+impl LedgerRecordKey {
+    fn transaction_count(&self) -> usize {
+        match self {
+            Self::Entry(_) => 1,
+            Self::Correction { .. } => 2,
+            Self::Batch(transaction_ids) => transaction_ids.len(),
+        }
+    }
+
+    fn transaction_id_at(&self, index: usize) -> Option<TransactionId> {
+        match (self, index) {
+            (Self::Entry(transaction_id), 0) => Some(*transaction_id),
+            (
+                Self::Correction {
+                    reversal_transaction_id,
+                    ..
+                },
+                0,
+            ) => Some(*reversal_transaction_id),
+            (
+                Self::Correction {
+                    replacement_transaction_id,
+                    ..
+                },
+                1,
+            ) => Some(*replacement_transaction_id),
+            (Self::Batch(transaction_ids), index) => transaction_ids.get(index).copied(),
+            (Self::Entry(_) | Self::Correction { .. }, _) => None,
+        }
+    }
 }
 
 type BalanceKey = (AccountId, AssetId);
 type BalanceUpdate = (BalanceKey, i128);
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct AssetSideTotals {
+    positive: LedgerMagnitude,
+    negative: LedgerMagnitude,
+}
+
+impl AssetSideTotals {
+    fn add(&mut self, amount: i128) {
+        match amount.cmp(&0) {
+            std::cmp::Ordering::Greater => self.positive.add_u128(amount.unsigned_abs()),
+            std::cmp::Ordering::Less => self.negative.add_u128(amount.unsigned_abs()),
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+
+    fn is_balanced(&self) -> bool {
+        self.positive == self.negative
+    }
+}
 
 /// One canonical non-zero account balance captured in a ledger checkpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -888,35 +1084,35 @@ impl LedgerBalance {
 }
 
 /// Independently accumulated positive and negative balances for one asset.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssetTrialBalance {
     asset_id: AssetId,
-    positive_total: u128,
-    negative_total: u128,
+    positive_total: LedgerMagnitude,
+    negative_total: LedgerMagnitude,
 }
 
 impl AssetTrialBalance {
     /// Returns the asset denomination.
     #[must_use]
-    pub const fn asset_id(self) -> AssetId {
+    pub const fn asset_id(&self) -> AssetId {
         self.asset_id
     }
 
     /// Returns the sum of strictly positive account balances.
     #[must_use]
-    pub const fn positive_total(self) -> u128 {
-        self.positive_total
+    pub const fn positive_total(&self) -> &LedgerMagnitude {
+        &self.positive_total
     }
 
     /// Returns the absolute sum of strictly negative account balances.
     #[must_use]
-    pub const fn negative_total(self) -> u128 {
-        self.negative_total
+    pub const fn negative_total(&self) -> &LedgerMagnitude {
+        &self.negative_total
     }
 
     /// Returns whether independently accumulated sides are equal.
     #[must_use]
-    pub const fn is_balanced(self) -> bool {
+    pub fn is_balanced(&self) -> bool {
         self.positive_total == self.negative_total
     }
 }
@@ -951,8 +1147,8 @@ impl ReconciliationStatement {
     ///
     /// # Errors
     ///
-    /// Returns [`ReconciliationError`] for zero/duplicate balances, side-total
-    /// overflow, or an unbalanced asset.
+    /// Returns [`ReconciliationError`] for zero/duplicate balances or an
+    /// unbalanced asset.
     pub fn new(
         reconciliation_id: ReconciliationId,
         generation: u64,
@@ -1120,13 +1316,13 @@ pub enum ReconciliationError {
     Unbalanced {
         /// Unbalanced asset.
         asset_id: AssetId,
-        /// Sum of positive balances.
-        positive_total: u128,
-        /// Absolute sum of negative balances.
-        negative_total: u128,
+        /// Exact sum of positive balances.
+        positive_total: Box<LedgerMagnitude>,
+        /// Exact absolute sum of negative balances.
+        negative_total: Box<LedgerMagnitude>,
     },
-    /// Reconciliation arithmetic or cardinality exceeded its representation.
-    ArithmeticOverflow,
+    /// Reconciliation cardinality exceeded its representation.
+    CardinalityOverflow,
     /// The external statement did not represent the current ledger generation.
     GenerationMismatch {
         /// Current ledger generation.
@@ -1179,9 +1375,7 @@ impl fmt::Display for ReconciliationError {
                 formatter,
                 "reconciliation asset {asset_id} has positive total {positive_total} and negative total {negative_total}"
             ),
-            Self::ArithmeticOverflow => {
-                formatter.write_str("reconciliation arithmetic or cardinality overflow")
-            }
+            Self::CardinalityOverflow => formatter.write_str("reconciliation cardinality overflow"),
             Self::GenerationMismatch {
                 ledger_generation,
                 statement_generation,
@@ -1408,6 +1602,188 @@ impl Ledger {
             CorrectionPreparation::Replay(receipt) => Ok(receipt),
             CorrectionPreparation::Ready(prepared) => self.commit_correction(prepared),
         }
+    }
+
+    /// Applies two or more ordered entries as one indivisible ledger event.
+    ///
+    /// Lifecycle and lineage rules are evaluated in declared entry order.
+    /// Balance effects are aggregated directly into a final image, so neither
+    /// readers nor arithmetic observe a partial batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] for collision, partial prior commitment,
+    /// reversal-lineage, period, timestamp, sequence, or final-balance failure.
+    pub fn post_batch(&mut self, batch: LedgerBatch) -> Result<BatchReceipt, LedgerError> {
+        match self.prepare_batch(batch)? {
+            BatchPreparation::Replay(receipt) => Ok(receipt),
+            BatchPreparation::Ready(prepared) => self.commit_batch(prepared),
+        }
+    }
+
+    /// Validates a complete batch against the current ledger generation.
+    ///
+    /// Reversal targets and period controls introduced earlier in the same
+    /// batch are visible to later members. Later members are never visible to
+    /// earlier ones. No ledger state is mutated during preparation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] when exact replay cannot be established or any
+    /// ordered state transition or aggregate final balance is invalid.
+    pub fn prepare_batch(&self, batch: LedgerBatch) -> Result<BatchPreparation, LedgerError> {
+        if let Some(receipt) = self.existing_batch_receipt(&batch)? {
+            return Ok(BatchPreparation::Replay(receipt));
+        }
+        let mut previous_recorded_at = self.last_recorded_at;
+        let mut closed_through = self.closed_through;
+        let mut pending_entries: HashMap<TransactionId, &JournalEntry> =
+            HashMap::with_capacity(batch.entries.len());
+        let mut pending_reversals = HashMap::new();
+        let mut new_reversals = Vec::new();
+
+        for entry in &batch.entries {
+            if let Some(previous) = previous_recorded_at {
+                if entry.recorded_at < previous {
+                    return Err(LedgerError::RecordedTimestampRegression {
+                        previous,
+                        proposed: entry.recorded_at,
+                    });
+                }
+            }
+            validate_batch_lifecycle_entry(
+                entry,
+                &mut closed_through,
+                &self.entries,
+                &pending_entries,
+                &self.reversals,
+                &mut pending_reversals,
+                &mut new_reversals,
+            )?;
+            pending_entries.insert(entry.transaction_id, entry);
+            previous_recorded_at = Some(entry.recorded_at);
+        }
+
+        let next_balances = calculate_batch_balances(&self.balances, &batch.entries)?;
+        let sequence = u64::try_from(self.journal.len())
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or(LedgerError::ArithmeticOverflow)?;
+        Ok(BatchPreparation::Ready(PreparedBatch {
+            batch,
+            next_balances,
+            final_closed_through: closed_through,
+            new_reversals,
+            expected_record_count: self.journal.len(),
+            sequence,
+        }))
+    }
+
+    fn existing_batch_receipt(
+        &self,
+        batch: &LedgerBatch,
+    ) -> Result<Option<BatchReceipt>, LedgerError> {
+        let mut first_present = None;
+        let mut present_count = 0_usize;
+        let mut sequence = None;
+        for entry in &batch.entries {
+            let Some(existing) = self.entries.get(&entry.transaction_id) else {
+                continue;
+            };
+            if existing.entry != *entry {
+                return Err(LedgerError::TransactionIdCollision(entry.transaction_id));
+            }
+            first_present.get_or_insert(entry.transaction_id);
+            present_count = present_count
+                .checked_add(1)
+                .ok_or(LedgerError::ArithmeticOverflow)?;
+            sequence.get_or_insert(existing.sequence);
+        }
+        let Some(first_present) = first_present else {
+            return Ok(None);
+        };
+        if present_count != batch.entries.len() {
+            return Err(LedgerError::BatchAlreadyPartiallyCommitted(first_present));
+        }
+        let sequence =
+            sequence.ok_or(LedgerError::BatchAlreadyPartiallyCommitted(first_present))?;
+        if batch.entries.iter().any(|entry| {
+            self.entries
+                .get(&entry.transaction_id)
+                .is_none_or(|posted| posted.sequence != sequence)
+        }) {
+            return Err(LedgerError::BatchAlreadyPartiallyCommitted(first_present));
+        }
+        let record_index = sequence
+            .checked_sub(1)
+            .and_then(|value| usize::try_from(value).ok());
+        let exact_group = record_index
+            .and_then(|index| self.journal.get(index))
+            .is_some_and(|record| match record {
+                LedgerRecordKey::Batch(transaction_ids) => {
+                    transaction_ids.len() == batch.entries.len()
+                        && transaction_ids
+                            .iter()
+                            .zip(&batch.entries)
+                            .all(|(transaction_id, entry)| *transaction_id == entry.transaction_id)
+                }
+                LedgerRecordKey::Entry(_) | LedgerRecordKey::Correction { .. } => false,
+            });
+        if !exact_group {
+            return Err(LedgerError::BatchAlreadyPartiallyCommitted(first_present));
+        }
+        Ok(Some(BatchReceipt {
+            sequence,
+            replayed: true,
+            transaction_count: batch.entries.len(),
+        }))
+    }
+
+    /// Commits a prepared batch without another fallible business calculation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError::StalePreparation`] if another event committed
+    /// after preparation or any batch transaction is now present.
+    pub fn commit_batch(&mut self, prepared: PreparedBatch) -> Result<BatchReceipt, LedgerError> {
+        if self.journal.len() != prepared.expected_record_count
+            || prepared
+                .batch
+                .entries
+                .iter()
+                .any(|entry| self.entries.contains_key(&entry.transaction_id))
+        {
+            return Err(LedgerError::StalePreparation);
+        }
+        for (key, value) in prepared.next_balances {
+            self.balances.insert(key, value);
+        }
+        self.closed_through = prepared.final_closed_through;
+        for (original_transaction_id, reversal_transaction_id) in prepared.new_reversals {
+            self.reversals
+                .insert(original_transaction_id, reversal_transaction_id);
+        }
+        let transaction_count = prepared.batch.entries.len();
+        let last_recorded_at = prepared.batch.entries[transaction_count - 1].recorded_at;
+        let mut transaction_ids = Vec::with_capacity(transaction_count);
+        for entry in prepared.batch.entries {
+            let transaction_id = entry.transaction_id;
+            transaction_ids.push(transaction_id);
+            self.entries.insert(
+                transaction_id,
+                PostedEntry {
+                    entry,
+                    sequence: prepared.sequence,
+                },
+            );
+        }
+        self.journal.push(LedgerRecordKey::Batch(transaction_ids));
+        self.last_recorded_at = Some(last_recorded_at);
+        Ok(BatchReceipt {
+            sequence: prepared.sequence,
+            replayed: false,
+            transaction_count,
+        })
     }
 
     /// Validates an indivisible correction against the current ledger generation.
@@ -1899,17 +2275,7 @@ impl Ledger {
     /// Returns transaction identifiers in journal sequence order.
     pub fn transaction_ids(&self) -> impl Iterator<Item = TransactionId> + '_ {
         self.journal.iter().flat_map(|record| {
-            let values = match *record {
-                LedgerRecordKey::Entry(transaction_id) => [Some(transaction_id), None],
-                LedgerRecordKey::Correction {
-                    reversal_transaction_id,
-                    replacement_transaction_id,
-                } => [
-                    Some(reversal_transaction_id),
-                    Some(replacement_transaction_id),
-                ],
-            };
-            values.into_iter().flatten()
+            (0..record.transaction_count()).filter_map(move |index| record.transaction_id_at(index))
         })
     }
 
@@ -1921,25 +2287,36 @@ impl Ledger {
             .and_then(|value| usize::try_from(value).ok())?;
         self.journal
             .get(index)
-            .and_then(|record| self.materialize_record(*record))
+            .and_then(|record| self.materialize_record(record))
     }
 
-    fn materialize_record(&self, record: LedgerRecordKey) -> Option<LedgerRecord> {
+    fn materialize_record(&self, record: &LedgerRecordKey) -> Option<LedgerRecord> {
         match record {
             LedgerRecordKey::Entry(transaction_id) => self
                 .entries
-                .get(&transaction_id)
+                .get(transaction_id)
                 .map(|posted| LedgerRecord::Entry(posted.entry.clone())),
             LedgerRecordKey::Correction {
                 reversal_transaction_id,
                 replacement_transaction_id,
             } => {
-                let reversal = self.entries.get(&reversal_transaction_id)?.entry.clone();
-                let replacement = self.entries.get(&replacement_transaction_id)?.entry.clone();
+                let reversal = self.entries.get(reversal_transaction_id)?.entry.clone();
+                let replacement = self.entries.get(replacement_transaction_id)?.entry.clone();
                 Some(LedgerRecord::Correction(LedgerCorrection {
                     reversal,
                     replacement,
                 }))
+            }
+            LedgerRecordKey::Batch(transaction_ids) => {
+                let entries = transaction_ids
+                    .iter()
+                    .map(|transaction_id| {
+                        self.entries
+                            .get(transaction_id)
+                            .map(|posted| posted.entry.clone())
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(LedgerRecord::Batch(LedgerBatch { entries }))
             }
         }
     }
@@ -1984,7 +2361,7 @@ impl Ledger {
         statement: &ReconciliationStatement,
     ) -> Result<ReconciliationReport, ReconciliationError> {
         let ledger_generation = u64::try_from(self.journal.len())
-            .map_err(|_| ReconciliationError::ArithmeticOverflow)?;
+            .map_err(|_| ReconciliationError::CardinalityOverflow)?;
         if ledger_generation != statement.generation {
             return Err(ReconciliationError::GenerationMismatch {
                 ledger_generation,
@@ -2031,7 +2408,7 @@ impl Ledger {
             };
             compared_balances = compared_balances
                 .checked_add(1)
-                .ok_or(ReconciliationError::ArithmeticOverflow)?;
+                .ok_or(ReconciliationError::CardinalityOverflow)?;
             let difference = statement_amount.checked_sub(ledger_amount).ok_or(
                 ReconciliationError::DifferenceOverflow {
                     account_id: key.1,
@@ -2062,42 +2439,26 @@ impl Ledger {
 
     /// Independently accumulates positive and negative balances for every asset.
     ///
-    /// The result is in ascending asset-ID order. It is `O(A)` time and `O(D)`
-    /// memory for `A` non-zero account balances and `D` asset denominations.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LedgerError::ArithmeticOverflow`] if either unsigned side
-    /// cannot be accumulated in `u128`.
-    pub fn trial_balance(&self) -> Result<Vec<AssetTrialBalance>, LedgerError> {
-        let mut totals: BTreeMap<AssetId, (u128, u128)> = BTreeMap::new();
+    /// The result is in ascending asset-ID order. Totals have arbitrary exact
+    /// magnitude, with an allocation-free `u128` common case. It is amortized
+    /// `O(A log D)` time and `O(D + W)` memory for `A` non-zero balances, `D`
+    /// asset denominations, and `W` spilled magnitude limbs.
+    #[must_use]
+    pub fn trial_balance(&self) -> Vec<AssetTrialBalance> {
+        let mut totals: BTreeMap<AssetId, AssetSideTotals> = BTreeMap::new();
         for (&(_, asset_id), &amount) in &self.balances {
-            if amount == 0 {
-                continue;
-            }
-            let total = totals.entry(asset_id).or_default();
-            if amount > 0 {
-                total.0 = total
-                    .0
-                    .checked_add(amount.unsigned_abs())
-                    .ok_or(LedgerError::ArithmeticOverflow)?;
-            } else {
-                total.1 = total
-                    .1
-                    .checked_add(amount.unsigned_abs())
-                    .ok_or(LedgerError::ArithmeticOverflow)?;
+            if amount != 0 {
+                totals.entry(asset_id).or_default().add(amount);
             }
         }
-        Ok(totals
+        totals
             .into_iter()
-            .map(
-                |(asset_id, (positive_total, negative_total))| AssetTrialBalance {
-                    asset_id,
-                    positive_total,
-                    negative_total,
-                },
-            )
-            .collect())
+            .map(|(asset_id, totals)| AssetTrialBalance {
+                asset_id,
+                positive_total: totals.positive,
+                negative_total: totals.negative,
+            })
+            .collect()
     }
 
     /// Cross-audits journal order, idempotency entries, deterministic replay,
@@ -2111,10 +2472,7 @@ impl Ledger {
             .journal
             .iter()
             .try_fold(0_usize, |count, record| {
-                count.checked_add(match record {
-                    LedgerRecordKey::Entry(_) => 1,
-                    LedgerRecordKey::Correction { .. } => 2,
-                })
+                count.checked_add(record.transaction_count())
             })
             .ok_or_else(|| LedgerInvariantViolation::new("ledger entry cardinality overflow"))?;
         if self.entries.len() != expected_entry_count {
@@ -2123,22 +2481,14 @@ impl Ledger {
             ));
         }
         let mut records = Vec::with_capacity(self.journal.len());
-        for (index, record_key) in self.journal.iter().copied().enumerate() {
+        for (index, record_key) in self.journal.iter().enumerate() {
             let expected_sequence = u64::try_from(index)
                 .ok()
                 .and_then(|value| value.checked_add(1))
                 .ok_or_else(|| LedgerInvariantViolation::new("ledger sequence overflow"))?;
-            let transaction_ids = match record_key {
-                LedgerRecordKey::Entry(transaction_id) => [Some(transaction_id), None],
-                LedgerRecordKey::Correction {
-                    reversal_transaction_id,
-                    replacement_transaction_id,
-                } => [
-                    Some(reversal_transaction_id),
-                    Some(replacement_transaction_id),
-                ],
-            };
-            for transaction_id in transaction_ids.into_iter().flatten() {
+            for transaction_id in (0..record_key.transaction_count())
+                .filter_map(|position| record_key.transaction_id_at(position))
+            {
                 let posted = self.entries.get(&transaction_id).ok_or_else(|| {
                     LedgerInvariantViolation::new(format!(
                         "journal transaction {transaction_id} is absent from the entry index"
@@ -2186,9 +2536,7 @@ impl Ledger {
                 "stored booking timestamp differs from deterministic record replay",
             ));
         }
-        let trial = self
-            .trial_balance()
-            .map_err(|error| LedgerInvariantViolation::new(error.to_string()))?;
+        let trial = self.trial_balance();
         if let Some(unbalanced) = trial.into_iter().find(|value| !value.is_balanced()) {
             return Err(LedgerInvariantViolation::new(format!(
                 "asset {} trial balance is not zero",
@@ -2211,7 +2559,6 @@ impl Ledger {
         let records = self
             .journal
             .iter()
-            .copied()
             .enumerate()
             .map(|(index, record)| {
                 self.materialize_record(record).ok_or_else(|| {
@@ -2241,6 +2588,7 @@ impl Ledger {
             match record {
                 LedgerRecord::Entry(entry) => ledger.post(entry).map(|_| ()),
                 LedgerRecord::Correction(correction) => ledger.correct(correction).map(|_| ()),
+                LedgerRecord::Batch(batch) => ledger.post_batch(batch).map(|_| ()),
             }
             .map_err(|error| LedgerCheckpointError::RecordReplay { index, error })?;
         }
@@ -2273,6 +2621,9 @@ fn replay_records(records: &[LedgerRecord]) -> Result<Ledger, LedgerError> {
             LedgerRecord::Correction(correction) => {
                 ledger.correct(correction.clone())?;
             }
+            LedgerRecord::Batch(batch) => {
+                ledger.post_batch(batch.clone())?;
+            }
         }
     }
     Ok(ledger)
@@ -2303,6 +2654,9 @@ fn validate_checkpoint(
             LedgerRecord::Correction(correction) => replayed
                 .correct(correction.clone())
                 .map(|value| value.replayed),
+            LedgerRecord::Batch(batch) => replayed
+                .post_batch(batch.clone())
+                .map(|value| value.replayed),
         }
         .map_err(|error| LedgerCheckpointError::RecordReplay { index, error })?;
         if replayed_record {
@@ -2325,6 +2679,67 @@ fn postings_are_exact_inverse(candidate: &[Posting], original: &[Posting]) -> bo
                 && candidate.asset_id == original.asset_id
                 && original.amount.checked_neg() == Some(candidate.amount)
         })
+}
+
+#[derive(Default)]
+struct BalanceDeltaTerms {
+    positive: Vec<i128>,
+    negative: Vec<i128>,
+}
+
+fn calculate_batch_balances(
+    balances: &HashMap<BalanceKey, i128>,
+    entries: &[JournalEntry],
+) -> Result<Vec<BalanceUpdate>, LedgerError> {
+    let posting_count = entries.iter().try_fold(0_usize, |count, entry| {
+        count.checked_add(entry.postings.len())
+    });
+    let mut terms = HashMap::<BalanceKey, BalanceDeltaTerms>::with_capacity(
+        posting_count.ok_or(LedgerError::ArithmeticOverflow)?,
+    );
+    for posting in entries.iter().flat_map(|entry| &entry.postings) {
+        let values = terms
+            .entry((posting.account_id, posting.asset_id))
+            .or_default();
+        if posting.amount > 0 {
+            values.positive.push(posting.amount);
+        } else {
+            values.negative.push(posting.amount);
+        }
+    }
+
+    let mut next_balances = Vec::with_capacity(terms.len());
+    for (key, values) in terms {
+        let current = balances.get(&key).copied().unwrap_or(0);
+        let next = checked_add_signed_terms(current, &values.positive, &values.negative)
+            .ok_or(LedgerError::ArithmeticOverflow)?;
+        if next != current {
+            next_balances.push((key, next));
+        }
+    }
+    Ok(next_balances)
+}
+
+fn checked_add_signed_terms(mut value: i128, positive: &[i128], negative: &[i128]) -> Option<i128> {
+    let mut positive_index = 0;
+    let mut negative_index = 0;
+    while positive_index < positive.len() || negative_index < negative.len() {
+        let amount = if value >= 0 && negative_index < negative.len() {
+            let amount = negative[negative_index];
+            negative_index += 1;
+            amount
+        } else if positive_index < positive.len() {
+            let amount = positive[positive_index];
+            positive_index += 1;
+            amount
+        } else {
+            let amount = negative[negative_index];
+            negative_index += 1;
+            amount
+        };
+        value = value.checked_add(amount)?;
+    }
+    Some(value)
 }
 
 fn calculate_correction_balances(
@@ -2391,6 +2806,84 @@ fn checked_add_three(first: i128, second: i128, third: i128) -> Option<i128> {
         })
 }
 
+fn validate_batch_lifecycle_entry(
+    entry: &JournalEntry,
+    closed_through: &mut Option<AccountingDate>,
+    base_entries: &HashMap<TransactionId, PostedEntry>,
+    pending_entries: &HashMap<TransactionId, &JournalEntry>,
+    base_reversals: &HashMap<TransactionId, TransactionId>,
+    pending_reversals: &mut HashMap<TransactionId, TransactionId>,
+    new_reversals: &mut Vec<(TransactionId, TransactionId)>,
+) -> Result<(), LedgerError> {
+    match entry.kind {
+        LedgerEntryKind::Standard => validate_financial_entry(entry, *closed_through),
+        LedgerEntryKind::Reversal {
+            reversed_transaction_id,
+        } => {
+            validate_financial_entry(entry, *closed_through)?;
+            let original = pending_entries
+                .get(&reversed_transaction_id)
+                .copied()
+                .or_else(|| {
+                    base_entries
+                        .get(&reversed_transaction_id)
+                        .map(|posted| &posted.entry)
+                })
+                .ok_or(LedgerError::ReversalTargetMissing(reversed_transaction_id))?;
+            if matches!(
+                original.kind,
+                LedgerEntryKind::PeriodClose { .. } | LedgerEntryKind::PeriodReopen { .. }
+            ) {
+                return Err(LedgerError::NonFinancialReversalTarget(
+                    reversed_transaction_id,
+                ));
+            }
+            if let Some(&reversal_transaction_id) = pending_reversals
+                .get(&reversed_transaction_id)
+                .or_else(|| base_reversals.get(&reversed_transaction_id))
+            {
+                return Err(LedgerError::TransactionAlreadyReversed {
+                    original_transaction_id: reversed_transaction_id,
+                    reversal_transaction_id,
+                });
+            }
+            if !postings_are_exact_inverse(&entry.postings, &original.postings) {
+                return Err(LedgerError::InvalidReversalPostings(
+                    reversed_transaction_id,
+                ));
+            }
+            pending_reversals.insert(reversed_transaction_id, entry.transaction_id);
+            new_reversals.push((reversed_transaction_id, entry.transaction_id));
+            Ok(())
+        }
+        LedgerEntryKind::PeriodClose {
+            closed_through: proposed,
+        } => {
+            validate_control_entry(entry)?;
+            if closed_through.is_some_and(|current| proposed <= current) {
+                return Err(LedgerError::PeriodCloseNotAdvancing {
+                    current_closed_through: *closed_through,
+                    proposed_closed_through: proposed,
+                });
+            }
+            *closed_through = Some(proposed);
+            Ok(())
+        }
+        LedgerEntryKind::PeriodReopen { new_closed_through } => {
+            validate_control_entry(entry)?;
+            let current = closed_through.ok_or(LedgerError::AccountingPeriodAlreadyOpen)?;
+            if new_closed_through.is_some_and(|proposed| proposed >= current) {
+                return Err(LedgerError::InvalidPeriodReopen {
+                    current_closed_through: current,
+                    proposed_closed_through: new_closed_through,
+                });
+            }
+            *closed_through = new_closed_through;
+            Ok(())
+        }
+    }
+}
+
 fn validate_financial_entry(
     entry: &JournalEntry,
     closed_through: Option<AccountingDate>,
@@ -2439,29 +2932,18 @@ fn validate_reconciliation_balances(
             asset_id: pair[0].asset_id,
         });
     }
-    let mut totals: BTreeMap<AssetId, (u128, u128)> = BTreeMap::new();
+    let mut totals: BTreeMap<AssetId, AssetSideTotals> = BTreeMap::new();
     for balance in balances {
-        let total = totals.entry(balance.asset_id).or_default();
-        if balance.amount > 0 {
-            total.0 = total
-                .0
-                .checked_add(balance.amount.unsigned_abs())
-                .ok_or(ReconciliationError::ArithmeticOverflow)?;
-        } else {
-            total.1 = total
-                .1
-                .checked_add(balance.amount.unsigned_abs())
-                .ok_or(ReconciliationError::ArithmeticOverflow)?;
-        }
+        totals
+            .entry(balance.asset_id)
+            .or_default()
+            .add(balance.amount);
     }
-    if let Some((asset_id, (positive_total, negative_total))) = totals
-        .into_iter()
-        .find(|(_, (positive, negative))| positive != negative)
-    {
+    if let Some((asset_id, totals)) = totals.into_iter().find(|(_, totals)| !totals.is_balanced()) {
         return Err(ReconciliationError::Unbalanced {
             asset_id,
-            positive_total,
-            negative_total,
+            positive_total: Box::new(totals.positive),
+            negative_total: Box::new(totals.negative),
         });
     }
     Ok(())
@@ -2471,7 +2953,7 @@ fn validate_postings(postings: &[Posting]) -> Result<(), LedgerError> {
     if postings.len() < 2 {
         return Err(LedgerError::TooFewPostings);
     }
-    let mut sums: BTreeMap<AssetId, i128> = BTreeMap::new();
+    let mut totals: BTreeMap<AssetId, AssetSideTotals> = BTreeMap::new();
     let mut keys = BTreeSet::new();
     for posting in postings {
         if posting.amount == 0 {
@@ -2480,15 +2962,18 @@ fn validate_postings(postings: &[Posting]) -> Result<(), LedgerError> {
         if !keys.insert((posting.account_id, posting.asset_id)) {
             return Err(LedgerError::DuplicateAccountAsset);
         }
-        let current = sums.get(&posting.asset_id).copied().unwrap_or(0);
-        let sum = current
-            .checked_add(posting.amount)
-            .ok_or(LedgerError::ArithmeticOverflow)?;
-        sums.insert(posting.asset_id, sum);
+        totals
+            .entry(posting.asset_id)
+            .or_default()
+            .add(posting.amount);
     }
-    for (asset_id, residual) in sums {
-        if residual != 0 {
-            return Err(LedgerError::Unbalanced { asset_id, residual });
+    for (asset_id, totals) in totals {
+        if !totals.is_balanced() {
+            return Err(LedgerError::Unbalanced {
+                asset_id,
+                positive_total: Box::new(totals.positive),
+                negative_total: Box::new(totals.negative),
+            });
         }
     }
     Ok(())

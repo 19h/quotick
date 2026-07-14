@@ -15,8 +15,8 @@ use crate::instrument::{
     PriceRules, QuantityRules, ReserveOrderRules, TradingState,
 };
 use crate::ledger::{
-    JournalEntry, LedgerBalance, LedgerCheckpoint, LedgerCheckpointError, LedgerCorrection,
-    LedgerEntryKind, LedgerError, LedgerRecord, Posting,
+    JournalEntry, LedgerBalance, LedgerBatch, LedgerCheckpoint, LedgerCheckpointError,
+    LedgerCorrection, LedgerEntryKind, LedgerError, LedgerRecord, Posting,
 };
 use crate::market_data::{
     MarketDataError, MarketDataKind, MarketDataLevel, MarketDataSnapshot, MarketDataUpdate,
@@ -1664,6 +1664,34 @@ impl BinaryCodec for LedgerCorrection {
     }
 }
 
+impl BinaryCodec for LedgerBatch {
+    fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let mut encoder = Encoder::default();
+        encoder.length("ledger batch entries", self.entries().len())?;
+        for entry in self.entries() {
+            let bytes = entry.encode()?;
+            encoder.length("ledger batch entry payload", bytes.len())?;
+            encoder.bytes(&bytes);
+        }
+        Ok(encoder.finish())
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut decoder = Decoder::new(bytes);
+        // A period control is the smallest entry at 47 bytes; each member also
+        // carries a four-byte payload length.
+        let count = decoder.count("ledger batch entries", 51)?;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length = usize::try_from(decoder.u32()?)
+                .map_err(|_| CodecError::InvalidValue("ledger batch entry exceeds usize"))?;
+            entries.push(JournalEntry::decode(decoder.bytes(length)?)?);
+        }
+        decoder.finish()?;
+        LedgerBatch::new(entries).map_err(CodecError::InvalidJournalEntry)
+    }
+}
+
 impl BinaryCodec for LedgerRecord {
     fn encode(&self) -> Result<Vec<u8>, CodecError> {
         let mut encoder = Encoder::default();
@@ -1675,6 +1703,10 @@ impl BinaryCodec for LedgerRecord {
             Self::Correction(correction) => {
                 encoder.u8(1);
                 encoder.bytes(&correction.encode()?);
+            }
+            Self::Batch(batch) => {
+                encoder.u8(2);
+                encoder.bytes(&batch.encode()?);
             }
         }
         Ok(encoder.finish())
@@ -1688,6 +1720,7 @@ impl BinaryCodec for LedgerRecord {
         match tag {
             0 => JournalEntry::decode(payload).map(Self::Entry),
             1 => LedgerCorrection::decode(payload).map(Self::Correction),
+            2 => LedgerBatch::decode(payload).map(Self::Batch),
             tag => Err(CodecError::InvalidTag {
                 type_name: "ledger record",
                 tag: *tag,

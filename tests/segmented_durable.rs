@@ -14,7 +14,7 @@ use quotick::journal::{
     Durability, JournalLayout, JournalOptions, SegmentedJournal, SegmentedJournalOptions,
     SegmentedJournalReader,
 };
-use quotick::ledger::{JournalEntry, LedgerCorrection, Posting};
+use quotick::ledger::{JournalEntry, LedgerBatch, LedgerCorrection, Posting};
 use quotick::matching::{
     Command, NewOrder, OrderBook, OrderType, SelfTradePrevention, TimeInForce,
 };
@@ -276,6 +276,28 @@ fn ledger_correction_rotates_as_one_frame_and_recovers_as_one_event() {
     assert_eq!(recovered.ledger().entry_count(), 3);
     assert_eq!(recovered.ledger().balance(account(11), asset(1)), 70);
     assert!(recovered.correct(correction).expect("exact retry").replayed);
+    recovered.ledger().validate().expect("ledger validates");
+}
+
+#[test]
+fn ledger_batch_rotates_as_one_frame_and_recovers_as_one_event() {
+    let directory = TestDirectory::new("ledger-batch");
+    let batch = LedgerBatch::new(vec![entry(1, 100), entry(2, -30)]).expect("batch constructs");
+    let suffix = entry(3, 5);
+    let capacity = frame_length(&batch).max(frame_length(&suffix));
+    let options = options(capacity);
+    let mut ledger = DurableLedger::open_segmented(directory.path(), options).expect("opens");
+    ledger.post_batch(batch.clone()).expect("batch posts");
+    ledger.post(suffix).expect("suffix posts");
+    ledger.close().expect("closes");
+
+    let mut recovered = DurableLedger::open_segmented(directory.path(), options).expect("replays");
+    assert_eq!(recovered.recovery().journal.segment_count, 2);
+    assert_eq!(recovered.recovery().replayed_records, 2);
+    assert_eq!(recovered.ledger().record_count(), 2);
+    assert_eq!(recovered.ledger().entry_count(), 3);
+    assert_eq!(recovered.ledger().balance(account(11), asset(1)), 75);
+    assert!(recovered.post_batch(batch).expect("exact retry").replayed);
     recovered.ledger().validate().expect("ledger validates");
 }
 

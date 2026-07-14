@@ -17,6 +17,7 @@ mod durable_storage;
 pub mod instrument;
 pub mod journal;
 pub mod ledger;
+mod ledger_magnitude;
 pub mod market_data;
 pub mod matching;
 pub mod risk;

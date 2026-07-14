@@ -1,13 +1,16 @@
 //! A deterministic, single-instrument, price-time-priority matching engine.
 //!
 //! One [`OrderBook`] is intended to be owned by one execution shard.  It uses
-//! an order hash index and intrusive FIFO links inside ordered price levels.
-//! New resting orders and cancellations therefore avoid scans of an entire
-//! price level.  Price discovery is `O(log P)`, where `P` is the number of
-//! occupied price levels; a command consuming `E` displayed maker slices is
-//! `O((E + 1) log P)`. A reserve maker can contribute multiple slices.
+//! an order hash index, ordered per-account/per-side indexes, and intrusive FIFO
+//! links inside ordered price levels. New resting orders and cancellations avoid
+//! scans of an entire price level or book. A redundant complete best-level cache
+//! makes market-extremum discovery `O(1)`; ordered level insertion, deletion,
+//! and next-worse traversal remain `O(log P)`, where `P` is the number of
+//! occupied price levels. A command consuming `E` displayed maker slices is
+//! `O((E + 1) log P)`. A reserve maker can contribute multiple slices. Account
+//! mass-cancel selection is `O(K)` for `K` selected orders.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use crate::domain::{
@@ -947,6 +950,156 @@ struct PriceLevel {
     order_count: u64,
 }
 
+/// Ordered occupied prices for one side with a mutation-maintained market
+/// extremum.
+///
+/// The ordered map remains the authoritative enumeration/index structure. The
+/// cached best price is redundant derived state, updated only by `insert` and
+/// `remove` and independently checked by `validate_extremum`. Read-only best
+/// price discovery therefore does not traverse the tree.
+#[derive(Debug, Eq, PartialEq)]
+struct PriceLevels {
+    side: Side,
+    by_price: BTreeMap<Price, PriceLevel>,
+    best: Option<(Price, PriceLevel)>,
+}
+
+impl PriceLevels {
+    fn new(side: Side) -> Self {
+        Self {
+            side,
+            by_price: BTreeMap::new(),
+            best: None,
+        }
+    }
+
+    fn get(&self, price: Price) -> Option<&PriceLevel> {
+        self.by_price.get(&price)
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = (&Price, &PriceLevel)> {
+        self.by_price.iter()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &PriceLevel> {
+        self.by_price.values()
+    }
+
+    fn best_price(&self) -> Option<Price> {
+        self.best.map(|(price, _)| price)
+    }
+
+    fn best_level(&self) -> Option<(Price, PriceLevel)> {
+        self.best
+    }
+
+    fn insert(&mut self, price: Price, level: PriceLevel) -> Option<PriceLevel> {
+        let replaced = self.by_price.insert(price, level);
+        if self
+            .best
+            .is_none_or(|(current, _)| current == price || self.is_better(price, current))
+        {
+            self.best = Some((price, level));
+        }
+        replaced
+    }
+
+    fn update<R>(&mut self, price: Price, update: impl FnOnce(&mut PriceLevel) -> R) -> Option<R> {
+        let (result, snapshot) = {
+            let level = self.by_price.get_mut(&price)?;
+            let result = update(level);
+            (result, *level)
+        };
+        if self.best.is_some_and(|(best_price, _)| best_price == price) {
+            self.best = Some((price, snapshot));
+        }
+        Some(result)
+    }
+
+    fn remove(&mut self, price: Price) -> Option<PriceLevel> {
+        let removed = self.by_price.remove(&price);
+        if removed.is_some() && self.best.is_some_and(|(best_price, _)| best_price == price) {
+            self.best = self.map_extremum();
+        }
+        removed
+    }
+
+    fn next_worse(&self, current: Price) -> Option<Price> {
+        match self.side {
+            Side::Buy => self
+                .by_price
+                .range(..current)
+                .next_back()
+                .map(|(&price, _)| price),
+            Side::Sell => self
+                .by_price
+                .range((
+                    std::ops::Bound::Excluded(current),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+                .map(|(&price, _)| price),
+        }
+    }
+
+    fn validate_extremum(&self) -> Result<(), InvariantViolation> {
+        let actual = self.map_extremum();
+        if self.best != actual {
+            return Err(InvariantViolation::new(format!(
+                "{:?} cached best level {:?} differs from ordered-map extremum {:?}",
+                self.side, self.best, actual
+            )));
+        }
+        Ok(())
+    }
+
+    fn is_better(&self, candidate: Price, current: Price) -> bool {
+        match self.side {
+            Side::Buy => candidate > current,
+            Side::Sell => candidate < current,
+        }
+    }
+
+    fn map_extremum(&self) -> Option<(Price, PriceLevel)> {
+        match self.side {
+            Side::Buy => self
+                .by_price
+                .last_key_value()
+                .map(|(&price, &level)| (price, level)),
+            Side::Sell => self
+                .by_price
+                .first_key_value()
+                .map(|(&price, &level)| (price, level)),
+        }
+    }
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct AccountOrderIndex {
+    buys: BTreeSet<OrderId>,
+    sells: BTreeSet<OrderId>,
+}
+
+impl AccountOrderIndex {
+    fn orders(&self, side: Side) -> &BTreeSet<OrderId> {
+        match side {
+            Side::Buy => &self.buys,
+            Side::Sell => &self.sells,
+        }
+    }
+
+    fn orders_mut(&mut self, side: Side) -> &mut BTreeSet<OrderId> {
+        match side {
+            Side::Buy => &mut self.buys,
+            Side::Sell => &mut self.sells,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buys.is_empty() && self.sells.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CachedReport {
     command: Command,
@@ -976,9 +1129,10 @@ struct ReserveRefresh {
 #[derive(Debug, Eq, PartialEq)]
 pub struct OrderBook {
     definition: InstrumentDefinition,
-    bids: BTreeMap<Price, PriceLevel>,
-    asks: BTreeMap<Price, PriceLevel>,
+    bids: PriceLevels,
+    asks: PriceLevels,
     orders: HashMap<OrderId, RestingOrder>,
+    account_orders: HashMap<AccountId, AccountOrderIndex>,
     seen_order_ids: HashSet<OrderId>,
     reports: HashMap<CommandId, CachedReport>,
     next_sequence: u64,
@@ -991,9 +1145,10 @@ impl OrderBook {
     pub fn new(definition: InstrumentDefinition) -> Self {
         Self {
             definition,
-            bids: BTreeMap::new(),
-            asks: BTreeMap::new(),
+            bids: PriceLevels::new(Side::Buy),
+            asks: PriceLevels::new(Side::Sell),
             orders: HashMap::new(),
+            account_orders: HashMap::new(),
             seen_order_ids: HashSet::new(),
             reports: HashMap::new(),
             next_sequence: 1,
@@ -1365,16 +1520,16 @@ impl OrderBook {
     #[must_use]
     pub fn best_bid(&self) -> Option<LevelSnapshot> {
         self.bids
-            .last_key_value()
-            .map(|(&price, level)| Self::level_snapshot(price, level))
+            .best_level()
+            .map(|(price, level)| Self::level_snapshot(price, &level))
     }
 
     /// Returns the current best ask.
     #[must_use]
     pub fn best_ask(&self) -> Option<LevelSnapshot> {
         self.asks
-            .first_key_value()
-            .map(|(&price, level)| Self::level_snapshot(price, level))
+            .best_level()
+            .map(|(price, level)| Self::level_snapshot(price, &level))
     }
 
     /// Returns up to `limit` levels in market-priority order.
@@ -1401,7 +1556,7 @@ impl OrderBook {
     #[must_use]
     pub fn level(&self, side: Side, price: Price) -> Option<LevelSnapshot> {
         self.levels(side)
-            .get(&price)
+            .get(price)
             .map(|level| Self::level_snapshot(price, level))
     }
 
@@ -1486,6 +1641,42 @@ impl OrderBook {
         self.orders.len()
     }
 
+    /// Returns the active-order count for one account and optional side.
+    ///
+    /// This performs one expected `O(1)` account lookup and no book scan.
+    #[must_use]
+    pub fn account_active_order_count(
+        &self,
+        account_id: AccountId,
+        scope: MassCancelScope,
+    ) -> usize {
+        let Some(index) = self.account_orders.get(&account_id) else {
+            return 0;
+        };
+        match scope {
+            MassCancelScope::All => index.buys.len().saturating_add(index.sells.len()),
+            MassCancelScope::Side(side) => index.orders(side).len(),
+        }
+    }
+
+    /// Returns one account's selected active order IDs in canonical ascending order.
+    ///
+    /// This allocates `O(K)` output and traverses only the `K` selected orders.
+    #[must_use]
+    pub fn account_active_order_ids(
+        &self,
+        account_id: AccountId,
+        scope: MassCancelScope,
+    ) -> Vec<OrderId> {
+        let Some(index) = self.account_orders.get(&account_id) else {
+            return Vec::new();
+        };
+        match scope {
+            MassCancelScope::All => index.buys.union(&index.sells).copied().collect(),
+            MassCancelScope::Side(side) => index.orders(side).iter().copied().collect(),
+        }
+    }
+
     /// Audits all index, FIFO-link, aggregate, and spread invariants.
     ///
     /// This is `O(O + P)` and allocates `O(O)` temporary memory, so it is
@@ -1497,6 +1688,8 @@ impl OrderBook {
     /// Returns [`InvariantViolation`] at the first detected corruption.
     pub fn validate(&self) -> Result<(), InvariantViolation> {
         let mut visited = HashSet::with_capacity(self.orders.len());
+        self.bids.validate_extremum()?;
+        self.asks.validate_extremum()?;
         self.validate_side(Side::Buy, &mut visited)?;
         self.validate_side(Side::Sell, &mut visited)?;
         if visited.len() != self.orders.len() {
@@ -1514,6 +1707,7 @@ impl OrderBook {
                 "an active order is absent from the accepted-order index",
             ));
         }
+        self.validate_account_order_index()?;
         if let (Some(bid), Some(ask)) = (self.best_price(Side::Buy), self.best_price(Side::Sell)) {
             if bid >= ask {
                 return Err(InvariantViolation::new(format!(
@@ -1522,6 +1716,43 @@ impl OrderBook {
                     ask.raw()
                 )));
             }
+        }
+        Ok(())
+    }
+
+    fn validate_account_order_index(&self) -> Result<(), InvariantViolation> {
+        let mut indexed = HashSet::with_capacity(self.orders.len());
+        for (&account_id, index) in &self.account_orders {
+            if index.is_empty() {
+                return Err(InvariantViolation::new(format!(
+                    "account {account_id} has an empty active-order index"
+                )));
+            }
+            for side in [Side::Buy, Side::Sell] {
+                for &order_id in index.orders(side) {
+                    if !indexed.insert(order_id) {
+                        return Err(InvariantViolation::new(format!(
+                            "order {order_id} occurs more than once in account indexes"
+                        )));
+                    }
+                    let order = self.orders.get(&order_id).ok_or_else(|| {
+                        InvariantViolation::new(format!(
+                            "account index references missing order {order_id}"
+                        ))
+                    })?;
+                    if order.account_id != account_id || order.side != side {
+                        return Err(InvariantViolation::new(format!(
+                            "order {order_id} is indexed under the wrong account or side"
+                        )));
+                    }
+                }
+            }
+        }
+        if indexed.len() != self.orders.len() {
+            return Err(InvariantViolation::new(format!(
+                "{} active orders are absent from account indexes",
+                self.orders.len() - indexed.len()
+            )));
         }
         Ok(())
     }
@@ -1539,7 +1770,7 @@ impl OrderBook {
         side: Side,
         visited: &mut HashSet<OrderId>,
     ) -> Result<(), InvariantViolation> {
-        for (&price, level) in self.levels(side) {
+        for (&price, level) in self.levels(side).iter() {
             if level.order_count == 0 || level.total_quantity == 0 {
                 return Err(InvariantViolation::new(format!(
                     "empty {side:?} level at price {}",
@@ -1670,22 +1901,14 @@ impl OrderBook {
     }
 
     fn apply_mass_cancel(&mut self, command: MassCancel) -> Result<ExecutionReport, MatchingError> {
-        let mut selected: Vec<OrderId> = self
-            .orders
-            .values()
-            .filter(|order| {
-                order.account_id == command.account_id && command.scope.includes(order.side)
-            })
-            .map(|order| order.order_id)
-            .collect();
-        selected.sort_unstable();
+        let selected = self.take_account_orders(command.account_id, command.scope);
 
         let cancelled_order_count =
             u64::try_from(selected.len()).map_err(|_| MatchingError::SequenceExhausted)?;
         let mut cancelled_quantity_lots = 0_u128;
         let mut events = Vec::with_capacity(selected.len().saturating_add(1));
         for order_id in selected {
-            let removed = self.remove_order(order_id);
+            let removed = self.remove_order_preserving_account_index(order_id);
             cancelled_quantity_lots = cancelled_quantity_lots
                 .checked_add(u128::from(removed.leaves))
                 .expect("u64-sized active-order set cannot overflow u128 total quantity");
@@ -1748,11 +1971,11 @@ impl OrderBook {
         if priority_retained {
             let new_displayed = old.displayed.min(new_quantity);
             let displayed_reduction = old.displayed - new_displayed;
-            let level = self
-                .levels_mut(old.side)
-                .get_mut(&old.price)
+            self.levels_mut(old.side)
+                .update(old.price, |level| {
+                    level.total_quantity -= u128::from(displayed_reduction);
+                })
                 .expect("resting order must reference an existing level");
-            level.total_quantity -= u128::from(displayed_reduction);
             let order = self
                 .orders
                 .get_mut(&command.order_id)
@@ -2104,18 +2327,13 @@ impl OrderBook {
 
     fn best_opposite_order(&self, side: Side, order_type: OrderType) -> Option<OrderId> {
         let opposite = side.opposite();
-        let price = self.best_price(opposite)?;
+        let (price, level) = self.levels(opposite).best_level()?;
         let crosses = match (side, order_type) {
             (_, OrderType::Market) => true,
             (Side::Buy, OrderType::Limit(limit)) => limit >= price,
             (Side::Sell, OrderType::Limit(limit)) => limit <= price,
         };
-        crosses.then(|| {
-            self.levels(opposite)
-                .get(&price)
-                .expect("best price must have a level")
-                .head
-        })
+        crosses.then_some(level.head)
     }
 
     fn can_fill(&self, incoming: &NewOrder) -> bool {
@@ -2132,7 +2350,7 @@ impl OrderBook {
             }
             let level = self
                 .levels(incoming.side.opposite())
-                .get(&current_price)
+                .get(current_price)
                 .expect("enumerated price must have a level");
             let mut queue = VecDeque::new();
             let mut order_id = Some(level.head);
@@ -2174,48 +2392,66 @@ impl OrderBook {
     }
 
     fn next_worse_price(&self, side: Side, current: Price) -> Option<Price> {
-        match side {
-            Side::Buy => self
-                .bids
-                .range(..current)
-                .next_back()
-                .map(|(&price, _)| price),
-            Side::Sell => self
-                .asks
-                .range((
-                    std::ops::Bound::Excluded(current),
-                    std::ops::Bound::Unbounded,
-                ))
-                .next()
-                .map(|(&price, _)| price),
-        }
+        self.levels(side).next_worse(current)
     }
 
     fn best_price(&self, side: Side) -> Option<Price> {
-        match side {
-            Side::Buy => self.bids.last_key_value().map(|(&price, _)| price),
-            Side::Sell => self.asks.first_key_value().map(|(&price, _)| price),
-        }
+        self.levels(side).best_price()
     }
 
-    fn levels(&self, side: Side) -> &BTreeMap<Price, PriceLevel> {
+    fn levels(&self, side: Side) -> &PriceLevels {
         match side {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
         }
     }
 
-    fn levels_mut(&mut self, side: Side) -> &mut BTreeMap<Price, PriceLevel> {
+    fn take_account_orders(
+        &mut self,
+        account_id: AccountId,
+        scope: MassCancelScope,
+    ) -> Vec<OrderId> {
+        match scope {
+            MassCancelScope::All => self
+                .account_orders
+                .remove(&account_id)
+                .map_or_else(Vec::new, |index| merge_order_ids(index.buys, index.sells)),
+            MassCancelScope::Side(side) => {
+                let Some(index) = self.account_orders.get_mut(&account_id) else {
+                    return Vec::new();
+                };
+                let selected = std::mem::take(index.orders_mut(side));
+                let remove_account = index.is_empty();
+                if remove_account {
+                    self.account_orders.remove(&account_id);
+                }
+                selected.into_iter().collect()
+            }
+        }
+    }
+
+    fn levels_mut(&mut self, side: Side) -> &mut PriceLevels {
         match side {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
         }
     }
 
-    fn append_order(&mut self, mut order: RestingOrder) {
+    fn append_order(&mut self, order: RestingOrder) {
+        let inserted = self
+            .account_orders
+            .entry(order.account_id)
+            .or_default()
+            .orders_mut(order.side)
+            .insert(order.order_id);
+        assert!(inserted, "active order must be absent from account index");
+        self.append_order_preserving_account_index(order);
+    }
+
+    fn append_order_preserving_account_index(&mut self, mut order: RestingOrder) {
         let existing_tail = self
             .levels(order.side)
-            .get(&order.price)
+            .get(order.price)
             .map(|level| level.tail);
         order.previous = existing_tail;
 
@@ -2224,13 +2460,13 @@ impl OrderBook {
                 .get_mut(&tail)
                 .expect("price-level tail must exist")
                 .next = Some(order.order_id);
-            let level = self
-                .levels_mut(order.side)
-                .get_mut(&order.price)
+            self.levels_mut(order.side)
+                .update(order.price, |level| {
+                    level.tail = order.order_id;
+                    level.total_quantity += u128::from(order.displayed);
+                    level.order_count += 1;
+                })
                 .expect("tail implies existing price level");
-            level.tail = order.order_id;
-            level.total_quantity += u128::from(order.displayed);
-            level.order_count += 1;
         } else {
             self.levels_mut(order.side).insert(
                 order.price,
@@ -2242,7 +2478,10 @@ impl OrderBook {
                 },
             );
         }
-        self.orders.insert(order.order_id, order);
+        assert!(
+            self.orders.insert(order.order_id, order).is_none(),
+            "active order identifier must be unique"
+        );
     }
 
     fn decrement_resting(&mut self, order_id: OrderId, quantity: u64) -> Option<ReserveRefresh> {
@@ -2262,12 +2501,13 @@ impl OrderBook {
             updated.leaves -= quantity;
             updated.displayed -= quantity;
             self.levels_mut(order.side)
-                .get_mut(&order.price)
-                .expect("resting order must reference a level")
-                .total_quantity -= u128::from(quantity);
+                .update(order.price, |level| {
+                    level.total_quantity -= u128::from(quantity);
+                })
+                .expect("resting order must reference a level");
             None
         } else {
-            let mut refreshed = self.remove_order(order_id);
+            let mut refreshed = self.remove_order_preserving_account_index(order_id);
             refreshed.leaves -= quantity;
             refreshed.displayed = refreshed.display.displayed_lots(refreshed.leaves);
             refreshed.previous = None;
@@ -2278,12 +2518,28 @@ impl OrderBook {
                 displayed: refreshed.displayed,
                 leaves: refreshed.leaves,
             };
-            self.append_order(refreshed);
+            self.append_order_preserving_account_index(refreshed);
             Some(result)
         }
     }
 
     fn remove_order(&mut self, order_id: OrderId) -> RestingOrder {
+        let order = self.remove_order_preserving_account_index(order_id);
+        let index = self
+            .account_orders
+            .get_mut(&order.account_id)
+            .expect("active order account index must exist");
+        assert!(
+            index.orders_mut(order.side).remove(&order_id),
+            "active order must exist in its account index"
+        );
+        if index.is_empty() {
+            self.account_orders.remove(&order.account_id);
+        }
+        order
+    }
+
+    fn remove_order_preserving_account_index(&mut self, order_id: OrderId) -> RestingOrder {
         let order = self
             .orders
             .remove(&order_id)
@@ -2301,25 +2557,120 @@ impl OrderBook {
                 .previous = order.previous;
         }
 
-        let level = self
+        let level_is_empty = self
             .levels_mut(order.side)
-            .get_mut(&order.price)
+            .update(order.price, |level| {
+                level.total_quantity -= u128::from(order.displayed);
+                level.order_count -= 1;
+                if order.previous.is_none() {
+                    if let Some(next) = order.next {
+                        level.head = next;
+                    }
+                }
+                if order.next.is_none() {
+                    if let Some(previous) = order.previous {
+                        level.tail = previous;
+                    }
+                }
+                level.order_count == 0
+            })
             .expect("resting order must reference a level");
-        level.total_quantity -= u128::from(order.displayed);
-        level.order_count -= 1;
-        if order.previous.is_none() {
-            if let Some(next) = order.next {
-                level.head = next;
-            }
-        }
-        if order.next.is_none() {
-            if let Some(previous) = order.previous {
-                level.tail = previous;
-            }
-        }
-        if level.order_count == 0 {
-            self.levels_mut(order.side).remove(&order.price);
+        if level_is_empty {
+            self.levels_mut(order.side).remove(order.price);
         }
         order
+    }
+}
+
+fn merge_order_ids(buys: BTreeSet<OrderId>, sells: BTreeSet<OrderId>) -> Vec<OrderId> {
+    let capacity = buys
+        .len()
+        .checked_add(sells.len())
+        .expect("disjoint active-order subsets cannot exceed total address space");
+    let mut merged = Vec::with_capacity(capacity);
+    let mut buys = buys.into_iter().peekable();
+    let mut sells = sells.into_iter().peekable();
+    while let (Some(buy), Some(sell)) = (buys.peek(), sells.peek()) {
+        if buy < sell {
+            merged.push(buys.next().expect("peeked buy exists"));
+        } else {
+            assert_ne!(buy, sell, "active order cannot be indexed on both sides");
+            merged.push(sells.next().expect("peeked sell exists"));
+        }
+    }
+    merged.extend(buys);
+    merged.extend(sells);
+    merged
+}
+
+#[cfg(test)]
+mod price_level_index_tests {
+    use super::{InvariantViolation, PriceLevel, PriceLevels};
+    use crate::{OrderId, Price, Side};
+
+    fn level(order_id: u64) -> PriceLevel {
+        let order_id = OrderId::new(order_id).expect("non-zero test order identifier");
+        PriceLevel {
+            head: order_id,
+            tail: order_id,
+            total_quantity: u128::from(order_id.get()),
+            order_count: 1,
+        }
+    }
+
+    #[test]
+    fn cached_extremum_tracks_both_market_directions_and_non_best_removal() {
+        for (side, expected) in [(Side::Buy, 110), (Side::Sell, 90)] {
+            let mut levels = PriceLevels::new(side);
+            assert_eq!(levels.best_price(), None);
+
+            assert!(levels.insert(Price::from_raw(100), level(1)).is_none());
+            assert!(levels.insert(Price::from_raw(90), level(2)).is_none());
+            assert!(levels.insert(Price::from_raw(110), level(3)).is_none());
+            assert_eq!(levels.best_price(), Some(Price::from_raw(expected)));
+            levels.validate_extremum().unwrap();
+
+            assert!(levels.remove(Price::from_raw(100)).is_some());
+            assert_eq!(levels.best_price(), Some(Price::from_raw(expected)));
+            levels.validate_extremum().unwrap();
+        }
+    }
+
+    #[test]
+    fn deleting_best_recomputes_until_the_side_is_empty() {
+        for (side, ordered_prices) in [(Side::Buy, [110, 100, 90]), (Side::Sell, [90, 100, 110])] {
+            let mut levels = PriceLevels::new(side);
+            for (index, price) in [100, 90, 110].into_iter().enumerate() {
+                assert!(
+                    levels
+                        .insert(Price::from_raw(price), level(index as u64 + 1))
+                        .is_none()
+                );
+            }
+            for price in ordered_prices {
+                assert_eq!(levels.best_price(), Some(Price::from_raw(price)));
+                assert!(levels.remove(Price::from_raw(price)).is_some());
+                levels.validate_extremum().unwrap();
+            }
+            assert_eq!(levels.best_price(), None);
+        }
+    }
+
+    #[test]
+    fn invariant_validation_rejects_missing_stale_and_non_extreme_caches() {
+        let mut levels = PriceLevels::new(Side::Buy);
+        levels.insert(Price::from_raw(100), level(1));
+        levels.insert(Price::from_raw(110), level(2));
+
+        for corrupted in [
+            None,
+            Some((Price::from_raw(100), level(1))),
+            Some((Price::from_raw(120), level(3))),
+            Some((Price::from_raw(110), level(4))),
+        ] {
+            levels.best = corrupted;
+            let error: InvariantViolation = levels.validate_extremum().unwrap_err();
+            assert!(error.detail().contains("cached best"));
+        }
     }
 }

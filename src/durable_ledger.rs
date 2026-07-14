@@ -11,9 +11,9 @@ use crate::journal::{
     SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
 };
 use crate::ledger::{
-    CorrectionPreparation, CorrectionReceipt, JournalEntry, Ledger, LedgerCheckpoint,
-    LedgerCheckpointError, LedgerCorrection, LedgerError, LedgerInvariantViolation, LedgerRecord,
-    PostReceipt, PostingPreparation, SettlementConvention,
+    BatchPreparation, BatchReceipt, CorrectionPreparation, CorrectionReceipt, JournalEntry, Ledger,
+    LedgerBatch, LedgerCheckpoint, LedgerCheckpointError, LedgerCorrection, LedgerError,
+    LedgerInvariantViolation, LedgerRecord, PostReceipt, PostingPreparation, SettlementConvention,
 };
 use crate::matching::Trade;
 use crate::snapshot::{SnapshotError, SnapshotFile, SnapshotOptions, SnapshotReceipt};
@@ -293,6 +293,7 @@ impl DurableLedger {
             let record = match frame.kind() {
                 RecordKind::LedgerEntry => LedgerRecord::Entry(frame.decode()?),
                 RecordKind::LedgerCorrection => LedgerRecord::Correction(frame.decode()?),
+                RecordKind::LedgerBatch => LedgerRecord::Batch(frame.decode()?),
                 kind => {
                     return Err(DurableLedgerError::UnexpectedRecord {
                         sequence: frame.sequence(),
@@ -317,6 +318,7 @@ impl DurableLedger {
             let replayed = match record {
                 LedgerRecord::Entry(entry) => ledger.post(entry)?.replayed,
                 LedgerRecord::Correction(correction) => ledger.correct(correction)?.replayed,
+                LedgerRecord::Batch(batch) => ledger.post_batch(batch)?.replayed,
             };
             if replayed {
                 return Err(DurableLedgerError::DuplicateTransactionRecord {
@@ -417,6 +419,36 @@ impl DurableLedger {
             return Err(error.into());
         }
         match self.ledger.commit_correction(prepared) {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => {
+                self.poisoned = true;
+                Err(DurableLedgerError::Ledger(error))
+            }
+        }
+    }
+
+    /// Durably records and commits an ordered multi-entry event in one WAL frame.
+    ///
+    /// Exact retries return the original receipt without appending a frame. A
+    /// torn final frame contributes no batch member during repair recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableLedgerError`] for batch preparation, WAL, or commit
+    /// failure. Ambiguous I/O or a post-append commit failure poisons the runtime.
+    pub fn post_batch(&mut self, batch: LedgerBatch) -> Result<BatchReceipt, DurableLedgerError> {
+        if self.poisoned {
+            return Err(DurableLedgerError::Poisoned);
+        }
+        let prepared = match self.ledger.prepare_batch(batch)? {
+            BatchPreparation::Replay(receipt) => return Ok(receipt),
+            BatchPreparation::Ready(prepared) => prepared,
+        };
+        if let Err(error) = self.journal.append(prepared.batch()) {
+            self.poisoned = self.journal.is_poisoned();
+            return Err(error.into());
+        }
+        match self.ledger.commit_batch(prepared) {
             Ok(receipt) => Ok(receipt),
             Err(error) => {
                 self.poisoned = true;

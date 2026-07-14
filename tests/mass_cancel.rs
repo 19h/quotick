@@ -13,7 +13,7 @@ use quotick::journal::{Durability, JournalOptions};
 use quotick::market_data::{MarketDataError, MarketDataPublisher, MarketDataReplica};
 use quotick::matching::{
     CancelReason, Command, CommandOutcome, EventKind, MassCancel, MassCancelScope, NewOrder,
-    OrderBook, OrderDisplay, OrderType, SelfTradePrevention, TimeInForce,
+    OrderBook, OrderDisplay, OrderType, ReplaceOrder, SelfTradePrevention, TimeInForce,
 };
 use quotick::risk::{
     AccountRiskDefinition, AccountRiskState, RiskLimitSpec, RiskLimits, RiskManagedOrderBook,
@@ -137,6 +137,158 @@ fn side_scoped_mass_cancel_is_canonical_total_leaves_aware_and_idempotent() {
     assert!(retry.replayed);
     assert_eq!(retry.events, report.events);
     assert_eq!(book.active_order_count(), 2);
+    book.validate().unwrap();
+}
+
+#[test]
+fn sparse_account_selection_is_canonical_and_independent_of_total_book_cardinality() {
+    let mut book = OrderBook::new(definition(TradingState::Open));
+    for value in 1..=512 {
+        book.submit(order(
+            value,
+            value,
+            1_000 + value,
+            Side::Buy,
+            1,
+            OrderDisplay::FullyDisplayed,
+            80,
+        ))
+        .unwrap();
+    }
+    for command in [
+        order(
+            513,
+            30_000,
+            11,
+            Side::Buy,
+            3,
+            OrderDisplay::FullyDisplayed,
+            90,
+        ),
+        order(
+            514,
+            10_000,
+            11,
+            Side::Sell,
+            5,
+            OrderDisplay::FullyDisplayed,
+            110,
+        ),
+        order(
+            515,
+            20_000,
+            11,
+            Side::Buy,
+            7,
+            OrderDisplay::FullyDisplayed,
+            85,
+        ),
+    ] {
+        book.submit(command).unwrap();
+    }
+
+    assert_eq!(
+        book.account_active_order_ids(AccountId::new(11).unwrap(), MassCancelScope::All),
+        vec![
+            OrderId::new(10_000).unwrap(),
+            OrderId::new(20_000).unwrap(),
+            OrderId::new(30_000).unwrap(),
+        ]
+    );
+    assert_eq!(
+        book.account_active_order_ids(
+            AccountId::new(11).unwrap(),
+            MassCancelScope::Side(Side::Buy),
+        ),
+        vec![OrderId::new(20_000).unwrap(), OrderId::new(30_000).unwrap(),]
+    );
+    assert_eq!(
+        book.account_active_order_count(AccountId::new(11).unwrap(), MassCancelScope::All),
+        3
+    );
+
+    let report = book
+        .submit(mass_cancel(516, 11, MassCancelScope::Side(Side::Buy)))
+        .unwrap();
+    let cancelled: Vec<_> = report
+        .events
+        .iter()
+        .filter_map(|event| match event.kind {
+            EventKind::OrderCancelled { order_id, .. } => Some(order_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        cancelled,
+        vec![OrderId::new(20_000).unwrap(), OrderId::new(30_000).unwrap(),]
+    );
+    assert_eq!(book.active_order_count(), 513);
+    assert_eq!(
+        book.account_active_order_ids(AccountId::new(11).unwrap(), MassCancelScope::All),
+        vec![OrderId::new(10_000).unwrap()]
+    );
+    book.validate().unwrap();
+}
+
+#[test]
+fn account_index_tracks_reserve_refresh_priority_loss_and_full_execution() {
+    let mut book = OrderBook::new(definition(TradingState::Open));
+    book.submit(order(1, 100, 11, Side::Sell, 30, reserve(10), 110))
+        .unwrap();
+    book.submit(order(
+        2,
+        200,
+        11,
+        Side::Buy,
+        5,
+        OrderDisplay::FullyDisplayed,
+        90,
+    ))
+    .unwrap();
+    let immediate_buy = |command_id: u64, order_id: u64, quantity: u64| {
+        Command::New(NewOrder {
+            command_id: CommandId::new(command_id).unwrap(),
+            order_id: OrderId::new(order_id).unwrap(),
+            account_id: AccountId::new(12).unwrap(),
+            instrument_id: InstrumentId::new(1).unwrap(),
+            instrument_version: InstrumentVersion::new(1).unwrap(),
+            side: Side::Buy,
+            quantity: Quantity::new(quantity).unwrap(),
+            display: OrderDisplay::FullyDisplayed,
+            order_type: OrderType::Limit(Price::from_raw(110)),
+            time_in_force: TimeInForce::ImmediateOrCancel,
+            self_trade_prevention: SelfTradePrevention::CancelAggressor,
+            received_at: TimestampNs::from_unix_nanos(command_id),
+        })
+    };
+
+    book.submit(immediate_buy(3, 300, 10)).unwrap();
+    assert_eq!(
+        book.account_active_order_ids(AccountId::new(11).unwrap(), MassCancelScope::All),
+        vec![OrderId::new(100).unwrap(), OrderId::new(200).unwrap()]
+    );
+    book.submit(Command::Replace(ReplaceOrder {
+        command_id: CommandId::new(4).unwrap(),
+        order_id: OrderId::new(200).unwrap(),
+        account_id: AccountId::new(11).unwrap(),
+        instrument_id: InstrumentId::new(1).unwrap(),
+        instrument_version: InstrumentVersion::new(1).unwrap(),
+        new_quantity: Quantity::new(7).unwrap(),
+        new_price: Price::from_raw(95),
+        new_display: OrderDisplay::FullyDisplayed,
+        received_at: TimestampNs::from_unix_nanos(4),
+    }))
+    .unwrap();
+    assert_eq!(
+        book.account_active_order_count(AccountId::new(11).unwrap(), MassCancelScope::All),
+        2
+    );
+
+    book.submit(immediate_buy(5, 500, 20)).unwrap();
+    assert_eq!(
+        book.account_active_order_ids(AccountId::new(11).unwrap(), MassCancelScope::All),
+        vec![OrderId::new(200).unwrap()]
+    );
     book.validate().unwrap();
 }
 

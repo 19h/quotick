@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::codec::{BinaryCodec, CodecError};
 use crate::instrument::InstrumentDefinition;
-use crate::ledger::{JournalEntry, LedgerCorrection};
+use crate::ledger::{JournalEntry, LedgerBatch, LedgerCorrection};
 use crate::matching::{Command, ExecutionReport};
 use crate::risk::AccountRiskDefinition;
 
@@ -62,6 +62,8 @@ pub enum RecordKind {
     AccountRiskDefinition,
     /// One atomic ledger reversal-plus-replacement correction.
     LedgerCorrection,
+    /// One atomic ordered group of ledger entries.
+    LedgerBatch,
 }
 
 impl RecordKind {
@@ -73,6 +75,7 @@ impl RecordKind {
             Self::InstrumentDefinition => 4,
             Self::AccountRiskDefinition => 5,
             Self::LedgerCorrection => 6,
+            Self::LedgerBatch => 7,
         }
     }
 
@@ -84,6 +87,7 @@ impl RecordKind {
             4 => Ok(Self::InstrumentDefinition),
             5 => Ok(Self::AccountRiskDefinition),
             6 => Ok(Self::LedgerCorrection),
+            7 => Ok(Self::LedgerBatch),
             _ => Err(JournalError::UnknownRecordKind { offset, value }),
         }
     }
@@ -119,6 +123,10 @@ impl DurableRecord for LedgerCorrection {
     const KIND: RecordKind = RecordKind::LedgerCorrection;
 }
 
+impl DurableRecord for LedgerBatch {
+    const KIND: RecordKind = RecordKind::LedgerBatch;
+}
+
 /// A decoded known payload from a journal frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KnownRecord {
@@ -134,6 +142,8 @@ pub enum KnownRecord {
     AccountRiskDefinition(AccountRiskDefinition),
     /// Atomic accounting correction.
     LedgerCorrection(LedgerCorrection),
+    /// Atomic ordered accounting batch.
+    LedgerBatch(LedgerBatch),
 }
 
 /// Acknowledgement policy for successful appends.
@@ -431,6 +441,7 @@ impl JournalFrame {
                 self.decode().map(KnownRecord::AccountRiskDefinition)
             }
             RecordKind::LedgerCorrection => self.decode().map(KnownRecord::LedgerCorrection),
+            RecordKind::LedgerBatch => self.decode().map(KnownRecord::LedgerBatch),
         }
     }
 }

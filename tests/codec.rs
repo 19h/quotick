@@ -4,7 +4,8 @@ use quotick::instrument::{
     PriceRules, QuantityRules, TradingState,
 };
 use quotick::ledger::{
-    JournalEntry, Ledger, LedgerCorrection, LedgerEntryKind, LedgerError, LedgerRecord, Posting,
+    JournalEntry, Ledger, LedgerBatch, LedgerCorrection, LedgerEntryKind, LedgerError,
+    LedgerRecord, Posting,
 };
 use quotick::market_data::{
     MarketDataError, MarketDataPublisher, MarketDataReplica, MarketDataSnapshot, MarketDataUpdate,
@@ -910,5 +911,60 @@ fn ledger_correction_and_record_codecs_preserve_atomic_grouping() {
             type_name: "ledger record",
             tag: 255,
         })
+    );
+}
+
+#[test]
+fn ledger_batch_and_record_codecs_preserve_variable_length_atomic_grouping() {
+    let make_entry = |transaction_id: u64, recorded_at: u64, amount: i128| {
+        JournalEntry::new(
+            id(TransactionId::new(transaction_id)),
+            transaction_id,
+            AccountingDate::UNIX_EPOCH,
+            TimestampNs::from_unix_nanos(recorded_at),
+            vec![
+                Posting {
+                    account_id: id(AccountId::new(1)),
+                    asset_id: id(AssetId::new(8)),
+                    amount,
+                },
+                Posting {
+                    account_id: id(AccountId::new(2)),
+                    asset_id: id(AssetId::new(8)),
+                    amount: -amount,
+                },
+            ],
+        )
+        .unwrap()
+    };
+    let batch = LedgerBatch::new(vec![make_entry(40, 100, 50), make_entry(41, 101, -20)]).unwrap();
+    let encoded = batch.encode().unwrap();
+    assert_eq!(LedgerBatch::decode(&encoded).unwrap(), batch);
+
+    let record = LedgerRecord::Batch(batch.clone());
+    let encoded_record = record.encode().unwrap();
+    assert_eq!(encoded_record[0], 2);
+    assert_eq!(LedgerRecord::decode(&encoded_record).unwrap(), record);
+
+    let first_length = u32::from_le_bytes(encoded[4..8].try_into().unwrap()) as usize;
+    let mut singleton = 1_u32.to_le_bytes().to_vec();
+    singleton.extend_from_slice(&encoded[4..8 + first_length]);
+    assert_eq!(
+        LedgerBatch::decode(&singleton),
+        Err(CodecError::InvalidJournalEntry(
+            LedgerError::BatchTooFewEntries
+        ))
+    );
+
+    let second_length_offset = 8 + first_length;
+    let second_payload_offset = second_length_offset + 4;
+    let mut duplicate = encoded;
+    duplicate[second_payload_offset..second_payload_offset + 8]
+        .copy_from_slice(&40_u64.to_le_bytes());
+    assert_eq!(
+        LedgerBatch::decode(&duplicate),
+        Err(CodecError::InvalidJournalEntry(
+            LedgerError::BatchDuplicateTransaction(id(TransactionId::new(40)))
+        ))
     );
 }

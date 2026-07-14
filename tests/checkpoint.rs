@@ -54,15 +54,15 @@ fn populated_ledger() -> Ledger {
 fn trial_balance_and_checkpoint_are_canonical_and_independently_replayable() {
     let ledger = populated_ledger();
     ledger.validate().expect("ledger cross-audits");
-    let trial = ledger.trial_balance().expect("trial balance computes");
+    let trial = ledger.trial_balance();
     assert_eq!(trial.len(), 2);
     assert_eq!(trial[0].asset_id(), asset(1));
-    assert_eq!(trial[0].positive_total(), 500);
-    assert_eq!(trial[0].negative_total(), 500);
+    assert_eq!(trial[0].positive_total().as_u128(), Some(500));
+    assert_eq!(trial[0].negative_total().as_u128(), Some(500));
     assert!(trial[0].is_balanced());
     assert_eq!(trial[1].asset_id(), asset(2));
-    assert_eq!(trial[1].positive_total(), 900);
-    assert_eq!(trial[1].negative_total(), 900);
+    assert_eq!(trial[1].positive_total().as_u128(), Some(900));
+    assert_eq!(trial[1].negative_total().as_u128(), Some(900));
 
     let checkpoint = ledger.checkpoint().expect("checkpoint captures");
     assert_eq!(checkpoint.generation(), 3);
