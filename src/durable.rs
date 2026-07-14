@@ -943,7 +943,9 @@ fn replay_matching_frame(
         | RecordKind::AccountRiskDefinition
         | RecordKind::LedgerCorrection
         | RecordKind::LedgerBatch
-        | RecordKind::CheckpointAnchor => Err(DurableError::UnexpectedRecord {
+        | RecordKind::CheckpointAnchor
+        | RecordKind::CallAuctionCommand
+        | RecordKind::CallAuctionExecutionReport => Err(DurableError::UnexpectedRecord {
             sequence: frame.sequence(),
             kind: frame.kind(),
         }),

@@ -354,6 +354,7 @@ fn mass_cancel_atomically_releases_total_risk_and_publishes_displayed_depth() {
     let mut replica = MarketDataReplica::new(
         InstrumentId::new(1).unwrap(),
         InstrumentVersion::new(1).unwrap(),
+        TradingState::Open,
     );
     replica.apply_snapshot(&publisher.snapshot()).unwrap();
 

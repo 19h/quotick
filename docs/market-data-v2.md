@@ -1,4 +1,4 @@
-# Market-data payload format version 1
+# Market-data payload format version 2
 
 This document defines the complete-value binary payloads implemented by
 `BinaryCodec` for `MarketDataUpdate` and `MarketDataSnapshot`. It does not
@@ -11,9 +11,9 @@ native Rust representation is serialized.
 - One non-replayed matching event produces exactly one public update carrying
   the identical event sequence and timestamp.
 - Matching-event sequences are strictly contiguous. There is no sequence
-  renumbering or conflation in version 1.
+  renumbering or conflation in version 2.
 - `NoBookChange` preserves continuity for private lifecycle events that do not
-  modify public depth or print a trade.
+  modify public depth, print a trade, or change instrument state.
 - Reserve hidden leaves are never included in public quantity or order count.
   A depleted visible slice can delete an order/level in its trade update; a
   following source-sequenced level update publishes the replenished slice after
@@ -26,8 +26,13 @@ native Rust representation is serialized.
   count are either both zero, meaning deletion, or both non-zero.
 - A trade update contains an anonymized print and the absolute maker-level state
   after execution. Account, order, and command identifiers are excluded.
+- An accepted trading-state control produces a public transition carrying the
+  prior state, effective state, and compare-and-increment revision. A
+  transition-and-cancel command emits ordinary absolute level updates for each
+  cancelled order before its final state update.
 - Full-depth snapshots contain only occupied levels in strict market-priority
-  order: descending bids and ascending asks.
+  order: descending bids and ascending asks. They also carry the effective
+  trading state and revision at the same source boundary.
 - Instrument identifier and immutable definition version are present in every
   update and snapshot.
 - A publisher reconstructed from a WAL-recovered `OrderBook` starts at the
@@ -77,6 +82,7 @@ The payload begins at offset 32 with a `u8` kind tag:
 | 0 | none (`NoBookChange`) | 33 |
 | 1 | one 33-byte aggregate level | 66 |
 | 2 | trade ID `u64`, price `i64`, quantity `u64`, aggressor side `u8`, one 33-byte maker level | 91 |
+| 3 | previous trading state `u8`, current trading state `u8`, revision `u64` | 43 |
 
 For tag 2, trade price equals maker-level price, aggressor side opposes maker
 side, and trade ID cannot exceed the event sequence. A replica additionally
@@ -86,6 +92,11 @@ For a fully depleted reserve slice, the count decreases even though the private
 order retains hidden leaves. Its subsequent refresh is an ordinary absolute
 level update at the next matching-event sequence and increases visible order
 count again.
+
+For tag 3, trading-state tags are open `0`, cancel-only `1`, halted `2`, and
+closed `3`. Prior and current state must differ. Revision is non-zero, cannot
+exceed the event sequence, and must equal the replica's current revision plus
+one; prior state must equal the replica's current state.
 
 ## Full-depth snapshot
 
@@ -99,13 +110,17 @@ The snapshot begins with:
 | 24 | `u8` | last-trade presence tag: none `0`, some `1` |
 | 25 | conditional `u64` | last trade ID when the presence tag is `1` |
 
-The optional trade identifier is followed by a bid count `u32`, that many
-33-byte aggregate levels, an ask count `u32`, and that many aggregate levels.
-The last trade ID, when present, cannot exceed the snapshot event sequence.
+The optional trade identifier is followed by effective trading state `u8`,
+trading-state revision `u64`, a bid count `u32`, that many 33-byte aggregate
+levels, an ask count `u32`, and that many aggregate levels. The last trade ID,
+when present, cannot exceed the snapshot event sequence. The trading-state
+revision cannot exceed that sequence. Revision zero denotes the immutable
+definition's initial state; a replica rejects another state at revision zero.
 
 The decoder rejects invalid tags, zero identifiers, truncated collections,
 trailing bytes, empty occupied levels, wrong-side levels, duplicate or
-non-priority-ordered prices, and crossed or locked snapshots.
+non-priority-ordered prices, infeasible state revisions, and crossed or locked
+snapshots.
 
 Snapshots contain displayed aggregate quantity only. Total hidden reserve
 leaves and private reserve order identifiers are intentionally absent.
@@ -123,15 +138,22 @@ race-free consumer procedure is:
    following update to be contiguous.
 5. If this condition fails, discard the buffer and repeat from step 1.
 
-`MarketDataReplica` implements snapshot replacement, contiguous batch
-application, nonmutating gap detection, and fail-closed structural poisoning.
+`MarketDataReplica` is initialized with the definition's trading state and
+implements snapshot replacement, contiguous batch application, nonmutating gap
+detection, state-revision comparison, and fail-closed structural poisoning.
 Transport buffering and retry orchestration remain outside this payload layer.
+
+Version 2 preserves the byte representation of incremental tags `0`–`2` and
+adds tag `3`. It changes every full-depth snapshot by inserting the 9-byte
+state/revision pair. Payloads contain no self-describing schema-version field;
+transport/session negotiation must select version 2 before decoding. A
+version-1 snapshot must not be passed to the version-2 decoder.
 
 ## Information boundary
 
 Although hidden total leaves are excluded, a refresh proves that additional
 quantity survived the preceding slice depletion, and a final partial slice can
-bound that surviving quantity. Version 1 performs no delay, conflation,
+bound that surviving quantity. Version 2 performs no delay, conflation,
 randomized peak, or venue-specific obfuscation. Consumers must therefore treat
 the feed as displayed-depth data, not as proof that reserve size is
 non-inferable.

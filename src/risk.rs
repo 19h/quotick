@@ -333,6 +333,56 @@ pub enum RiskError {
     ProfileRegistryLocked,
 }
 
+/// Market or limit execution-price domain used by conservative risk valuation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RiskPriceConstraint {
+    /// Execution may occur anywhere inside the immutable instrument collar.
+    Market,
+    /// Execution is bounded by this validated side-specific limit.
+    Limit(Price),
+}
+
+/// Domain-neutral deterministic pre-trade rejection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RiskRejectReason {
+    /// Account entry is blocked.
+    AccountBlocked,
+    /// The order is not a strict aggregate position reduction.
+    ReduceOnly,
+    /// Per-order quantity exceeds its limit.
+    OrderQuantityLimit,
+    /// Per-order conservative notional exceeds its limit.
+    OrderNotionalLimit,
+    /// Resting order count would exceed its limit.
+    OpenOrderCountLimit,
+    /// Aggregate resting quantity would exceed its limit.
+    OpenQuantityLimit,
+    /// Aggregate conservative resting notional would exceed its limit.
+    OpenNotionalLimit,
+    /// Worst-case long or short position would exceed its limit.
+    PositionLimit,
+    /// Checked arithmetic could not represent the decision.
+    ArithmeticOverflow,
+}
+
+impl fmt::Display for RiskRejectReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::AccountBlocked => "risk account is blocked",
+            Self::ReduceOnly => "order does not strictly reduce aggregate position exposure",
+            Self::OrderQuantityLimit => "order quantity exceeds the risk limit",
+            Self::OrderNotionalLimit => "order notional exceeds the risk limit",
+            Self::OpenOrderCountLimit => "open-order count exceeds the risk limit",
+            Self::OpenQuantityLimit => "open quantity exceeds the risk limit",
+            Self::OpenNotionalLimit => "open notional exceeds the risk limit",
+            Self::PositionLimit => "worst-case position exceeds the risk limit",
+            Self::ArithmeticOverflow => "risk arithmetic overflow",
+        })
+    }
+}
+
+impl std::error::Error for RiskRejectReason {}
+
 impl fmt::Display for RiskError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -722,6 +772,7 @@ pub struct ReservationSnapshot {
     account_id: AccountId,
     side: Side,
     price: Price,
+    valuation_per_lot: u64,
     quantity_lots: u64,
     notional: u128,
 }
@@ -743,6 +794,12 @@ impl ReservationSnapshot {
     #[must_use]
     pub const fn price(self) -> Price {
         self.price
+    }
+
+    /// Returns the maximum reachable absolute price magnitude reserved per lot.
+    #[must_use]
+    pub const fn valuation_per_lot(self) -> u64 {
+        self.valuation_per_lot
     }
 
     /// Returns the reserved leaves quantity.
@@ -924,7 +981,7 @@ impl RiskEngine {
     fn authorize(&self, command: Command) -> Result<(), RejectReason> {
         match command {
             Command::New(order) => self.authorize_new(order),
-            Command::Cancel(_) | Command::MassCancel(_) => Ok(()),
+            Command::Cancel(_) | Command::MassCancel(_) | Command::TradingStateControl(_) => Ok(()),
             Command::Replace(order) => self.authorize_replace(order),
             Command::AccountControl(control) => self
                 .accounts
@@ -994,68 +1051,15 @@ impl RiskEngine {
         notional: u128,
         may_rest: bool,
     ) -> Result<(), RejectReason> {
-        let limits = account.profile.limits;
-        match account.profile.state {
-            AccountRiskState::Active => {}
-            AccountRiskState::Blocked => return Err(RejectReason::RiskAccountBlocked),
-            AccountRiskState::ReduceOnly => {
-                if !strictly_reduces(baseline, side, quantity) {
-                    return Err(RejectReason::RiskReduceOnly);
-                }
-            }
-        }
-        if quantity > limits.max_order_quantity_lots() {
-            return Err(RejectReason::RiskOrderQuantityLimit);
-        }
-        if notional > limits.max_order_notional() {
-            return Err(RejectReason::RiskOrderNotionalLimit);
-        }
-        let added_open_orders = u64::from(may_rest);
-        let added_open_quantity = if may_rest { u128::from(quantity) } else { 0 };
-        let added_open_notional = if may_rest { notional } else { 0 };
-        let open_orders = baseline
-            .open_orders
-            .checked_add(added_open_orders)
-            .ok_or(RejectReason::RiskArithmeticOverflow)?;
-        if open_orders > limits.max_open_orders() {
-            return Err(RejectReason::RiskOpenOrderCountLimit);
-        }
-        let total_open = baseline
-            .open_buy_lots
-            .checked_add(baseline.open_sell_lots)
-            .and_then(|value| value.checked_add(added_open_quantity))
-            .ok_or(RejectReason::RiskArithmeticOverflow)?;
-        if total_open > limits.max_open_quantity_lots() {
-            return Err(RejectReason::RiskOpenQuantityLimit);
-        }
-        let open_notional = baseline
-            .open_notional
-            .checked_add(added_open_notional)
-            .ok_or(RejectReason::RiskArithmeticOverflow)?;
-        if open_notional > limits.max_open_notional() {
-            return Err(RejectReason::RiskOpenNotionalLimit);
-        }
-        let (worst_buy, worst_sell) = match side {
-            Side::Buy => (
-                baseline
-                    .open_buy_lots
-                    .checked_add(u128::from(quantity))
-                    .ok_or(RejectReason::RiskArithmeticOverflow)?,
-                baseline.open_sell_lots,
-            ),
-            Side::Sell => (
-                baseline.open_buy_lots,
-                baseline
-                    .open_sell_lots
-                    .checked_add(u128::from(quantity))
-                    .ok_or(RejectReason::RiskArithmeticOverflow)?,
-            ),
-        };
-        if !worst_case_position_within_limits(baseline.position_lots, worst_buy, worst_sell, limits)
-        {
-            return Err(RejectReason::RiskPositionLimit);
-        }
-        Ok(())
+        evaluate_pretrade_order(
+            account.profile,
+            baseline,
+            side,
+            quantity,
+            notional,
+            may_rest,
+        )
+        .map_err(matching_risk_rejection)
     }
 
     fn order_notional(
@@ -1064,25 +1068,12 @@ impl RiskEngine {
         order_type: OrderType,
         quantity: u64,
     ) -> Result<u128, RejectReason> {
-        let rules = self.definition.price_rules();
-        let magnitude = match (side, order_type) {
-            (Side::Buy, OrderType::Limit(limit)) => limit
-                .raw()
-                .unsigned_abs()
-                .max(rules.minimum().raw().unsigned_abs()),
-            (Side::Sell, OrderType::Limit(limit)) => limit
-                .raw()
-                .unsigned_abs()
-                .max(rules.maximum().raw().unsigned_abs()),
-            (_, OrderType::Market) => rules
-                .minimum()
-                .raw()
-                .unsigned_abs()
-                .max(rules.maximum().raw().unsigned_abs()),
+        let constraint = match order_type {
+            OrderType::Market => RiskPriceConstraint::Market,
+            OrderType::Limit(price) => RiskPriceConstraint::Limit(price),
         };
-        u128::from(magnitude)
-            .checked_mul(u128::from(quantity))
-            .ok_or(RejectReason::RiskArithmeticOverflow)
+        conservative_order_notional(self.definition, side, constraint, quantity)
+            .map_err(matching_risk_rejection)
     }
 
     fn apply(&mut self, command: Command, report: &ExecutionReport) {
@@ -1133,7 +1124,10 @@ impl RiskEngine {
                     );
                 }
             }
-            Command::Cancel(_) | Command::MassCancel(_) | Command::AccountControl(_) => {}
+            Command::Cancel(_)
+            | Command::MassCancel(_)
+            | Command::AccountControl(_)
+            | Command::TradingStateControl(_) => {}
             Command::Replace(order) => {
                 if replacement_retained_priority(report, order.order_id) {
                     self.insert_reservation(
@@ -1192,12 +1186,16 @@ impl RiskEngine {
             self.reservations.len() < prepared_capacity,
             "risk construction/restoration must reserve insertion headroom"
         );
-        let notional = absolute_notional(price, quantity_lots)
+        let valuation_per_lot =
+            conservative_price_magnitude(self.definition, side, RiskPriceConstraint::Limit(price));
+        let notional = u128::from(valuation_per_lot)
+            .checked_mul(u128::from(quantity_lots))
             .expect("pre-trade notional capacity must cover resting leaves");
         let reservation = ReservationSnapshot {
             account_id,
             side,
             price,
+            valuation_per_lot,
             quantity_lots,
             notional,
         };
@@ -1301,13 +1299,21 @@ impl RiskEngine {
         }
         let mut calculated: HashMap<AccountId, (u128, u128, u128, u64)> = HashMap::new();
         for (&order_id, reservation) in &self.reservations {
-            let expected_notional = absolute_notional(reservation.price, reservation.quantity_lots)
+            let expected_valuation = conservative_price_magnitude(
+                self.definition,
+                reservation.side,
+                RiskPriceConstraint::Limit(reservation.price),
+            );
+            let expected_notional = u128::from(expected_valuation)
+                .checked_mul(u128::from(reservation.quantity_lots))
                 .ok_or_else(|| {
                     RiskInvariantViolation::new(format!(
                         "reservation {order_id} notional cannot be represented"
                     ))
                 })?;
-            if reservation.notional != expected_notional {
+            if reservation.valuation_per_lot != expected_valuation
+                || reservation.notional != expected_notional
+            {
                 return Err(RiskInvariantViolation::new(format!(
                     "reservation {order_id} has inconsistent notional"
                 )));
@@ -1628,11 +1634,155 @@ impl RiskManagedOrderBook {
     }
 }
 
-fn absolute_notional(price: Price, quantity_lots: u64) -> Option<u128> {
-    u128::from(price.raw().unsigned_abs()).checked_mul(u128::from(quantity_lots))
+/// Returns the maximum reachable absolute execution-price magnitude per lot.
+///
+/// A buy limit spans the instrument minimum through its limit; a sell limit
+/// spans its limit through the instrument maximum. Market interest spans the
+/// complete immutable collar. The supplied limit must already satisfy the
+/// instrument definition.
+#[must_use]
+pub fn conservative_price_magnitude(
+    definition: InstrumentDefinition,
+    side: Side,
+    constraint: RiskPriceConstraint,
+) -> u64 {
+    let rules = definition.price_rules();
+    match (side, constraint) {
+        (Side::Buy, RiskPriceConstraint::Limit(limit)) => limit
+            .raw()
+            .unsigned_abs()
+            .max(rules.minimum().raw().unsigned_abs()),
+        (Side::Sell, RiskPriceConstraint::Limit(limit)) => limit
+            .raw()
+            .unsigned_abs()
+            .max(rules.maximum().raw().unsigned_abs()),
+        (_, RiskPriceConstraint::Market) => rules
+            .minimum()
+            .raw()
+            .unsigned_abs()
+            .max(rules.maximum().raw().unsigned_abs()),
+    }
 }
 
-fn position_within_limits(position: i128, limits: RiskLimits) -> bool {
+/// Computes maximum reachable absolute raw-price-times-lots notional.
+///
+/// # Errors
+///
+/// Returns [`RiskRejectReason::ArithmeticOverflow`] when the product cannot fit
+/// in `u128`.
+pub fn conservative_order_notional(
+    definition: InstrumentDefinition,
+    side: Side,
+    constraint: RiskPriceConstraint,
+    quantity_lots: u64,
+) -> Result<u128, RiskRejectReason> {
+    u128::from(conservative_price_magnitude(definition, side, constraint))
+        .checked_mul(u128::from(quantity_lots))
+        .ok_or(RiskRejectReason::ArithmeticOverflow)
+}
+
+/// Evaluates one order against immutable account limits and current exposure.
+///
+/// `notional` must be the complete conservative notional for `quantity_lots`.
+/// When `may_rest` is false, resting count/quantity/notional are not added, but
+/// worst-case position still includes the complete incoming quantity because
+/// it may execute immediately.
+///
+/// # Errors
+///
+/// Returns the first deterministic limit or arithmetic rejection.
+pub fn evaluate_pretrade_order(
+    profile: RiskProfile,
+    baseline: RiskSnapshot,
+    side: Side,
+    quantity_lots: u64,
+    notional: u128,
+    may_rest: bool,
+) -> Result<(), RiskRejectReason> {
+    let limits = profile.limits;
+    match profile.state {
+        AccountRiskState::Active => {}
+        AccountRiskState::Blocked => return Err(RiskRejectReason::AccountBlocked),
+        AccountRiskState::ReduceOnly => {
+            if !strictly_reduces(baseline, side, quantity_lots) {
+                return Err(RiskRejectReason::ReduceOnly);
+            }
+        }
+    }
+    if quantity_lots > limits.max_order_quantity_lots() {
+        return Err(RiskRejectReason::OrderQuantityLimit);
+    }
+    if notional > limits.max_order_notional() {
+        return Err(RiskRejectReason::OrderNotionalLimit);
+    }
+    let added_open_orders = u64::from(may_rest);
+    let added_open_quantity = if may_rest {
+        u128::from(quantity_lots)
+    } else {
+        0
+    };
+    let added_open_notional = if may_rest { notional } else { 0 };
+    let open_orders = baseline
+        .open_orders
+        .checked_add(added_open_orders)
+        .ok_or(RiskRejectReason::ArithmeticOverflow)?;
+    if open_orders > limits.max_open_orders() {
+        return Err(RiskRejectReason::OpenOrderCountLimit);
+    }
+    let total_open = baseline
+        .open_buy_lots
+        .checked_add(baseline.open_sell_lots)
+        .and_then(|value| value.checked_add(added_open_quantity))
+        .ok_or(RiskRejectReason::ArithmeticOverflow)?;
+    if total_open > limits.max_open_quantity_lots() {
+        return Err(RiskRejectReason::OpenQuantityLimit);
+    }
+    let open_notional = baseline
+        .open_notional
+        .checked_add(added_open_notional)
+        .ok_or(RiskRejectReason::ArithmeticOverflow)?;
+    if open_notional > limits.max_open_notional() {
+        return Err(RiskRejectReason::OpenNotionalLimit);
+    }
+    let (worst_buy, worst_sell) = match side {
+        Side::Buy => (
+            baseline
+                .open_buy_lots
+                .checked_add(u128::from(quantity_lots))
+                .ok_or(RiskRejectReason::ArithmeticOverflow)?,
+            baseline.open_sell_lots,
+        ),
+        Side::Sell => (
+            baseline.open_buy_lots,
+            baseline
+                .open_sell_lots
+                .checked_add(u128::from(quantity_lots))
+                .ok_or(RiskRejectReason::ArithmeticOverflow)?,
+        ),
+    };
+    if !worst_case_position_within_limits(baseline.position_lots, worst_buy, worst_sell, limits) {
+        return Err(RiskRejectReason::PositionLimit);
+    }
+    Ok(())
+}
+
+const fn matching_risk_rejection(reason: RiskRejectReason) -> RejectReason {
+    match reason {
+        RiskRejectReason::AccountBlocked => RejectReason::RiskAccountBlocked,
+        RiskRejectReason::ReduceOnly => RejectReason::RiskReduceOnly,
+        RiskRejectReason::OrderQuantityLimit => RejectReason::RiskOrderQuantityLimit,
+        RiskRejectReason::OrderNotionalLimit => RejectReason::RiskOrderNotionalLimit,
+        RiskRejectReason::OpenOrderCountLimit => RejectReason::RiskOpenOrderCountLimit,
+        RiskRejectReason::OpenQuantityLimit => RejectReason::RiskOpenQuantityLimit,
+        RiskRejectReason::OpenNotionalLimit => RejectReason::RiskOpenNotionalLimit,
+        RiskRejectReason::PositionLimit => RejectReason::RiskPositionLimit,
+        RiskRejectReason::ArithmeticOverflow => RejectReason::RiskArithmeticOverflow,
+    }
+}
+
+/// Returns whether an executed signed position is inside immutable limits.
+#[must_use]
+pub fn position_within_limits(position: i128, limits: RiskLimits) -> bool {
     if position >= 0 {
         position.unsigned_abs() <= limits.max_long_position_lots()
     } else {
@@ -1640,7 +1790,10 @@ fn position_within_limits(position: i128, limits: RiskLimits) -> bool {
     }
 }
 
-fn worst_case_position_within_limits(
+/// Returns whether independent full execution of all open buys or all open
+/// sells remains inside the long and short limits.
+#[must_use]
+pub fn worst_case_position_within_limits(
     position: i128,
     open_buy_lots: u128,
     open_sell_lots: u128,
@@ -1658,10 +1811,13 @@ fn worst_case_position_within_limits(
     let Some(short) = position.checked_sub(sells) else {
         return false;
     };
-    long <= i128::try_from(limits.max_long_position_lots()).expect("validated long limit fits i128")
-        && short
-            >= -i128::try_from(limits.max_short_position_lots())
-                .expect("validated short limit fits i128")
+    let Ok(long_limit) = i128::try_from(limits.max_long_position_lots()) else {
+        return false;
+    };
+    let Ok(short_limit) = i128::try_from(limits.max_short_position_lots()) else {
+        return false;
+    };
+    long <= long_limit && short >= -short_limit
 }
 
 fn strictly_reduces(exposure: RiskSnapshot, side: Side, quantity: u64) -> bool {

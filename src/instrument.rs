@@ -494,6 +494,27 @@ impl QuantityRules {
         Ok(())
     }
 
+    /// Validates positive active leaves after one or more executions.
+    ///
+    /// The original order-entry maximum and lot grid remain authoritative, but
+    /// partial execution may leave less than the minimum admissible new-order
+    /// quantity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmissionError`] when leaves exceed the order maximum or are
+    /// not aligned to the lot increment.
+    pub const fn validate_leaves(self, quantity: Quantity) -> Result<(), AdmissionError> {
+        let lots = quantity.lots();
+        if lots > self.maximum {
+            return Err(AdmissionError::QuantityOutsideLimits);
+        }
+        if lots % self.increment != 0 {
+            return Err(AdmissionError::QuantityOffGrid);
+        }
+        Ok(())
+    }
+
     const fn display_is_aligned(self, quantity: Quantity) -> bool {
         quantity.lots() % self.increment == 0
     }
@@ -681,16 +702,36 @@ impl InstrumentDefinition {
     /// Returns [`AdmissionError`] for identity/version mismatch or a rule
     /// violation under this immutable definition.
     pub fn admit(self, command: Command) -> Result<(), AdmissionError> {
+        self.admit_in_state(command, self.spec.trading_state)
+    }
+
+    /// Validates a command against an explicit effective trading state.
+    ///
+    /// The immutable definition supplies genesis state; sequenced matching
+    /// controls supply the effective state after genesis.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmissionError`] for identity/version mismatch or a rule
+    /// violation under this definition and effective state.
+    pub fn admit_in_state(
+        self,
+        command: Command,
+        trading_state: TradingState,
+    ) -> Result<(), AdmissionError> {
         match command {
-            Command::New(value) => self.admit_new(value),
+            Command::New(value) => self.admit_new(value, trading_state),
             Command::Cancel(value) => {
                 self.validate_identity(value.instrument_id, value.instrument_version)
             }
-            Command::Replace(value) => self.admit_replace(value),
+            Command::Replace(value) => self.admit_replace(value, trading_state),
             Command::MassCancel(value) => {
                 self.validate_identity(value.instrument_id, value.instrument_version)
             }
             Command::AccountControl(value) => {
+                self.validate_identity(value.instrument_id, value.instrument_version)
+            }
+            Command::TradingStateControl(value) => {
                 self.validate_identity(value.instrument_id, value.instrument_version)
             }
         }
@@ -710,9 +751,9 @@ impl InstrumentDefinition {
         Ok(self.settlement_convention())
     }
 
-    fn admit_new(self, order: NewOrder) -> Result<(), AdmissionError> {
+    fn admit_new(self, order: NewOrder, trading_state: TradingState) -> Result<(), AdmissionError> {
         self.validate_identity(order.instrument_id, order.instrument_version)?;
-        if !self.spec.trading_state.permits_entry() {
+        if !trading_state.permits_entry() {
             return Err(AdmissionError::TradingStateDisallowsEntry);
         }
         self.spec.quantity.validate(order.quantity)?;
@@ -723,9 +764,13 @@ impl InstrumentDefinition {
         Ok(())
     }
 
-    fn admit_replace(self, order: ReplaceOrder) -> Result<(), AdmissionError> {
+    fn admit_replace(
+        self,
+        order: ReplaceOrder,
+        trading_state: TradingState,
+    ) -> Result<(), AdmissionError> {
         self.validate_identity(order.instrument_id, order.instrument_version)?;
-        if !self.spec.trading_state.permits_entry() {
+        if !trading_state.permits_entry() {
             return Err(AdmissionError::TradingStateDisallowsEntry);
         }
         self.spec.quantity.validate(order.new_quantity)?;

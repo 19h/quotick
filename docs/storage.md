@@ -185,19 +185,20 @@ malformed pending content, and preserves both files on divergence or invalid
 current state. A pending file rejected only because its version/kind is
 unsupported or its size exceeds the caller's configured limit is preserved.
 The complete wire and decision contract is
-[Semantic snapshot format version 2](snapshot-v2.md).
+[Semantic snapshot format version 4](snapshot-v4.md).
 
 Direct users must dedicate the target and its two sidecars to snapshots.
-`DurableOrderBook`, `DurableRiskOrderBook`, and `DurableLedger` additionally
-check that a checkpoint target, pending path, and lease cannot alias their
-single-file WAL/lease or reside anywhere inside their segmented directory.
-`write_checkpoint` synchronizes the WAL before publishing an independently
-audited matching, coupled risk/matching, or ledger image.
+`DurableOrderBook`, `DurableRiskOrderBook`, `DurableLedger`, and
+`DurableCallAuctionEngine` additionally check that a checkpoint target, pending
+path, and lease cannot alias their single-file WAL/lease or reside anywhere
+inside their segmented directory. `write_checkpoint` synchronizes the WAL
+before publishing an independently audited matching, coupled risk/matching,
+ledger, or call-auction image.
 
 ## Checkpoint WAL cutover
 
 `compact_to_checkpoint` is implemented for both physical layouts of durable
-matching, coupled risk/matching, and ledger runtimes. It alternates deterministic
+matching, coupled risk/matching, ledger, and call-auction runtimes. It alternates deterministic
 `<checkpoint base>.cutover-a` and `.cutover-b` snapshot slots. The inactive slot
 is published with the ordinary `QSNP` pending-file, file-barrier, rename, and
 directory-barrier protocol before the WAL selector changes. The anchor binds
@@ -321,6 +322,10 @@ grouping, batch torn-tail repair and whole-frame segment rotation, managed-
 directory rejection, WAL-path alias rejection, single/segmented WAL-prefix
 proof, suffix replay, coupled risk rejection/position/reservation restoration,
 immutable-profile binding, and reversal-index recovery.
+Call-auction coverage additionally includes canonical phase/book/counter/cache
+restoration, multi-cycle retained remainders, exact retry suppression, uncut
+prefix forks/ahead state, corrupt/wrong A/B slots, and dangling suffix
+completion after an anchor.
 Cutover tests additionally cover repeated A/B replacement, non-genesis physical
 sequences, anchor/snapshot divergence, missing checkpoint context, suffix
 continuation, occupied and abandoned staging paths, path aliasing, generation

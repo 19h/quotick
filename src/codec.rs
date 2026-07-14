@@ -6,6 +6,9 @@
 
 use std::fmt;
 
+use crate::auction_engine::{CallAuctionCheckpoint, CallAuctionCheckpointError};
+use crate::auction_market_data::CallAuctionMarketDataError;
+use crate::auction_risk::{CallAuctionRiskCheckpoint, CallAuctionRiskCheckpointError};
 use crate::domain::{
     AccountId, AccountingDate, AssetId, CommandId, DomainError, InstrumentId, InstrumentVersion,
     OrderId, Price, Quantity, Side, TimestampNs, TradeId, TransactionId,
@@ -27,13 +30,17 @@ use crate::matching::{
     Command, CommandOutcome, CommandReportCheckpoint, Event, EventKind, ExecutionReport,
     MassCancel, MassCancelScope, NewOrder, OrderBookCheckpoint, OrderBookCheckpointError,
     OrderDisplay, OrderType, RejectReason, ReplaceOrder, RestingOrderCheckpoint,
-    SelfTradePrevention, TimeInForce, Trade,
+    SelfTradePrevention, TimeInForce, Trade, TradingStateControl, TradingStateControlAction,
+    TradingStateSnapshot,
 };
 use crate::risk::{
     AccountRiskDefinition, AccountRiskState, RiskAccountCheckpoint, RiskError, RiskLimitSpec,
     RiskLimits, RiskManagedCheckpoint, RiskManagedCheckpointError, RiskProfile, RiskSnapshot,
 };
 use crate::snapshot::{CheckpointAnchor, CheckpointSlot, SnapshotKind};
+
+mod auction;
+mod auction_market_data;
 
 /// A deterministic binary encoding or validation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +77,11 @@ pub enum CodecError {
         /// Declared element count.
         length: usize,
     },
+    /// A decoded collection could not reserve its validated finite storage.
+    CapacityReservationFailed {
+        /// Logical collection whose reservation failed.
+        field: &'static str,
+    },
     /// A decoded identifier or quantity violated its domain invariant.
     InvalidDomain(DomainError),
     /// A decoded value violated a cross-field invariant.
@@ -84,10 +96,16 @@ pub enum CodecError {
     InvalidRisk(RiskError),
     /// Decoded public market data violated sequence-independent invariants.
     InvalidMarketData(MarketDataError),
+    /// Decoded public call-auction data violated structural invariants.
+    InvalidAuctionMarketData(CallAuctionMarketDataError),
     /// Decoded matching checkpoint violated semantic or structural invariants.
     InvalidMatchingCheckpoint(OrderBookCheckpointError),
     /// Decoded coupled risk/matching checkpoint violated semantic invariants.
     InvalidRiskCheckpoint(RiskManagedCheckpointError),
+    /// Decoded call-auction checkpoint violated semantic invariants.
+    InvalidAuctionCheckpoint(CallAuctionCheckpointError),
+    /// Decoded coupled call-auction/risk checkpoint violated semantic invariants.
+    InvalidAuctionRiskCheckpoint(CallAuctionRiskCheckpointError),
 }
 
 impl fmt::Display for CodecError {
@@ -113,6 +131,9 @@ impl fmt::Display for CodecError {
             Self::InvalidLength { field, length } => {
                 write!(formatter, "declared {field} length {length} is impossible")
             }
+            Self::CapacityReservationFailed { field } => {
+                write!(formatter, "could not reserve decoded {field} storage")
+            }
             Self::InvalidDomain(error) => error.fmt(formatter),
             Self::InvalidValue(detail) => formatter.write_str(detail),
             Self::InvalidJournalEntry(error) => error.fmt(formatter),
@@ -120,8 +141,11 @@ impl fmt::Display for CodecError {
             Self::InvalidInstrument(error) => error.fmt(formatter),
             Self::InvalidRisk(error) => error.fmt(formatter),
             Self::InvalidMarketData(error) => error.fmt(formatter),
+            Self::InvalidAuctionMarketData(error) => error.fmt(formatter),
             Self::InvalidMatchingCheckpoint(error) => error.fmt(formatter),
             Self::InvalidRiskCheckpoint(error) => error.fmt(formatter),
+            Self::InvalidAuctionCheckpoint(error) => error.fmt(formatter),
+            Self::InvalidAuctionRiskCheckpoint(error) => error.fmt(formatter),
         }
     }
 }
@@ -135,8 +159,11 @@ impl std::error::Error for CodecError {
             Self::InvalidInstrument(error) => Some(error),
             Self::InvalidRisk(error) => Some(error),
             Self::InvalidMarketData(error) => Some(error),
+            Self::InvalidAuctionMarketData(error) => Some(error),
             Self::InvalidMatchingCheckpoint(error) => Some(error),
             Self::InvalidRiskCheckpoint(error) => Some(error),
+            Self::InvalidAuctionCheckpoint(error) => Some(error),
+            Self::InvalidAuctionRiskCheckpoint(error) => Some(error),
             _ => None,
         }
     }
@@ -166,6 +193,12 @@ impl From<MarketDataError> for CodecError {
     }
 }
 
+impl From<CallAuctionMarketDataError> for CodecError {
+    fn from(error: CallAuctionMarketDataError) -> Self {
+        Self::InvalidAuctionMarketData(error)
+    }
+}
+
 impl From<LedgerCheckpointError> for CodecError {
     fn from(error: LedgerCheckpointError) -> Self {
         Self::InvalidLedgerCheckpoint(error)
@@ -181,6 +214,18 @@ impl From<OrderBookCheckpointError> for CodecError {
 impl From<RiskManagedCheckpointError> for CodecError {
     fn from(error: RiskManagedCheckpointError) -> Self {
         Self::InvalidRiskCheckpoint(error)
+    }
+}
+
+impl From<CallAuctionCheckpointError> for CodecError {
+    fn from(error: CallAuctionCheckpointError) -> Self {
+        Self::InvalidAuctionCheckpoint(error)
+    }
+}
+
+impl From<CallAuctionRiskCheckpointError> for CodecError {
+    fn from(error: CallAuctionRiskCheckpointError) -> Self {
+        Self::InvalidAuctionRiskCheckpoint(error)
     }
 }
 
@@ -385,6 +430,8 @@ impl BinaryCodec for CheckpointAnchor {
             SnapshotKind::LedgerCheckpoint => 1,
             SnapshotKind::MatchingCheckpoint => 2,
             SnapshotKind::RiskManagedCheckpoint => 3,
+            SnapshotKind::CallAuctionCheckpoint => 4,
+            SnapshotKind::CallAuctionRiskCheckpoint => 5,
         });
         encoder.u8(self.slot().wire());
         encoder.u64(self.generation());
@@ -555,6 +602,26 @@ fn decode_account_control_action(
     }
 }
 
+fn encode_trading_state_control_action(encoder: &mut Encoder, value: TradingStateControlAction) {
+    encoder.u8(match value {
+        TradingStateControlAction::Transition => 0,
+        TradingStateControlAction::TransitionAndCancel => 1,
+    });
+}
+
+fn decode_trading_state_control_action(
+    decoder: &mut Decoder<'_>,
+) -> Result<TradingStateControlAction, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(TradingStateControlAction::Transition),
+        1 => Ok(TradingStateControlAction::TransitionAndCancel),
+        tag => Err(CodecError::InvalidTag {
+            type_name: "TradingStateControlAction",
+            tag,
+        }),
+    }
+}
+
 fn encode_time_in_force(encoder: &mut Encoder, value: TimeInForce) {
     encoder.u8(match value {
         TimeInForce::GoodTilCancelled => 0,
@@ -635,6 +702,10 @@ fn encode_reject_reason(encoder: &mut Encoder, value: RejectReason) {
         RejectReason::AccountAdmissionBlocked => 31,
         RejectReason::AccountControlRevisionMismatch => 32,
         RejectReason::AccountControlRevisionExhausted => 33,
+        RejectReason::TradingStateControlRevisionMismatch => 34,
+        RejectReason::TradingStateControlRevisionExhausted => 35,
+        RejectReason::TradingStateUnchanged => 36,
+        RejectReason::TradingStateControlCannotCancelIntoOpen => 37,
     });
 }
 
@@ -674,6 +745,10 @@ fn decode_reject_reason(decoder: &mut Decoder<'_>) -> Result<RejectReason, Codec
         31 => Ok(RejectReason::AccountAdmissionBlocked),
         32 => Ok(RejectReason::AccountControlRevisionMismatch),
         33 => Ok(RejectReason::AccountControlRevisionExhausted),
+        34 => Ok(RejectReason::TradingStateControlRevisionMismatch),
+        35 => Ok(RejectReason::TradingStateControlRevisionExhausted),
+        36 => Ok(RejectReason::TradingStateUnchanged),
+        37 => Ok(RejectReason::TradingStateControlCannotCancelIntoOpen),
         tag => Err(CodecError::InvalidTag {
             type_name: "RejectReason",
             tag,
@@ -689,6 +764,7 @@ fn encode_cancel_reason(encoder: &mut Encoder, value: CancelReason) {
         CancelReason::SelfTradeResting => 3,
         CancelReason::MassCancel => 4,
         CancelReason::AccountControl => 5,
+        CancelReason::TradingStateControl => 6,
     });
 }
 
@@ -700,6 +776,7 @@ fn decode_cancel_reason(decoder: &mut Decoder<'_>) -> Result<CancelReason, Codec
         3 => Ok(CancelReason::SelfTradeResting),
         4 => Ok(CancelReason::MassCancel),
         5 => Ok(CancelReason::AccountControl),
+        6 => Ok(CancelReason::TradingStateControl),
         tag => Err(CodecError::InvalidTag {
             type_name: "CancelReason",
             tag,
@@ -800,6 +877,16 @@ fn encode_command(encoder: &mut Encoder, command: Command) {
             encode_account_control_action(encoder, value.action);
             encoder.u64(value.received_at.as_unix_nanos());
         }
+        Command::TradingStateControl(value) => {
+            encoder.u8(5);
+            encoder.u64(value.command_id.get());
+            encoder.u64(value.instrument_id.get());
+            encoder.u64(value.instrument_version.get());
+            encoder.u64(value.expected_revision);
+            encode_trading_state(encoder, value.target_state);
+            encode_trading_state_control_action(encoder, value.action);
+            encoder.u64(value.received_at.as_unix_nanos());
+        }
     }
 }
 
@@ -853,6 +940,15 @@ fn decode_command(decoder: &mut Decoder<'_>) -> Result<Command, CodecError> {
             instrument_version: instrument_version(decoder)?,
             expected_revision: decoder.u64()?,
             action: decode_account_control_action(decoder)?,
+            received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
+        })),
+        5 => Ok(Command::TradingStateControl(TradingStateControl {
+            command_id: command_id(decoder)?,
+            instrument_id: instrument(decoder)?,
+            instrument_version: instrument_version(decoder)?,
+            expected_revision: decoder.u64()?,
+            target_state: decode_trading_state(decoder)?,
+            action: decode_trading_state_control_action(decoder)?,
             received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
         })),
         tag => Err(CodecError::InvalidTag {
@@ -1249,6 +1345,20 @@ fn encode_event_kind(encoder: &mut Encoder, kind: EventKind) {
             cancelled_order_count,
             cancelled_quantity_lots,
         ),
+        EventKind::TradingStateControlApplied {
+            previous_state,
+            current_state,
+            revision,
+            cancelled_order_count,
+            cancelled_quantity_lots,
+        } => {
+            encoder.u8(10);
+            encode_trading_state(encoder, previous_state);
+            encode_trading_state(encoder, current_state);
+            encoder.u64(revision);
+            encoder.u64(cancelled_order_count);
+            encoder.u128(cancelled_quantity_lots);
+        }
     }
 }
 
@@ -1304,6 +1414,13 @@ fn decode_event_kind(decoder: &mut Decoder<'_>) -> Result<EventKind, CodecError>
             account_id: account(decoder)?,
             previous_state: decode_account_admission_state(decoder)?,
             current_state: decode_account_admission_state(decoder)?,
+            revision: decoder.u64()?,
+            cancelled_order_count: decoder.u64()?,
+            cancelled_quantity_lots: decoder.u128()?,
+        }),
+        10 => Ok(EventKind::TradingStateControlApplied {
+            previous_state: decode_trading_state(decoder)?,
+            current_state: decode_trading_state(decoder)?,
             revision: decoder.u64()?,
             cancelled_order_count: decoder.u64()?,
             cancelled_quantity_lots: decoder.u128()?,
@@ -1531,6 +1648,69 @@ impl BinaryCodec for RiskManagedCheckpoint {
     }
 }
 
+impl BinaryCodec for CallAuctionRiskCheckpoint {
+    fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let mut encoder = Encoder::default();
+        encoder.u64(self.wal_first_sequence());
+        encode_sized_bytes(
+            &mut encoder,
+            "auction risk checkpoint auction bytes",
+            &self.auction().encode()?,
+        )?;
+        encoder.length("auction risk checkpoint accounts", self.accounts().len())?;
+        for account in self.accounts() {
+            let definition = AccountRiskDefinition::new(account.account_id(), account.profile());
+            encode_sized_bytes(
+                &mut encoder,
+                "auction risk checkpoint account definition bytes",
+                &definition.encode()?,
+            )?;
+            let exposure = account.exposure();
+            encoder.i128(exposure.position_lots());
+            encoder.u128(exposure.open_buy_lots());
+            encoder.u128(exposure.open_sell_lots());
+            encoder.u128(exposure.open_notional());
+            encoder.u64(exposure.open_orders());
+        }
+        Ok(encoder.finish())
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let mut decoder = Decoder::new(bytes);
+        let wal_first_sequence = decoder.u64()?;
+        let auction = CallAuctionCheckpoint::decode(
+            decoder.sized_bytes("auction risk checkpoint auction bytes")?,
+        )?;
+        let account_count = decoder.count("auction risk checkpoint accounts", 76)?;
+        let mut accounts = Vec::new();
+        accounts.try_reserve_exact(account_count).map_err(|_| {
+            CodecError::CapacityReservationFailed {
+                field: "auction risk checkpoint accounts",
+            }
+        })?;
+        for _ in 0..account_count {
+            let definition = AccountRiskDefinition::decode(
+                decoder.sized_bytes("auction risk checkpoint account definition bytes")?,
+            )?;
+            let exposure = RiskSnapshot::from_parts(
+                decoder.i128()?,
+                decoder.u128()?,
+                decoder.u128()?,
+                decoder.u128()?,
+                decoder.u64()?,
+            );
+            accounts.push(RiskAccountCheckpoint::from_parts(
+                definition.account_id(),
+                definition.profile(),
+                exposure,
+            ));
+        }
+        decoder.finish()?;
+        CallAuctionRiskCheckpoint::from_parts(wal_first_sequence, auction, accounts)
+            .map_err(Into::into)
+    }
+}
+
 fn validate_report(
     command_id: CommandId,
     outcome: CommandOutcome,
@@ -1612,6 +1792,16 @@ impl BinaryCodec for MarketDataUpdate {
                 encode_side(&mut encoder, print.aggressor_side);
                 encode_market_data_level(&mut encoder, maker_level);
             }
+            MarketDataKind::TradingState {
+                previous_state,
+                current_state,
+                revision,
+            } => {
+                encoder.u8(3);
+                encode_trading_state(&mut encoder, previous_state);
+                encode_trading_state(&mut encoder, current_state);
+                encoder.u64(revision);
+            }
         }
         Ok(encoder.finish())
     }
@@ -1633,6 +1823,11 @@ impl BinaryCodec for MarketDataUpdate {
                     aggressor_side: decode_side(&mut decoder)?,
                 },
                 maker_level: decode_market_data_level(&mut decoder)?,
+            },
+            3 => MarketDataKind::TradingState {
+                previous_state: decode_trading_state(&mut decoder)?,
+                current_state: decode_trading_state(&mut decoder)?,
+                revision: decoder.u64()?,
             },
             tag => {
                 return Err(CodecError::InvalidTag {
@@ -1665,6 +1860,8 @@ impl BinaryCodec for MarketDataSnapshot {
             }
             None => encoder.u8(0),
         }
+        encode_trading_state(&mut encoder, self.trading_state().state());
+        encoder.u64(self.trading_state().revision());
         encoder.length("market-data snapshot bids", self.bids().len())?;
         for level in self.bids() {
             encode_market_data_level(&mut encoder, *level);
@@ -1691,6 +1888,8 @@ impl BinaryCodec for MarketDataSnapshot {
                 });
             }
         };
+        let trading_state =
+            TradingStateSnapshot::from_parts(decode_trading_state(&mut decoder)?, decoder.u64()?);
         let bid_count = decoder.count("market-data snapshot bids", 33)?;
         let mut bids = Vec::with_capacity(bid_count);
         for _ in 0..bid_count {
@@ -1707,6 +1906,7 @@ impl BinaryCodec for MarketDataSnapshot {
             instrument_version,
             as_of_sequence,
             last_trade_id,
+            trading_state,
             bids,
             asks,
         )?)

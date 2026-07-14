@@ -174,6 +174,56 @@ fn price_and_quantity_rules_enforce_signed_grids_and_inclusive_bounds() {
         quantities.validate(Quantity::new(5).unwrap()),
         Err(AdmissionError::QuantityOutsideLimits)
     );
+    assert_eq!(
+        quantities.validate_leaves(Quantity::new(5).unwrap()),
+        Ok(())
+    );
+    assert_eq!(
+        quantities.validate_leaves(Quantity::new(6).unwrap()),
+        Err(AdmissionError::QuantityOffGrid)
+    );
+    assert_eq!(
+        quantities.validate_leaves(Quantity::new(105).unwrap()),
+        Err(AdmissionError::QuantityOutsideLimits)
+    );
+}
+
+#[test]
+fn partial_leaves_below_entry_minimum_survive_matching_checkpoint_round_trip() {
+    let definition = definition_with(1, 0, 5, TradingState::Open);
+    let mut book = OrderBook::new(definition);
+    book.submit(Command::New(new_order(
+        1,
+        1,
+        10,
+        1,
+        15,
+        OrderType::Limit(Price::from_raw(100)),
+    )))
+    .unwrap();
+    let mut sell = new_order(2, 2, 10, 1, 10, OrderType::Limit(Price::from_raw(100)));
+    sell.account_id = AccountId::new(8).unwrap();
+    sell.side = Side::Sell;
+    sell.time_in_force = TimeInForce::ImmediateOrCancel;
+    book.submit(Command::New(sell)).unwrap();
+    assert_eq!(
+        book.order(OrderId::new(1).unwrap())
+            .unwrap()
+            .leaves_quantity
+            .lots(),
+        5
+    );
+    let checkpoint = book.checkpoint(1, 5).unwrap();
+    let restored = OrderBook::from_checkpoint(checkpoint).unwrap();
+    assert_eq!(
+        restored
+            .order(OrderId::new(1).unwrap())
+            .unwrap()
+            .leaves_quantity
+            .lots(),
+        5
+    );
+    restored.validate().unwrap();
 }
 
 #[test]

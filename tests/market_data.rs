@@ -151,7 +151,7 @@ fn assert_mirrors(book: &OrderBook, replica: &MarketDataReplica) {
 fn incremental_updates_reconstruct_trades_replacements_and_cancellations() {
     let mut book = OrderBook::new(definition());
     let mut publisher = MarketDataPublisher::from_book(&book).expect("publisher bootstraps");
-    let mut replica = MarketDataReplica::new(instrument(), version());
+    let mut replica = MarketDataReplica::new(instrument(), version(), TradingState::Open);
     let genesis = publisher.snapshot();
     replica
         .apply_snapshot(&genesis)
@@ -218,7 +218,7 @@ fn incremental_updates_reconstruct_trades_replacements_and_cancellations() {
 fn account_control_cancellations_and_rejections_preserve_public_trace_continuity() {
     let mut book = OrderBook::new(definition());
     let mut publisher = MarketDataPublisher::from_book(&book).unwrap();
-    let mut replica = MarketDataReplica::new(instrument(), version());
+    let mut replica = MarketDataReplica::new(instrument(), version(), TradingState::Open);
     replica.apply_snapshot(&publisher.snapshot()).unwrap();
 
     for command in [
@@ -309,7 +309,7 @@ fn account_control_prior_state_corruption_poison_publisher() {
 fn gaps_are_nonmutating_and_a_newer_full_depth_snapshot_recovers_the_replica() {
     let mut book = OrderBook::new(definition());
     let mut publisher = MarketDataPublisher::from_book(&book).expect("publisher bootstraps");
-    let mut replica = MarketDataReplica::new(instrument(), version());
+    let mut replica = MarketDataReplica::new(instrument(), version(), TradingState::Open);
     let genesis = publisher.snapshot();
     replica
         .apply_snapshot(&genesis)
@@ -389,7 +389,7 @@ fn gaps_are_nonmutating_and_a_newer_full_depth_snapshot_recovers_the_replica() {
 fn decrement_and_cancel_stp_publishes_the_changed_resting_level() {
     let mut book = OrderBook::new(definition());
     let mut publisher = MarketDataPublisher::from_book(&book).expect("publisher bootstraps");
-    let mut replica = MarketDataReplica::new(instrument(), version());
+    let mut replica = MarketDataReplica::new(instrument(), version(), TradingState::Open);
     replica
         .apply_snapshot(&publisher.snapshot())
         .expect("snapshot applies");
@@ -519,7 +519,7 @@ fn every_self_trade_policy_reconstructs_public_depth() {
     ] {
         let mut book = OrderBook::new(definition());
         let mut publisher = MarketDataPublisher::from_book(&book).expect("publisher bootstraps");
-        let mut replica = MarketDataReplica::new(instrument(), version());
+        let mut replica = MarketDataReplica::new(instrument(), version(), TradingState::Open);
         replica
             .apply_snapshot(&publisher.snapshot())
             .expect("snapshot applies");
@@ -560,7 +560,7 @@ fn every_self_trade_policy_reconstructs_public_depth() {
 fn multi_maker_negative_price_trades_reconstruct_public_depth() {
     let mut book = OrderBook::new(definition());
     let mut publisher = MarketDataPublisher::from_book(&book).expect("publisher bootstraps");
-    let mut replica = MarketDataReplica::new(instrument(), version());
+    let mut replica = MarketDataReplica::new(instrument(), version(), TradingState::Open);
     replica
         .apply_snapshot(&publisher.snapshot())
         .expect("snapshot applies");
@@ -633,7 +633,7 @@ fn multi_maker_negative_price_trades_reconstruct_public_depth() {
 fn replica_rejects_a_trade_that_does_not_reconcile_to_the_maker_level() {
     let mut book = OrderBook::new(definition());
     let mut publisher = MarketDataPublisher::from_book(&book).expect("publisher bootstraps");
-    let mut replica = MarketDataReplica::new(instrument(), version());
+    let mut replica = MarketDataReplica::new(instrument(), version(), TradingState::Open);
     replica
         .apply_snapshot(&publisher.snapshot())
         .expect("snapshot applies");
@@ -715,7 +715,7 @@ fn publisher_bootstraps_from_wal_recovery_and_continues_without_retransmission()
     let mut publisher =
         MarketDataPublisher::from_book(durable.book()).expect("publisher bootstraps from replay");
     assert_eq!(publisher.last_sequence(), 2);
-    let mut replica = MarketDataReplica::new(instrument(), version());
+    let mut replica = MarketDataReplica::new(instrument(), version(), TradingState::Open);
     replica
         .apply_snapshot(&publisher.snapshot())
         .expect("recovered snapshot applies");

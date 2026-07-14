@@ -728,6 +728,7 @@ fn public_incrementals_expose_only_each_active_peak_across_refresh() {
     let mut replica = MarketDataReplica::new(
         InstrumentId::new(1).unwrap(),
         InstrumentVersion::new(1).unwrap(),
+        TradingState::Open,
     );
     replica.apply_snapshot(&publisher.snapshot()).unwrap();
 
@@ -764,7 +765,7 @@ fn public_incrementals_expose_only_each_active_peak_across_refresh() {
         .updates()
         .iter()
         .filter_map(|update| match update.kind() {
-            MarketDataKind::NoBookChange => None,
+            MarketDataKind::NoBookChange | MarketDataKind::TradingState { .. } => None,
             MarketDataKind::Level(level) => Some((level.quantity, level.order_count)),
             MarketDataKind::Trade { maker_level, .. } => {
                 Some((maker_level.quantity, maker_level.order_count))

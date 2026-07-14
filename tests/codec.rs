@@ -14,7 +14,7 @@ use quotick::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
     Command, CommandOutcome, Event, EventKind, ExecutionReport, MassCancel, MassCancelScope,
     NewOrder, OrderBook, OrderDisplay, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention,
-    TimeInForce, Trade,
+    TimeInForce, Trade, TradingStateControl, TradingStateControlAction,
 };
 use quotick::risk::{
     AccountRiskDefinition, AccountRiskState, RiskError, RiskLimitSpec, RiskLimits, RiskProfile,
@@ -142,6 +142,93 @@ fn account_control_codec_has_a_stable_little_endian_layout() {
 }
 
 #[test]
+fn trading_state_control_codec_has_a_stable_little_endian_layout() {
+    let value = Command::TradingStateControl(TradingStateControl {
+        command_id: id(CommandId::new(11)),
+        instrument_id: id(InstrumentId::new(4)),
+        instrument_version: version(),
+        expected_revision: 12,
+        target_state: TradingState::Halted,
+        action: TradingStateControlAction::TransitionAndCancel,
+        received_at: TimestampNs::from_unix_nanos(13),
+    });
+    let encoded = value.encode().unwrap();
+    let mut expected = vec![5];
+    expected.extend_from_slice(&11_u64.to_le_bytes());
+    expected.extend_from_slice(&4_u64.to_le_bytes());
+    expected.extend_from_slice(&1_u64.to_le_bytes());
+    expected.extend_from_slice(&12_u64.to_le_bytes());
+    expected.push(2);
+    expected.push(1);
+    expected.extend_from_slice(&13_u64.to_le_bytes());
+    assert_eq!(encoded, expected);
+    assert_eq!(Command::decode(&encoded).unwrap(), value);
+}
+
+#[test]
+fn trading_state_control_report_tags_have_a_stable_layout() {
+    let command_id = id(CommandId::new(11));
+    let report = ExecutionReport {
+        command_id,
+        outcome: CommandOutcome::Accepted,
+        events: vec![
+            Event {
+                sequence: 1,
+                command_id,
+                occurred_at: TimestampNs::from_unix_nanos(13),
+                kind: EventKind::OrderCancelled {
+                    order_id: id(OrderId::new(20)),
+                    quantity: Quantity::new(5).unwrap(),
+                    reason: CancelReason::TradingStateControl,
+                },
+            },
+            Event {
+                sequence: 2,
+                command_id,
+                occurred_at: TimestampNs::from_unix_nanos(13),
+                kind: EventKind::TradingStateControlApplied {
+                    previous_state: TradingState::Open,
+                    current_state: TradingState::Halted,
+                    revision: 1,
+                    cancelled_order_count: 1,
+                    cancelled_quantity_lots: 5,
+                },
+            },
+        ]
+        .into(),
+        replayed: false,
+    };
+    let encoded = report.encode().unwrap();
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&11_u64.to_le_bytes());
+    expected.push(0);
+    expected.push(0);
+    expected.extend_from_slice(&2_u32.to_le_bytes());
+    expected.extend_from_slice(&1_u64.to_le_bytes());
+    expected.extend_from_slice(&11_u64.to_le_bytes());
+    expected.extend_from_slice(&13_u64.to_le_bytes());
+    expected.push(3);
+    expected.extend_from_slice(&20_u64.to_le_bytes());
+    expected.extend_from_slice(&5_u64.to_le_bytes());
+    expected.push(6);
+    expected.extend_from_slice(&2_u64.to_le_bytes());
+    expected.extend_from_slice(&11_u64.to_le_bytes());
+    expected.extend_from_slice(&13_u64.to_le_bytes());
+    expected.push(10);
+    expected.push(0);
+    expected.push(2);
+    expected.extend_from_slice(&1_u64.to_le_bytes());
+    expected.extend_from_slice(&1_u64.to_le_bytes());
+    expected.extend_from_slice(&5_u128.to_le_bytes());
+    assert_eq!(encoded, expected);
+    assert_eq!(ExecutionReport::decode(&encoded).unwrap(), report);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one codec scenario keeps incremental, state, snapshot, and replica bytes contiguous"
+)]
 fn market_data_codecs_round_trip_stable_incrementals_and_full_depth_snapshots() {
     let mut book = OrderBook::new(definition());
     let mut publisher = MarketDataPublisher::from_book(&book).expect("publisher bootstraps");
@@ -195,12 +282,49 @@ fn market_data_codecs_round_trip_stable_incrementals_and_full_depth_snapshots() 
 
     let snapshot = publisher.snapshot();
     let encoded_snapshot = snapshot.encode().expect("snapshot encodes");
-    assert_eq!(encoded_snapshot.len(), 66);
+    assert_eq!(encoded_snapshot.len(), 75);
     assert_eq!(
         MarketDataSnapshot::decode(&encoded_snapshot).unwrap(),
         snapshot
     );
-    let mut replica = MarketDataReplica::new(id(InstrumentId::new(4)), version());
+    let state_command = Command::TradingStateControl(TradingStateControl {
+        command_id: id(CommandId::new(92)),
+        instrument_id: id(InstrumentId::new(4)),
+        instrument_version: version(),
+        expected_revision: 0,
+        target_state: TradingState::Halted,
+        action: TradingStateControlAction::Transition,
+        received_at: TimestampNs::from_unix_nanos(10),
+    });
+    let state_report = book.submit(state_command).unwrap();
+    let state_batch = publisher
+        .publish(state_command, &state_report, &book)
+        .unwrap();
+    let encoded_state = state_batch.updates()[0].encode().unwrap();
+    let mut expected_state = Vec::new();
+    expected_state.extend_from_slice(&4_u64.to_le_bytes());
+    expected_state.extend_from_slice(&1_u64.to_le_bytes());
+    expected_state.extend_from_slice(&3_u64.to_le_bytes());
+    expected_state.extend_from_slice(&10_u64.to_le_bytes());
+    expected_state.push(3);
+    expected_state.push(0);
+    expected_state.push(2);
+    expected_state.extend_from_slice(&1_u64.to_le_bytes());
+    assert_eq!(encoded_state, expected_state);
+    assert_eq!(
+        MarketDataUpdate::decode(&encoded_state).unwrap(),
+        state_batch.updates()[0]
+    );
+    let halted_snapshot = publisher.snapshot();
+    let encoded_halted_snapshot = halted_snapshot.encode().unwrap();
+    assert_eq!(encoded_halted_snapshot[25], 2);
+    assert_eq!(&encoded_halted_snapshot[26..34], &1_u64.to_le_bytes());
+    assert_eq!(
+        MarketDataSnapshot::decode(&encoded_halted_snapshot).unwrap(),
+        halted_snapshot
+    );
+    let mut replica =
+        MarketDataReplica::new(id(InstrumentId::new(4)), version(), TradingState::Open);
     replica
         .apply_snapshot(&genesis)
         .expect("genesis snapshot applies");
@@ -208,7 +332,9 @@ fn market_data_codecs_round_trip_stable_incrementals_and_full_depth_snapshots() 
         let decoded = MarketDataUpdate::decode(&update.encode().unwrap()).unwrap();
         replica.apply(decoded).expect("decoded update applies");
     }
+    replica.apply_batch(&state_batch).unwrap();
     assert_eq!(replica.depth(Side::Buy, 10), book.depth(Side::Buy, 10));
+    assert_eq!(replica.trading_state(), book.trading_state());
     let mut invalid_trade_option = encoded_snapshot;
     invalid_trade_option[24] = 2;
     assert_eq!(

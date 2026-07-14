@@ -8,8 +8,9 @@
 //! deletion, and next-worse traversal remain `O(log P)`, where `P` is the number
 //! of occupied price levels. A command consuming `E` displayed maker slices is
 //! `O((E + 1) log P)`. A reserve maker can contribute multiple slices. Account
-//! mass-cancel and block-and-cancel selection visit `K` selected orders and
-//! canonically sort them in `O(K log K)`. FOK inspection uses `O(1)` auxiliary space and visits each
+//! mass-cancel and block-and-cancel selection visit `K` selected orders;
+//! instrument transition-and-cancel visits all `O` active orders. Both
+//! canonically sort in `O(K log K)` or `O(O log O)`. FOK inspection uses `O(1)` auxiliary space and visits each
 //! active order in crossed levels at most once; it never materializes reserve
 //! replenishment slices.
 
@@ -25,7 +26,7 @@ use crate::domain::{
     TimestampNs, TradeId,
 };
 use crate::indexed_avl::IndexedAvlMap;
-use crate::instrument::{AdmissionError, InstrumentDefinition};
+use crate::instrument::{AdmissionError, InstrumentDefinition, TradingState};
 
 static NEXT_ORDER_BOOK_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -280,6 +281,59 @@ pub struct AccountControl {
     pub received_at: TimestampNs,
 }
 
+/// Mutation applied by one instrument-wide trading-state control.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TradingStateControlAction {
+    /// Change state without cancelling resting orders.
+    Transition,
+    /// Change to an entry-closed state and atomically cancel every resting order.
+    TransitionAndCancel,
+}
+
+/// Revision-checked instrument-wide trading-state command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TradingStateControl {
+    /// Globally unique idempotency key within the shard generation.
+    pub command_id: CommandId,
+    /// Routed instrument.
+    pub instrument_id: InstrumentId,
+    /// Immutable instrument-definition version expected by the controller.
+    pub instrument_version: InstrumentVersion,
+    /// Current revision observed by the controller; genesis is revision zero.
+    pub expected_revision: u64,
+    /// Requested effective trading state.
+    pub target_state: TradingState,
+    /// Transition-only or transition-plus-cancel-all behavior.
+    pub action: TradingStateControlAction,
+    /// Gateway/controller receive time.
+    pub received_at: TimestampNs,
+}
+
+/// Read-only effective instrument trading state and control revision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TradingStateSnapshot {
+    state: TradingState,
+    revision: u64,
+}
+
+impl TradingStateSnapshot {
+    pub(crate) const fn from_parts(state: TradingState, revision: u64) -> Self {
+        Self { state, revision }
+    }
+
+    /// Returns the effective trading state.
+    #[must_use]
+    pub const fn state(self) -> TradingState {
+        self.state
+    }
+
+    /// Returns the last accepted state-control revision; zero denotes genesis.
+    #[must_use]
+    pub const fn revision(self) -> u64 {
+        self.revision
+    }
+}
+
 /// Read-only effective account-fence state.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AccountControlSnapshot {
@@ -318,6 +372,8 @@ pub enum Command {
     MassCancel(MassCancel),
     /// Change an account admission fence, optionally cancelling all resting orders atomically.
     AccountControl(AccountControl),
+    /// Change the instrument-wide effective trading state.
+    TradingStateControl(TradingStateControl),
 }
 
 impl Command {
@@ -328,6 +384,7 @@ impl Command {
             Self::Replace(command) => command.command_id,
             Self::MassCancel(command) => command.command_id,
             Self::AccountControl(command) => command.command_id,
+            Self::TradingStateControl(command) => command.command_id,
         }
     }
 
@@ -338,6 +395,7 @@ impl Command {
             Self::Replace(command) => command.received_at,
             Self::MassCancel(command) => command.received_at,
             Self::AccountControl(command) => command.received_at,
+            Self::TradingStateControl(command) => command.received_at,
         }
     }
 }
@@ -413,6 +471,14 @@ pub enum RejectReason {
     AccountControlRevisionMismatch,
     /// The account-control revision cannot advance beyond `u64::MAX`.
     AccountControlRevisionExhausted,
+    /// The trading-state compare revision did not equal current state.
+    TradingStateControlRevisionMismatch,
+    /// The trading-state control revision cannot advance beyond `u64::MAX`.
+    TradingStateControlRevisionExhausted,
+    /// The requested trading state is already effective.
+    TradingStateUnchanged,
+    /// Cancel-all cannot transition into the entry-open state.
+    TradingStateControlCannotCancelIntoOpen,
 }
 
 impl From<AdmissionError> for RejectReason {
@@ -450,6 +516,8 @@ pub enum CancelReason {
     MassCancel,
     /// Resting quantity removed by an atomic account admission control.
     AccountControl,
+    /// Resting quantity removed by an instrument-wide state transition.
+    TradingStateControl,
 }
 
 /// Whether a filled order supplied or removed liquidity.
@@ -542,6 +610,19 @@ pub enum EventKind {
         /// Effective state after this transition.
         current_state: AccountAdmissionState,
         /// Newly committed monotonically increasing account-control revision.
+        revision: u64,
+        /// Number of resting orders atomically removed by the transition.
+        cancelled_order_count: u64,
+        /// Sum of removed total leaves in lots, including hidden reserve leaves.
+        cancelled_quantity_lots: u128,
+    },
+    /// A revision-checked instrument-wide trading-state transition completed atomically.
+    TradingStateControlApplied {
+        /// Effective state before this transition.
+        previous_state: TradingState,
+        /// Effective state after this transition.
+        current_state: TradingState,
+        /// Newly committed monotonically increasing control revision.
         revision: u64,
         /// Number of resting orders atomically removed by the transition.
         cancelled_order_count: u64,
@@ -765,7 +846,7 @@ pub enum CommandPreparation {
 ///
 /// A prepared command contains no borrowed book state and can be written to a
 /// WAL before commit. It owns the empty Arc-backed event vector and, for mass
-/// cancellation, the empty order-selection vector whose complete command-specific
+/// cancellation or transition-and-cancel, the empty order-selection vector whose complete command-specific
 /// capacities were fallibly reserved during preparation. All matching hash-table
 /// headroom was reserved when the book was constructed, so preparation borrows the
 /// book immutably and cannot change either allocator or semantic book state.
@@ -1067,6 +1148,8 @@ impl OrderBookCheckpoint {
         let mut command_ids = HashSet::with_capacity(self.history.len());
         let mut seen_order_ids = HashSet::new();
         let mut account_controls: HashMap<AccountId, AccountControlSnapshot> = HashMap::new();
+        let mut trading_state =
+            TradingStateSnapshot::from_parts(self.definition.trading_state(), 0);
         let mut expected_event_sequence = 1_u64;
         let mut expected_trade_id = 1_u64;
         for entry in &self.history {
@@ -1202,6 +1285,80 @@ impl OrderBookCheckpoint {
                     },
                 );
             }
+            if let (Command::TradingStateControl(control), CommandOutcome::Accepted) =
+                (entry.command, entry.report.outcome)
+            {
+                if trading_state.revision != control.expected_revision
+                    || trading_state.state == control.target_state
+                    || (control.action == TradingStateControlAction::TransitionAndCancel
+                        && control.target_state == TradingState::Open)
+                {
+                    return Err(OrderBookCheckpointError::new(
+                        "checkpoint trading-state control chain is invalid",
+                    ));
+                }
+                let revision = control.expected_revision.checked_add(1).ok_or_else(|| {
+                    OrderBookCheckpointError::new(
+                        "checkpoint trading-state control revision is exhausted",
+                    )
+                })?;
+                let mut cancelled_order_count = 0_u64;
+                let mut cancelled_quantity_lots = 0_u128;
+                let mut previous_order_id = None;
+                for event in &entry.report.events[..entry.report.events.len() - 1] {
+                    let EventKind::OrderCancelled {
+                        order_id,
+                        quantity,
+                        reason: CancelReason::TradingStateControl,
+                    } = event.kind
+                    else {
+                        return Err(OrderBookCheckpointError::new(
+                            "checkpoint trading-state trace contains an invalid transition",
+                        ));
+                    };
+                    if previous_order_id.is_some_and(|previous| order_id <= previous) {
+                        return Err(OrderBookCheckpointError::new(
+                            "checkpoint trading-state cancellations are not canonical",
+                        ));
+                    }
+                    previous_order_id = Some(order_id);
+                    cancelled_order_count =
+                        cancelled_order_count.checked_add(1).ok_or_else(|| {
+                            OrderBookCheckpointError::new(
+                                "checkpoint trading-state cancellation count is exhausted",
+                            )
+                        })?;
+                    cancelled_quantity_lots = cancelled_quantity_lots
+                        .checked_add(u128::from(quantity.lots()))
+                        .ok_or_else(|| {
+                            OrderBookCheckpointError::new(
+                                "checkpoint trading-state cancellation quantity overflow",
+                            )
+                        })?;
+                }
+                if (control.action == TradingStateControlAction::Transition
+                    && cancelled_order_count != 0)
+                    || !matches!(
+                        entry.report.events.last().map(|event| event.kind),
+                        Some(EventKind::TradingStateControlApplied {
+                            previous_state,
+                            current_state,
+                            revision: observed_revision,
+                            cancelled_order_count: observed_count,
+                            cancelled_quantity_lots: observed_quantity,
+                        }) if previous_state == trading_state.state
+                            && current_state == control.target_state
+                            && observed_revision == revision
+                            && observed_count == cancelled_order_count
+                            && observed_quantity == cancelled_quantity_lots
+                    )
+                {
+                    return Err(OrderBookCheckpointError::new(
+                        "checkpoint trading-state completion event is invalid",
+                    ));
+                }
+                trading_state = TradingStateSnapshot::from_parts(control.target_state, revision);
+            }
         }
 
         let mut active_ids = HashSet::with_capacity(self.orders.len());
@@ -1285,7 +1442,7 @@ fn validate_checkpoint_order(
         .map_err(|_| OrderBookCheckpointError::new("checkpoint order price violates definition"))?;
     definition
         .quantity_rules()
-        .validate(order.leaves)
+        .validate_leaves(order.leaves)
         .map_err(|_| OrderBookCheckpointError::new("checkpoint order leaves violate definition"))?;
     if order.displayed.lots() > order.leaves.lots() {
         return Err(OrderBookCheckpointError::new(
@@ -1411,6 +1568,8 @@ pub enum MatchingCapacity {
     ReportEvents,
     /// Active-order identifiers selected by one mass cancellation.
     MassCancelSelection,
+    /// All active-order identifiers selected by an instrument state control.
+    TradingStateSelection,
     /// Coupled pre-trade risk reservations for active orders.
     RiskReservations,
     /// Immutable account profiles registered in a coupled risk shard.
@@ -1430,6 +1589,7 @@ impl fmt::Display for MatchingCapacity {
             Self::AskPriceLevels => "ask price levels",
             Self::ReportEvents => "execution-report events",
             Self::MassCancelSelection => "mass-cancel order selection",
+            Self::TradingStateSelection => "trading-state order selection",
             Self::RiskReservations => "risk reservations",
             Self::RiskAccounts => "registered risk accounts",
         })
@@ -1505,7 +1665,7 @@ pub struct OrderBookLimitsSpec {
     pub max_account_controls: usize,
     /// Maximum retained command/report pairs.
     pub max_retained_commands: usize,
-    /// Tail history slots reserved exclusively for cancel and mass-cancel commands.
+    /// Tail history slots reserved for business-valid cancellation-capable commands.
     pub cancellation_reserve: usize,
     /// Maximum events retained by one execution report.
     pub max_report_events: usize,
@@ -2187,6 +2347,7 @@ enum LevelLiquidity {
 pub struct OrderBook {
     instance_id: u64,
     definition: InstrumentDefinition,
+    trading_state: TradingStateSnapshot,
     limits: OrderBookLimits,
     bids: PriceLevels,
     asks: PriceLevels,
@@ -2202,6 +2363,7 @@ pub struct OrderBook {
 impl PartialEq for OrderBook {
     fn eq(&self, other: &Self) -> bool {
         self.definition == other.definition
+            && self.trading_state == other.trading_state
             && self.limits == other.limits
             && self.bids == other.bids
             && self.asks == other.asks
@@ -2292,9 +2454,11 @@ impl OrderBook {
                 MatchingError::CapacityReservationFailed(MatchingCapacity::CommandHistory)
             })?;
         let instance_id = next_order_book_instance_id()?;
+        let trading_state = TradingStateSnapshot::from_parts(definition.trading_state(), 0);
         Ok(Self {
             instance_id,
             definition,
+            trading_state,
             limits,
             bids,
             asks,
@@ -2462,6 +2626,17 @@ impl OrderBook {
                     },
                 );
             }
+            if let (Command::TradingStateControl(control), CommandOutcome::Accepted) =
+                (entry.command, entry.report.outcome)
+            {
+                let revision = control.expected_revision.checked_add(1).ok_or_else(|| {
+                    OrderBookCheckpointError::new(
+                        "checkpoint trading-state control revision is exhausted",
+                    )
+                })?;
+                book.trading_state =
+                    TradingStateSnapshot::from_parts(control.target_state, revision);
+            }
             for event in &entry.report.events {
                 book.next_sequence = event.sequence.checked_add(1).ok_or_else(|| {
                     OrderBookCheckpointError::new("checkpoint event sequence is exhausted")
@@ -2519,6 +2694,12 @@ impl OrderBook {
         self.definition.version()
     }
 
+    /// Returns the effective instrument trading state and accepted revision.
+    #[must_use]
+    pub const fn trading_state(&self) -> TradingStateSnapshot {
+        self.trading_state
+    }
+
     /// Applies a command exactly once and returns its complete trace.
     ///
     /// An exact duplicate returns the original event sequence with `replayed`
@@ -2545,11 +2726,15 @@ impl OrderBook {
     ///
     /// Returns the business [`RejectReason`] that [`OrderBook::submit`] would
     /// emit for a command not already present in the idempotency cache.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive command match preserves documented business-rejection precedence"
+    )]
     pub fn check_business_rules(&self, command: Command) -> Result<(), RejectReason> {
         match command {
             Command::New(command) => {
                 self.definition
-                    .admit(Command::New(command))
+                    .admit_in_state(Command::New(command), self.trading_state.state)
                     .map_err(RejectReason::from)?;
                 if self.seen_order_ids.contains(&command.order_id) {
                     return Err(RejectReason::DuplicateOrder);
@@ -2606,7 +2791,7 @@ impl OrderBook {
             }
             Command::Replace(command) => {
                 self.definition
-                    .admit(Command::Replace(command))
+                    .admit_in_state(Command::Replace(command), self.trading_state.state)
                     .map_err(RejectReason::from)?;
                 let order = self
                     .orders
@@ -2638,6 +2823,25 @@ impl OrderBook {
                 }
                 if command.expected_revision.checked_add(1).is_none() {
                     return Err(RejectReason::AccountControlRevisionExhausted);
+                }
+            }
+            Command::TradingStateControl(command) => {
+                self.definition
+                    .admit(Command::TradingStateControl(command))
+                    .map_err(RejectReason::from)?;
+                if self.trading_state.revision != command.expected_revision {
+                    return Err(RejectReason::TradingStateControlRevisionMismatch);
+                }
+                if command.expected_revision.checked_add(1).is_none() {
+                    return Err(RejectReason::TradingStateControlRevisionExhausted);
+                }
+                if self.trading_state.state == command.target_state {
+                    return Err(RejectReason::TradingStateUnchanged);
+                }
+                if command.action == TradingStateControlAction::TransitionAndCancel
+                    && command.target_state == TradingState::Open
+                {
+                    return Err(RejectReason::TradingStateControlCannotCancelIntoOpen);
                 }
             }
         }
@@ -2672,7 +2876,7 @@ impl OrderBook {
     /// Preparation checks idempotency, all operational capacity and identifier
     /// bounds, and core matching business rules exactly once. It also fallibly
     /// reserves the complete report event buffer and any mass-cancel or
-    /// block-and-cancel selection buffer.
+    /// block-and-cancel or instrument transition-and-cancel selection buffer.
     /// Every matching hash index already owns its complete configured headroom,
     /// so preparation is read-only with respect to the book. A ready token can be durably written
     /// through [`PreparedCommand::command`] and then applied with
@@ -2736,6 +2940,21 @@ impl OrderBook {
                 })?;
                 Some(selected)
             }
+            (
+                None,
+                Command::TradingStateControl(TradingStateControl {
+                    action: TradingStateControlAction::TransitionAndCancel,
+                    ..
+                }),
+            ) => {
+                let mut selected = Vec::new();
+                selected.try_reserve_exact(self.orders.len()).map_err(|_| {
+                    MatchingError::CapacityReservationFailed(
+                        MatchingCapacity::TradingStateSelection,
+                    )
+                })?;
+                Some(selected)
+            }
             _ => None,
         };
         Ok(CommandPreparation::Ready(PreparedCommand {
@@ -2779,6 +2998,16 @@ impl OrderBook {
                         self.account_active_order_count(command.account_id, MassCancelScope::All)
                     }
                     AccountControlAction::Enable => 0,
+                };
+                let events = selected
+                    .checked_add(1)
+                    .ok_or(MatchingError::SequenceExhausted)?;
+                return Ok((events, 0));
+            }
+            Command::TradingStateControl(command) => {
+                let selected = match command.action {
+                    TradingStateControlAction::Transition => 0,
+                    TradingStateControlAction::TransitionAndCancel => self.orders.len(),
                 };
                 let events = selected
                     .checked_add(1)
@@ -2935,6 +3164,9 @@ impl OrderBook {
                 Command::AccountControl(control) => {
                     self.apply_account_control(control, events, selected_order_ids)?
                 }
+                Command::TradingStateControl(control) => {
+                    self.apply_trading_state_control(control, events, selected_order_ids)?
+                }
             }
         };
         self.cache_report(command, &report);
@@ -2957,6 +3189,13 @@ impl OrderBook {
                     | Command::MassCancel(_)
                     | Command::AccountControl(AccountControl {
                         action: AccountControlAction::BlockAndCancel,
+                        ..
+                    })
+                    | Command::TradingStateControl(TradingStateControl {
+                        action: TradingStateControlAction::TransitionAndCancel,
+                        target_state: TradingState::CancelOnly
+                            | TradingState::Halted
+                            | TradingState::Closed,
                         ..
                     })
             ) {
@@ -2983,7 +3222,7 @@ impl OrderBook {
         match command {
             Command::New(command) => self.check_new_capacity(command),
             Command::Replace(command) => self.check_replace_capacity(command),
-            Command::Cancel(_) | Command::MassCancel(_) => Ok(()),
+            Command::Cancel(_) | Command::MassCancel(_) | Command::TradingStateControl(_) => Ok(()),
             Command::AccountControl(command) => {
                 if core_rejection.is_some()
                     || self.account_controls.contains_key(&command.account_id)
@@ -3932,6 +4171,84 @@ impl OrderBook {
                 account_id: command.account_id,
                 previous_state: previous.state,
                 current_state,
+                revision,
+                cancelled_order_count,
+                cancelled_quantity_lots,
+            },
+        )?;
+        Ok(ExecutionReport {
+            command_id: command.command_id,
+            outcome: CommandOutcome::Accepted,
+            events: events.finish(),
+            replayed: false,
+        })
+    }
+
+    fn apply_trading_state_control(
+        &mut self,
+        command: TradingStateControl,
+        mut events: EventTraceBuilder,
+        selected: Option<Vec<OrderId>>,
+    ) -> Result<ExecutionReport, MatchingError> {
+        let previous = self.trading_state;
+        assert_eq!(
+            previous.revision, command.expected_revision,
+            "trading-state revision was checked during preparation"
+        );
+        let revision = command
+            .expected_revision
+            .checked_add(1)
+            .expect("trading-state revision exhaustion was preflighted");
+
+        let (cancelled_order_count, cancelled_quantity_lots) = match command.action {
+            TradingStateControlAction::Transition => {
+                assert!(
+                    selected.is_none(),
+                    "transition-only control needs no order-selection storage"
+                );
+                (0, 0)
+            }
+            TradingStateControlAction::TransitionAndCancel => {
+                let mut selected =
+                    selected.expect("transition-and-cancel preparation owns selection storage");
+                let selected_count = self.orders.len();
+                debug_assert_eq!(events.maximum_events, selected_count + 1);
+                debug_assert!(selected.capacity() >= selected_count);
+                let selected_buffer = selected.as_ptr();
+                selected.extend(self.orders.keys().copied());
+                selected.sort_unstable();
+                debug_assert_eq!(selected.len(), selected_count);
+                debug_assert_eq!(selected.as_ptr(), selected_buffer);
+
+                let cancelled_order_count =
+                    u64::try_from(selected_count).map_err(|_| MatchingError::SequenceExhausted)?;
+                let mut cancelled_quantity_lots = 0_u128;
+                for order_id in selected {
+                    let removed = self.remove_order(order_id);
+                    cancelled_quantity_lots = cancelled_quantity_lots
+                        .checked_add(u128::from(removed.leaves))
+                        .expect("u64-sized active-order set cannot overflow u128 total quantity");
+                    self.push_cancelled(
+                        &mut events,
+                        command.command_id,
+                        command.received_at,
+                        order_id,
+                        removed.leaves,
+                        CancelReason::TradingStateControl,
+                    )?;
+                }
+                (cancelled_order_count, cancelled_quantity_lots)
+            }
+        };
+
+        self.trading_state = TradingStateSnapshot::from_parts(command.target_state, revision);
+        self.push_event(
+            &mut events,
+            command.command_id,
+            command.received_at,
+            EventKind::TradingStateControlApplied {
+                previous_state: previous.state,
+                current_state: command.target_state,
                 revision,
                 cancelled_order_count,
                 cancelled_quantity_lots,

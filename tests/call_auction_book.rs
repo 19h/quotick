@@ -1,0 +1,741 @@
+use std::collections::{BTreeMap, HashMap};
+
+use quotick::auction::{
+    AuctionLevel, AuctionMarketInterest, AuctionOrderConstraint, AuctionPricePolicy,
+    discover_bounded_clearing_price,
+};
+use quotick::auction_book::{
+    CallAuctionAdmissionError, CallAuctionBook, CallAuctionBookLimits, CallAuctionBookLimitsError,
+    CallAuctionBookLimitsSpec, CallAuctionCancelError, CallAuctionCapacity, CallAuctionIndicative,
+    CallAuctionOrder, CallAuctionPlanError,
+};
+use quotick::instrument::{
+    AdmissionError, InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol,
+    PriceRules, QuantityRules, ReserveOrderRules, TradingState,
+};
+use quotick::{
+    AccountId, AssetId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
+    TimestampNs,
+};
+
+fn account(value: u64) -> AccountId {
+    AccountId::new(value).unwrap()
+}
+
+fn instrument() -> InstrumentId {
+    InstrumentId::new(7).unwrap()
+}
+
+fn version() -> InstrumentVersion {
+    InstrumentVersion::new(3).unwrap()
+}
+
+fn definition() -> InstrumentDefinition {
+    InstrumentDefinition::new(InstrumentSpec {
+        instrument_id: instrument(),
+        version: version(),
+        effective_from: TimestampNs::from_unix_nanos(0),
+        symbol: InstrumentSymbol::new("AUCTION").unwrap(),
+        kind: InstrumentKind::Spot,
+        base_asset_id: AssetId::new(1).unwrap(),
+        quote_asset_id: AssetId::new(2).unwrap(),
+        price: PriceRules::new(0, 5, Price::from_raw(-100), Price::from_raw(200)).unwrap(),
+        quantity: QuantityRules::new(1, 1, 1_000).unwrap(),
+        reserve: ReserveOrderRules::disabled(),
+        base_units_per_lot: 1,
+        quote_units_per_price_unit: 1,
+        trading_state: TradingState::Halted,
+    })
+    .unwrap()
+}
+
+fn limits(active: usize, levels: usize, accepted: usize) -> CallAuctionBookLimits {
+    CallAuctionBookLimits::new(CallAuctionBookLimitsSpec {
+        max_active_orders: active,
+        max_price_levels_per_side: levels,
+        max_accepted_order_ids: accepted,
+    })
+    .unwrap()
+}
+
+fn order(
+    id: u64,
+    owner: u64,
+    side: Side,
+    constraint: AuctionOrderConstraint,
+    quantity: u64,
+) -> CallAuctionOrder {
+    CallAuctionOrder::new(
+        OrderId::new(id).unwrap(),
+        account(owner),
+        instrument(),
+        version(),
+        side,
+        constraint,
+        Quantity::new(quantity).unwrap(),
+    )
+}
+
+#[test]
+fn limits_reject_zero_and_incoherent_bounds() {
+    let make = |active, levels, accepted| {
+        CallAuctionBookLimits::new(CallAuctionBookLimitsSpec {
+            max_active_orders: active,
+            max_price_levels_per_side: levels,
+            max_accepted_order_ids: accepted,
+        })
+    };
+    assert_eq!(
+        make(0, 1, 1),
+        Err(CallAuctionBookLimitsError::ZeroActiveOrders)
+    );
+    assert_eq!(
+        make(1, 0, 1),
+        Err(CallAuctionBookLimitsError::ZeroPriceLevels)
+    );
+    assert_eq!(
+        make(1, 1, 0),
+        Err(CallAuctionBookLimitsError::ZeroAcceptedOrderIds)
+    );
+    assert_eq!(
+        make(1, 2, 2),
+        Err(CallAuctionBookLimitsError::PriceLevelsExceedActiveOrders)
+    );
+    assert_eq!(
+        make(2, 1, 1),
+        Err(CallAuctionBookLimitsError::ActiveOrdersExceedAcceptedOrderIds)
+    );
+}
+
+#[test]
+fn crossed_limit_and_market_interest_clears_and_allocates_without_mutation() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(16, 8, 32)).unwrap();
+    book.admit(order(
+        1,
+        1,
+        Side::Buy,
+        AuctionOrderConstraint::Limit(Price::from_raw(110)),
+        10,
+    ))
+    .unwrap();
+    book.admit(order(2, 1, Side::Buy, AuctionOrderConstraint::Market, 4))
+        .unwrap();
+    book.admit(order(
+        3,
+        2,
+        Side::Sell,
+        AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        8,
+    ))
+    .unwrap();
+    book.admit(order(4, 2, Side::Sell, AuctionOrderConstraint::Market, 2))
+        .unwrap();
+
+    assert_eq!(book.best_limit_price(Side::Buy), Some(Price::from_raw(110)));
+    assert_eq!(
+        book.best_limit_price(Side::Sell),
+        Some(Price::from_raw(100))
+    );
+    assert_eq!(book.market_quantity(Side::Buy), 4);
+    assert_eq!(book.market_quantity(Side::Sell), 2);
+    let indicative = book
+        .indicative_clearing(
+            book.instrument_price_band(),
+            Price::from_raw(105),
+            AuctionPricePolicy::REFERENCE_THEN_LOWER,
+        )
+        .unwrap()
+        .unwrap();
+    let clearing = indicative.clearing();
+    assert_eq!(clearing.price(), Price::from_raw(105));
+    assert_eq!(clearing.buy_quantity(), 14);
+    assert_eq!(clearing.sell_quantity(), 10);
+    assert_eq!(clearing.executable_quantity(), 10);
+
+    let plan = book.allocation_plan(indicative).unwrap();
+    assert_eq!(
+        plan.buy_fills()
+            .iter()
+            .map(|fill| (fill.order_id().get(), fill.quantity_lots()))
+            .collect::<Vec<_>>(),
+        vec![(2, 4), (1, 6)]
+    );
+    assert_eq!(
+        plan.sell_fills()
+            .iter()
+            .map(|fill| (fill.order_id().get(), fill.quantity_lots()))
+            .collect::<Vec<_>>(),
+        vec![(4, 2), (3, 8)]
+    );
+    assert_eq!(book.active_order_count(), 4);
+    book.validate().unwrap();
+}
+
+#[test]
+fn shard_sequence_enforces_market_price_and_fifo_priority() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(16, 8, 32)).unwrap();
+    let first = book
+        .admit(order(10, 1, Side::Buy, AuctionOrderConstraint::Market, 2))
+        .unwrap();
+    let second = book
+        .admit(order(
+            11,
+            1,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(110)),
+            4,
+        ))
+        .unwrap();
+    let third = book
+        .admit(order(
+            12,
+            1,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(110)),
+            4,
+        ))
+        .unwrap();
+    book.admit(order(
+        13,
+        1,
+        Side::Buy,
+        AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        4,
+    ))
+    .unwrap();
+    book.admit(order(14, 2, Side::Sell, AuctionOrderConstraint::Market, 7))
+        .unwrap();
+    assert!(first.priority_sequence < second.priority_sequence);
+    assert!(second.priority_sequence < third.priority_sequence);
+
+    let indicative = book
+        .indicative_clearing(
+            book.instrument_price_band(),
+            Price::from_raw(105),
+            AuctionPricePolicy::REFERENCE_THEN_LOWER,
+        )
+        .unwrap()
+        .unwrap();
+    let plan = book.allocation_plan(indicative).unwrap();
+    assert_eq!(
+        plan.buy_fills()
+            .iter()
+            .map(|fill| (fill.order_id().get(), fill.quantity_lots()))
+            .collect::<Vec<_>>(),
+        vec![(10, 2), (11, 4), (12, 1)]
+    );
+    book.validate().unwrap();
+}
+
+#[test]
+fn allocation_rejects_foreign_and_stale_indicative_results() {
+    let mut first = CallAuctionBook::try_with_limits(definition(), limits(8, 4, 16)).unwrap();
+    first
+        .admit(order(1, 1, Side::Buy, AuctionOrderConstraint::Market, 5))
+        .unwrap();
+    first
+        .admit(order(2, 2, Side::Sell, AuctionOrderConstraint::Market, 5))
+        .unwrap();
+    let indicative = first
+        .indicative_clearing(
+            first.instrument_price_band(),
+            Price::from_raw(0),
+            AuctionPricePolicy::REFERENCE_THEN_LOWER,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(indicative.state_revision(), 2);
+
+    let mut second = CallAuctionBook::try_with_limits(definition(), limits(8, 4, 16)).unwrap();
+    second
+        .admit(order(1, 1, Side::Buy, AuctionOrderConstraint::Market, 5))
+        .unwrap();
+    second
+        .admit(order(2, 2, Side::Sell, AuctionOrderConstraint::Market, 5))
+        .unwrap();
+    assert_eq!(
+        second.allocation_plan(indicative),
+        Err(CallAuctionPlanError::ForeignBook)
+    );
+
+    first
+        .admit(order(3, 1, Side::Buy, AuctionOrderConstraint::Market, 1))
+        .unwrap();
+    assert_eq!(
+        first.allocation_plan(indicative),
+        Err(CallAuctionPlanError::StaleRevision {
+            observed: 2,
+            current: 3,
+        })
+    );
+}
+
+#[test]
+fn cancellation_checks_owner_unlinks_middle_and_never_reuses_identity() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(8, 4, 8)).unwrap();
+    for id in 1..=3 {
+        book.admit(order(
+            id,
+            1,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+            id,
+        ))
+        .unwrap();
+    }
+    assert_eq!(
+        book.cancel(account(2), OrderId::new(2).unwrap()),
+        Err(CallAuctionCancelError::AccountMismatch)
+    );
+    let canceled = book.cancel(account(1), OrderId::new(2).unwrap()).unwrap();
+    assert_eq!(canceled.order_id.get(), 2);
+    assert_eq!(book.active_order_count(), 2);
+    assert_eq!(book.accepted_order_id_count(), 3);
+    assert_eq!(
+        book.admit(order(2, 1, Side::Sell, AuctionOrderConstraint::Market, 1,)),
+        Err(CallAuctionAdmissionError::DuplicateOrderId)
+    );
+    assert_eq!(
+        book.cancel(account(1), OrderId::new(2).unwrap()),
+        Err(CallAuctionCancelError::UnknownOrder)
+    );
+    assert_eq!(
+        book.order(OrderId::new(1).unwrap())
+            .unwrap()
+            .quantity
+            .lots(),
+        1
+    );
+    assert_eq!(
+        book.order(OrderId::new(3).unwrap())
+            .unwrap()
+            .quantity
+            .lots(),
+        3
+    );
+    book.validate().unwrap();
+}
+
+#[test]
+fn admission_validates_routing_version_price_and_quantity() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(8, 4, 8)).unwrap();
+    let wrong_instrument = CallAuctionOrder::new(
+        OrderId::new(1).unwrap(),
+        account(1),
+        InstrumentId::new(99).unwrap(),
+        version(),
+        Side::Buy,
+        AuctionOrderConstraint::Market,
+        Quantity::new(1).unwrap(),
+    );
+    assert_eq!(
+        book.admit(wrong_instrument),
+        Err(CallAuctionAdmissionError::Instrument(
+            AdmissionError::WrongInstrument
+        ))
+    );
+    let wrong_version = CallAuctionOrder::new(
+        OrderId::new(2).unwrap(),
+        account(1),
+        instrument(),
+        InstrumentVersion::new(99).unwrap(),
+        Side::Buy,
+        AuctionOrderConstraint::Market,
+        Quantity::new(1).unwrap(),
+    );
+    assert_eq!(
+        book.admit(wrong_version),
+        Err(CallAuctionAdmissionError::Instrument(
+            AdmissionError::WrongVersion
+        ))
+    );
+    assert_eq!(
+        book.admit(order(
+            3,
+            1,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(101)),
+            1,
+        )),
+        Err(CallAuctionAdmissionError::Instrument(
+            AdmissionError::PriceOffTickGrid
+        ))
+    );
+    assert_eq!(
+        book.admit(order(
+            4,
+            1,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(205)),
+            1,
+        )),
+        Err(CallAuctionAdmissionError::Instrument(
+            AdmissionError::PriceOutsideCollar
+        ))
+    );
+    assert_eq!(
+        book.admit(order(
+            5,
+            1,
+            Side::Buy,
+            AuctionOrderConstraint::Market,
+            1_001
+        )),
+        Err(CallAuctionAdmissionError::Instrument(
+            AdmissionError::QuantityOutsideLimits
+        ))
+    );
+    assert_eq!(book.accepted_order_id_count(), 0);
+}
+
+#[test]
+fn finite_capacities_fail_before_mutation_and_are_independent_per_side() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(3, 1, 4)).unwrap();
+    book.admit(order(
+        1,
+        1,
+        Side::Buy,
+        AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        1,
+    ))
+    .unwrap();
+    book.admit(order(
+        2,
+        1,
+        Side::Buy,
+        AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        1,
+    ))
+    .unwrap();
+    assert_eq!(
+        book.admit(order(
+            3,
+            1,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(105)),
+            1,
+        )),
+        Err(CallAuctionAdmissionError::CapacityExceeded(
+            CallAuctionCapacity::BidPriceLevels
+        ))
+    );
+    book.admit(order(4, 1, Side::Buy, AuctionOrderConstraint::Market, 1))
+        .unwrap();
+    assert_eq!(
+        book.admit(order(5, 2, Side::Sell, AuctionOrderConstraint::Market, 1)),
+        Err(CallAuctionAdmissionError::CapacityExceeded(
+            CallAuctionCapacity::ActiveOrders
+        ))
+    );
+    book.cancel(account(1), OrderId::new(2).unwrap()).unwrap();
+    book.admit(order(
+        6,
+        2,
+        Side::Sell,
+        AuctionOrderConstraint::Limit(Price::from_raw(95)),
+        1,
+    ))
+    .unwrap();
+    assert_eq!(book.price_level_count(Side::Buy), 1);
+    assert_eq!(book.price_level_count(Side::Sell), 1);
+    book.cancel(account(1), OrderId::new(1).unwrap()).unwrap();
+    assert_eq!(
+        book.admit(order(7, 1, Side::Buy, AuctionOrderConstraint::Market, 1)),
+        Err(CallAuctionAdmissionError::CapacityExceeded(
+            CallAuctionCapacity::AcceptedOrderIds
+        ))
+    );
+    book.validate().unwrap();
+}
+
+#[test]
+fn constructor_reservations_do_not_grow_across_mutation_and_analysis() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(4, 2, 8)).unwrap();
+    let initial = book.resource_status();
+    for id in 1..=8 {
+        let side = if id % 2 == 0 { Side::Buy } else { Side::Sell };
+        let price = if id % 4 < 2 { 100 } else { 105 };
+        book.admit(order(
+            id,
+            1,
+            side,
+            AuctionOrderConstraint::Limit(Price::from_raw(price)),
+            1,
+        ))
+        .unwrap();
+        let _ = book
+            .indicative_clearing(
+                book.instrument_price_band(),
+                Price::from_raw(100),
+                AuctionPricePolicy::REFERENCE_THEN_LOWER,
+            )
+            .unwrap();
+        book.cancel(account(1), OrderId::new(id).unwrap()).unwrap();
+    }
+    let final_status = book.resource_status();
+    assert_eq!(
+        final_status.allocated_active_orders,
+        initial.allocated_active_orders
+    );
+    assert_eq!(
+        final_status.allocated_accepted_order_ids,
+        initial.allocated_accepted_order_ids
+    );
+    assert_eq!(
+        final_status.allocated_bid_price_levels,
+        initial.allocated_bid_price_levels
+    );
+    assert_eq!(
+        final_status.allocated_ask_price_levels,
+        initial.allocated_ask_price_levels
+    );
+    assert_eq!(final_status.bid_level_scratch, initial.bid_level_scratch);
+    assert_eq!(final_status.ask_level_scratch, initial.ask_level_scratch);
+    assert_eq!(final_status.buy_order_scratch, initial.buy_order_scratch);
+    assert_eq!(final_status.sell_order_scratch, initial.sell_order_scratch);
+    assert_eq!(final_status.active_orders, 0);
+    assert_eq!(final_status.accepted_order_ids, 8);
+    book.validate().unwrap();
+}
+
+#[derive(Clone, Copy)]
+struct ModelOrder {
+    account: AccountId,
+    side: Side,
+    constraint: AuctionOrderConstraint,
+    quantity: u64,
+    sequence: u64,
+}
+
+fn next_random(state: &mut u64) -> u64 {
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    *state
+}
+
+fn expected_fills(
+    model: &HashMap<OrderId, ModelOrder>,
+    side: Side,
+    clearing_price: Price,
+    mut remaining: u128,
+) -> Vec<(OrderId, u64)> {
+    let mut orders = model
+        .iter()
+        .filter(|(_, order)| order.side == side)
+        .map(|(id, order)| (*id, *order))
+        .collect::<Vec<_>>();
+    orders.sort_by_key(|(id, order)| {
+        let (kind, price_rank) = match order.constraint {
+            AuctionOrderConstraint::Market => (0_u8, 0_i64),
+            AuctionOrderConstraint::Limit(price) => (
+                1,
+                if side == Side::Buy {
+                    -price.raw()
+                } else {
+                    price.raw()
+                },
+            ),
+        };
+        (kind, price_rank, order.sequence, *id)
+    });
+    let mut fills = Vec::new();
+    for (id, order) in orders {
+        let eligible = match order.constraint {
+            AuctionOrderConstraint::Market => true,
+            AuctionOrderConstraint::Limit(price) => match side {
+                Side::Buy => price >= clearing_price,
+                Side::Sell => price <= clearing_price,
+            },
+        };
+        if remaining == 0 || !eligible {
+            break;
+        }
+        let filled = u64::try_from(u128::from(order.quantity).min(remaining)).unwrap();
+        fills.push((id, filled));
+        remaining -= u128::from(filled);
+    }
+    fills
+}
+
+fn verify_model(book: &mut CallAuctionBook, model: &HashMap<OrderId, ModelOrder>, step: usize) {
+    let mut bids = BTreeMap::<Price, u128>::new();
+    let mut asks = BTreeMap::<Price, u128>::new();
+    let mut market_buy = 0_u128;
+    let mut market_sell = 0_u128;
+    for order in model.values() {
+        match (order.side, order.constraint) {
+            (Side::Buy, AuctionOrderConstraint::Market) => {
+                market_buy += u128::from(order.quantity);
+            }
+            (Side::Sell, AuctionOrderConstraint::Market) => {
+                market_sell += u128::from(order.quantity);
+            }
+            (Side::Buy, AuctionOrderConstraint::Limit(price)) => {
+                *bids.entry(price).or_default() += u128::from(order.quantity);
+            }
+            (Side::Sell, AuctionOrderConstraint::Limit(price)) => {
+                *asks.entry(price).or_default() += u128::from(order.quantity);
+            }
+        }
+    }
+    let bid_levels = bids
+        .iter()
+        .rev()
+        .map(|(price, quantity)| AuctionLevel::new(*price, *quantity).unwrap())
+        .collect::<Vec<_>>();
+    let ask_levels = asks
+        .iter()
+        .map(|(price, quantity)| AuctionLevel::new(*price, *quantity).unwrap())
+        .collect::<Vec<_>>();
+    let expected = discover_bounded_clearing_price(
+        &bid_levels,
+        &ask_levels,
+        AuctionMarketInterest::new(market_buy, market_sell),
+        book.price_grid(),
+        book.instrument_price_band(),
+        Price::from_raw(0),
+        AuctionPricePolicy::PRESSURE_THEN_REFERENCE_LOWER,
+    )
+    .unwrap();
+    let actual_indicative = book
+        .indicative_clearing(
+            book.instrument_price_band(),
+            Price::from_raw(0),
+            AuctionPricePolicy::PRESSURE_THEN_REFERENCE_LOWER,
+        )
+        .unwrap();
+    let actual = actual_indicative.map(CallAuctionIndicative::clearing);
+    assert_eq!(actual, expected, "step {step}");
+    if let Some(indicative) = actual_indicative {
+        let clearing = indicative.clearing();
+        let plan = book.allocation_plan(indicative).unwrap();
+        let actual_buys = plan
+            .buy_fills()
+            .iter()
+            .map(|fill| (fill.order_id(), fill.quantity_lots()))
+            .collect::<Vec<_>>();
+        let actual_sells = plan
+            .sell_fills()
+            .iter()
+            .map(|fill| (fill.order_id(), fill.quantity_lots()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_buys,
+            expected_fills(
+                model,
+                Side::Buy,
+                clearing.price(),
+                clearing.executable_quantity()
+            ),
+            "buy allocation step {step}"
+        );
+        assert_eq!(
+            actual_sells,
+            expected_fills(
+                model,
+                Side::Sell,
+                clearing.price(),
+                clearing.executable_quantity()
+            ),
+            "sell allocation step {step}"
+        );
+    }
+    assert_eq!(book.active_order_count(), model.len());
+    book.validate().unwrap();
+}
+
+#[test]
+fn randomized_mutations_match_independent_aggregate_and_priority_models() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(64, 64, 10_000)).unwrap();
+    let initial_resources = book.resource_status();
+    let mut model = HashMap::<OrderId, ModelOrder>::new();
+    let mut rng = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next_id = 1_u64;
+
+    for step in 0..20_000 {
+        let choose_add = model.is_empty() || (next_random(&mut rng) % 100 < 62 && model.len() < 64);
+        if choose_add && next_id <= 10_000 {
+            let id = OrderId::new(next_id).unwrap();
+            next_id += 1;
+            let owner = account(next_random(&mut rng) % 8 + 1);
+            let side = if next_random(&mut rng) & 1 == 0 {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
+            let constraint = if next_random(&mut rng) % 5 == 0 {
+                AuctionOrderConstraint::Market
+            } else {
+                let raw = i64::try_from(next_random(&mut rng) % 61).unwrap() * 5 - 100;
+                AuctionOrderConstraint::Limit(Price::from_raw(raw))
+            };
+            let quantity = next_random(&mut rng) % 25 + 1;
+            let accepted = book
+                .admit(CallAuctionOrder::new(
+                    id,
+                    owner,
+                    instrument(),
+                    version(),
+                    side,
+                    constraint,
+                    Quantity::new(quantity).unwrap(),
+                ))
+                .unwrap();
+            model.insert(
+                id,
+                ModelOrder {
+                    account: owner,
+                    side,
+                    constraint,
+                    quantity,
+                    sequence: accepted.priority_sequence,
+                },
+            );
+        } else if !model.is_empty() {
+            let model_len = u64::try_from(model.len()).unwrap();
+            let index = usize::try_from(next_random(&mut rng) % model_len).unwrap();
+            let id = *model.keys().nth(index).unwrap();
+            let expected = model.remove(&id).unwrap();
+            let canceled = book.cancel(expected.account, id).unwrap();
+            assert_eq!(canceled.quantity.lots(), expected.quantity);
+        }
+
+        if step % 97 == 0 {
+            verify_model(&mut book, &model, step);
+        }
+    }
+    let final_resources = book.resource_status();
+    assert_eq!(
+        final_resources.allocated_active_orders,
+        initial_resources.allocated_active_orders
+    );
+    assert_eq!(
+        final_resources.allocated_accepted_order_ids,
+        initial_resources.allocated_accepted_order_ids
+    );
+    assert_eq!(
+        final_resources.allocated_bid_price_levels,
+        initial_resources.allocated_bid_price_levels
+    );
+    assert_eq!(
+        final_resources.allocated_ask_price_levels,
+        initial_resources.allocated_ask_price_levels
+    );
+    assert_eq!(
+        final_resources.bid_level_scratch,
+        initial_resources.bid_level_scratch
+    );
+    assert_eq!(
+        final_resources.ask_level_scratch,
+        initial_resources.ask_level_scratch
+    );
+    assert_eq!(
+        final_resources.buy_order_scratch,
+        initial_resources.buy_order_scratch
+    );
+    assert_eq!(
+        final_resources.sell_order_scratch,
+        initial_resources.sell_order_scratch
+    );
+}

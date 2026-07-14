@@ -1,4 +1,4 @@
-use quotick::domain::{AccountId, DomainError, Price, Quantity, Side};
+use quotick::domain::{AccountId, AuctionId, DomainError, Price, Quantity, Side};
 
 #[test]
 fn identifiers_reserve_zero_and_preserve_nonzero_values() {
@@ -7,6 +7,10 @@ fn identifiers_reserve_zero_and_preserve_nonzero_values() {
         Err(DomainError::ZeroIdentifier("account identifier"))
     );
     assert_eq!(AccountId::new(42).expect("valid identifier").get(), 42);
+    assert_eq!(
+        AuctionId::new(0),
+        Err(DomainError::ZeroIdentifier("auction identifier"))
+    );
 }
 
 #[test]

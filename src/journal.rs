@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::auction_engine::{CallAuctionCommand, CallAuctionExecutionReport};
 use crate::codec::{BinaryCodec, CodecError};
 use crate::instrument::InstrumentDefinition;
 use crate::ledger::{JournalEntry, LedgerBatch, LedgerCorrection};
@@ -35,7 +36,7 @@ pub use crate::segmented_journal::{
 };
 
 const MAGIC: [u8; 4] = *b"QWAL";
-const FORMAT_VERSION: u16 = 3;
+const FORMAT_VERSION: u16 = 4;
 pub(crate) const HEADER_LENGTH: usize = 24;
 const CHECKSUM_START: usize = 12;
 const CHECKSUM_END: usize = 16;
@@ -67,6 +68,10 @@ pub enum RecordKind {
     LedgerBatch,
     /// Identity of a synchronized semantic checkpoint replacing an older WAL prefix.
     CheckpointAnchor,
+    /// A call-auction command written before application.
+    CallAuctionCommand,
+    /// The complete trace resulting from one call-auction command.
+    CallAuctionExecutionReport,
 }
 
 impl RecordKind {
@@ -80,6 +85,8 @@ impl RecordKind {
             Self::LedgerCorrection => 6,
             Self::LedgerBatch => 7,
             Self::CheckpointAnchor => 8,
+            Self::CallAuctionCommand => 9,
+            Self::CallAuctionExecutionReport => 10,
         }
     }
 
@@ -93,6 +100,8 @@ impl RecordKind {
             6 => Ok(Self::LedgerCorrection),
             7 => Ok(Self::LedgerBatch),
             8 => Ok(Self::CheckpointAnchor),
+            9 => Ok(Self::CallAuctionCommand),
+            10 => Ok(Self::CallAuctionExecutionReport),
             _ => Err(JournalError::UnknownRecordKind { offset, value }),
         }
     }
@@ -136,6 +145,14 @@ impl DurableRecord for CheckpointAnchor {
     const KIND: RecordKind = RecordKind::CheckpointAnchor;
 }
 
+impl DurableRecord for CallAuctionCommand {
+    const KIND: RecordKind = RecordKind::CallAuctionCommand;
+}
+
+impl DurableRecord for CallAuctionExecutionReport {
+    const KIND: RecordKind = RecordKind::CallAuctionExecutionReport;
+}
+
 /// A decoded known payload from a journal frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KnownRecord {
@@ -155,6 +172,10 @@ pub enum KnownRecord {
     LedgerBatch(LedgerBatch),
     /// Synchronized checkpoint identity at a compacted physical WAL origin.
     CheckpointAnchor(CheckpointAnchor),
+    /// Sequenced call-auction command.
+    CallAuctionCommand(CallAuctionCommand),
+    /// Complete call-auction execution trace.
+    CallAuctionExecutionReport(CallAuctionExecutionReport),
 }
 
 /// Acknowledgement policy for successful appends.
@@ -454,6 +475,10 @@ impl JournalFrame {
             RecordKind::LedgerCorrection => self.decode().map(KnownRecord::LedgerCorrection),
             RecordKind::LedgerBatch => self.decode().map(KnownRecord::LedgerBatch),
             RecordKind::CheckpointAnchor => self.decode().map(KnownRecord::CheckpointAnchor),
+            RecordKind::CallAuctionCommand => self.decode().map(KnownRecord::CallAuctionCommand),
+            RecordKind::CallAuctionExecutionReport => {
+                self.decode().map(KnownRecord::CallAuctionExecutionReport)
+            }
         }
     }
 }

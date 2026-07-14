@@ -60,6 +60,7 @@ macro_rules! identifier {
 
 identifier!(AccountId, "account identifier");
 identifier!(AssetId, "asset identifier");
+identifier!(AuctionId, "auction identifier");
 identifier!(CommandId, "command identifier");
 identifier!(InstrumentId, "instrument identifier");
 identifier!(InstrumentVersion, "instrument version");

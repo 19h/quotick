@@ -1,8 +1,11 @@
 # WAL Format Version 3
 
-This document is the authoritative byte-level schema for Quotick WAL version 3.
-All multibyte integers are little-endian. No Rust enum layout, padding, pointer,
-or platform ABI is persisted.
+This document preserves the historical byte-level schema for expired Quotick
+WAL version 3. The current runtime rejects this envelope and writes
+[WAL version 4](wal-v4.md). Version 4 incorporates record payloads `1` through
+`8` from this document byte-for-byte, while changing the envelope version and
+adding call-auction record kinds. All multibyte integers are little-endian. No
+Rust enum layout, padding, pointer, or platform ABI is persisted.
 
 ## Frame
 
@@ -110,8 +113,8 @@ these records in strictly increasing account-ID order.
 
 ## Command payload
 
-The first `u8` selects new `0`, cancel `1`, replace `2`, mass cancel `3`, or
-account control `4`.
+The first `u8` selects new `0`, cancel `1`, replace `2`, mass cancel `3`,
+account control `4`, or instrument trading-state control `5`.
 
 - New: command ID, order ID, account ID, instrument ID, instrument version,
   side, quantity, display policy, order type, time in force, self-trade policy,
@@ -124,6 +127,9 @@ account control `4`.
   selection scope, receive timestamp.
 - Account control: command ID, account ID, instrument ID, instrument version,
   expected control revision `u64`, action, receive timestamp.
+- Instrument trading-state control: command ID, instrument ID, instrument
+  version, expected state revision `u64`, target trading-state tag, action,
+  receive timestamp.
 
 Side tags are buy `0`, sell `1`. Order type tags are market `0`, limit `1`
 followed by price. Time-in-force tags are GTC `0`, IOC `1`, FOK `2`, post-only
@@ -148,6 +154,15 @@ resting order for the account in the same command transition. Enable reopens
 entry and cancels nothing. New orders and replacements for a blocked account
 are rejected; owner cancellations remain admitted.
 
+Trading-state-control action tags are transition `0` and
+transition-and-cancel `1`. Effective state starts from the definition's state at
+revision zero. Acceptance requires an exact expected revision, increments it
+once, and requires a different target. Transition-and-cancel cannot target open;
+for another target it cancels every active order in ascending order ID before
+the final state event. Transition retains resting orders. New and replace use
+effective state; cancellation and administrative controls remain available in
+every state after identity validation.
+
 ## Matching capacity and WAL admission
 
 `OrderBookLimits` is finite operational process policy and is not encoded in
@@ -167,11 +182,14 @@ state. Both stable-slot price-level AVL arenas, all five matching hash indexes,
 and the complete coupled-risk profile and reservation indexes are fallibly
 reserved to their configured maxima when the shard is constructed. Preparation therefore borrows
 matching/risk state immutably and fallibly reserves only the complete report
-vector and exact `K`-identifier mass-cancel or block-and-cancel selection
-vector. These structures
-cannot grow or rehash during commit; level insertion/deletion and account
-membership allocate no node. Arc control blocks and unrelated codec/checkpoint
-buffers are not covered by this operational guarantee. AVL topology, vacant-slot links,
+vector and the exact identifier selection for mass-cancel, block-and-cancel, or
+instrument transition-and-cancel. These structures
+cannot grow during commit; level insertion/deletion and account membership
+allocate no node. Standard-library active-order/account and risk-reservation
+hashes can nevertheless rehash after deletion/different-key insertion churn;
+allocator failure on that path is outside the recoverable protocol under A12.
+Arc control blocks and unrelated codec/checkpoint buffers are likewise outside
+this operational guarantee. AVL topology, vacant-slot links,
 and account/side membership links are derived in-memory state: they are absent
 from WAL/checkpoint bytes and are rebuilt and independently audited during
 recovery.
@@ -193,9 +211,10 @@ opposite-side matching. All three limits are decided before WAL append.
 
 Retained command history has an ordinary prefix and a protected cancellation
 tail. Once the ordinary prefix fills, new and replace commands fail preflight.
-Only a cancel, mass cancel, or block-and-cancel account control that currently
-passes core instrument, identity, ownership/revision, and active-state checks
-may enter the tail. Enable controls remain ordinary admission commands. Exact cached retries do
+Only a cancel, mass cancel, block-and-cancel account control, or instrument
+transition-and-cancel into an entry-closed state that currently passes core
+instrument, identity, ownership/revision, and active-state checks may enter the
+tail. Reopening controls remain ordinary admission commands. Exact cached retries do
 not append frames and remain available at total exhaustion. The configured tail
 is at least the maximum active-order count, permitting one valid individual
 cancel for every maximally populated order when the reserve has not already
@@ -223,9 +242,11 @@ arithmetic overflow `24`, reserve unsupported `25`, display quantity off grid
 `26`, display quantity not smaller than total `27`, reserve replenishment limit
 `28`, reserve cannot be immediate `29`, display-mode conversion forbidden
 `30`, account admission blocked `31`, account-control revision mismatch `32`,
-and account-control revision exhausted `33`. Cancellation-reason tags are user
+account-control revision exhausted `33`, trading-state revision mismatch `34`,
+trading-state revision exhausted `35`, trading state unchanged `36`, and
+transition-and-cancel into open `37`. Cancellation-reason tags are user
 request `0`, unfilled remainder `1`, STP aggressor `2`, STP resting `3`, mass
-cancel `4`, and account control `5`.
+cancel `4`, account control `5`, and trading-state control `6`.
 
 ## Execution-report payload
 
@@ -246,6 +267,7 @@ event-kind union:
 | 7 | reserve refreshed: order ID, price, displayed quantity, total leaves quantity |
 | 8 | mass cancel completed: account ID, scope, cancelled order count `u64`, total cancelled leaves `u128` |
 | 9 | account control applied: account ID, previous/current admission-state tags, revision `u64`, cancelled order count `u64`, total cancelled leaves `u128` |
+| 10 | trading-state control applied: previous/current trading-state tags, revision `u64`, cancelled order count `u64`, total cancelled leaves `u128` |
 
 Decoding requires non-empty, contiguous events correlated to the report command.
 Accepted reports cannot contain rejection events; rejected reports contain
@@ -269,10 +291,19 @@ enable control emits only tag `9` with zero cancellation aggregates. Admission
 state tags are enabled `0` and blocked `1`; the completion revision equals
 `expected revision + 1` and carries the exact prior and resulting state.
 
-Under assumptions A15 and A57, account-control command tag `4`, event tag `9`,
-rejection tags `31`–`33`, and cancellation tag `5` remain unchanged in version
-3. Version-1 and version-2 WAL artifacts are rejected as unsupported; absent
-control or cutover fields are never assigned inferred semantics.
+An instrument transition-and-cancel emits one tag-`3` cancellation with reason
+`6` per active order in strictly ascending order ID, then one tag-`10`
+completion whose aggregates equal those cancellations. Transition-only emits
+only tag `10` with zero aggregates. Trading-state tags are those defined for the
+instrument payload; completion revision equals `expected revision + 1` and
+carries the exact prior and target state.
+
+Under assumptions A15, A57, and A59, account-control command tag `4`, event tag
+`9`, rejection tags `31`–`33`, and cancellation tag `5` remain unchanged;
+instrument-state control uses command tag `5`, event tag `10`, rejection tags
+`34`–`37`, and cancellation tag `6` in version 3. Version-1 and version-2 WAL
+artifacts are rejected as unsupported; absent control or cutover fields are
+never assigned inferred semantics.
 
 ## Ledger-entry payload
 

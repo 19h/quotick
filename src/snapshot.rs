@@ -6,6 +6,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::auction_engine::CallAuctionCheckpoint;
+use crate::auction_risk::CallAuctionRiskCheckpoint;
 use crate::codec::{BinaryCodec, CodecError};
 use crate::journal::{
     Journal, JournalError, SEGMENT_DIRECTORY_MARKER, WriterLease, WriterLeaseOwner, crc32c_parts,
@@ -16,7 +18,7 @@ use crate::matching::OrderBookCheckpoint;
 use crate::risk::RiskManagedCheckpoint;
 
 const MAGIC: [u8; 4] = *b"QSNP";
-const VERSION: u16 = 2;
+const VERSION: u16 = 4;
 const HEADER_LENGTH: usize = 28;
 const CHECKSUM_START: usize = 16;
 const CHECKSUM_END: usize = 20;
@@ -32,6 +34,10 @@ pub enum SnapshotKind {
     MatchingCheckpoint = 2,
     /// Coupled matching, risk-profile, position, and reservation state.
     RiskManagedCheckpoint = 3,
+    /// Canonical call-auction phase, book, counters, and command history.
+    CallAuctionCheckpoint = 4,
+    /// Coupled call-auction profiles, positions, reservations, and history.
+    CallAuctionRiskCheckpoint = 5,
 }
 
 impl SnapshotKind {
@@ -44,6 +50,8 @@ impl SnapshotKind {
             1 => Some(Self::LedgerCheckpoint),
             2 => Some(Self::MatchingCheckpoint),
             3 => Some(Self::RiskManagedCheckpoint),
+            4 => Some(Self::CallAuctionCheckpoint),
+            5 => Some(Self::CallAuctionRiskCheckpoint),
             _ => None,
         }
     }
@@ -88,12 +96,14 @@ mod sealed {
     impl SnapshotPayload for crate::ledger::LedgerCheckpoint {}
     impl SnapshotPayload for crate::matching::OrderBookCheckpoint {}
     impl SnapshotPayload for crate::risk::RiskManagedCheckpoint {}
+    impl SnapshotPayload for crate::auction_engine::CallAuctionCheckpoint {}
+    impl SnapshotPayload for crate::auction_risk::CallAuctionRiskCheckpoint {}
 }
 
 /// Typed semantic value with a crate-controlled stable snapshot-kind assignment.
 ///
 /// This trait is sealed so downstream implementations cannot claim an existing
-/// version-2 kind tag with a different codec.
+/// version-3 kind tag with a different codec.
 pub trait SnapshotPayload: BinaryCodec + sealed::SnapshotPayload {
     /// Stable envelope payload kind.
     const KIND: SnapshotKind;
@@ -131,6 +141,30 @@ impl SnapshotPayload for OrderBookCheckpoint {
 
 impl SnapshotPayload for RiskManagedCheckpoint {
     const KIND: SnapshotKind = SnapshotKind::RiskManagedCheckpoint;
+
+    fn generation(&self) -> u64 {
+        self.generation()
+    }
+
+    fn is_successor_of(&self, previous: &Self) -> bool {
+        self.is_successor_of(previous)
+    }
+}
+
+impl SnapshotPayload for CallAuctionCheckpoint {
+    const KIND: SnapshotKind = SnapshotKind::CallAuctionCheckpoint;
+
+    fn generation(&self) -> u64 {
+        self.generation()
+    }
+
+    fn is_successor_of(&self, previous: &Self) -> bool {
+        self.is_successor_of(previous)
+    }
+}
+
+impl SnapshotPayload for CallAuctionRiskCheckpoint {
+    const KIND: SnapshotKind = SnapshotKind::CallAuctionRiskCheckpoint;
 
     fn generation(&self) -> u64 {
         self.generation()

@@ -90,21 +90,30 @@ recovery.
   closes entry and removes all resting orders in canonical order; enable reopens
   entry. Exact retries preserve the committed revision and stale revisions are
   sequenced rejections.
+- Revision-checked instrument trading-state controls: transition among open,
+  cancel-only, halted, and closed states, optionally cancelling every resting
+  order in ascending `OrderId` order in the same report. Effective state and
+  revision survive WAL/checkpoint recovery and are published to level-2 replicas.
 - Cancel-aggressor, cancel-resting, cancel-both, and decrement-and-cancel
   self-trade prevention.
 - Atomic FOK preflight, exact-command idempotency, collision detection, and
   monotonic event and trade sequences.
+- Bounded crossed-interest call-auction order books with anonymized aggregate
+  market/limit depth, phase and cycle updates, two-sided trade prints, final
+  clearing summaries, full-depth snapshots, and gap-detecting replicas.
 - Allocation-free FOK liquidity inspection that uses total reserve leaves where
   reachable and current displayed slices before an aggressor-blocking self-order
   barrier, without constructing replenishment queues.
 - Validated finite matching limits for active orders/accounts, occupied levels,
-  accepted identifiers, retained account controls, reports, and events per report; mandatory
-  constructor-time reservation prevents every matching and coupled-risk hash
-  index from growing or rehashing through the selected maxima.
+  accepted identifiers, retained account controls, reports, and events per
+  report. Mandatory constructor-time reservation establishes complete semantic
+  headroom; stable price arenas do not grow, while standard-library active and
+  risk hashes may still rehash under long deletion/insertion churn.
 - A protected retained-history tail sized to at least the maximum active-order
   population. Ordinary admission closes first; only currently valid cancel and
-  mass-cancel and block-and-cancel controls may consume the reserve; enable
-  remains ordinary admission, and exact retries bypass all capacity gates.
+  mass-cancel, block-and-cancel, and entry-closing instrument transition-and-cancel
+  controls may consume the reserve; reopening controls remain ordinary admission,
+  and exact retries bypass all capacity gates.
 - Residual-aware capacity admission for GTC/post-only orders. A boundary scan
   proves whether fills or self-trade prevention leave anything to rest, without
   mutating the book or materializing reserve replenishment slices, and accounts
@@ -124,6 +133,48 @@ recovery.
   vector before matching; event insertion cannot grow it during mutation.
 - Complete execution traces suitable for replay, downstream publication, and
   risk reconstruction.
+- A venue-neutral, allocation-free call-auction analytical kernel over canonical
+  aggregate depth and market interest. It evaluates complete demand/supply
+  intervals inside an explicit aligned candidate-price band, maximizes
+  executable quantity, minimizes absolute imbalance, and applies an explicit
+  optional pressure/reference/final-price policy. A bounded linear
+  allocator then reconciles eligible order totals and produces deterministic
+  market/price/class/time/ID per-side fills. The kernels remain pure; the
+  collection book consumes their revision-bound plan through a separate
+  process-local uncross transition.
+- A separate bounded `CallAuctionBook` admits crossed market/limit interest for
+  one instrument version, assigns internal FIFO priority, retains never-reusable
+  order identities, supports owner-checked cancellation, and supplies canonical
+  aggregate and order input to both analytical kernels. Its identity and price
+  indexes are constructor-reserved stable-slot AVL arenas, so bounded collection
+  mutation and analysis scratch do not allocate under identity churn. Indicative
+  results are bound to a process-local book identity and exact mutation revision,
+  preventing stale or cross-book allocation. Move-only uncross preparation
+  requests capacity for the complete deterministic buyer/seller trade pairs and
+  selected remainder cancellations; allocation-free commit validates the preparation,
+  applies every fill and remainder atomically, assigns contiguous book-local
+  trade identifiers, and advances one revision. Remainder treatment is explicit
+  (`RetainAll`, `CancelMarket`, or `CancelAll`); the only represented auction
+  self-trade policy is explicit `Permit`.
+- A bounded `CallAuctionEngine` owns that collection book and makes auction
+  lifecycle explicit: `Closed`, `Collecting`, and `Frozen`, exact contiguous
+  `AuctionId` cycles, revision-checked controls, cycle/revision-fenced entry,
+  phase-gated uncross, sequenced business rejections, and exact-command
+  idempotency with shared immutable traces. A protected history lane remains
+  available only to currently valid cancellation, freeze/close, and executable
+  uncross commands;
+  successful uncross closes the cycle, while explicit close retains interest
+  and owner cancellation remains available in every phase.
+- Stable little-endian call-auction command/report codecs and a WAL-version-4
+  `DurableCallAuctionEngine` for single-file or segmented storage. Recovery
+  verifies every deterministic command/report pair, completes at most one final
+  dangling non-retry command, rejects divergent or noncanonical retry history,
+  and reconstructs exact-retry cache identity without appending retry frames.
+  Snapshot-version-4 call-auction checkpoints retain canonical phase, cycle,
+  book, counters, accepted identities, active orders, and complete exact-retry
+  history. Uncut recovery proves the checkpoint against the exact WAL prefix;
+  single-file and segmented A/B cutover replace that prefix with an
+  anchor-bound checkpoint and replay only the suffix.
 
 ### Pre-trade risk
 
@@ -140,6 +191,16 @@ recovery.
 - Worst-case long and short position limits across open exposure.
 - Conservative reachable-price notional for positive, zero-crossing, and
   negative price collars.
+- Coupled call-auction admission with core-first sequenced risk rejections;
+  every accepted market or limit order reserves the maximum reachable absolute
+  signed-collar price magnitude for its active leaves.
+- Auction uncross accounting that releases both paired reservations, applies
+  explicit remainder cancellation, and nets all buys/sells once per account so
+  permitted same-account pairs have zero position effect.
+- Canonical coupled auction/risk checkpoints with independently replayed
+  command lineage, active-order reservation reconstruction, stable
+  [little-endian encoding](docs/auction-risk-checkpoint-v1.md), exact retry
+  continuity, and explicit restore limits.
 - Trace-driven reservation release across fills, individual, mass, and atomic
   account-control cancellation, replacement, and self-trade prevention.
 - Cross-audits between active orders, reservations, aggregates, and positions.
@@ -226,15 +287,37 @@ recovery for a single-instrument execution shard and a multi-asset ledger. It
 does not implement gateways, authentication, distributed sequencing,
 replication or consensus, portfolio collateral and margin, clearing lifecycle,
 network market-data fanout, administrative interfaces, or reporting systems.
+The matching model is a continuous price-time-priority book with sequenced
+instrument-wide open/cancel-only/halted/closed controls. A separate bounded
+call-auction collection book admits crossed market/limit interest and feeds
+statically banded aggregate discovery plus price-time allocation and a
+process-local atomic uncross. A sequenced engine adds phase
+control, exact auction/revision checks, command idempotency, and immutable
+execution reports. New entry is bound to the active cycle and exact phase
+revision; cancellation is deliberately revision-independent. Explicit close
+retains collection interest. The auction path keeps owner cancellation
+available in every phase. Stable command/report codecs, semantic checkpoints,
+exact-prefix verification, and single-file/segmented A/B WAL cutover are
+implemented. The coupled auction-risk path provides profile admission,
+conservative reservations, position effects, versioned snapshots, and durable
+single-file/segmented recovery with A/B cutover. The auction
+path also does not provide ledger effects, reference or dynamic-band
+derivation, preventive self-trade policies, market-data transport, settlement,
+controller authentication, calendar/session scheduling, or venue-specific
+uncross rules.
+The platform also does not implement stop or pegged orders, discretionary
+ranges, day/GTD expiry, cross-instrument or multi-leg execution,
+volatility-interruption trigger logic, or venue-specific priority rule sets.
 
 The exact invariants and environmental assumptions are documented in:
 
 - [Architecture](docs/architecture.md)
 - [Assumption register](docs/assumptions.md)
 - [Local storage contract](docs/storage.md)
-- [WAL format version 3](docs/wal-v3.md)
-- [Semantic snapshot format version 2](docs/snapshot-v2.md)
-- [Market-data payload format version 1](docs/market-data-v1.md)
+- [WAL format version 4](docs/wal-v4.md)
+- [Semantic snapshot format version 4](docs/snapshot-v4.md)
+- [Market-data payload format version 2](docs/market-data-v2.md)
+- [Coupled call-auction risk checkpoint payload version 1](docs/auction-risk-checkpoint-v1.md)
 
 ## Build and verify
 
@@ -252,7 +335,22 @@ The test suites cover:
 - **Matching and risk:** financial-domain boundaries, price/FIFO priority,
   reserve admission and replenishment, hidden-versus-displayed quantity,
   canonical mass cancellation, revisioned account fencing and atomic kill
-  cancellation, every self-trade policy, risk rejection, and reservation release.
+  cancellation, every self-trade policy, risk rejection, reservation release,
+  full-domain and banded market-aware call-auction price discovery
+  differentially checked against exhaustive tick-grid enumeration, and
+  price-time allocation differentially checked against literal order-priority
+  walks; crossed collection admission/cancellation and 20,000 mixed mutations
+  differentially checked against independent aggregate and priority models;
+  process-local atomic uncross pairing and post-state images checked against
+  10,000 literal two-pointer and remainder-policy models; sequenced auction
+  lifecycle checked against a 10,000-command literal phase model, including
+  exact retry/collision, stale/foreign preparation, delayed-entry fencing,
+  protected-history limits, invalid transitions, and sequence/revision
+  exhaustion; coupled auction risk checked for core-first rejection, signed-
+  collar reservation, reduce-only aggregate exposure, partial-fill/remainder
+  release, same-account netting, capacity stability, and exact retry; and partial residual
+  leaves below the entry minimum checked across both auction commit and
+  continuous-book checkpoint restoration.
 - **Market data and accounting:** displayed-depth reconstruction, settlement,
   arithmetic rollback, exact reversal and reinstatement chains, indivisible
   reversal-plus-replacement corrections, generalized multi-entry netting,
@@ -264,9 +362,12 @@ The test suites cover:
   corruption handling, active-tail repair, concurrent-writer exclusion,
   injected write, acknowledgement, and cutover-directory barrier failures,
   explicit abandoned-cutover staging recovery, forced termination, and
-  replay-divergence detection.
+  replay-divergence detection; stable call-auction command/report bytes,
+  single/segmented full-prefix replay, torn final-report completion, exact-retry
+  frame suppression, and rejection of divergent or noncanonical retry history.
 - **Checkpoints:** canonical matching FIFO/reserve/STP state, coupled risk
-  positions and total-leaves reservations, independent replay audits, stable
+  positions and total-leaves reservations, coupled auction-risk position and
+  active-remainder reconstruction, independent replay audits, stable
   snapshot framing, semantic corruption, immutable-profile binding, WAL-prefix
   divergence, generation forks, pending-file recovery, exact retries, A/B anchor
   identity, repeated cutover in both physical layouts, generation-selection
@@ -294,6 +395,53 @@ reports, and `T` never-evicted controlled accounts; account indexing adds two li
 head/tail/count/aggregate state per active account, within the same `O(O)`
 bound. The two complete best-level caches add `O(1)` space.
 
+For `B` canonical aggregate bid levels and `A` canonical aggregate ask levels,
+call-auction discovery is `O(B + A)` time and `O(1)` auxiliary space. It merges
+the monotone demand/supply transition streams, incorporates constant market
+interest, and evaluates full constant-state intervals inside an aligned band
+without enumerating the numeric price range or allocating.
+For `O_b` supplied buy orders, `O_a` supplied sell orders, and `F_b + F_a`
+positive fills, price-time allocation is `O(O_b + O_a)` time and
+`O(F_b + F_a)` result space. Both fill-vector capacity requests use the exact
+derived cardinalities and succeed before either side is constructed; the
+allocator may grant more capacity, and no vector grows while fills are emitted.
+
+For a call-auction collection with `I` accepted identities, `O` active orders,
+and `P` occupied limit prices, admission is
+`O(log I + log O + log P)` and owner-checked cancellation is
+`O(log O + log P)`. Aggregate scratch construction and discovery are
+`O(B + A)`. Canonical order scratch construction is `O(O log O + P)` because
+intrusive FIFO identities are resolved through a stable AVL; allocation then
+adds `O(O)` work and `O(F_b + F_a)` result memory. Constructor-reserved
+collection state is `O(I_max + O_max + P_max)` and does not grow during bounded
+mutation or analysis scratch reconstruction. For `T` buyer/seller trade pairs,
+`C` remainder cancellations, and `M <= O` affected orders, uncross preparation
+is `O(O log O + P + F_b + F_a + T)` time with
+`O(F_b + F_a + T + C)` fallibly reserved result memory. The two-pointer pairing
+bound is `T <= F_b + F_a - 1` when both fill vectors are non-empty. Commit is
+`O(M(log O + log P))` and performs no heap allocation.
+
+For `H` retained sequenced auction reports, phase controls, business rejection,
+and monotonic idempotency lookup are expected `O(1)`; submit and cancel inherit
+the collection-book bounds above. Uncross preparation has the preceding book
+bound plus `O(T + C)` exact report-capacity derivation, and commit adds
+`O(T + C)` event emission into the already reserved trace without vector
+growth. The independent engine audit sorts retained command sequences and
+validates the underlying book in `O(H log H + I + O + P)` time with
+`O(H + O)` scratch. Engine state occupies
+`O(H_max + I_max + O_max + P_max)` memory.
+
+For `C` persisted auction commands, `E` persisted auction events, `B` WAL bytes,
+and `S` physical segments, full-WAL durable auction reopen scans framing in
+`O(B + S)` and replays the sum of the `C` engine command costs plus `O(E)`
+report comparison. Checkpoint capture performs complete deterministic replay;
+semantic event projection has a conservative `O((C + E) log O)` ordered-map
+bound before the engine/book audit because complete idempotency history is
+retained. After an A/B cutover, reopen scans the anchor and suffix WAL bytes,
+validates and directly rebuilds the indexed engine, and executes only suffix
+commands; cutover bounds WAL scan and command re-execution, not checkpoint size
+or semantic validation time.
+
 FOK preflight over `O_c` active orders in `P_c` crossed levels is
 `O(O_c + P_c log P)` time and `O(1)` auxiliary space. Each inspected order is
 visited at most once; complexity is independent of the number of reserve slices
@@ -304,7 +452,17 @@ occupied prices per side, 65,536 accepted order IDs, 65,536 controlled accounts,
 65,536 retained commands, and 65,536 events per report, with the final 4,096 history slots reserved for
 valid cancellation controls. The report limit must be at least
 `max_active_orders + 1`, preserving one cancellation event per maximally active
-order plus the mass-cancel completion event. A coupled shard requests hash entry
+order plus the mass-cancel completion event. Auction allocation independently
+defaults to at most 65,536 supplied orders and therefore at most 65,536 positive
+fill records per side; its exact byte footprint is target-layout dependent.
+Uncross trade and remainder-cancellation capacity requests use their exact
+derived cardinalities, although the allocator may grant more capacity; there is
+no separate configured uncross-vector maximum beyond the bounded active-order
+population. The sequenced call-auction engine defaults to 65,536 retained
+reports, a final 4,098-report terminal lane (`O_max + 2` for `O_max = 4,096`),
+and 8,193 events per report (`2 O_max + 1`). Its monotonic command-history hash
+is reserved to the complete finite maximum and never deletes entries. A coupled
+shard requests hash entry
 headroom
 `H = 2 O_max + A_max + I_max + T_max + C_max + R_max`
 `= 2(4,096) + 4,096 + 4(65,536) = 274,432`
@@ -318,7 +476,8 @@ coupled-risk profile and reservation indexes to their complete applicable bounds
 `try_with_limits` reports the exact price arena or hash resource when a requested
 reservation cannot be represented or allocated. Command preparation therefore
 borrows matching and coupled-risk state immutably; it fallibly reserves only the
-complete event buffer and exact `K`-identifier mass-cancel or block-and-cancel selection buffer before
+complete event buffer and exact identifier selection buffer for mass-cancel,
+block-and-cancel, or instrument transition-and-cancel before
 durable command append. Capacity preflight is expected
 `O(1)` on the normal path, except for
 validating a reserve-lane control through the ordinary core lookup. If an
@@ -338,8 +497,9 @@ errors are not sequenced and durable wrappers reject them before WAL append.
 IOC, FOK, and market orders do not consume a resting-capacity gate.
 One `PreparedCommand` carries the completed operational/core proof through risk
 authorization and WAL append, together with the already-reserved unique report
-buffer and optional mass-cancel/account-control selection buffer. Matching hash-table insertion
-cannot rehash after construction. Commit validates book identity and
+buffer and optional mass-cancel/account-control/instrument-control selection buffer. Matching hash-table insertion
+has constructor headroom but can rehash after sustained deletion/different-key
+insertion churn. Commit validates book identity and
 retained-command generation in expected `O(1)` time; foreign and stale tokens
 cannot mutate state. The complete risk-reservation index is constructor-owned,
 so profile registration between split preparation and commit cannot introduce
@@ -358,7 +518,8 @@ transition, so report insertion cannot reallocate. The bound includes uncrossed
 opposite-side work and may retain unused capacity.
 
 Risk authorization and trace application are expected `O(1)` per order event.
-Profile and reservation insertion cannot rehash after shard construction.
+Monotonic profile insertion remains within constructor-reserved headroom;
+the churning reservation hash can rehash under the A12 allocator boundary.
 A complete risk cross-audit is `O(O + A)` for `A <= R_max` registered accounts,
 and risk state uses `O(O + A)` memory. Profile registration is expected `O(1)`,
 allocation-free within the constructor-owned bound, and disabled after the first

@@ -5,7 +5,8 @@ use quotick::instrument::{
 use quotick::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, Command,
     CommandOutcome, CommandPreparation, NewOrder, OrderBookLimits, OrderBookLimitsSpec, OrderType,
-    RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce,
+    RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce, TradingStateControl,
+    TradingStateControlAction,
 };
 use quotick::risk::{
     AccountRiskState, RiskError, RiskHashIndex, RiskLimitSpec, RiskLimits, RiskManagedLimits,
@@ -157,6 +158,23 @@ fn account_control(
     })
 }
 
+fn trading_state_control(
+    command_id: u64,
+    expected_revision: u64,
+    target_state: TradingState,
+    action: TradingStateControlAction,
+) -> Command {
+    Command::TradingStateControl(TradingStateControl {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        expected_revision,
+        target_state,
+        action,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
 fn prepare_read_only(
     book: &RiskManagedOrderBook,
     command: Command,
@@ -256,6 +274,50 @@ fn risk_managed_account_control_requires_a_profile_and_releases_reservations() {
         AccountAdmissionState::Enabled
     );
     assert_eq!(book.book().account_control(account(12)).revision(), 0);
+    book.validate().unwrap();
+}
+
+#[test]
+fn risk_managed_state_control_releases_all_account_reservations() {
+    let mut book = RiskManagedOrderBook::new(definition());
+    for owner in [11, 12] {
+        book.register_account(account(owner), profile(AccountRiskState::Active, 0))
+            .unwrap();
+    }
+    book.submit(limit_order(
+        1,
+        1,
+        11,
+        Side::Buy,
+        5,
+        90,
+        TimeInForce::GoodTilCancelled,
+    ))
+    .unwrap();
+    book.submit(limit_order(
+        2,
+        2,
+        12,
+        Side::Sell,
+        7,
+        110,
+        TimeInForce::GoodTilCancelled,
+    ))
+    .unwrap();
+    assert_eq!(book.risk().reservation_count(), 2);
+
+    let report = book
+        .submit(trading_state_control(
+            3,
+            0,
+            TradingState::Halted,
+            TradingStateControlAction::TransitionAndCancel,
+        ))
+        .unwrap();
+    assert_eq!(report.outcome, CommandOutcome::Accepted);
+    assert_eq!(book.risk().reservation_count(), 0);
+    assert_eq!(book.book().trading_state().state(), TradingState::Halted);
+    assert_eq!(book.book().active_order_count(), 0);
     book.validate().unwrap();
 }
 
@@ -662,22 +724,28 @@ fn aggregate_open_notional_accounts_for_existing_maker_reservations() {
         })
         .unwrap(),
     );
-    for index in 20..26 {
+    assert_eq!(
         book.submit(limit_order(
-            index,
-            index,
+            20,
+            20,
             11,
             Side::Buy,
             1,
             100,
             TimeInForce::GoodTilCancelled,
         ))
-        .unwrap();
-    }
+        .unwrap()
+        .outcome,
+        CommandOutcome::Accepted
+    );
+    assert_eq!(
+        book.risk().snapshot(account(11)).unwrap().open_notional(),
+        1_000
+    );
     assert_eq!(
         book.submit(limit_order(
-            26,
-            26,
+            21,
+            21,
             11,
             Side::Buy,
             1,
@@ -803,7 +871,7 @@ fn fills_and_cancels_update_positions_and_release_resting_reservations() {
     .unwrap();
     let seller = book.risk().snapshot(account(12)).unwrap();
     assert_eq!(seller.open_sell_lots(), 5);
-    assert_eq!(seller.open_notional(), 500);
+    assert_eq!(seller.open_notional(), 5_000);
 
     book.submit(limit_order(
         2,
@@ -822,7 +890,7 @@ fn fills_and_cancels_update_positions_and_release_resting_reservations() {
     let seller = book.risk().snapshot(account(12)).unwrap();
     assert_eq!(seller.position_lots(), 7);
     assert_eq!(seller.open_sell_lots(), 2);
-    assert_eq!(seller.open_notional(), 200);
+    assert_eq!(seller.open_notional(), 2_000);
     assert_eq!(
         book.risk()
             .reservation(OrderId::new(1).unwrap())
@@ -951,7 +1019,7 @@ fn rejected_replace_preserves_the_original_book_and_reservation() {
     );
     assert_eq!(
         book.risk().snapshot(account(11)).unwrap().open_notional(),
-        300
+        3_000
     );
     book.validate().unwrap();
 }

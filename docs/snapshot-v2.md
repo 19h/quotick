@@ -1,5 +1,11 @@
 # Semantic snapshot format version 2
 
+Version 2 is retained as historical provenance for payload kinds `1` through
+`3`. Snapshot version 3 subsequently preserved those payload bytes and added
+call-auction kind `4`. The current runtime rejects both expired envelopes and
+uses [snapshot version 4](snapshot-v4.md), which also adds coupled
+call-auction/risk kind `5`.
+
 `SnapshotFile` stores a complete typed semantic value in a bounded, versioned,
 CRC-32C envelope. Version 2 assigns payload kind `1` to `LedgerCheckpoint`,
 kind `2` to `OrderBookCheckpoint`, and kind `3` to
@@ -47,7 +53,7 @@ nanoseconds, posting count and postings, followed by lifecycle kind, optional
 related transaction, and optional signed epoch-day period boundary. Financial
 entries contain at least two postings; period close/reopen controls contain
 zero. The complete byte schema and lifecycle tags are defined in
-[WAL format version 3](wal-v3.md).
+[WAL format version 4](wal-v4.md).
 
 Record tag `0` contains one `JournalEntry`. Record tag `1` contains one
 `LedgerCorrection`: reversal length `u32` and entry payload, followed by
@@ -85,7 +91,7 @@ The matching payload is:
 Display policy is fully displayed tag `0` with no value or reserve tag `1`
 followed by peak lots `u64`. The order sizes above therefore differ by 8 B.
 Command, report, event, display, side, and STP fields use the exact tags in
-[WAL format version 3](wal-v3.md).
+[WAL format version 4](wal-v4.md).
 
 Active orders are canonicalized as all buys then all sells, with ascending raw
 price within each side and FIFO order within a price. This storage order is not
@@ -101,6 +107,14 @@ requires each accepted control's expected revision to equal its account's prior
 revision, the final completion event to carry the exact prior/resulting states
 and incremented revision, and block-and-cancel aggregates to equal its ordered
 cancellation events. A reconstructed blocked account cannot retain an order.
+
+Effective instrument trading state is likewise derived from the definition's
+genesis state plus accepted command/report history and is not duplicated as a
+direct field. Validation requires an exact revision chain, a different target,
+no transition-and-cancel into open, ascending state-control cancellation order,
+exact cancellation aggregates, and one final event carrying the prior/target
+states and incremented revision. Restoration materializes that derived
+`(TradingState, revision)` before structural cross-audit.
 
 The metadata boundary is followed by exactly one command frame and one report
 frame per retained history entry, so a valid stable boundary satisfies
@@ -190,9 +204,11 @@ A matching checkpoint is accepted structurally only when:
 5. accepted order identifiers are unique and every active order was accepted;
 6. active orders have unique identifiers, canonical side/price/FIFO order,
    definition-valid prices and leaves, and coherent displayed/reserve state;
-7. reconstruction produces valid FIFO links, price-level aggregates, accepted-
+7. account-control and instrument-state-control histories have contiguous
+   revisions and exact cancellation/completion grammar;
+8. reconstruction produces valid FIFO links, price-level aggregates, accepted-
    order membership, and an uncrossed book.
-8. restoration under caller-selected `OrderBookLimits` proves retained command,
+9. restoration under caller-selected `OrderBookLimits` proves retained command,
    accepted-ID, account-control, active-order, active-account, and per-side occupied-level
    cardinalities fit before allocating live indexes.
 
@@ -278,7 +294,7 @@ WAL anchor. Each slot is an ordinary independently framed version-2
 `QSNP` file with its own `.pending` and writer-lease sidecars; no alternate
 snapshot envelope is introduced. The synchronized `SnapshotReceipt`
 generation, payload length, and complete envelope checksum are copied into the
-version-3 WAL anchor together with the selected slot and the independent
+version-4 WAL anchor together with the selected slot and the independent
 physical WAL boundary.
 
 The inactive slot is published before the physical WAL selector changes. A

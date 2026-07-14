@@ -12,10 +12,12 @@ use crate::domain::{
     AccountId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
     TimestampNs, TradeId,
 };
+use crate::instrument::TradingState;
 use crate::matching::{
     AccountAdmissionState, AccountControlAction, AccountControlSnapshot, CancelReason, Command,
     CommandOutcome, Event, EventKind, ExecutionReport, LevelSnapshot, MassCancelScope, OrderBook,
-    OrderDisplay, OrderType, SelfTradePrevention, Trade,
+    OrderDisplay, OrderType, SelfTradePrevention, Trade, TradingStateControlAction,
+    TradingStateSnapshot,
 };
 
 /// An absolute aggregate state for one publicly visible price level.
@@ -79,6 +81,15 @@ pub enum MarketDataKind {
         /// Absolute maker-level state after the execution.
         maker_level: MarketDataLevel,
     },
+    /// The effective instrument-wide trading state changed.
+    TradingState {
+        /// Effective state before the transition.
+        previous_state: TradingState,
+        /// Effective state after the transition.
+        current_state: TradingState,
+        /// Monotonically increasing state-control revision.
+        revision: u64,
+    },
 }
 
 /// A source-sequenced public market-data update.
@@ -111,6 +122,18 @@ impl MarketDataUpdate {
             {
                 return Err(MarketDataError::InvalidUpdate(
                     "trade print contradicts its maker-level update",
+                ));
+            }
+        }
+        if let MarketDataKind::TradingState {
+            previous_state,
+            current_state,
+            revision,
+        } = kind
+        {
+            if previous_state == current_state || revision == 0 || revision > sequence {
+                return Err(MarketDataError::InvalidUpdate(
+                    "trading-state update must change state at a feasible non-zero revision",
                 ));
             }
         }
@@ -194,6 +217,7 @@ pub struct MarketDataSnapshot {
     instrument_version: InstrumentVersion,
     as_of_sequence: u64,
     last_trade_id: Option<TradeId>,
+    trading_state: TradingStateSnapshot,
     bids: Vec<MarketDataLevel>,
     asks: Vec<MarketDataLevel>,
 }
@@ -204,6 +228,7 @@ impl MarketDataSnapshot {
         instrument_version: InstrumentVersion,
         as_of_sequence: u64,
         last_trade_id: Option<TradeId>,
+        trading_state: TradingStateSnapshot,
         bids: Vec<MarketDataLevel>,
         asks: Vec<MarketDataLevel>,
     ) -> Result<Self, MarketDataError> {
@@ -212,6 +237,7 @@ impl MarketDataSnapshot {
             instrument_version,
             as_of_sequence,
             last_trade_id,
+            trading_state,
             bids,
             asks,
         };
@@ -243,6 +269,12 @@ impl MarketDataSnapshot {
         self.last_trade_id
     }
 
+    /// Returns the effective trading state at the snapshot boundary.
+    #[must_use]
+    pub const fn trading_state(&self) -> TradingStateSnapshot {
+        self.trading_state
+    }
+
     /// Returns bids in best-to-worst order.
     #[must_use]
     pub fn bids(&self) -> &[MarketDataLevel] {
@@ -262,6 +294,11 @@ impl MarketDataSnapshot {
         {
             return Err(MarketDataError::InvalidSnapshot(
                 "snapshot trade identifier exceeds its event sequence",
+            ));
+        }
+        if self.trading_state.revision() > self.as_of_sequence {
+            return Err(MarketDataError::InvalidSnapshot(
+                "snapshot trading-state revision exceeds its event sequence",
             ));
         }
         validate_snapshot_side(Side::Buy, &self.bids)?;
@@ -403,6 +440,7 @@ pub struct MarketDataPublisher {
     asks: BTreeMap<Price, Aggregate>,
     orders: HashMap<OrderId, TrackedOrder>,
     account_controls: HashMap<AccountId, AccountControlSnapshot>,
+    trading_state: TradingStateSnapshot,
     last_sequence: u64,
     last_trade_id: Option<TradeId>,
     poisoned: bool,
@@ -447,6 +485,7 @@ impl MarketDataPublisher {
             asks,
             orders,
             account_controls: book.account_controls().collect(),
+            trading_state: book.trading_state(),
             last_sequence: book.last_event_sequence(),
             last_trade_id: book.last_trade_id(),
             poisoned: false,
@@ -475,6 +514,7 @@ impl MarketDataPublisher {
             instrument_version: self.instrument_version,
             as_of_sequence: self.last_sequence,
             last_trade_id: self.last_trade_id,
+            trading_state: self.trading_state,
             bids: levels_in_priority(Side::Buy, &self.bids),
             asks: levels_in_priority(Side::Sell, &self.asks),
         }
@@ -579,7 +619,12 @@ impl MarketDataPublisher {
             self.last_sequence = event.sequence;
         }
         let requires_completion = report.outcome == CommandOutcome::Accepted
-            && matches!(command, Command::MassCancel(_) | Command::AccountControl(_));
+            && matches!(
+                command,
+                Command::MassCancel(_)
+                    | Command::AccountControl(_)
+                    | Command::TradingStateControl(_)
+            );
         if requires_completion != mass_cancel_progress.completed {
             return self.fail(MarketDataError::TraceMismatch(
                 "aggregate cancellation/control command and completion event disagree",
@@ -611,6 +656,7 @@ impl MarketDataPublisher {
         }
         if self.last_sequence != book.last_event_sequence()
             || self.last_trade_id != book.last_trade_id()
+            || self.trading_state != book.trading_state()
         {
             return Err(MarketDataError::SourceDivergence(
                 "publisher source sequences differ from the matching book",
@@ -660,6 +706,10 @@ impl MarketDataPublisher {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive private-event grammar keeps every source transition auditable"
+    )]
     fn apply_event(
         &mut self,
         command: Command,
@@ -754,6 +804,21 @@ impl MarketDataPublisher {
             } => self.handle_account_control_applied(
                 command,
                 account_id,
+                previous_state,
+                current_state,
+                revision,
+                cancelled_order_count,
+                cancelled_quantity_lots,
+                mass_cancel_progress,
+            ),
+            EventKind::TradingStateControlApplied {
+                previous_state,
+                current_state,
+                revision,
+                cancelled_order_count,
+                cancelled_quantity_lots,
+            } => self.handle_trading_state_control_applied(
+                command,
                 previous_state,
                 current_state,
                 revision,
@@ -914,7 +979,7 @@ impl MarketDataPublisher {
         if expected_maker != trade.maker_order_id
             || maker.price != trade.price
             || maker.account_id != maker_account
-            || command_account_id(command) != taker_account
+            || command_account_id(command) != Some(taker_account)
         {
             return Err(MarketDataError::TraceMismatch(
                 "trade identity, owner, side, or price contradicts tracked state",
@@ -933,6 +998,10 @@ impl MarketDataPublisher {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive cancellation grammar validates every reason against its command"
+    )]
     fn handle_cancel(
         &mut self,
         command: Command,
@@ -957,7 +1026,7 @@ impl MarketDataPublisher {
                 }
                 CancelReason::SelfTradeResting => {
                     if command_order_id(command).is_none()
-                        || command_account_id(command) != order.account_id
+                        || command_account_id(command) != Some(order.account_id)
                     {
                         return Err(MarketDataError::TraceMismatch(
                             "self-trade cancellation targeted another account",
@@ -1006,6 +1075,33 @@ impl MarketDataPublisher {
                     {
                         return Err(MarketDataError::TraceMismatch(
                             "account control targeted an order outside its account",
+                        ));
+                    }
+                    mass_cancel_progress.order_count = mass_cancel_progress
+                        .order_count
+                        .checked_add(1)
+                        .ok_or(MarketDataError::ArithmeticOverflow)?;
+                    mass_cancel_progress.quantity_lots = mass_cancel_progress
+                        .quantity_lots
+                        .checked_add(u128::from(quantity.lots()))
+                        .ok_or(MarketDataError::ArithmeticOverflow)?;
+                    mass_cancel_progress.last_order_id = Some(order_id);
+                }
+                CancelReason::TradingStateControl => {
+                    let Command::TradingStateControl(control) = command else {
+                        return Err(MarketDataError::TraceMismatch(
+                            "non-state-control command emitted a state-control cancellation",
+                        ));
+                    };
+                    if control.action != TradingStateControlAction::TransitionAndCancel
+                        || control.target_state == TradingState::Open
+                        || mass_cancel_progress.completed
+                        || mass_cancel_progress
+                            .last_order_id
+                            .is_some_and(|previous| order_id <= previous)
+                    {
+                        return Err(MarketDataError::TraceMismatch(
+                            "trading-state control cancellation is not canonical",
                         ));
                     }
                     mass_cancel_progress.order_count = mass_cancel_progress
@@ -1125,6 +1221,55 @@ impl MarketDataPublisher {
 
     #[allow(
         clippy::too_many_arguments,
+        reason = "the trading-state completion event is a fixed audit record"
+    )]
+    fn handle_trading_state_control_applied(
+        &mut self,
+        command: Command,
+        previous_state: TradingState,
+        current_state: TradingState,
+        revision: u64,
+        cancelled_order_count: u64,
+        cancelled_quantity_lots: u128,
+        progress: &mut MassCancelProgress,
+    ) -> Result<MarketDataKind, MarketDataError> {
+        let Command::TradingStateControl(control) = command else {
+            return Err(MarketDataError::TraceMismatch(
+                "non-state-control command emitted TradingStateControlApplied",
+            ));
+        };
+        let expected_revision = control
+            .expected_revision
+            .checked_add(1)
+            .ok_or(MarketDataError::ArithmeticOverflow)?;
+        if progress.completed
+            || self.trading_state.state() != previous_state
+            || self.trading_state.revision() != control.expected_revision
+            || control.target_state != current_state
+            || previous_state == current_state
+            || revision != expected_revision
+            || progress.order_count != cancelled_order_count
+            || progress.quantity_lots != cancelled_quantity_lots
+            || (control.action == TradingStateControlAction::Transition
+                && (cancelled_order_count != 0 || cancelled_quantity_lots != 0))
+            || (control.action == TradingStateControlAction::TransitionAndCancel
+                && (control.target_state == TradingState::Open || !self.orders.is_empty()))
+        {
+            return Err(MarketDataError::TraceMismatch(
+                "TradingStateControlApplied contradicts its command or cancellations",
+            ));
+        }
+        self.trading_state = TradingStateSnapshot::from_parts(current_state, revision);
+        progress.completed = true;
+        Ok(MarketDataKind::TradingState {
+            previous_state,
+            current_state,
+            revision,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
         reason = "the replacement event is a fixed state-transition record"
     )]
     fn handle_replace(
@@ -1213,7 +1358,7 @@ impl MarketDataPublisher {
         if self
             .orders
             .get(&resting_order_id)
-            .is_none_or(|resting| resting.account_id != command_account_id(command))
+            .is_none_or(|resting| Some(resting.account_id) != command_account_id(command))
         {
             return Err(MarketDataError::TraceMismatch(
                 "self-trade resting order is absent or owned by another account",
@@ -1392,6 +1537,7 @@ impl MarketDataPublisher {
         if book.last_event_sequence() != self.last_sequence
             || book.last_trade_id() != self.last_trade_id
             || book.active_order_count() != self.orders.len()
+            || book.trading_state() != self.trading_state
         {
             return Err(MarketDataError::SourceDivergence(
                 "published sequence, trade, or order count differs from the matching book",
@@ -1406,7 +1552,7 @@ impl MarketDataPublisher {
                 MarketDataKind::Trade { maker_level, .. } => {
                     affected.insert((maker_level.side, maker_level.price));
                 }
-                MarketDataKind::NoBookChange => {}
+                MarketDataKind::NoBookChange | MarketDataKind::TradingState { .. } => {}
             }
         }
         for (side, price) in affected {
@@ -1458,13 +1604,19 @@ pub struct MarketDataReplica {
     asks: BTreeMap<Price, Aggregate>,
     last_sequence: u64,
     last_trade_id: Option<TradeId>,
+    initial_trading_state: TradingState,
+    trading_state: TradingStateSnapshot,
     poisoned: bool,
 }
 
 impl MarketDataReplica {
     /// Creates an empty consumer for one immutable instrument version.
     #[must_use]
-    pub fn new(instrument_id: InstrumentId, instrument_version: InstrumentVersion) -> Self {
+    pub fn new(
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        initial_trading_state: TradingState,
+    ) -> Self {
         Self {
             instrument_id,
             instrument_version,
@@ -1472,6 +1624,8 @@ impl MarketDataReplica {
             asks: BTreeMap::new(),
             last_sequence: 0,
             last_trade_id: None,
+            initial_trading_state,
+            trading_state: TradingStateSnapshot::from_parts(initial_trading_state, 0),
             poisoned: false,
         }
     }
@@ -1496,6 +1650,13 @@ impl MarketDataReplica {
             });
         }
         snapshot.validate()?;
+        if snapshot.trading_state.revision() == 0
+            && snapshot.trading_state.state() != self.initial_trading_state
+        {
+            return Err(MarketDataError::InvalidSnapshot(
+                "genesis trading state differs from the configured instrument",
+            ));
+        }
         let bids = snapshot
             .bids
             .iter()
@@ -1526,6 +1687,7 @@ impl MarketDataReplica {
         self.asks = asks;
         self.last_sequence = snapshot.as_of_sequence;
         self.last_trade_id = snapshot.last_trade_id;
+        self.trading_state = snapshot.trading_state;
         self.poisoned = false;
         Ok(())
     }
@@ -1681,6 +1843,12 @@ impl MarketDataReplica {
         self.last_sequence
     }
 
+    /// Returns the current effective trading state and accepted revision.
+    #[must_use]
+    pub const fn trading_state(&self) -> TradingStateSnapshot {
+        self.trading_state
+    }
+
     /// Returns whether invalid incremental state requires a new snapshot.
     #[must_use]
     pub const fn is_poisoned(&self) -> bool {
@@ -1735,6 +1903,26 @@ impl MarketDataReplica {
                 }
                 self.last_trade_id = Some(print.trade_id);
                 self.set_level(maker_level);
+            }
+            MarketDataKind::TradingState {
+                previous_state,
+                current_state,
+                revision,
+            } => {
+                let expected_revision = self
+                    .trading_state
+                    .revision()
+                    .checked_add(1)
+                    .ok_or(MarketDataError::ArithmeticOverflow)?;
+                if self.trading_state.state() != previous_state
+                    || previous_state == current_state
+                    || revision != expected_revision
+                {
+                    return Err(MarketDataError::InvalidUpdate(
+                        "trading-state update is not the next valid transition",
+                    ));
+                }
+                self.trading_state = TradingStateSnapshot::from_parts(current_state, revision);
             }
         }
         if let (Some((&bid, _)), Some((&ask, _))) =
@@ -1824,6 +2012,7 @@ const fn command_id(command: Command) -> CommandId {
         Command::Replace(value) => value.command_id,
         Command::MassCancel(value) => value.command_id,
         Command::AccountControl(value) => value.command_id,
+        Command::TradingStateControl(value) => value.command_id,
     }
 }
 
@@ -1832,17 +2021,20 @@ const fn command_order_id(command: Command) -> Option<OrderId> {
         Command::New(value) => Some(value.order_id),
         Command::Cancel(value) => Some(value.order_id),
         Command::Replace(value) => Some(value.order_id),
-        Command::MassCancel(_) | Command::AccountControl(_) => None,
+        Command::MassCancel(_) | Command::AccountControl(_) | Command::TradingStateControl(_) => {
+            None
+        }
     }
 }
 
-const fn command_account_id(command: Command) -> AccountId {
+const fn command_account_id(command: Command) -> Option<AccountId> {
     match command {
-        Command::New(value) => value.account_id,
-        Command::Cancel(value) => value.account_id,
-        Command::Replace(value) => value.account_id,
-        Command::MassCancel(value) => value.account_id,
-        Command::AccountControl(value) => value.account_id,
+        Command::New(value) => Some(value.account_id),
+        Command::Cancel(value) => Some(value.account_id),
+        Command::Replace(value) => Some(value.account_id),
+        Command::MassCancel(value) => Some(value.account_id),
+        Command::AccountControl(value) => Some(value.account_id),
+        Command::TradingStateControl(_) => None,
     }
 }
 
@@ -1853,6 +2045,7 @@ const fn command_instrument(command: Command) -> InstrumentId {
         Command::Replace(value) => value.instrument_id,
         Command::MassCancel(value) => value.instrument_id,
         Command::AccountControl(value) => value.instrument_id,
+        Command::TradingStateControl(value) => value.instrument_id,
     }
 }
 
@@ -1863,6 +2056,7 @@ const fn command_version(command: Command) -> InstrumentVersion {
         Command::Replace(value) => value.instrument_version,
         Command::MassCancel(value) => value.instrument_version,
         Command::AccountControl(value) => value.instrument_version,
+        Command::TradingStateControl(value) => value.instrument_version,
     }
 }
 
@@ -1873,6 +2067,7 @@ const fn command_time(command: Command) -> TimestampNs {
         Command::Replace(value) => value.received_at,
         Command::MassCancel(value) => value.received_at,
         Command::AccountControl(value) => value.received_at,
+        Command::TradingStateControl(value) => value.received_at,
     }
 }
 
