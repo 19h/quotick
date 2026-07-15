@@ -66,6 +66,7 @@ verify deterministic replay during recovery.
 | --- | --- |
 | `domain` | Validated identifiers, integer fixed-point `Price` and `Quantity`, timestamps, accounting dates |
 | `instrument` | Effective-time-versioned instrument catalog, per-version admission rules, settlement conventions |
+| `calendar` | Immutable versioned UTC session schedules, day/session TIF normalization, expiry controls |
 | `matching` | Bounded price-time-priority `OrderBook` with prepare/commit split, event traces, and checkpoints |
 | `auction`, `auction_book`, `auction_engine` | Pure clearing-price and allocation kernels, bounded collection book, sequenced phase engine |
 | `risk`, `auction_risk` | Immutable account profiles, conservative reservations, coupled matching and auction shards |
@@ -73,7 +74,7 @@ verify deterministic replay during recovery.
 | `ledger` | Atomic multi-asset double-entry ledger with DVP trade settlement |
 | `journal`, `snapshot` | CRC-32C WAL (single-file and segmented), `QSNP` semantic snapshots, A/B checkpoint-cutover primitives |
 | `durable`, `durable_risk`, `durable_auction`, `durable_ledger` | Crash-recoverable single-writer runtimes |
-| `codec` | Stable little-endian `BinaryCodec` implementations for every durable record |
+| `codec` | Stable little-endian `BinaryCodec` implementations for durable records and calendar images |
 
 ## Quick start
 
@@ -196,6 +197,22 @@ book applies it.
   settlement arithmetic in the ledger.
 - Allocation telemetry and an allocation-free structural cross-audit of every
   index and version history.
+
+### Trading calendars
+
+- Immutable `TradingCalendar` generations bind non-zero calendar/version
+  identities to canonical UTC session rows with caller-supplied accounting
+  dates, half-open entry windows, and explicit session/day expiry boundaries.
+- Binary-search lookup finds active, next, ID-selected, and date-selected
+  sessions. `Day` and `GoodForSession` ingress qualifiers normalize to the
+  matching engine's existing absolute GTD lifetime; native TIF values pass
+  through without requiring an active session.
+- Boundary-checked factories produce the existing sequenced `ExpirySweep`, so
+  matching order, idempotency, risk release, market-data projection, and
+  recovery semantics are reused. Calendar code reads no clock and infers no
+  time zone, holiday, early close, or venue-hours rule.
+- A stable little-endian calendar payload preserves the immutable schedule;
+  clones share its row and ID-index storage in `O(1)`.
 
 ### Continuous matching
 
@@ -365,8 +382,9 @@ book applies it.
 
 ## Default resource envelopes
 
-Every component reserves its complete configured envelope at construction and
-never grows it afterward. The defaults:
+Every bounded mutable component reserves its complete configured envelope at
+construction and never grows it afterward. Immutable calendars own their
+caller-supplied finite row image plus one exact derived ID index. The defaults:
 
 | Component | Defaults |
 | --- | --- |
@@ -396,11 +414,14 @@ path with banded aggregate discovery, price-time allocation, and a
 process-local atomic uncross. Continuous stop orders require an authoritative
 external source to submit each sequenced reference; matching never infers one
 from local trades or wall time. The platform does not implement pegged orders,
-discretionary ranges, day/session-calendar expiry, cross-instrument or
-multi-leg execution, volatility-interruption trigger logic, or venue-specific
-priority rule sets. The auction path additionally provides no ledger effects,
-reference or dynamic-band derivation, preventive self-trade policies, calendar
-or session scheduling, or venue-specific uncross rules.
+discretionary ranges, cross-instrument or multi-leg execution, volatility-
+interruption trigger logic, or venue-specific priority rule sets. Immutable
+calendar images and day/session-to-GTD normalization are implemented, but
+authoritative calendar ingestion, signed distribution, atomic activation,
+original-request audit durability, and sequenced session-state transitions are
+external. The auction path additionally provides no ledger effects, reference
+or dynamic-band derivation, preventive self-trade policies, calendar-driven
+phase scheduling, or venue-specific uncross rules.
 
 The complete boundary, the failure model, and the register of environmental
 assumptions are documented in
@@ -412,9 +433,10 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 103 tagged assumptions (A1–A103), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 104 tagged assumptions (A1–A104), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
+| [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
 | [WAL format v7](docs/wal-v7.md) | Current write-ahead-log frame and record schema |
 | [Snapshot format v7](docs/snapshot-v7.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
 | [Market-data payload v3](docs/market-data-v3.md) | Current continuous market-data update/snapshot payloads |
@@ -453,6 +475,10 @@ includes:
   mass cancellation, account and trading-state controls, every self-trade
   policy, risk rejection and reservation release, and capacity behavior at
   every configured bound.
+- **Trading calendars:** schedule chronology and identity validation, exact
+  half-open entry boundaries, multi-session trading dates, day/session TIF
+  normalization, boundary-checked expiry controls, malformed payload rejection,
+  core GTD/replay composition, and immutable storage sharing.
 - **Call auctions:** discovery differentially checked against exhaustive
   tick-grid enumeration, allocation against literal order-priority walks,
   20,000 mixed book mutations and 10,000 uncross cases against independent

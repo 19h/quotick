@@ -9,6 +9,7 @@ layout, allocator rounding, and resident-page behavior are target-dependent.
 Contents:
 
 - [Instrument catalog](#instrument-catalog)
+- [Trading calendars](#trading-calendars)
 - [Continuous matching](#continuous-matching)
 - [Call-auction discovery and allocation](#call-auction-discovery-and-allocation)
 - [Call-auction collection book](#call-auction-collection-book)
@@ -45,6 +46,33 @@ definitions. A full adversarial hash collision cluster makes index access
 `O(A)` or `O(I)` without changing the finite memory bound. The
 allocation-free structural audit is expected `O(A + D + I²)` and deliberately
 favors exhaustive overlap detection over control-plane audit latency.
+
+## Trading calendars
+
+For `S` sessions in one immutable `TradingCalendar` generation, construction
+validates the already ordered schedule in `O(S)` time, exactly reserves one
+`S`-entry session-ID index, and sorts that index in `O(S log S)` time. The
+caller-supplied session vector and the derived index occupy `O(S)` storage.
+Converting those vectors to shared owners creates two control blocks under A12;
+the generation never mutates or grows afterward.
+
+- Active-session and strictly-next-session lookup are `O(log S)` by entry-open
+  order.
+- Lookup by `TradingSessionId` is `O(log S)` in the derived index.
+- `sessions_on` performs two partition searches and is `O(log S)` before
+  returning a borrowed contiguous slice.
+- Day or good-for-session lifetime resolution is `O(log S)` and `O(1)`
+  auxiliary space. Constructing a boundary-checked `ExpirySweep` by session ID
+  is `O(log S)`.
+- Cloning a calendar is `O(1)` time and space per handle and copies no session
+  or index rows. Equality remains `O(S)` in the worst case.
+
+For an encoded payload of `S` sessions, byte length is exactly
+`28 B + 44 S B`. Encoding is `O(S)` time and output space. Decoding proves the
+row count before exactly reserving `O(S)` rows, then reconstructs the sorted ID
+index, so it is `O(S log S)` time and `O(S)` owned space. Calendar resolution
+adds no new matching hot-path structure: its output uses the existing GTD
+expiry arena and sweep bounds.
 
 ## Continuous matching
 

@@ -14,9 +14,11 @@ use std::fmt;
 use crate::auction_engine::{CallAuctionCheckpoint, CallAuctionCheckpointError};
 use crate::auction_market_data::CallAuctionMarketDataError;
 use crate::auction_risk::{CallAuctionRiskCheckpoint, CallAuctionRiskCheckpointError};
+use crate::calendar::{TradingCalendar, TradingCalendarError, TradingSession};
 use crate::domain::{
-    AccountId, AccountingDate, AssetId, CommandId, DomainError, InstrumentId, InstrumentVersion,
-    OrderId, Price, Quantity, Side, TimestampNs, TradeId, TransactionId,
+    AccountId, AccountingDate, AssetId, CalendarId, CalendarVersion, CommandId, DomainError,
+    InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side, TimestampNs, TradeId,
+    TradingSessionId, TransactionId,
 };
 use crate::instrument::{
     InstrumentDefinition, InstrumentError, InstrumentKind, InstrumentSpec, InstrumentSymbol,
@@ -111,6 +113,8 @@ pub enum CodecError {
     InvalidLedgerCheckpoint(LedgerCheckpointError),
     /// A decoded instrument definition violated instrument-master invariants.
     InvalidInstrument(InstrumentError),
+    /// A decoded trading calendar violated schedule invariants.
+    InvalidTradingCalendar(TradingCalendarError),
     /// A decoded risk definition violated limit invariants.
     InvalidRisk(RiskError),
     /// Decoded public market data violated sequence-independent invariants.
@@ -172,6 +176,7 @@ impl fmt::Display for CodecError {
             Self::InvalidJournalEntry(error) => error.fmt(formatter),
             Self::InvalidLedgerCheckpoint(error) => error.fmt(formatter),
             Self::InvalidInstrument(error) => error.fmt(formatter),
+            Self::InvalidTradingCalendar(error) => error.fmt(formatter),
             Self::InvalidRisk(error) => error.fmt(formatter),
             Self::InvalidMarketData(error) => error.fmt(formatter),
             Self::InvalidAuctionMarketData(error) => error.fmt(formatter),
@@ -190,6 +195,7 @@ impl std::error::Error for CodecError {
             Self::InvalidJournalEntry(error) => Some(error),
             Self::InvalidLedgerCheckpoint(error) => Some(error),
             Self::InvalidInstrument(error) => Some(error),
+            Self::InvalidTradingCalendar(error) => Some(error),
             Self::InvalidRisk(error) => Some(error),
             Self::InvalidMarketData(error) => Some(error),
             Self::InvalidAuctionMarketData(error) => Some(error),
@@ -211,6 +217,12 @@ impl From<DomainError> for CodecError {
 impl From<InstrumentError> for CodecError {
     fn from(error: InstrumentError) -> Self {
         Self::InvalidInstrument(error)
+    }
+}
+
+impl From<TradingCalendarError> for CodecError {
+    fn from(error: TradingCalendarError) -> Self {
+        Self::InvalidTradingCalendar(error)
     }
 }
 
@@ -498,6 +510,53 @@ fn reserve_decoded_vec<T>(field: &'static str, maximum: usize) -> Result<Vec<T>,
         .try_reserve_exact(maximum)
         .map_err(|_| CodecError::CapacityReservationFailed { field, maximum })?;
     Ok(values)
+}
+
+impl BinaryCodec for TradingCalendar {
+    fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        let mut encoder = Encoder::default();
+        encoder.u64(self.calendar_id().get());
+        encoder.u64(self.version().get());
+        encoder.u64(self.effective_from().as_unix_nanos());
+        encoder.length("trading calendar sessions", self.sessions().len())?;
+        for session in self.sessions() {
+            encoder.u64(session.session_id().get());
+            encoder.i32(session.trading_date().days_since_unix_epoch());
+            encoder.u64(session.order_entry_opens_at().as_unix_nanos());
+            encoder.u64(session.order_entry_closes_at().as_unix_nanos());
+            encoder.u64(session.session_orders_expire_at().as_unix_nanos());
+            encoder.u64(session.day_orders_expire_at().as_unix_nanos());
+        }
+        encoder.finish()
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        const SESSION_BYTES: usize = 44;
+
+        let mut decoder = Decoder::new(bytes);
+        let calendar_id = CalendarId::new(decoder.u64()?)?;
+        let version = CalendarVersion::new(decoder.u64()?)?;
+        let effective_from = TimestampNs::from_unix_nanos(decoder.u64()?);
+        let count = decoder.count("trading calendar sessions", SESSION_BYTES)?;
+        let mut sessions = reserve_decoded_vec("trading calendar sessions", count)?;
+        for _ in 0..count {
+            sessions.push(TradingSession::new(
+                TradingSessionId::new(decoder.u64()?)?,
+                AccountingDate::from_days_since_unix_epoch(decoder.i32()?),
+                TimestampNs::from_unix_nanos(decoder.u64()?),
+                TimestampNs::from_unix_nanos(decoder.u64()?),
+                TimestampNs::from_unix_nanos(decoder.u64()?),
+                TimestampNs::from_unix_nanos(decoder.u64()?),
+            )?);
+        }
+        decoder.finish()?;
+        Ok(TradingCalendar::try_new(
+            calendar_id,
+            version,
+            effective_from,
+            sessions,
+        )?)
+    }
 }
 
 impl BinaryCodec for CheckpointAnchor {

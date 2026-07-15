@@ -61,6 +61,8 @@ macro_rules! identifier {
 identifier!(AccountId, "account identifier");
 identifier!(AssetId, "asset identifier");
 identifier!(AuctionId, "auction identifier");
+identifier!(CalendarId, "calendar identifier");
+identifier!(CalendarVersion, "calendar version");
 identifier!(CommandId, "command identifier");
 identifier!(InstrumentId, "instrument identifier");
 identifier!(InstrumentVersion, "instrument version");
@@ -68,6 +70,7 @@ identifier!(OrderId, "order identifier");
 identifier!(ReconciliationId, "reconciliation identifier");
 identifier!(TradeId, "trade identifier");
 identifier!(TransactionId, "transaction identifier");
+identifier!(TradingSessionId, "trading-session identifier");
 
 /// Accounting-date scalar represented as signed days from 1970-01-01.
 ///

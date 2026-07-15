@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A103 are stable and are referenced from code comments and other
+identifiers A1-A104 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -188,6 +188,8 @@ price arenas, continuous and call-auction replica active/standby depth, the
 ledger journal vector, prepared auction/ledger buffers, the continuous
 order-selection pool, and the call-auction uncross pool reserve their
 applicable complete or command-exact bounds before mutation.
+The immutable trading calendar owns its caller-supplied row vector and exactly
+reserves its derived session-ID index before publication.
 
 Successful continuous-book/risk, call-auction-book/engine/risk, and indexed-AVL
 structural audits allocate no scratch; continuous matching/risk,
@@ -212,13 +214,15 @@ are expected `O(1)` under `RandomState`; an adversarial full collision cluster
 is `O(N)` but remains bounded and allocation-free. Matching, auction, ledger,
 and both publication paths own complete commit/output inputs before mutation.
 Exact retry shares existing state and cannot consume capacity; creating an
-arena or selection/uncross-pool `Arc` during construction, constructing a
-snapshot-file image, or an external clone remains outside the guarantee.
+arena, calendar, or selection/uncross-pool `Arc` during construction,
+constructing a snapshot-file image, or an external clone remains outside the
+guarantee.
 
 **Falsification probe.** Force all keys into one collision cluster and remove
 head/middle/tail entries; differentially execute at least 100,000 mixed hash
 operations; assert dense/bucket/vector/AVL/event-arena capacities never move;
-exercise interleaved catalog version registration, allocation-free
+exercise interleaved catalog version registration, immutable calendar
+construction/lookup/codec/clone behavior, allocation-free
 continuous/call-auction book/engine/risk and AVL audits, typed
 continuous/call-auction/ledger checkpoint capture/validation, codec, and
 journal-frame reservation failure, sustained matching/risk deletion, both
@@ -262,29 +266,34 @@ integrity; concern about the second requires authenticated records.
 
 ## A15 — format version immutability
 
-**Assumption.** WAL format version 7, snapshot format version 7, and continuous
-market-data payload version 3 are immutable. WAL and snapshot versions `1`
-through `6` are expired and rejected explicitly rather than inferred or
-migrated. WAL v7 preserves the v6 frame and record-kind registry, adds one
+**Assumption.** WAL format version 7, snapshot format version 7, continuous
+market-data payload version 3, and trading-calendar payload version 1 are
+immutable. WAL and snapshot versions `1` through `6` are expired and rejected
+explicitly rather than inferred or migrated. WAL v7 preserves the v6 frame and
+record-kind registry, adds one
 instrument-definition boolean, fully hidden display tag `2`, continuous
 rejection tags `48`/`49`, and call-auction admission-error tag `11`.
 Snapshot v7 preserves ledger kind `1`, embeds the changed definition in kinds
 `2` through `5`, and permits canonical fully hidden continuous rows in kinds
 `2`/`3`. Market-data v3 preserves v2 bytes but adds the absent-public-maker
-trade interpretation required for fully hidden execution. No runtime
+trade interpretation required for fully hidden execution. Trading-calendar v1
+is a complete value with no self-describing schema field; an enclosing protocol
+selects it explicitly, while its encoded `CalendarVersion` identifies schedule
+content rather than wire interpretation. No runtime
 interprets an expired envelope as current. Any future incompatible evolution
 uses a new explicit version and provenance-preserving migration when
 authoritative predecessors exist.
 
 **Dependent results.** Deterministic decoding, historical replay, checkpoint
-recovery, anchor interpretation, stable auction records/images, and fail-closed
-format boundaries.
+recovery, anchor interpretation, stable auction records/images, stable calendar
+images, and fail-closed format boundaries.
 
-**Falsification probe.** Byte-compare golden WAL-v7, snapshot-v7, and market-
-data-v3 fixtures through every supported release; mutate valid WAL frames and
-images to versions `1` through `6`; verify definition booleans, every display
-and hidden rejection tag, continuous expiry/stop tags, raw auction record tags
-`9`/`10`, snapshot kinds `1` through `5`, and hidden-maker trade application.
+**Falsification probe.** Byte-compare golden WAL-v7, snapshot-v7, market-data-
+v3, and trading-calendar-v1 fixtures through every supported release; mutate
+valid WAL frames and images to versions `1` through `6`; verify definition
+booleans, every display and hidden rejection tag, continuous expiry/stop tags,
+raw auction record tags `9`/`10`, snapshot kinds `1` through `5`, hidden-maker
+trade application, and every calendar scalar/row offset.
 Any changed supported bytes/interpretation or acceptance across an expired
 envelope boundary falsifies A15.
 
@@ -3006,6 +3015,52 @@ sequence gap, replay divergence, or required venue rule outside the represented
 class model falsifies A103 for that integration and requires a new versioned
 policy.
 
+## A104 — versioned UTC trading-calendar authority
+
+**Assumption.** One upstream publisher assigns every immutable
+`TradingCalendar` generation a non-zero `(CalendarId, CalendarVersion)` pair
+whose content never changes. It supplies complete sessions in canonical entry-
+time order with unique non-zero `TradingSessionId` values, authoritative UTC
+nanosecond entry/session/day boundaries, and authoritative `AccountingDate`
+values. The same ID/version pair is not reused for different bytes. Quotick
+validates structural chronology but does not derive or authenticate venue
+hours, time zones, daylight-saving transitions, holidays, early closes, or
+business dates.
+
+The gateway resolves `Day` or `GoodForSession` at its authoritative
+`received_at` against the half-open active entry window and submits the
+resulting absolute GTD deadline to matching. It retains the returned calendar,
+session, and date provenance when that evidence is required; the current
+matching WAL/checkpoint grammar retains only the normalized deadline. A
+controller submits the corresponding explicit inclusive `ExpirySweep` at or
+after the calendar boundary. Native TIF values do not require an active
+session and pass through unchanged.
+
+**Dependent results.** [A5, A15, A17, A20, A21, A37, A39, A80, A81, A104]
+Deterministic active-session lookup, day/good-for-session normalization,
+boundary-checked sweep construction, stable calendar bytes, and reuse of the
+existing GTD matching/risk/publication/recovery semantics. Calendar queries
+read no wall clock, and a cloned generation shares immutable rows/indexes.
+No claim follows that the core matching WAL can reconstruct the original
+calendar-relative request or prove which publisher authorized a generation.
+
+**Falsification probe.** Import independently sourced venue schedules across
+overnight sessions, multiple sessions assigned to one trading date, weekends,
+holidays, daylight-saving changes, early closes, and version cutovers. Resolve
+at `open - 1 ns`, `open`, `close - 1 ns`, `close`, session expiry, and day
+expiry; compare calendar ID/version/session/date/deadline evidence and replay
+the normalized command/sweep stream. Mutate row order, duplicate IDs,
+same-date day boundaries, cross-date overlap, identifiers, counts, and trailing
+bytes. Reuse one ID/version for different content, omit or delay a boundary
+sweep, or discard ingress provenance before an audit reconstruction.
+
+Any accepted structural contradiction, time-zone or holiday inference inside
+Quotick, resolution outside the active entry window, noncanonical boundary,
+changed supported bytes, matching replay divergence, or publisher schedule
+disagreement falsifies A104 or its environment. Authenticated distribution,
+atomic activation, original-request durability, multi-shard synchronization,
+and sequenced session-state transitions require additional protocols.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -3068,9 +3123,11 @@ capability, a remaining risk, or an opportunity.
   checkpoint-memory-bounded restart remain.
 - **High impact:** immutable versioned tick, lot, asset, trading-state,
   settlement, bounded native reserve, and fully hidden admission rules are
-  implemented; authoritative source ingestion, venue-certified display/queue
-  adapters, calendars, corporate
-  actions, derivative lifecycle rules, and signed configuration distribution
+  implemented. Immutable versioned UTC trading-calendar images, canonical
+  session lookup, day/session-to-GTD normalization, expiry-sweep construction,
+  and stable calendar payload bytes are also implemented; authoritative source
+  ingestion, signed distribution, atomic activation, venue-certified
+  display/queue adapters, corporate actions, and derivative lifecycle rules
   remain outside the boundary.
 - **High impact:** the dated ledger codec is deployment-safe only under A35.
   Any authoritative undated predecessor requires an explicit version boundary
@@ -3112,7 +3169,8 @@ capability, a remaining risk, or an opportunity.
   public/private transport, market-on-auction and imbalance-only order types,
   authoritative external continuous stop-reference ingestion, pegged triggers,
   discretionary ranges,
-  day/session-calendar expiry, calendar/session scheduling,
+  authoritative calendar distribution/activation, ingress-provenance
+  durability, sequenced session-state transitions,
   volatility-trigger logic and interruption auctions,
   venue-specific amendment priority, and atomic multi-leg/cross-instrument
   execution require explicit sequenced state machines, new wire versions,
@@ -3175,9 +3233,11 @@ capability, a remaining risk, or an opportunity.
   semantics.
 - **High impact risk:** continuous GTD is driven only by an explicit sequenced
   inclusive watermark. Clock selection, controller authentication, sweep
-  cadence, delayed-command policy, calendar/session mapping, and multi-shard
-  synchronization are external. An unsequenced local timer or inferred session
-  close would invalidate deterministic replay.
+  cadence, delayed-command policy, calendar generation activation, original-
+  request audit persistence, and multi-shard synchronization are external.
+  A104 supplies deterministic mapping once one immutable UTC generation is
+  selected; an unsequenced local timer or inferred session close would still
+  invalidate deterministic replay.
 - **Medium impact:** expiring `K` orders traverses the ordered expiry prefix and
   then performs `K` price/expiry AVL removals, emitting `K + 1` events. The
   asymptotic bound is deterministic; pinned-hardware p50/p99.9 latency, burst

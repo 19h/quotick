@@ -9,6 +9,11 @@ command before matching and records its trace afterward. `DurableLedger`
 records each prepared entry, indivisible correction, or ordered multi-entry
 batch before committing calculated balances.
 
+One immutable `TradingCalendar` generation provides validated UTC entry and
+expiry boundaries to an upstream ingress/controller. It normalizes day/session
+lifetimes into existing matching GTD semantics but is not itself a durable
+runtime or a clock source.
+
 ```text
 implemented
 
@@ -50,6 +55,7 @@ gateway -> authentication -> portfolio/collateral risk -> replicated sequencer a
 - [Coupled call-auction risk invariants](#coupled-call-auction-risk-invariants)
 - [Durable call-auction invariants](#durable-call-auction-invariants)
 - [Instrument invariants](#instrument-invariants)
+- [Trading-calendar invariants](#trading-calendar-invariants)
 - [Ledger invariants](#ledger-invariants)
 - [Pre-trade risk invariants](#pre-trade-risk-invariants)
 - [Market-data publication invariants](#market-data-publication-invariants)
@@ -881,6 +887,56 @@ definition binding across matching and settlement.
 10. The definition-correlated settlement path rejects a trade whose instrument
    ID or version differs before constructing or persisting ledger postings.
 
+## Trading-calendar invariants
+
+This section defines the immutable UTC schedule, session lookup, and
+calendar-relative order-lifetime boundary.
+
+1. One `TradingCalendar` generation has non-zero `CalendarId` and
+   `CalendarVersion` values, one UTC nanosecond `effective_from`, and at least
+   one `TradingSession`. Session identifiers are non-zero and unique within the
+   generation.
+2. Each session has one caller-supplied `AccountingDate` and four UTC
+   nanosecond boundaries satisfying
+   `entry open < entry close <= session expiry <= day expiry`. The entry window
+   is half-open: the session is active exactly for `open <= at < close`.
+3. Sessions are supplied in entry-time order. A preceding session-order expiry
+   cannot exceed the next entry open. Trading dates are nondecreasing; sessions
+   on one date carry the identical day-order expiry; when the date advances,
+   the prior day expiry cannot exceed the next entry open. The generation
+   effective time cannot follow its first entry open.
+4. Construction validates the ordered schedule and builds a separate
+   session-ID-sorted index. Active-session, next-session, session-ID, and
+   date-range queries use binary search and do not infer calendar fields from
+   UTC timestamps.
+5. `CalendarTimeInForce::GoodForSession` and `CalendarTimeInForce::Day`
+   require an active entry session and resolve to the existing
+   `TimeInForce::GoodTilTimestamp` with the session-order or day-order expiry,
+   respectively. `CalendarTimeInForce::Native` is unchanged and does not
+   require an active session. `ResolvedTimeInForce` also carries the calendar
+   ID/version and optional active session/date for ingress audit correlation.
+6. `TradingCalendar::expiry_sweep` selects the session-order or day-order
+   boundary by session ID and constructs the existing `ExpirySweep`. The
+   control receive time must be at or after that inclusive boundary. Matching
+   retains its existing canonical `(deadline, OrderId)` expiry order,
+   idempotency, risk release, event, replay, and market-data behavior.
+7. Calendar construction and resolution read no clock and perform no
+   time-zone, daylight-saving, holiday, venue-hours, early-close, or business-
+   day calculation. The publisher supplies already-resolved UTC boundaries and
+   accounting dates; upstream correctness is A104.
+8. `TradingCalendar` has a stable complete-value little-endian codec defined by
+   [Trading-calendar payload format version 1](trading-calendar-v1.md).
+   Decoding proves its `u32` session count against the remaining 44 B rows,
+   reserves exact row storage fallibly, and re-applies every semantic invariant.
+9. The matching command/WAL/checkpoint model receives only the normalized GTD
+   deadline. It does not retain the original calendar-relative qualifier,
+   calendar identity/version, or session identity. A gateway that requires
+   those audit fields must persist `ResolvedTimeInForce` provenance in a
+   separately versioned protocol; no existing matching field implies it.
+10. Calendar generations and their two indexes are immutable shared values.
+    Cloning one copies shared-owner handles in `O(1)`; equality and codec bytes
+    remain value-based.
+
 ## Ledger invariants
 
 This section defines the ledger contract: entries, balances, reversals,
@@ -1535,6 +1591,11 @@ GTD tests cover deadline intake, equal-deadline `OrderId` ordering, inclusive
 sweeps, empty advances, watermark regression and future-horizon rejection,
 replacement retention, risk release, private market-data validation, checkpoint
 restoration, WAL reopen, and exact retry without frame growth.
+Trading-calendar tests cover zero identifiers, invalid session boundaries,
+noncanonical schedules, duplicate identities, half-open entry lookup, shared
+multi-session day expiry, native and calendar-relative TIF resolution, exact
+expiry-sweep boundaries, matching replay reuse, stable bytes, malformed counts,
+truncation, trailing bytes, and immutable clone storage sharing.
 Stop tests cover reference initialization, side-derived admission, dormant
 public invisibility, buy/sell trigger ordering, bounded continuation backlog,
 market/limit activation, FOK/post-only/capacity terminal cancellation,
@@ -1755,6 +1816,18 @@ There is no additional claim that semantic checkpoint history is size bounded.
   no session identifier, calendar, trading method/mode, event reason, or FIX
   compatibility claim. Those omissions bound A59 and prevent state labels from
   being interpreted as auction/session scheduling.
+- FIX `TimeInForce(59)` defines Day (`0`) and Good Till Date (`6`) order
+  lifetimes in the
+  [FIX Latest field definition](https://fiximate.fixtrading.org/en/FIX.Latest/tag59.html).
+  Quotick maps its explicit calendar-relative ingress variants to an absolute
+  internal GTD deadline; it does not interpret a missing field or claim FIX
+  message compatibility.
+- FIX `TradingSessionID(336)` identifies a trading session and specifies the
+  Day-plus-session-ID pattern when a session spans more than one calendar day
+  in the
+  [FIX 5.0 SP2 field definition](https://fiximate.fixtrading.org/legacy/en/FIX.5.0SP2/tag336.html).
+  Quotick instead uses a non-zero internal `TradingSessionId` and separately
+  supplied `AccountingDate`; adapter value mapping remains external.
 - Nasdaq Equity 4 Rule 4754(b)(2) specifies a Closing Cross price hierarchy
   beginning with maximum executable shares, then minimum imbalance, followed by
   venue-specific remaining-interest, midpoint-distance, benchmark, and
@@ -1791,8 +1864,8 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Snapshots and compaction | single-file and segmented matching/risk/ledger/call-auction WAL cutover plus off-thread direct and WAL-synchronized plain/coupled continuous-matching and call-auction replay verification are implemented; verified matching/risk/auction handles can retire an older prefix by cursor-streaming only its synchronized suffix. Remaining evidence is bounded checkpoint memory and writer audit-copy/projection/direct-reconstruction pause, bounded suffix-copy pause, semantic generation rollover, and externally retained audit/idempotency proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
-| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, explicit-reference stop-market/stop-limit activation, native reserve and fully hidden continuous queue classes, bounded crossed call-auction collection, aggregate depth queries, banded discovery, price-time allocation, deterministic pairing/atomic uncross, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, and plain/coupled-risk full-WAL plus cutover recovery are implemented; remaining work is authoritative external stop-reference ingestion, auction reference and dynamic-band derivation, venue-specific display/priority/allocation policies, preventive self-trade policies, ledger integration, calendar/session scheduling and day/session expiry, volatility/interruption auctions, pegged, discretionary, venue-specific amendment/uncross/publication semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
-| High | Instrument lifecycle expansion | trading calendars, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
+| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, explicit-reference stop-market/stop-limit activation, native reserve and fully hidden continuous queue classes, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, aggregate depth queries, banded discovery, price-time allocation, deterministic pairing/atomic uncross, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, and plain/coupled-risk full-WAL plus cutover recovery are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authoritative external stop-reference ingestion, auction reference and dynamic-band derivation, venue-specific display/priority/allocation policies, preventive self-trade policies, ledger integration, volatility/interruption auctions, pegged, discretionary, venue-specific amendment/uncross/publication semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
+| High | Instrument lifecycle expansion | authoritative calendar ingestion/distribution/activation, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |
 | High | Clearing lifecycle | novation/allocation, fees, settlement dates, fails, corrections, busts, and reconciliation |
