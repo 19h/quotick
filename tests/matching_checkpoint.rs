@@ -644,7 +644,7 @@ fn matching_checkpoint_has_a_distinct_stable_snapshot_kind_and_codec_round_trip(
         Err(CodecError::InvalidMatchingCheckpoint(_))
     ));
 
-    let history_count = first_order + 43;
+    let history_count = first_order + 52;
     let command_length = usize::try_from(u32::from_le_bytes(
         encoded[history_count + 4..history_count + 8]
             .try_into()

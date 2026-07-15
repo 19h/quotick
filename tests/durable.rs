@@ -11,7 +11,8 @@ use quotick::journal::{
     Durability, Journal, JournalError, JournalOptions, JournalReader, RecordKind, RecoveryMode,
 };
 use quotick::matching::{
-    Command, MatchingError, NewOrder, OrderBook, OrderType, SelfTradePrevention, TimeInForce,
+    CancelReason, Command, EventKind, ExpirySweep, MatchingError, NewOrder, OrderBook, OrderType,
+    SelfTradePrevention, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -96,6 +97,26 @@ fn command(command_id: u64, order_id: u64, quantity: u64) -> Command {
     })
 }
 
+fn gtd_command(command_id: u64, order_id: u64, quantity: u64, expires_at: u64) -> Command {
+    let Command::New(mut value) = command(command_id, order_id, quantity) else {
+        unreachable!("command fixture is always new")
+    };
+    value.time_in_force = TimeInForce::GoodTilTimestamp {
+        expires_at: TimestampNs::from_unix_nanos(expires_at),
+    };
+    Command::New(value)
+}
+
+fn expiry_sweep(command_id: u64, through: u64, received_at: u64) -> Command {
+    Command::ExpirySweep(ExpirySweep {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        through: TimestampNs::from_unix_nanos(through),
+        received_at: TimestampNs::from_unix_nanos(received_at),
+    })
+}
+
 fn options() -> JournalOptions {
     JournalOptions {
         durability: Durability::Buffered,
@@ -145,6 +166,39 @@ fn submit_writes_command_then_report_and_reopen_reconstructs_state() {
         5
     );
     reopened.book().validate().expect("restored book validates");
+}
+
+#[test]
+fn durable_gtd_expiry_restores_the_watermark_and_exact_retry() {
+    let file = TestFile::new("gtd-expiry");
+    let order = gtd_command(1, 1, 5, 10);
+    let sweep = expiry_sweep(2, 10, 10);
+    let mut durable = DurableOrderBook::open(file.path(), definition(), options()).unwrap();
+    durable.submit(order).unwrap();
+    let report = durable.submit(sweep).unwrap();
+    assert!(matches!(
+        report.events[0].kind,
+        EventKind::OrderCancelled {
+            reason: CancelReason::Expired,
+            ..
+        }
+    ));
+    durable.sync_all().unwrap();
+    drop(durable);
+
+    let mut reopened = DurableOrderBook::open(file.path(), definition(), options()).unwrap();
+    assert_eq!(
+        reopened.book().expiry_watermark(),
+        Some(TimestampNs::from_unix_nanos(10))
+    );
+    assert_eq!(reopened.book().active_order_count(), 0);
+    let frames_before_retry = frame_kinds(file.path(), options()).len();
+    assert!(reopened.submit(sweep).unwrap().replayed);
+    assert_eq!(
+        frame_kinds(file.path(), options()).len(),
+        frames_before_retry
+    );
+    reopened.book().validate().unwrap();
 }
 
 #[test]

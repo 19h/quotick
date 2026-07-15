@@ -73,14 +73,24 @@ price-level removals in `O(K log P)`, independent of total active-order count
 `O`. Total time is `O(K(log K + log P))` with `O(K)` prepared scratch space.
 Block-and-cancel has the identical bound; enable is expected `O(1)`.
 
+For `K` GTD orders at or before one inclusive expiry watermark, preparation
+counts the ordered expiry prefix in `O(K + 1)` time and leases `O(K)` existing
+selection scratch. Commit traverses that prefix again in canonical
+`(deadline, OrderId)` order and removes each order from its price level and
+expiry AVL. With `P` occupied prices and `X` active GTD orders, commit is
+`O(K(log(P + 1) + log(X + 1)))`; its report contains exactly `K + 1` events.
+An empty sweep is `O(1)`, consumes no lease, and still advances the watermark.
+
 Active matching state uses `O(O + P + C + T)` memory for `O` resting orders,
 `C` retained idempotency reports, and `T` never-evicted controlled accounts;
+the fixed GTD index contributes at most one AVL entry per active order, and
 account indexing adds two links per active order plus fixed
 head/tail/count/aggregate state per active account, within the same `O(O)`
 bound. The two complete best-level caches add `O(1)` space.
 
 Successful full-book validation traverses all price FIFO and account lists in
-`O(O)` and audits both initialized AVL arenas in `O(P log(P + 1))`, using
+`O(O)`, audits both initialized price AVL arenas in `O(P log(P + 1))`, and
+audits `X_i` initialized expiry-arena slots in `O(X_i log(X_i + 1))`, using
 `O(1)` auxiliary space and no heap allocation. Human-readable failure-detail
 formatting may allocate after corruption is detected.
 
@@ -211,10 +221,11 @@ Default matching limits are:
 | Retained commands        | 65,536  |
 | Events per report        | 65,536  |
 
-The final 4,096 history slots are reserved for valid cancellation controls.
+The final 4,096 history slots are reserved for valid cancellation-capable
+commands.
 The report limit must be at least `max_active_orders + 1`, preserving one
 cancellation event per maximally active order plus the mass-cancel completion
-event.
+event or one complete expiry sweep.
 
 ### Order-selection buffer pool
 
@@ -225,7 +236,7 @@ order-selection buffers.
 - The measured minimum element payload is
   `2 × 4,096 × 8 B = 65,536 B = 0.065536 MB`, before vector headers, the
   pool vector, Arc/mutex, allocator rounding, and resident pages.
-- A zero-cardinality selection requires no lease.
+- A zero-cardinality control selection or expiry sweep requires no lease.
 - Holding two non-empty preparations exhausts the pool and produces an
   unsequenced typed preparation failure; dropping or consuming a preparation
   returns its cleared buffer.
@@ -296,7 +307,8 @@ On the current `aarch64-apple-darwin` build:
 
 ### Constructor reservations
 
-Every constructor fallibly reserves two stable-slot indexed AVL arenas, one
+Every constructor fallibly reserves three stable-slot indexed AVL arenas (two
+price indexes and one GTD-expiry index), one
 262,144-slot default continuous retained-event arena, one 73,730-slot default
 call-auction retained-event arena, all five fixed-capacity matching hash
 indexes, and the coupled-risk profile and reservation indexes to their
@@ -310,14 +322,14 @@ cannot be represented or allocated.
 Command preparation therefore borrows matching and coupled-risk state
 immutably; it proves the report bound against existing event headroom and
 acquires one constructor-owned selection lease for a non-empty mass-cancel,
-block-and-cancel, or instrument transition-and-cancel before durable command
-append. Empty selections bypass the pool; non-empty pool exhaustion is typed
-before sequencing or append.
+expiry sweep, block-and-cancel, or instrument transition-and-cancel before
+durable command append. Empty selections bypass the pool; non-empty pool
+exhaustion is typed before sequencing or append.
 
 - Capacity preflight is expected `O(1)` on the normal path, except for
   validating a reserve-lane control through the ordinary core lookup.
 - If an active-order, active-account, or same-side price-level bound is
-  already full, a GTC/post-only limit order performs an allocation-free
+  already full, a GTC/GTD/post-only limit order performs an allocation-free
   residual preview in `O(O_c + P_c log P)` time and `O(1)` auxiliary space
   for `O_c` orders in `P_c` crossed levels. A proved no-residual order
   bypasses the resting-capacity gate.
@@ -336,7 +348,7 @@ before sequencing or append.
 
 One `PreparedCommand` carries the completed operational/core proof through
 risk authorization and WAL append, together with the safe report bound and
-optional mass-cancel/account-control/instrument-control selection lease.
+optional mass-cancel/expiry/account-control/instrument-control selection lease.
 Matching hash-table insertion uses constructor-owned dense entries plus a
 fixed open-addressed bucket array; backward-shift deletion and dense
 `swap_remove` reuse that storage without growth. Commit validates book
@@ -360,13 +372,16 @@ allocation or event copy. Cache, retry, and checkpoint trace clones are
 `O(1)` time and space per handle and do not allocate or copy events. Report
 encoding emits the unchanged ordered event sequence.
 
-Preparation computes a safe event/trade bound in `O(1)` from
-mutation-maintained side/account work aggregates and checks both the
-per-report limit and total arena headroom. It consumes no slot; only actual
-commit events advance the cursor. The protected event tail has `O_max + 1`
+Incoming matching preparation computes a safe event/trade bound in `O(1)` from
+mutation-maintained side/account work aggregates; expiry preparation uses the
+`O(K + 1)` prefix count stated above. Both check the per-report limit and total
+arena headroom. Preparation consumes no slot; only actual commit events advance
+the cursor. The protected event tail has `O_max + 1`
 slots, so ordinary capacity is `E_max - (O_max + 1)`. The conservative bound
 includes uncrossed opposite-side work and may reject early near a boundary,
-but retains no per-command unused capacity.
+but retains no per-command unused capacity. A sweep over `K <= O_max` active
+GTD orders has the exact bound `K + 1` and therefore fits the same protected
+tail.
 
 ## Risk engine
 

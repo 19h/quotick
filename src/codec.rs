@@ -33,10 +33,10 @@ use crate::market_data::{
 use crate::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
     Command, CommandOutcome, CommandReportCheckpoint, Event, EventKind, ExecutionReport,
-    MassCancel, MassCancelScope, NewOrder, OrderBookCheckpoint, OrderBookCheckpointError,
-    OrderDisplay, OrderType, RejectReason, ReplaceOrder, RestingOrderCheckpoint,
-    SelfTradePrevention, TimeInForce, Trade, TradingStateControl, TradingStateControlAction,
-    TradingStateSnapshot,
+    ExpirySweep, MassCancel, MassCancelScope, NewOrder, OrderBookCheckpoint,
+    OrderBookCheckpointError, OrderDisplay, OrderType, RejectReason, ReplaceOrder,
+    RestingOrderCheckpoint, SelfTradePrevention, TimeInForce, Trade, TradingStateControl,
+    TradingStateControlAction, TradingStateSnapshot,
 };
 use crate::risk::{
     AccountRiskDefinition, AccountRiskState, RiskAccountCheckpoint, RiskError, RiskLimitSpec,
@@ -710,12 +710,16 @@ fn decode_trading_state_control_action(
 }
 
 fn encode_time_in_force(encoder: &mut Encoder, value: TimeInForce) {
-    encoder.u8(match value {
-        TimeInForce::GoodTilCancelled => 0,
-        TimeInForce::ImmediateOrCancel => 1,
-        TimeInForce::FillOrKill => 2,
-        TimeInForce::PostOnly => 3,
-    });
+    match value {
+        TimeInForce::GoodTilCancelled => encoder.u8(0),
+        TimeInForce::ImmediateOrCancel => encoder.u8(1),
+        TimeInForce::FillOrKill => encoder.u8(2),
+        TimeInForce::PostOnly => encoder.u8(3),
+        TimeInForce::GoodTilTimestamp { expires_at } => {
+            encoder.u8(4);
+            encoder.u64(expires_at.as_unix_nanos());
+        }
+    }
 }
 
 fn decode_time_in_force(decoder: &mut Decoder<'_>) -> Result<TimeInForce, CodecError> {
@@ -724,6 +728,9 @@ fn decode_time_in_force(decoder: &mut Decoder<'_>) -> Result<TimeInForce, CodecE
         1 => Ok(TimeInForce::ImmediateOrCancel),
         2 => Ok(TimeInForce::FillOrKill),
         3 => Ok(TimeInForce::PostOnly),
+        4 => Ok(TimeInForce::GoodTilTimestamp {
+            expires_at: TimestampNs::from_unix_nanos(decoder.u64()?),
+        }),
         tag => Err(CodecError::InvalidTag {
             type_name: "TimeInForce",
             tag,
@@ -793,6 +800,9 @@ fn encode_reject_reason(encoder: &mut Encoder, value: RejectReason) {
         RejectReason::TradingStateControlRevisionExhausted => 35,
         RejectReason::TradingStateUnchanged => 36,
         RejectReason::TradingStateControlCannotCancelIntoOpen => 37,
+        RejectReason::OrderAlreadyExpired => 38,
+        RejectReason::ExpiryWatermarkRegression => 39,
+        RejectReason::ExpiryHorizonAfterCommandTime => 40,
     });
 }
 
@@ -836,6 +846,9 @@ fn decode_reject_reason(decoder: &mut Decoder<'_>) -> Result<RejectReason, Codec
         35 => Ok(RejectReason::TradingStateControlRevisionExhausted),
         36 => Ok(RejectReason::TradingStateUnchanged),
         37 => Ok(RejectReason::TradingStateControlCannotCancelIntoOpen),
+        38 => Ok(RejectReason::OrderAlreadyExpired),
+        39 => Ok(RejectReason::ExpiryWatermarkRegression),
+        40 => Ok(RejectReason::ExpiryHorizonAfterCommandTime),
         tag => Err(CodecError::InvalidTag {
             type_name: "RejectReason",
             tag,
@@ -852,6 +865,7 @@ fn encode_cancel_reason(encoder: &mut Encoder, value: CancelReason) {
         CancelReason::MassCancel => 4,
         CancelReason::AccountControl => 5,
         CancelReason::TradingStateControl => 6,
+        CancelReason::Expired => 7,
     });
 }
 
@@ -864,6 +878,7 @@ fn decode_cancel_reason(decoder: &mut Decoder<'_>) -> Result<CancelReason, Codec
         4 => Ok(CancelReason::MassCancel),
         5 => Ok(CancelReason::AccountControl),
         6 => Ok(CancelReason::TradingStateControl),
+        7 => Ok(CancelReason::Expired),
         tag => Err(CodecError::InvalidTag {
             type_name: "CancelReason",
             tag,
@@ -905,6 +920,23 @@ fn trade_id(decoder: &mut Decoder<'_>) -> Result<TradeId, CodecError> {
 
 fn transaction(decoder: &mut Decoder<'_>) -> Result<TransactionId, CodecError> {
     Ok(TransactionId::new(decoder.u64()?)?)
+}
+
+fn encode_optional_timestamp(encoder: &mut Encoder, value: Option<TimestampNs>) {
+    encoder.bool(value.is_some());
+    encoder.u64(value.map_or(0, TimestampNs::as_unix_nanos));
+}
+
+fn decode_optional_timestamp(
+    decoder: &mut Decoder<'_>,
+    field: &'static str,
+) -> Result<Option<TimestampNs>, CodecError> {
+    let present = decoder.bool()?;
+    let value = decoder.u64()?;
+    if !present && value != 0 {
+        return Err(CodecError::InvalidValue(field));
+    }
+    Ok(present.then(|| TimestampNs::from_unix_nanos(value)))
 }
 
 fn encode_command(encoder: &mut Encoder, command: Command) {
@@ -974,6 +1006,14 @@ fn encode_command(encoder: &mut Encoder, command: Command) {
             encode_trading_state_control_action(encoder, value.action);
             encoder.u64(value.received_at.as_unix_nanos());
         }
+        Command::ExpirySweep(value) => {
+            encoder.u8(6);
+            encoder.u64(value.command_id.get());
+            encoder.u64(value.instrument_id.get());
+            encoder.u64(value.instrument_version.get());
+            encoder.u64(value.through.as_unix_nanos());
+            encoder.u64(value.received_at.as_unix_nanos());
+        }
     }
 }
 
@@ -1036,6 +1076,13 @@ fn decode_command(decoder: &mut Decoder<'_>) -> Result<Command, CodecError> {
             expected_revision: decoder.u64()?,
             target_state: decode_trading_state(decoder)?,
             action: decode_trading_state_control_action(decoder)?,
+            received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
+        })),
+        6 => Ok(Command::ExpirySweep(ExpirySweep {
+            command_id: command_id(decoder)?,
+            instrument_id: instrument(decoder)?,
+            instrument_version: instrument_version(decoder)?,
+            through: TimestampNs::from_unix_nanos(decoder.u64()?),
             received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
         })),
         tag => Err(CodecError::InvalidTag {
@@ -1446,6 +1493,18 @@ fn encode_event_kind(encoder: &mut Encoder, kind: EventKind) {
             encoder.u64(cancelled_order_count);
             encoder.u128(cancelled_quantity_lots);
         }
+        EventKind::ExpirySweepCompleted {
+            previous_watermark,
+            current_watermark,
+            expired_order_count,
+            expired_quantity_lots,
+        } => {
+            encoder.u8(11);
+            encode_optional_timestamp(encoder, previous_watermark);
+            encoder.u64(current_watermark.as_unix_nanos());
+            encoder.u64(expired_order_count);
+            encoder.u128(expired_quantity_lots);
+        }
     }
 }
 
@@ -1511,6 +1570,15 @@ fn decode_event_kind(decoder: &mut Decoder<'_>) -> Result<EventKind, CodecError>
             revision: decoder.u64()?,
             cancelled_order_count: decoder.u64()?,
             cancelled_quantity_lots: decoder.u128()?,
+        }),
+        11 => Ok(EventKind::ExpirySweepCompleted {
+            previous_watermark: decode_optional_timestamp(
+                decoder,
+                "absent expiry watermark must have a zero value",
+            )?,
+            current_watermark: TimestampNs::from_unix_nanos(decoder.u64()?),
+            expired_order_count: decoder.u64()?,
+            expired_quantity_lots: decoder.u128()?,
         }),
         tag => Err(CodecError::InvalidTag {
             type_name: "EventKind",
@@ -1619,6 +1687,7 @@ impl BinaryCodec for OrderBookCheckpoint {
             encoder.u64(order.displayed().lots());
             encode_order_display(&mut encoder, order.display());
             encode_stp(&mut encoder, order.self_trade_prevention());
+            encode_optional_timestamp(&mut encoder, order.expires_at());
         }
         encoder.length("matching checkpoint command history", self.history().len())?;
         for entry in self.history() {
@@ -1643,7 +1712,7 @@ impl BinaryCodec for OrderBookCheckpoint {
         let definition = InstrumentDefinition::decode(
             decoder.sized_bytes("matching checkpoint definition bytes")?,
         )?;
-        let order_count = decoder.count("matching checkpoint active orders", 43)?;
+        let order_count = decoder.count("matching checkpoint active orders", 52)?;
         let mut orders = reserve_decoded_vec("matching checkpoint active orders", order_count)?;
         for _ in 0..order_count {
             orders.push(RestingOrderCheckpoint {
@@ -1655,6 +1724,10 @@ impl BinaryCodec for OrderBookCheckpoint {
                 displayed: quantity(&mut decoder)?,
                 display: decode_order_display(&mut decoder)?,
                 self_trade_prevention: decode_stp(&mut decoder)?,
+                expires_at: decode_optional_timestamp(
+                    &mut decoder,
+                    "absent order expiration must have a zero value",
+                )?,
             });
         }
         let history_count = decoder.count("matching checkpoint command history", 8)?;

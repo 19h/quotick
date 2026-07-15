@@ -1,7 +1,10 @@
-# Semantic Snapshot Format Version 4
+# Expired Semantic Snapshot Format Version 4
 
-`SnapshotFile` stores one complete typed semantic value in a bounded,
-versioned CRC-32C envelope. Version 4 preserves the version-3 payload bytes and
+This document preserves historical snapshot version 4. The current runtime
+rejects this envelope and writes [snapshot version 5](snapshot-v5.md), which
+adds explicit continuous GTD expiry state. `SnapshotFile` stores one complete
+typed semantic value in a bounded, versioned CRC-32C envelope. Version 4
+preserves the version-3 payload bytes and
 kind tags for ledger `1`, continuous matching `2`, continuous coupled risk `3`,
 and plain call auction `4`. It assigns previously invalid kind `5` to the
 coupled call-auction/risk checkpoint. All multibyte integers are little-endian.
@@ -101,10 +104,10 @@ capture pause, semantic-history lifetime, or allocator-failure exposure.
 
 ## Compatibility Boundary
 
-Only envelope version 4 is accepted. Snapshot versions 1, 2, and 3 are expired
-and rejected before payload interpretation. Version 4 preserves the complete
-payload bytes of every version-3 kind; changing an expired envelope version in
-place remains invalid because CRC-32C covers the header.
+The current runtime rejects snapshot versions 1 through 4 before payload
+interpretation. Version 4 preserved the complete payload bytes of every
+version-3 kind; changing an expired envelope version in place remains invalid
+because CRC-32C covers the header.
 
 If authoritative earlier artifacts must remain readable, migration requires an
 explicit provenance-preserving converter. The runtime does not infer missing

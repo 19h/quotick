@@ -1,11 +1,12 @@
-# WAL Format Version 3
+# Expired WAL Format Version 3
 
 **Expired historical format.** This document preserves the historical
 byte-level schema for expired Quotick WAL version 3; it is retained as
-provenance for the payloads carried forward by version 4. The current runtime
-rejects this envelope and writes [WAL version 4](wal-v4.md). Version 4
-incorporates record payloads `1` through `8` from this document byte-for-byte,
-while changing the envelope version and adding call-auction record kinds.
+provenance for payloads first carried forward by version 4. The current runtime
+rejects this envelope and writes [WAL version 5](wal-v5.md). Version 4
+historically incorporated record payloads `1` through `8` from this document
+byte-for-byte while changing the envelope and adding call-auction record kinds;
+version 5 preserves its unchanged non-continuous payload descendants.
 
 All multibyte integers are little-endian. No Rust enum layout, padding,
 pointer, or platform ABI is persisted.

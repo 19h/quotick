@@ -5,9 +5,9 @@ use quotick::instrument::{
 use quotick::journal::{Durability, JournalOptions};
 use quotick::matching::{
     AccountControl, AccountControlAction, CancelOrder, Command, CommandOutcome, CommandPreparation,
-    MassCancel, MassCancelScope, MatchingCapacity, MatchingError, MatchingHashIndex, NewOrder,
-    OrderBook, OrderBookLimits, OrderBookLimitsError, OrderBookLimitsSpec, OrderDisplay, OrderType,
-    RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce,
+    ExpirySweep, MassCancel, MassCancelScope, MatchingCapacity, MatchingError, MatchingHashIndex,
+    NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsError, OrderBookLimitsSpec, OrderDisplay,
+    OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce,
 };
 use quotick::risk::{
     AccountRiskState, RiskLimitSpec, RiskLimits, RiskManagedLimits, RiskManagedLimitsSpec,
@@ -155,6 +155,36 @@ fn resting(command_id: u64, order_id: u64, account_id: u64, side: Side, price: i
         OrderType::Limit(Price::from_raw(price)),
         TimeInForce::GoodTilCancelled,
     )
+}
+
+fn gtd_resting(
+    command_id: u64,
+    order_id: u64,
+    account_id: u64,
+    side: Side,
+    price: i64,
+    expires_at: u64,
+) -> Command {
+    new_order(
+        command_id,
+        order_id,
+        account_id,
+        side,
+        OrderType::Limit(Price::from_raw(price)),
+        TimeInForce::GoodTilTimestamp {
+            expires_at: TimestampNs::from_unix_nanos(expires_at),
+        },
+    )
+}
+
+fn expiry_sweep(command_id: u64, through: u64, received_at: u64) -> Command {
+    Command::ExpirySweep(ExpirySweep {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: InstrumentId::new(1).unwrap(),
+        instrument_version: InstrumentVersion::new(1).unwrap(),
+        through: TimestampNs::from_unix_nanos(through),
+        received_at: TimestampNs::from_unix_nanos(received_at),
+    })
 }
 
 fn resting_quantity(
@@ -1003,6 +1033,35 @@ fn ordinary_lane_exhaustion_preserves_cancel_mass_cancel_and_exact_retries() {
             MatchingCapacity::CommandHistory
         ))
     );
+    book.validate().unwrap();
+}
+
+#[test]
+fn ordinary_lane_exhaustion_preserves_only_business_valid_expiry_sweeps() {
+    let mut book = OrderBook::with_limits(definition(), limits(1, 1, 1, 8, 4, 1));
+    book.submit(gtd_resting(1, 1, 11, Side::Sell, 100, 10))
+        .unwrap();
+    for (command_id, order_id) in [(2, 2), (3, 3)] {
+        assert_eq!(
+            book.submit(invalid_market(command_id, order_id))
+                .unwrap()
+                .outcome,
+            CommandOutcome::Rejected(RejectReason::MarketOrderCannotRest)
+        );
+    }
+
+    assert_eq!(
+        book.submit(expiry_sweep(4, 11, 10)),
+        Err(MatchingError::CapacityExhausted(
+            MatchingCapacity::AdmissionCommandHistory
+        ))
+    );
+    let sweep = expiry_sweep(4, 10, 10);
+    let report = book.submit(sweep).unwrap();
+    assert_eq!(report.events.len(), 2);
+    assert_eq!(book.active_order_count(), 0);
+    assert!(book.submit(sweep).unwrap().replayed);
+    assert_eq!(book.retained_command_count(), 4);
     book.validate().unwrap();
 }
 

@@ -761,7 +761,7 @@ fn auction_checkpoint_has_stable_kind_codec_and_direct_restore() {
     SnapshotFile::write(&snapshot, &shared, SnapshotOptions::default()).unwrap();
     let bytes = fs::read(snapshot).unwrap();
     assert_eq!(&bytes[0..4], b"QSNP");
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 4);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 5);
     assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 4);
 }
 

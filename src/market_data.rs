@@ -757,6 +757,7 @@ struct TrackedOrder {
     leaves: u64,
     displayed: u64,
     display: OrderDisplay,
+    expires_at: Option<TimestampNs>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -764,6 +765,7 @@ struct MassCancelProgress {
     order_count: u64,
     quantity_lots: u128,
     last_order_id: Option<OrderId>,
+    last_expiry: Option<(TimestampNs, OrderId)>,
     completed: bool,
 }
 
@@ -779,6 +781,7 @@ pub struct MarketDataPublisher {
     account_controls: BoundedHashMap<AccountId, AccountControlSnapshot>,
     affected_levels: BoundedHashMap<(Side, Price), ()>,
     trading_state: TradingStateSnapshot,
+    expiry_watermark: Option<TimestampNs>,
     last_sequence: u64,
     last_trade_id: Option<TradeId>,
     poisoned: bool,
@@ -834,6 +837,7 @@ impl MarketDataPublisher {
                 MarketDataResource::BatchLevelIdentities,
             )?,
             trading_state: book.trading_state(),
+            expiry_watermark: book.expiry_watermark(),
             last_sequence: book.last_event_sequence(),
             last_trade_id: book.last_trade_id(),
             poisoned: false,
@@ -872,6 +876,7 @@ impl MarketDataPublisher {
                     leaves: order.leaves_quantity.lots(),
                     displayed: order.displayed_quantity.lots(),
                     display: order.display,
+                    expires_at: order.expires_at,
                 },
             );
         }
@@ -1056,7 +1061,7 @@ impl MarketDataPublisher {
             .map_err(|_| {
                 MarketDataError::PreparationAllocationFailed(MarketDataResource::BatchUpdates)
             })?;
-        let mut replacement_side = None;
+        let mut replacement_state = None;
         let mut mass_cancel_progress = MassCancelProgress::default();
         for event in &report.events {
             let expected = self
@@ -1076,7 +1081,7 @@ impl MarketDataPublisher {
             let kind = match self.apply_event(
                 command,
                 *event,
-                &mut replacement_side,
+                &mut replacement_state,
                 &mut mass_cancel_progress,
             ) {
                 Ok(kind) => kind,
@@ -1097,6 +1102,7 @@ impl MarketDataPublisher {
                 Command::MassCancel(_)
                     | Command::AccountControl(_)
                     | Command::TradingStateControl(_)
+                    | Command::ExpirySweep(_)
             );
         if requires_completion != mass_cancel_progress.completed {
             return self.fail(MarketDataError::TraceMismatch(
@@ -1130,6 +1136,7 @@ impl MarketDataPublisher {
         if self.last_sequence != book.last_event_sequence()
             || self.last_trade_id != book.last_trade_id()
             || self.trading_state != book.trading_state()
+            || self.expiry_watermark != book.expiry_watermark()
         {
             return Err(MarketDataError::SourceDivergence(
                 "publisher source sequences differ from the matching book",
@@ -1162,6 +1169,7 @@ impl MarketDataPublisher {
                 leaves: order.leaves_quantity.lots(),
                 displayed: order.displayed_quantity.lots(),
                 display: order.display,
+                expires_at: order.expires_at,
             };
             if self.orders.get(&order.order_id) != Some(&expected) {
                 return Err(MarketDataError::SourceDivergence(
@@ -1220,7 +1228,7 @@ impl MarketDataPublisher {
         &mut self,
         command: Command,
         event: Event,
-        replacement_side: &mut Option<Side>,
+        replacement_state: &mut Option<(Side, Option<TimestampNs>)>,
         mass_cancel_progress: &mut MassCancelProgress,
     ) -> Result<MarketDataKind, MarketDataError> {
         match event.kind {
@@ -1246,7 +1254,7 @@ impl MarketDataPublisher {
                 price,
                 leaves_quantity,
                 displayed_quantity,
-                replacement_side,
+                replacement_state,
             ),
             EventKind::Trade(trade) => self.handle_trade(command, trade),
             EventKind::OrderCancelled {
@@ -1273,7 +1281,7 @@ impl MarketDataPublisher {
                 old_display,
                 new_display,
                 priority_retained,
-                replacement_side,
+                replacement_state,
             ),
             EventKind::SelfTradePrevented {
                 aggressor_order_id,
@@ -1332,6 +1340,19 @@ impl MarketDataPublisher {
                 cancelled_quantity_lots,
                 mass_cancel_progress,
             ),
+            EventKind::ExpirySweepCompleted {
+                previous_watermark,
+                current_watermark,
+                expired_order_count,
+                expired_quantity_lots,
+            } => self.handle_expiry_sweep_completed(
+                command,
+                previous_watermark,
+                current_watermark,
+                expired_order_count,
+                expired_quantity_lots,
+                mass_cancel_progress,
+            ),
             EventKind::CommandRejected(_) => Ok(MarketDataKind::NoBookChange),
         }
     }
@@ -1365,16 +1386,21 @@ impl MarketDataPublisher {
         price: Price,
         leaves_quantity: Quantity,
         displayed_quantity: Quantity,
-        replacement_side: &mut Option<Side>,
+        replacement_state: &mut Option<(Side, Option<TimestampNs>)>,
     ) -> Result<MarketDataKind, MarketDataError> {
-        let (account_id, side, display) = match command {
+        let (account_id, side, display, expires_at) = match command {
             Command::New(new_order) if new_order.order_id == order_id => {
                 if new_order.order_type != OrderType::Limit(price) {
                     return Err(MarketDataError::TraceMismatch(
                         "resting price differs from the new limit",
                     ));
                 }
-                (new_order.account_id, new_order.side, new_order.display)
+                (
+                    new_order.account_id,
+                    new_order.side,
+                    new_order.display,
+                    new_order.time_in_force.expires_at(),
+                )
             }
             Command::Replace(replace) if replace.order_id == order_id => {
                 if replace.new_price != price {
@@ -1382,15 +1408,13 @@ impl MarketDataPublisher {
                         "resting price differs from the replacement limit",
                     ));
                 }
-                (
-                    replace.account_id,
-                    replacement_side
+                let (side, expires_at) =
+                    replacement_state
                         .take()
                         .ok_or(MarketDataError::TraceMismatch(
                             "replacement rested without losing its previous priority",
-                        ))?,
-                    replace.new_display,
-                )
+                        ))?;
+                (replace.account_id, side, replace.new_display, expires_at)
             }
             _ => {
                 return Err(MarketDataError::TraceMismatch(
@@ -1418,6 +1442,7 @@ impl MarketDataPublisher {
                     leaves: leaves_quantity.lots(),
                     displayed: displayed_quantity.lots(),
                     display,
+                    expires_at,
                 },
             )
             .map_err(|_| MarketDataError::CapacityExceeded {
@@ -1626,6 +1651,36 @@ impl MarketDataPublisher {
                         .ok_or(MarketDataError::ArithmeticOverflow)?;
                     mass_cancel_progress.last_order_id = Some(order_id);
                 }
+                CancelReason::Expired => {
+                    let Command::ExpirySweep(sweep) = command else {
+                        return Err(MarketDataError::TraceMismatch(
+                            "non-expiry command emitted an expiry cancellation",
+                        ));
+                    };
+                    let expires_at = order.expires_at.ok_or(MarketDataError::TraceMismatch(
+                        "expiry cancellation targeted a non-GTD order",
+                    ))?;
+                    let key = (expires_at, order_id);
+                    if mass_cancel_progress.completed
+                        || expires_at > sweep.through
+                        || mass_cancel_progress
+                            .last_expiry
+                            .is_some_and(|previous| key <= previous)
+                    {
+                        return Err(MarketDataError::TraceMismatch(
+                            "expiry cancellation is outside its sweep or not canonical",
+                        ));
+                    }
+                    mass_cancel_progress.order_count = mass_cancel_progress
+                        .order_count
+                        .checked_add(1)
+                        .ok_or(MarketDataError::ArithmeticOverflow)?;
+                    mass_cancel_progress.quantity_lots = mass_cancel_progress
+                        .quantity_lots
+                        .checked_add(u128::from(quantity.lots()))
+                        .ok_or(MarketDataError::ArithmeticOverflow)?;
+                    mass_cancel_progress.last_expiry = Some(key);
+                }
                 CancelReason::UnfilledRemainder | CancelReason::SelfTradeAggressor => {
                     return Err(MarketDataError::TraceMismatch(
                         "an incoming-only cancellation targeted a resting order",
@@ -1671,6 +1726,35 @@ impl MarketDataPublisher {
                 "MassCancelCompleted contradicts its command or cancellations",
             ));
         }
+        progress.completed = true;
+        Ok(MarketDataKind::NoBookChange)
+    }
+
+    fn handle_expiry_sweep_completed(
+        &mut self,
+        command: Command,
+        previous_watermark: Option<TimestampNs>,
+        current_watermark: TimestampNs,
+        expired_order_count: u64,
+        expired_quantity_lots: u128,
+        progress: &mut MassCancelProgress,
+    ) -> Result<MarketDataKind, MarketDataError> {
+        let Command::ExpirySweep(sweep) = command else {
+            return Err(MarketDataError::TraceMismatch(
+                "non-expiry command emitted ExpirySweepCompleted",
+            ));
+        };
+        if progress.completed
+            || previous_watermark != self.expiry_watermark
+            || current_watermark != sweep.through
+            || progress.order_count != expired_order_count
+            || progress.quantity_lots != expired_quantity_lots
+        {
+            return Err(MarketDataError::TraceMismatch(
+                "ExpirySweepCompleted contradicts its command or cancellations",
+            ));
+        }
+        self.expiry_watermark = Some(current_watermark);
         progress.completed = true;
         Ok(MarketDataKind::NoBookChange)
     }
@@ -1801,7 +1885,7 @@ impl MarketDataPublisher {
         old_display: OrderDisplay,
         new_display: OrderDisplay,
         priority_retained: bool,
-        replacement_side: &mut Option<Side>,
+        replacement_state: &mut Option<(Side, Option<TimestampNs>)>,
     ) -> Result<MarketDataKind, MarketDataError> {
         let Command::Replace(replace) = command else {
             return Err(MarketDataError::TraceMismatch(
@@ -1854,7 +1938,7 @@ impl MarketDataPublisher {
             tracked.displayed = new_displayed;
             self.reduce_level_quantity(old.side, old.price, displayed_reduction)?
         } else {
-            *replacement_side = Some(old.side);
+            *replacement_state = Some((old.side, old.expires_at));
             self.remove_tracked_order(order_id, old.leaves)?
         };
         Ok(MarketDataKind::Level(level))
@@ -2926,6 +3010,7 @@ const fn command_id(command: Command) -> CommandId {
         Command::MassCancel(value) => value.command_id,
         Command::AccountControl(value) => value.command_id,
         Command::TradingStateControl(value) => value.command_id,
+        Command::ExpirySweep(value) => value.command_id,
     }
 }
 
@@ -2934,9 +3019,10 @@ const fn command_order_id(command: Command) -> Option<OrderId> {
         Command::New(value) => Some(value.order_id),
         Command::Cancel(value) => Some(value.order_id),
         Command::Replace(value) => Some(value.order_id),
-        Command::MassCancel(_) | Command::AccountControl(_) | Command::TradingStateControl(_) => {
-            None
-        }
+        Command::MassCancel(_)
+        | Command::AccountControl(_)
+        | Command::TradingStateControl(_)
+        | Command::ExpirySweep(_) => None,
     }
 }
 
@@ -2947,7 +3033,7 @@ const fn command_account_id(command: Command) -> Option<AccountId> {
         Command::Replace(value) => Some(value.account_id),
         Command::MassCancel(value) => Some(value.account_id),
         Command::AccountControl(value) => Some(value.account_id),
-        Command::TradingStateControl(_) => None,
+        Command::TradingStateControl(_) | Command::ExpirySweep(_) => None,
     }
 }
 
@@ -2959,6 +3045,7 @@ const fn command_instrument(command: Command) -> InstrumentId {
         Command::MassCancel(value) => value.instrument_id,
         Command::AccountControl(value) => value.instrument_id,
         Command::TradingStateControl(value) => value.instrument_id,
+        Command::ExpirySweep(value) => value.instrument_id,
     }
 }
 
@@ -2970,6 +3057,7 @@ const fn command_version(command: Command) -> InstrumentVersion {
         Command::MassCancel(value) => value.instrument_version,
         Command::AccountControl(value) => value.instrument_version,
         Command::TradingStateControl(value) => value.instrument_version,
+        Command::ExpirySweep(value) => value.instrument_version,
     }
 }
 
@@ -2981,6 +3069,7 @@ const fn command_time(command: Command) -> TimestampNs {
         Command::MassCancel(value) => value.received_at,
         Command::AccountControl(value) => value.received_at,
         Command::TradingStateControl(value) => value.received_at,
+        Command::ExpirySweep(value) => value.received_at,
     }
 }
 

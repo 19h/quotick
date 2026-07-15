@@ -108,12 +108,40 @@ impl OrderDisplay {
 pub enum TimeInForce {
     /// Rest any unfilled limit quantity until explicitly cancelled.
     GoodTilCancelled,
+    /// Rest unfilled limit quantity until an explicit inclusive expiry sweep.
+    GoodTilTimestamp {
+        /// Absolute UTC expiration in nanoseconds since the Unix epoch.
+        expires_at: TimestampNs,
+    },
     /// Execute immediately and cancel any unfilled remainder.
     ImmediateOrCancel,
     /// Execute the complete quantity immediately or reject without mutation.
     FillOrKill,
     /// Reject if any quantity would execute immediately; otherwise rest.
     PostOnly,
+}
+
+impl TimeInForce {
+    /// Returns whether this lifetime permits a limit order to remain active.
+    #[must_use]
+    pub const fn may_rest(self) -> bool {
+        matches!(
+            self,
+            Self::GoodTilCancelled | Self::GoodTilTimestamp { .. } | Self::PostOnly
+        )
+    }
+
+    /// Returns the absolute expiration timestamp for GTD orders.
+    #[must_use]
+    pub const fn expires_at(self) -> Option<TimestampNs> {
+        match self {
+            Self::GoodTilTimestamp { expires_at } => Some(expires_at),
+            Self::GoodTilCancelled
+            | Self::ImmediateOrCancel
+            | Self::FillOrKill
+            | Self::PostOnly => None,
+        }
+    }
 }
 
 /// Action taken when an incoming order would trade with the same account.
@@ -313,6 +341,21 @@ pub struct TradingStateControl {
     pub received_at: TimestampNs,
 }
 
+/// Advances the deterministic inclusive GTD-expiry watermark for one shard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpirySweep {
+    /// Globally unique idempotency key within the shard generation.
+    pub command_id: CommandId,
+    /// Routed instrument.
+    pub instrument_id: InstrumentId,
+    /// Immutable instrument-definition version expected by the controller.
+    pub instrument_version: InstrumentVersion,
+    /// Inclusive absolute expiration horizon.
+    pub through: TimestampNs,
+    /// Gateway/controller receive time; the horizon cannot exceed this value.
+    pub received_at: TimestampNs,
+}
+
 /// Read-only effective instrument trading state and control revision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TradingStateSnapshot {
@@ -378,6 +421,8 @@ pub enum Command {
     AccountControl(AccountControl),
     /// Change the instrument-wide effective trading state.
     TradingStateControl(TradingStateControl),
+    /// Expire every GTD order at or before an inclusive absolute horizon.
+    ExpirySweep(ExpirySweep),
 }
 
 impl Command {
@@ -389,6 +434,7 @@ impl Command {
             Self::MassCancel(command) => command.command_id,
             Self::AccountControl(command) => command.command_id,
             Self::TradingStateControl(command) => command.command_id,
+            Self::ExpirySweep(command) => command.command_id,
         }
     }
 
@@ -400,6 +446,7 @@ impl Command {
             Self::MassCancel(command) => command.received_at,
             Self::AccountControl(command) => command.received_at,
             Self::TradingStateControl(command) => command.received_at,
+            Self::ExpirySweep(command) => command.received_at,
         }
     }
 }
@@ -483,6 +530,12 @@ pub enum RejectReason {
     TradingStateUnchanged,
     /// Cancel-all cannot transition into the entry-open state.
     TradingStateControlCannotCancelIntoOpen,
+    /// A GTD deadline was not later than intake or the committed expiry watermark.
+    OrderAlreadyExpired,
+    /// An expiry sweep attempted to move the committed watermark backward.
+    ExpiryWatermarkRegression,
+    /// An expiry sweep horizon was later than the command's own receive time.
+    ExpiryHorizonAfterCommandTime,
 }
 
 impl From<AdmissionError> for RejectReason {
@@ -522,6 +575,8 @@ pub enum CancelReason {
     AccountControl,
     /// Resting quantity removed by an instrument-wide state transition.
     TradingStateControl,
+    /// Resting GTD quantity reached an explicit inclusive expiry watermark.
+    Expired,
 }
 
 /// Whether a filled order supplied or removed liquidity.
@@ -632,6 +687,17 @@ pub enum EventKind {
         cancelled_order_count: u64,
         /// Sum of removed total leaves in lots, including hidden reserve leaves.
         cancelled_quantity_lots: u128,
+    },
+    /// An inclusive GTD-expiry watermark advance completed atomically.
+    ExpirySweepCompleted {
+        /// Previously committed inclusive watermark, absent before the first sweep.
+        previous_watermark: Option<TimestampNs>,
+        /// Newly committed inclusive watermark.
+        current_watermark: TimestampNs,
+        /// Number of resting GTD orders removed by this sweep.
+        expired_order_count: u64,
+        /// Sum of removed total leaves in lots, including hidden reserve leaves.
+        expired_quantity_lots: u128,
     },
     /// A trade occurred.
     Trade(Trade),
@@ -1281,6 +1347,8 @@ pub struct OrderSnapshot {
     pub displayed_quantity: Quantity,
     /// Persistent display policy.
     pub display: OrderDisplay,
+    /// Absolute expiry for GTD orders; absent for GTC and post-only orders.
+    pub expires_at: Option<TimestampNs>,
 }
 
 /// Complete private state of one resting order in a semantic checkpoint.
@@ -1298,6 +1366,7 @@ pub struct RestingOrderCheckpoint {
     pub(crate) displayed: Quantity,
     pub(crate) display: OrderDisplay,
     pub(crate) self_trade_prevention: SelfTradePrevention,
+    pub(crate) expires_at: Option<TimestampNs>,
 }
 
 impl RestingOrderCheckpoint {
@@ -1348,6 +1417,12 @@ impl RestingOrderCheckpoint {
     pub const fn self_trade_prevention(self) -> SelfTradePrevention {
         self.self_trade_prevention
     }
+
+    /// Returns the absolute GTD expiration, if present.
+    #[must_use]
+    pub const fn expires_at(self) -> Option<TimestampNs> {
+        self.expires_at
+    }
 }
 
 /// One chronologically ordered idempotency entry in a matching checkpoint.
@@ -1390,6 +1465,7 @@ struct OrderBookCheckpointLineage {
     seen_order_ids: BoundedHashSet<OrderId>,
     account_controls: BoundedHashMap<AccountId, AccountControlSnapshot>,
     trading_state: TradingStateSnapshot,
+    expiry_watermark: Option<TimestampNs>,
     retained_event_count: usize,
     next_sequence: u64,
     next_trade_id: u64,
@@ -1537,6 +1613,7 @@ impl OrderBookCheckpoint {
             )?;
         let mut trading_state =
             TradingStateSnapshot::from_parts(self.definition.trading_state(), 0);
+        let mut expiry_watermark = None;
         let mut retained_event_count = 0_usize;
         let mut expected_event_sequence = 1_u64;
         let mut expected_trade_id = 1_u64;
@@ -1764,6 +1841,65 @@ impl OrderBookCheckpoint {
                 }
                 trading_state = TradingStateSnapshot::from_parts(control.target_state, revision);
             }
+            if let (Command::ExpirySweep(sweep), CommandOutcome::Accepted) =
+                (entry.command, entry.report.outcome)
+            {
+                if sweep.through > sweep.received_at
+                    || expiry_watermark.is_some_and(|watermark| sweep.through < watermark)
+                {
+                    return Err(OrderBookCheckpointError::new(
+                        "checkpoint expiry-watermark chain is invalid",
+                    ));
+                }
+                let mut expired_order_count = 0_u64;
+                let mut expired_quantity_lots = 0_u128;
+                for event in entry
+                    .report
+                    .events
+                    .iter()
+                    .take(entry.report.events.len() - 1)
+                {
+                    let EventKind::OrderCancelled {
+                        quantity,
+                        reason: CancelReason::Expired,
+                        ..
+                    } = event.kind
+                    else {
+                        return Err(OrderBookCheckpointError::new(
+                            "checkpoint expiry trace contains an invalid transition",
+                        ));
+                    };
+                    expired_order_count = expired_order_count.checked_add(1).ok_or_else(|| {
+                        OrderBookCheckpointError::new(
+                            "checkpoint expiry cancellation count is exhausted",
+                        )
+                    })?;
+                    expired_quantity_lots = expired_quantity_lots
+                        .checked_add(u128::from(quantity.lots()))
+                        .ok_or_else(|| {
+                            OrderBookCheckpointError::new(
+                                "checkpoint expiry cancellation quantity overflow",
+                            )
+                        })?;
+                }
+                if !matches!(
+                    entry.report.events.last().map(|event| event.kind),
+                    Some(EventKind::ExpirySweepCompleted {
+                        previous_watermark,
+                        current_watermark,
+                        expired_order_count: observed_count,
+                        expired_quantity_lots: observed_quantity,
+                    }) if previous_watermark == expiry_watermark
+                        && current_watermark == sweep.through
+                        && observed_count == expired_order_count
+                        && observed_quantity == expired_quantity_lots
+                ) {
+                    return Err(OrderBookCheckpointError::new(
+                        "checkpoint expiry completion event is invalid",
+                    ));
+                }
+                expiry_watermark = Some(sweep.through);
+            }
         }
 
         let mut active_ids = reserve_checkpoint_set(
@@ -1785,6 +1921,14 @@ impl OrderBookCheckpoint {
             }
             previous_key = Some(key);
             validate_checkpoint_order(self.definition, *order)?;
+            if order
+                .expires_at
+                .is_some_and(|expires_at| expiry_watermark.is_some_and(|value| expires_at <= value))
+            {
+                return Err(OrderBookCheckpointError::new(
+                    "checkpoint retains an order at or before its expiry watermark",
+                ));
+            }
             if account_controls
                 .get(&order.account_id)
                 .is_some_and(|control| control.state == AccountAdmissionState::Blocked)
@@ -1798,6 +1942,7 @@ impl OrderBookCheckpoint {
             seen_order_ids,
             account_controls,
             trading_state,
+            expiry_watermark,
             retained_event_count,
             next_sequence: expected_event_sequence,
             next_trade_id: expected_trade_id,
@@ -2252,6 +2397,7 @@ mod staged_checkpoint_capture_tests {
             displayed: Quantity::new(1).unwrap(),
             display: OrderDisplay::FullyDisplayed,
             self_trade_prevention: SelfTradePrevention::CancelAggressor,
+            expires_at: None,
         });
         let error = capture.verify().unwrap_err();
         assert_eq!(
@@ -2417,6 +2563,8 @@ pub enum MatchingCapacity {
     AccountControls,
     /// Simultaneously active resting orders.
     ActiveOrders,
+    /// Ordered GTD-expiration index bounded by active orders.
+    ExpiryIndex,
     /// Accounts with at least one active resting order.
     ActiveAccounts,
     /// Occupied bid price levels.
@@ -2445,6 +2593,7 @@ impl fmt::Display for MatchingCapacity {
             Self::AcceptedOrderIds => "accepted order identifiers",
             Self::AccountControls => "account admission controls",
             Self::ActiveOrders => "active orders",
+            Self::ExpiryIndex => "GTD expiry index",
             Self::ActiveAccounts => "active accounts",
             Self::BidPriceLevels => "bid price levels",
             Self::AskPriceLevels => "ask price levels",
@@ -2903,6 +3052,7 @@ struct RestingOrder {
     displayed: u64,
     display: OrderDisplay,
     self_trade_prevention: SelfTradePrevention,
+    expires_at: Option<TimestampNs>,
     previous: Option<OrderId>,
     next: Option<OrderId>,
     account_previous: Option<OrderId>,
@@ -2919,9 +3069,16 @@ impl PartialEq for RestingOrder {
             && self.displayed == other.displayed
             && self.display == other.display
             && self.self_trade_prevention == other.self_trade_prevention
+            && self.expires_at == other.expires_at
             && self.previous == other.previous
             && self.next == other.next
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ExpiryKey {
+    expires_at: TimestampNs,
+    order_id: OrderId,
 }
 
 impl Eq for RestingOrder {}
@@ -3364,6 +3521,8 @@ pub struct OrderBook {
     bids: PriceLevels,
     asks: PriceLevels,
     orders: BoundedHashMap<OrderId, RestingOrder>,
+    expiries: IndexedAvlMap<ExpiryKey, OrderId>,
+    expiry_watermark: Option<TimestampNs>,
     account_orders: BoundedHashMap<AccountId, AccountOrderIndex>,
     seen_order_ids: BoundedHashSet<OrderId>,
     account_controls: BoundedHashMap<AccountId, AccountControlSnapshot>,
@@ -3383,6 +3542,8 @@ impl PartialEq for OrderBook {
             && self.bids == other.bids
             && self.asks == other.asks
             && self.orders == other.orders
+            && self.expiries == other.expiries
+            && self.expiry_watermark == other.expiry_watermark
             && self.account_orders == other.account_orders
             && self.seen_order_ids == other.seen_order_ids
             && self.account_controls == other.account_controls
@@ -3422,6 +3583,8 @@ impl Clone for OrderBook {
             bids: self.bids.clone(),
             asks: self.asks.clone(),
             orders: self.orders.clone(),
+            expiries: self.expiries.clone(),
+            expiry_watermark: self.expiry_watermark,
             account_orders: self.account_orders.clone(),
             seen_order_ids: self.seen_order_ids.clone(),
             account_controls: self.account_controls.clone(),
@@ -3484,6 +3647,8 @@ impl OrderBook {
         let orders = BoundedHashMap::try_new(limits.max_active_orders()).map_err(|_| {
             MatchingError::CapacityReservationFailed(MatchingCapacity::ActiveOrders)
         })?;
+        let expiries = IndexedAvlMap::try_with_capacity(limits.max_active_orders())
+            .map_err(|_| MatchingError::CapacityReservationFailed(MatchingCapacity::ExpiryIndex))?;
         let account_orders =
             BoundedHashMap::try_new(limits.max_active_accounts()).map_err(|_| {
                 MatchingError::CapacityReservationFailed(MatchingCapacity::ActiveAccounts)
@@ -3514,6 +3679,8 @@ impl OrderBook {
             bids,
             asks,
             orders,
+            expiries,
+            expiry_watermark: None,
             account_orders,
             seen_order_ids,
             account_controls,
@@ -3627,6 +3794,7 @@ impl OrderBook {
                         })?,
                         display: order.display,
                         self_trade_prevention: order.self_trade_prevention,
+                        expires_at: order.expires_at,
                     });
                     current = order.next;
                 }
@@ -3652,6 +3820,11 @@ impl OrderBook {
         if lineage.trading_state != self.trading_state {
             return Err(OrderBookCheckpointError::new(
                 "live trading-state control state differs from command history",
+            ));
+        }
+        if lineage.expiry_watermark != self.expiry_watermark {
+            return Err(OrderBookCheckpointError::new(
+                "live expiry watermark differs from command history",
             ));
         }
         if lineage.retained_event_count != self.retained_event_count {
@@ -3736,6 +3909,11 @@ impl OrderBook {
                 book.trading_state =
                     TradingStateSnapshot::from_parts(control.target_state, revision);
             }
+            if let (Command::ExpirySweep(sweep), CommandOutcome::Accepted) =
+                (entry.command, entry.report.outcome)
+            {
+                book.expiry_watermark = Some(sweep.through);
+            }
             for event in &entry.report.events {
                 book.next_sequence = event.sequence.checked_add(1).ok_or_else(|| {
                     OrderBookCheckpointError::new("checkpoint event sequence is exhausted")
@@ -3782,6 +3960,7 @@ impl OrderBook {
                 displayed: state.displayed.lots(),
                 display: state.display,
                 self_trade_prevention: state.self_trade_prevention,
+                expires_at: state.expires_at,
                 previous: None,
                 next: None,
                 account_previous: None,
@@ -3815,6 +3994,12 @@ impl OrderBook {
     #[must_use]
     pub const fn trading_state(&self) -> TradingStateSnapshot {
         self.trading_state
+    }
+
+    /// Returns the committed inclusive GTD-expiry watermark, if any.
+    #[must_use]
+    pub const fn expiry_watermark(&self) -> Option<TimestampNs> {
+        self.expiry_watermark
     }
 
     /// Applies a command exactly once and returns its complete trace.
@@ -3860,19 +4045,29 @@ impl OrderBook {
                 {
                     return Err(RejectReason::AccountAdmissionBlocked);
                 }
+                if command
+                    .time_in_force
+                    .expires_at()
+                    .is_some_and(|expires_at| {
+                        expires_at <= command.received_at
+                            || self
+                                .expiry_watermark
+                                .is_some_and(|watermark| expires_at <= watermark)
+                    })
+                {
+                    return Err(RejectReason::OrderAlreadyExpired);
+                }
                 if command.display.is_reserve()
-                    && !matches!(
-                        (command.order_type, command.time_in_force),
-                        (
-                            OrderType::Limit(_),
-                            TimeInForce::GoodTilCancelled | TimeInForce::PostOnly
-                        )
-                    )
+                    && !(matches!(command.order_type, OrderType::Limit(_))
+                        && command.time_in_force.may_rest())
                 {
                     return Err(RejectReason::ReserveOrderCannotBeImmediate);
                 }
                 match (command.order_type, command.time_in_force) {
-                    (OrderType::Market, TimeInForce::GoodTilCancelled) => {
+                    (
+                        OrderType::Market,
+                        TimeInForce::GoodTilCancelled | TimeInForce::GoodTilTimestamp { .. },
+                    ) => {
                         return Err(RejectReason::MarketOrderCannotRest);
                     }
                     (OrderType::Market, TimeInForce::PostOnly) => {
@@ -3961,6 +4156,20 @@ impl OrderBook {
                     return Err(RejectReason::TradingStateControlCannotCancelIntoOpen);
                 }
             }
+            Command::ExpirySweep(command) => {
+                self.definition
+                    .admit(Command::ExpirySweep(command))
+                    .map_err(RejectReason::from)?;
+                if command.through > command.received_at {
+                    return Err(RejectReason::ExpiryHorizonAfterCommandTime);
+                }
+                if self
+                    .expiry_watermark
+                    .is_some_and(|watermark| command.through < watermark)
+                {
+                    return Err(RejectReason::ExpiryWatermarkRegression);
+                }
+            }
         }
         Ok(())
     }
@@ -3993,8 +4202,8 @@ impl OrderBook {
     /// Preparation checks idempotency, all operational capacity and identifier
     /// bounds, and core matching business rules exactly once. It also proves the
     /// complete report event bound against constructor-owned arena headroom and
-    /// leases any non-empty mass-cancel, block-and-cancel, or instrument
-    /// transition-and-cancel selection buffer.
+    /// leases any non-empty mass-cancel, expiry-sweep, block-and-cancel, or
+    /// instrument transition-and-cancel selection buffer.
     /// Every matching hash index already owns its complete configured headroom,
     /// so preparation changes no semantic book state. A ready token can be durably written
     /// through [`PreparedCommand::command`] and then applied with
@@ -4057,6 +4266,9 @@ impl OrderBook {
                     ..
                 }),
             ) => Some(self.acquire_order_selection(self.orders.len())?),
+            (None, Command::ExpirySweep(command)) => {
+                Some(self.acquire_order_selection(self.expiring_order_count(command.through))?)
+            }
             _ => None,
         };
         Ok(CommandPreparation::Ready(PreparedCommand {
@@ -4087,8 +4299,10 @@ impl OrderBook {
         Ok(selected)
     }
 
-    /// Computes a safe command-specific report/trade bound in `O(1)` from
-    /// mutation-maintained side and account aggregates.
+    /// Computes a safe command-specific report/trade bound.
+    ///
+    /// Incoming matching commands use `O(1)` mutation-maintained aggregates;
+    /// an expiry sweep counts only its ordered qualifying prefix.
     fn maximum_report_work(
         &self,
         command: Command,
@@ -4129,6 +4343,13 @@ impl OrderBook {
                     TradingStateControlAction::Transition => 0,
                     TradingStateControlAction::TransitionAndCancel => self.orders.len(),
                 };
+                let events = selected
+                    .checked_add(1)
+                    .ok_or(MatchingError::SequenceExhausted)?;
+                return Ok((events, 0));
+            }
+            Command::ExpirySweep(command) => {
+                let selected = self.expiring_order_count(command.through);
                 let events = selected
                     .checked_add(1)
                     .ok_or(MatchingError::SequenceExhausted)?;
@@ -4292,6 +4513,11 @@ impl OrderBook {
                 Command::TradingStateControl(control) => {
                     self.apply_trading_state_control(control, events, selected_order_ids)?
                 }
+                Command::ExpirySweep(sweep) => self.apply_expiry_sweep(
+                    sweep,
+                    events,
+                    selected_order_ids.expect("accepted expiry sweep must own selection storage"),
+                )?,
             }
         };
         self.cache_report(command, &report);
@@ -4340,6 +4566,7 @@ impl OrderBook {
                         | TradingState::Closed,
                     ..
                 })
+                | Command::ExpirySweep(_)
         )
     }
 
@@ -4378,7 +4605,10 @@ impl OrderBook {
         match command {
             Command::New(command) => self.check_new_capacity(command),
             Command::Replace(command) => self.check_replace_capacity(command),
-            Command::Cancel(_) | Command::MassCancel(_) | Command::TradingStateControl(_) => Ok(()),
+            Command::Cancel(_)
+            | Command::MassCancel(_)
+            | Command::TradingStateControl(_)
+            | Command::ExpirySweep(_) => Ok(()),
             Command::AccountControl(command) => {
                 if core_rejection.is_some()
                     || self.account_controls.contains_key(&command.account_id)
@@ -4406,10 +4636,7 @@ impl OrderBook {
         let OrderType::Limit(price) = command.order_type else {
             return Ok(());
         };
-        if !matches!(
-            command.time_in_force,
-            TimeInForce::GoodTilCancelled | TimeInForce::PostOnly
-        ) {
+        if !command.time_in_force.may_rest() {
             return Ok(());
         }
         let active_orders_full = self.orders.len() >= self.limits.max_active_orders();
@@ -4637,6 +4864,7 @@ impl OrderBook {
                             leaves_quantity,
                             displayed_quantity,
                             display: order.display,
+                            expires_at: order.expires_at,
                         })
                 })
         })
@@ -4686,6 +4914,7 @@ impl OrderBook {
                 leaves_quantity,
                 displayed_quantity,
                 display: order.display,
+                expires_at: order.expires_at,
             })
         })
     }
@@ -4816,9 +5045,11 @@ impl OrderBook {
     ///
     /// Successful validation uses `O(1)` auxiliary space and performs no heap
     /// allocation. FIFO/account traversal is `O(O)` for `O` active orders; the
-    /// two allocation-free indexed-AVL audits are `O(P log(P + 1))` for at most `P`
-    /// initialized slots per side. Failure-detail formatting can allocate, so
-    /// this remains an offline audit rather than a matching-hot-path operation.
+    /// two price indexed-AVL audits are `O(P log(P + 1))` for at most `P`
+    /// initialized slots per side, and the expiry-AVL audit is
+    /// `O(X log(X + 1))` for `X <= O` initialized slots. Failure-detail
+    /// formatting can allocate, so this remains an offline audit rather than a
+    /// matching-hot-path operation.
     ///
     /// # Errors
     ///
@@ -4852,6 +5083,7 @@ impl OrderBook {
             ));
         }
         self.validate_account_order_index()?;
+        self.validate_expiry_index()?;
         if self.orders.values().any(|order| {
             self.account_control(order.account_id).state == AccountAdmissionState::Blocked
         }) {
@@ -4872,6 +5104,7 @@ impl OrderBook {
     }
 
     fn validate_capacity(&self) -> Result<(), InvariantViolation> {
+        self.validate_expiry_capacity()?;
         let reservations = [
             (
                 self.orders.capacity(),
@@ -4969,6 +5202,63 @@ impl OrderBook {
             return Err(InvariantViolation::new(
                 "retained account control has the reserved genesis revision",
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_expiry_capacity(&self) -> Result<(), InvariantViolation> {
+        if self.expiries.maximum() != self.limits.max_active_orders()
+            || self.expiries.allocation_capacity() < self.limits.max_active_orders()
+        {
+            return Err(InvariantViolation::new(
+                "GTD expiry-index reservation is below the active-order maximum",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_expiry_index(&self) -> Result<(), InvariantViolation> {
+        self.expiries.validate().map_err(|detail| {
+            InvariantViolation::new(format!("GTD expiry index is invalid: {detail}"))
+        })?;
+        let mut indexed = 0_usize;
+        for (key, &order_id) in self.expiries.iter() {
+            if key.order_id != order_id {
+                return Err(InvariantViolation::new(
+                    "GTD expiry key and indexed order identity differ",
+                ));
+            }
+            let order = self.orders.get(&order_id).ok_or_else(|| {
+                InvariantViolation::new(format!(
+                    "GTD expiry index references missing order {order_id}"
+                ))
+            })?;
+            if order.expires_at != Some(key.expires_at) {
+                return Err(InvariantViolation::new(format!(
+                    "GTD expiry index disagrees with order {order_id}"
+                )));
+            }
+            if self
+                .expiry_watermark
+                .is_some_and(|watermark| key.expires_at <= watermark)
+            {
+                return Err(InvariantViolation::new(format!(
+                    "order {order_id} remains active at or before the expiry watermark"
+                )));
+            }
+            indexed = indexed
+                .checked_add(1)
+                .ok_or_else(|| InvariantViolation::new("GTD expiry count is exhausted"))?;
+        }
+        let expected = self
+            .orders
+            .values()
+            .filter(|order| order.expires_at.is_some())
+            .count();
+        if indexed != expected {
+            return Err(InvariantViolation::new(format!(
+                "GTD expiry index covers {indexed} orders, expected {expected}"
+            )));
         }
         Ok(())
     }
@@ -5538,6 +5828,74 @@ impl OrderBook {
         })
     }
 
+    fn apply_expiry_sweep(
+        &mut self,
+        command: ExpirySweep,
+        mut events: EventTraceBuilder,
+        mut selected: PooledOrderSelection,
+    ) -> Result<ExecutionReport, MatchingError> {
+        let previous_watermark = self.expiry_watermark;
+        debug_assert!(previous_watermark.is_none_or(|value| command.through >= value));
+        let selected_count = self.expiring_order_count(command.through);
+        debug_assert_eq!(events.maximum_events, selected_count + 1);
+        if selected.capacity() < selected_count {
+            return Err(MatchingError::InternalInvariantViolation);
+        }
+        let selected_values = selected.values_mut();
+        let selected_buffer = selected_values.as_ptr();
+        selected_values.extend(
+            self.expiries
+                .iter()
+                .take_while(|(key, _)| key.expires_at <= command.through)
+                .map(|(_, &order_id)| order_id),
+        );
+        debug_assert_eq!(selected_values.len(), selected_count);
+        debug_assert_eq!(selected_values.as_ptr(), selected_buffer);
+
+        let expired_order_count =
+            u64::try_from(selected_count).map_err(|_| MatchingError::SequenceExhausted)?;
+        let mut expired_quantity_lots = 0_u128;
+        for order_id in selected_values.drain(..) {
+            let removed = self.remove_order(order_id);
+            expired_quantity_lots = expired_quantity_lots
+                .checked_add(u128::from(removed.leaves))
+                .expect("u64-sized active-order set cannot overflow u128 total quantity");
+            self.push_cancelled(
+                &mut events,
+                command.command_id,
+                command.received_at,
+                order_id,
+                removed.leaves,
+                CancelReason::Expired,
+            )?;
+        }
+        self.expiry_watermark = Some(command.through);
+        self.push_event(
+            &mut events,
+            command.command_id,
+            command.received_at,
+            EventKind::ExpirySweepCompleted {
+                previous_watermark,
+                current_watermark: command.through,
+                expired_order_count,
+                expired_quantity_lots,
+            },
+        )?;
+        Ok(ExecutionReport {
+            command_id: command.command_id,
+            outcome: CommandOutcome::Accepted,
+            events: events.finish(),
+            replayed: false,
+        })
+    }
+
+    fn expiring_order_count(&self, through: TimestampNs) -> usize {
+        self.expiries
+            .iter()
+            .take_while(|(key, _)| key.expires_at <= through)
+            .count()
+    }
+
     fn apply_replace(
         &mut self,
         command: ReplaceOrder,
@@ -5611,7 +5969,10 @@ impl OrderBook {
             };
             self.execute_incoming(
                 incoming,
-                TimeInForce::GoodTilCancelled,
+                old.expires_at
+                    .map_or(TimeInForce::GoodTilCancelled, |expires_at| {
+                        TimeInForce::GoodTilTimestamp { expires_at }
+                    }),
                 command.command_id,
                 command.received_at,
                 &mut events,
@@ -5724,7 +6085,12 @@ impl OrderBook {
             return Ok(());
         }
         match (incoming.order_type, time_in_force) {
-            (OrderType::Limit(price), TimeInForce::GoodTilCancelled | TimeInForce::PostOnly) => {
+            (
+                OrderType::Limit(price),
+                TimeInForce::GoodTilCancelled
+                | TimeInForce::GoodTilTimestamp { .. }
+                | TimeInForce::PostOnly,
+            ) => {
                 let displayed = incoming.display.displayed_lots(incoming.leaves);
                 self.append_order(RestingOrder {
                     order_id: incoming.order_id,
@@ -5735,6 +6101,7 @@ impl OrderBook {
                     displayed,
                     display: incoming.display,
                     self_trade_prevention: incoming.self_trade_prevention,
+                    expires_at: time_in_force.expires_at(),
                     previous: None,
                     next: None,
                     account_previous: None,
@@ -6390,6 +6757,20 @@ impl OrderBook {
             self.orders.insert(order.order_id, order).is_none(),
             "active order identifier must be unique"
         );
+        if let Some(expires_at) = order.expires_at {
+            assert!(
+                self.expiries
+                    .insert(
+                        ExpiryKey {
+                            expires_at,
+                            order_id: order.order_id,
+                        },
+                        order.order_id,
+                    )
+                    .is_none(),
+                "GTD expiry identity must be unique"
+            );
+        }
     }
 
     fn decrement_resting(
@@ -6572,6 +6953,16 @@ impl OrderBook {
             .orders
             .remove(&order_id)
             .expect("validated removal target must exist");
+        if let Some(expires_at) = order.expires_at {
+            assert_eq!(
+                self.expiries.remove(&ExpiryKey {
+                    expires_at,
+                    order_id,
+                }),
+                Some(order_id),
+                "active GTD order must have one expiry-index entry"
+            );
+        }
         debug_assert_eq!(level_handle.price, order.price);
         if let Some(previous) = order.previous {
             self.orders
@@ -6840,6 +7231,7 @@ mod price_level_index_tests {
                     displayed,
                     display,
                     self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                    expires_at: None,
                     previous: None,
                     next: None,
                     account_previous: None,
@@ -6893,6 +7285,7 @@ mod price_level_index_tests {
             displayed: old_leaves,
             display: OrderDisplay::FullyDisplayed,
             self_trade_prevention: incoming.self_trade_prevention,
+            expires_at: incoming.time_in_force.expires_at(),
             previous: None,
             next: None,
             account_previous: None,
@@ -6911,6 +7304,7 @@ mod price_level_index_tests {
             displayed: 1,
             display: OrderDisplay::FullyDisplayed,
             self_trade_prevention: SelfTradePrevention::CancelAggressor,
+            expires_at: None,
             previous: None,
             next: None,
             account_previous: None,
@@ -6933,6 +7327,7 @@ mod price_level_index_tests {
                 displayed: 1,
                 display: OrderDisplay::FullyDisplayed,
                 self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                expires_at: None,
                 previous: None,
                 next: None,
                 account_previous: None,
@@ -7032,6 +7427,7 @@ mod price_level_index_tests {
                     peak: Quantity::new(2).unwrap(),
                 },
                 self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                expires_at: None,
                 previous: None,
                 next: None,
                 account_previous: None,
@@ -7046,6 +7442,7 @@ mod price_level_index_tests {
                 displayed: 3,
                 display: OrderDisplay::FullyDisplayed,
                 self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                expires_at: None,
                 previous: None,
                 next: None,
                 account_previous: None,
@@ -7060,6 +7457,7 @@ mod price_level_index_tests {
                 displayed: 1,
                 display: OrderDisplay::FullyDisplayed,
                 self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                expires_at: None,
                 previous: None,
                 next: None,
                 account_previous: None,
@@ -7196,6 +7594,7 @@ mod price_level_index_tests {
                 displayed: 1,
                 display: OrderDisplay::FullyDisplayed,
                 self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                expires_at: None,
                 previous: None,
                 next: None,
                 account_previous: None,
@@ -7229,6 +7628,7 @@ mod price_level_index_tests {
                 displayed: 1,
                 display: OrderDisplay::FullyDisplayed,
                 self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                expires_at: None,
                 previous: None,
                 next: None,
                 account_previous: None,
@@ -7279,6 +7679,7 @@ mod price_level_index_tests {
                 displayed: 1,
                 display: OrderDisplay::FullyDisplayed,
                 self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                expires_at: None,
                 previous: None,
                 next: None,
                 account_previous: None,
@@ -7421,7 +7822,9 @@ mod price_level_index_tests {
             quantity: Quantity::new(1).unwrap(),
             display: OrderDisplay::FullyDisplayed,
             order_type: OrderType::Limit(Price::from_raw(1)),
-            time_in_force: TimeInForce::GoodTilCancelled,
+            time_in_force: TimeInForce::GoodTilTimestamp {
+                expires_at: TimestampNs::from_unix_nanos(100),
+            },
             self_trade_prevention: SelfTradePrevention::CancelAggressor,
             received_at: TimestampNs::from_unix_nanos(1),
         };
@@ -7442,6 +7845,9 @@ mod price_level_index_tests {
         assert!(initial_selection.allocated_order_ids_per_lease >= book.limits.max_active_orders());
         assert_eq!(book.bids.storage_len(), 0);
         assert!(book.bids.allocation_capacity() >= book.limits.max_price_levels_per_side());
+        assert_eq!(book.expiries.storage_len(), 0);
+        assert_eq!(book.expiries.maximum(), book.limits.max_active_orders());
+        assert!(book.expiries.allocation_capacity() >= book.limits.max_active_orders());
         assert_eq!(
             book.price_level_arena_status(Side::Buy),
             super::PriceLevelArenaStatus {
@@ -7462,9 +7868,12 @@ mod price_level_index_tests {
             book.account_controls.capacity(),
             book.reports.capacity(),
             book.bids.allocation_capacity(),
+            book.expiries.allocation_capacity(),
         );
         book.commit(prepared).unwrap();
         assert_eq!(book.bids.storage_len(), 1);
+        assert_eq!(book.expiries.storage_len(), 1);
+        assert_eq!(book.expiries.len(), 1);
         assert_eq!(book.price_level_arena_status(Side::Buy).occupied_slots, 1);
         assert_eq!(book.price_level_arena_status(Side::Buy).reusable_slots, 0);
         assert_eq!(
@@ -7476,6 +7885,7 @@ mod price_level_index_tests {
                 book.account_controls.capacity(),
                 book.reports.capacity(),
                 book.bids.allocation_capacity(),
+                book.expiries.allocation_capacity(),
             )
         );
 
@@ -7504,6 +7914,8 @@ mod price_level_index_tests {
         assert_eq!(book.order_selection_pool_status(), initial_selection);
         assert_eq!(book.active_order_count(), 0);
         assert_eq!(book.bids.storage_len(), 1);
+        assert_eq!(book.expiries.storage_len(), 1);
+        assert_eq!(book.expiries.len(), 0);
         assert_eq!(book.price_level_arena_status(Side::Buy).occupied_slots, 0);
         assert_eq!(book.price_level_arena_status(Side::Buy).reusable_slots, 1);
 
@@ -7517,6 +7929,8 @@ mod price_level_index_tests {
         .unwrap();
         assert_eq!(book.bids.storage_len(), 1);
         assert_eq!(book.bids.allocation_capacity(), capacities.5);
+        assert_eq!(book.expiries.allocation_capacity(), capacities.6);
+        assert_eq!(book.expiries.len(), 1);
         assert_eq!(book.price_level_arena_status(Side::Buy).occupied_slots, 1);
         assert_eq!(book.price_level_arena_status(Side::Buy).reusable_slots, 0);
 
@@ -7550,6 +7964,7 @@ mod price_level_index_tests {
             book.event_arena.slot_pointer(retained_events)
         );
         assert_eq!(book.active_order_count(), 0);
+        assert_eq!(book.expiries.len(), 0);
         assert_eq!(book.account_control(new.account_id).revision(), 1);
         assert_eq!(book.account_controls.capacity(), control_capacity);
     }
@@ -7569,6 +7984,13 @@ mod price_level_index_tests {
             .validate()
             .expect_err("lost control headroom is invalid");
         assert!(error.detail().contains("account-control hash capacity"));
+
+        let mut book = OrderBook::new(reserve_definition());
+        book.expiries.shrink_to_fit();
+        let error = book
+            .validate()
+            .expect_err("lost GTD-expiry headroom is invalid");
+        assert!(error.detail().contains("GTD expiry-index reservation"));
 
         let mut book = OrderBook::new(reserve_definition());
         Arc::get_mut(&mut book.order_selection_pool)

@@ -1,11 +1,12 @@
-# Semantic snapshot format version 2
+# Expired Semantic Snapshot Format Version 2
 
 **Expired historical format.** This document preserves the byte-level schema
 of snapshot version 2. Version 2 is retained as historical provenance for
 payload kinds `1` through `3`. Snapshot version 3 subsequently preserved those
 payload bytes and added call-auction kind `4`. The current runtime rejects
-both expired envelopes and uses [snapshot version 4](snapshot-v4.md), which
-also adds coupled call-auction/risk kind `5`.
+all expired versions through `4` and uses
+[snapshot version 5](snapshot-v5.md). Version 4 historically added coupled
+call-auction/risk kind `5`.
 
 `SnapshotFile` stores a complete typed semantic value in a bounded, versioned,
 CRC-32C envelope. Version 2 assigns payload kind `1` to `LedgerCheckpoint`,

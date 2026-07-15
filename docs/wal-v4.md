@@ -1,14 +1,16 @@
-# WAL Format Version 4
+# Expired WAL Format Version 4
 
-This document is the authoritative byte-level schema for Quotick WAL version
-4. All multibyte integers are little-endian. Rust enum layout, padding,
-pointer identity, collection capacity, and platform ABI are never persisted.
+This document preserves the byte-level schema for historical Quotick WAL
+version 4. The current runtime rejects this envelope and writes
+[WAL version 5](wal-v5.md), which adds explicit continuous GTD expiry state.
+All multibyte integers are little-endian. Rust enum layout, padding, pointer
+identity, collection capacity, and platform ABI are never persisted.
 
 Version 4 retains the version-3 payload bytes for record kinds `1` through `8`
-and adds call-auction record kinds `9` and `10`. The runtime accepts only
-version 4. Versions `1`, `2`, and `3` are expired envelopes and are rejected;
-the [version-3 schema](wal-v3.md) is retained only as historical provenance for
-the unchanged payloads incorporated here.
+and adds call-auction record kinds `9` and `10`. The historical version-4
+runtime accepted only version 4; versions `1`, `2`, and `3` were expired
+envelopes. The [version-3 schema](wal-v3.md) is retained only as historical
+provenance for the unchanged payloads incorporated here.
 
 ## Contents
 
@@ -333,9 +335,9 @@ under a non-risk state machine.
 
 ## Compatibility boundary
 
-There is no implicit upgrade or field inference across envelope versions.
-Versions `1`, `2`, and `3` fail before payload interpretation. If an
-authoritative version-3 deployment is discovered, migration requires an
+There is no implicit upgrade or field inference across envelope versions. The
+current runtime rejects versions `1` through `4` before payload interpretation.
+If an authoritative version-4 deployment is discovered, migration requires an
 explicit provenance-preserving converter that emits independently verifiable
-version-4 frames; changing the version bytes in place is invalid because the
+version-5 frames; changing the version bytes in place is invalid because the
 CRC covers the envelope.

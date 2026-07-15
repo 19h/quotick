@@ -2,8 +2,9 @@
 
 Version 3 introduced call-auction checkpoint kind `4` while preserving the
 version-2 payload bytes for kinds `1` through `3`. The current runtime rejects
-this envelope and writes [snapshot version 4](snapshot-v4.md), which preserves
-all four payload byte layouts and adds coupled call-auction/risk kind `5`.
+this envelope and writes [snapshot version 5](snapshot-v5.md). Version 4
+historically preserved all four payload byte layouts and added coupled
+call-auction/risk kind `5`; version 5 retains kinds `4` and `5` unchanged.
 
 The [version-2 schema](snapshot-v2.md) remains the byte-level definition of
 kinds `1` through `3`. Version 3 changes their envelope version only; it does

@@ -4,9 +4,9 @@ use quotick::instrument::{
 };
 use quotick::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
-    Command, CommandOutcome, CommandPreparation, Event, EventKind, EventTrace, MatchingError,
-    NewOrder, OrderBook, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce,
-    Trade,
+    Command, CommandOutcome, CommandPreparation, Event, EventKind, EventTrace, ExpirySweep,
+    MatchingError, NewOrder, OrderBook, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention,
+    TimeInForce, Trade,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -83,6 +83,16 @@ fn cancel(command: u64, order: u64, owner: u64) -> Command {
         instrument_id: instrument(),
         instrument_version: version(),
         received_at: TimestampNs::from_unix_nanos(command),
+    })
+}
+
+fn expiry_sweep(command: u64, through: u64, received_at: u64) -> Command {
+    Command::ExpirySweep(ExpirySweep {
+        command_id: CommandId::new(command).expect("non-zero command"),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        through: TimestampNs::from_unix_nanos(through),
+        received_at: TimestampNs::from_unix_nanos(received_at),
     })
 }
 
@@ -857,4 +867,142 @@ fn best_level_survives_creation_non_best_removal_reprice_fill_stp_and_restore() 
     assert_eq!(restored.best_bid(), book.best_bid());
     assert_eq!(restored.best_ask(), book.best_ask());
     restored.validate().expect("restored extrema are valid");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end GTD fixture audits ordering, temporal fences, replacement, and recovery"
+)]
+fn gtd_sweeps_expire_in_deadline_identity_order_and_fence_time_regression() {
+    let mut book = OrderBook::new(definition());
+    for (command, order, quantity, price, expires_at) in
+        [(1, 1, 1, 90, 30), (2, 2, 2, 80, 20), (3, 3, 3, 70, 20)]
+    {
+        book.submit(limit_order(
+            command,
+            order,
+            10 + order,
+            Side::Buy,
+            quantity,
+            price,
+            TimeInForce::GoodTilTimestamp {
+                expires_at: TimestampNs::from_unix_nanos(expires_at),
+            },
+            SelfTradePrevention::CancelAggressor,
+        ))
+        .expect("GTD order accepted");
+    }
+    book.submit(limit_order(
+        4,
+        4,
+        14,
+        Side::Buy,
+        4,
+        60,
+        TimeInForce::GoodTilCancelled,
+        SelfTradePrevention::CancelAggressor,
+    ))
+    .expect("GTC order accepted");
+
+    let sweep = expiry_sweep(5, 20, 20);
+    let report = book.submit(sweep).expect("expiry sweep accepted");
+    assert_eq!(report.events.len(), 3);
+    assert!(matches!(
+        report.events[0].kind,
+        EventKind::OrderCancelled {
+            order_id,
+            quantity,
+            reason: CancelReason::Expired,
+        } if order_id == OrderId::new(2).unwrap() && quantity.lots() == 2
+    ));
+    assert!(matches!(
+        report.events[1].kind,
+        EventKind::OrderCancelled {
+            order_id,
+            quantity,
+            reason: CancelReason::Expired,
+        } if order_id == OrderId::new(3).unwrap() && quantity.lots() == 3
+    ));
+    assert!(matches!(
+        report.events[2].kind,
+        EventKind::ExpirySweepCompleted {
+            previous_watermark: None,
+            current_watermark,
+            expired_order_count: 2,
+            expired_quantity_lots: 5,
+        } if current_watermark == TimestampNs::from_unix_nanos(20)
+    ));
+    assert_eq!(
+        book.expiry_watermark(),
+        Some(TimestampNs::from_unix_nanos(20))
+    );
+    assert!(book.order(OrderId::new(2).unwrap()).is_none());
+    assert!(book.order(OrderId::new(3).unwrap()).is_none());
+    assert!(book.order(OrderId::new(1).unwrap()).is_some());
+    assert!(book.order(OrderId::new(4).unwrap()).is_some());
+
+    let replay = book.submit(sweep).expect("exact sweep retry");
+    assert!(replay.replayed);
+    assert_eq!(replay.events, report.events);
+
+    let stale_order = limit_order(
+        6,
+        6,
+        16,
+        Side::Buy,
+        1,
+        50,
+        TimeInForce::GoodTilTimestamp {
+            expires_at: TimestampNs::from_unix_nanos(20),
+        },
+        SelfTradePrevention::CancelAggressor,
+    );
+    let rejected = book
+        .submit(stale_order)
+        .expect("business rejection is sequenced");
+    assert_eq!(
+        rejected.outcome,
+        CommandOutcome::Rejected(RejectReason::OrderAlreadyExpired)
+    );
+    assert_eq!(
+        book.submit(expiry_sweep(7, 19, 20)).unwrap().outcome,
+        CommandOutcome::Rejected(RejectReason::ExpiryWatermarkRegression)
+    );
+    assert_eq!(
+        book.submit(expiry_sweep(8, 30, 29)).unwrap().outcome,
+        CommandOutcome::Rejected(RejectReason::ExpiryHorizonAfterCommandTime)
+    );
+
+    book.submit(replace(9, 1, 11, 1, 95))
+        .expect("replacement retains GTD deadline");
+    let final_sweep = book
+        .submit(expiry_sweep(10, 30, 30))
+        .expect("later sweep accepted");
+    assert!(matches!(
+        final_sweep.events[0].kind,
+        EventKind::OrderCancelled {
+            order_id,
+            reason: CancelReason::Expired,
+            ..
+        } if order_id == OrderId::new(1).unwrap()
+    ));
+    assert!(book.order(OrderId::new(1).unwrap()).is_none());
+    assert!(book.order(OrderId::new(4).unwrap()).is_some());
+    book.validate()
+        .expect("expiry index and book remain coherent");
+
+    let checkpoint = book
+        .checkpoint(1, 21)
+        .expect("ten commands terminate at the declared WAL boundary");
+    let mut restored = OrderBook::from_checkpoint(&checkpoint).expect("GTD checkpoint restores");
+    assert_eq!(restored.expiry_watermark(), book.expiry_watermark());
+    assert_eq!(
+        restored.order(OrderId::new(4).unwrap()),
+        book.order(OrderId::new(4).unwrap())
+    );
+    assert!(restored.submit(expiry_sweep(10, 30, 30)).unwrap().replayed);
+    restored
+        .validate()
+        .expect("restored expiry state is coherent");
 }

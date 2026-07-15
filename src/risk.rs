@@ -19,7 +19,7 @@ use crate::matching::{
     Command, CommandOutcome, CommandPreparation, EventKind, ExecutionReport, MatchingCapacity,
     MatchingError, NewOrder, OrderBook, OrderBookCheckpoint, OrderBookCheckpointError,
     OrderBookLimits, OrderBookLimitsSpec, OrderType, PreparedCommand, RejectReason, ReplaceOrder,
-    SelfTradePrevention, TimeInForce, Trade,
+    SelfTradePrevention, Trade,
 };
 
 /// Account-level order-entry state.
@@ -1260,7 +1260,10 @@ impl RiskEngine {
     fn authorize(&self, command: Command) -> Result<(), RejectReason> {
         match command {
             Command::New(order) => self.authorize_new(order),
-            Command::Cancel(_) | Command::MassCancel(_) | Command::TradingStateControl(_) => Ok(()),
+            Command::Cancel(_)
+            | Command::MassCancel(_)
+            | Command::TradingStateControl(_)
+            | Command::ExpirySweep(_) => Ok(()),
             Command::Replace(order) => self.authorize_replace(order),
             Command::AccountControl(control) => self
                 .accounts
@@ -1282,13 +1285,7 @@ impl RiskEngine {
             order.side,
             order.quantity.lots(),
             notional,
-            matches!(
-                (order.order_type, order.time_in_force),
-                (
-                    OrderType::Limit(_),
-                    TimeInForce::GoodTilCancelled | TimeInForce::PostOnly
-                )
-            ),
+            matches!(order.order_type, OrderType::Limit(_)) && order.time_in_force.may_rest(),
         )
     }
 
@@ -1407,7 +1404,8 @@ impl RiskEngine {
             Command::Cancel(_)
             | Command::MassCancel(_)
             | Command::AccountControl(_)
-            | Command::TradingStateControl(_) => {}
+            | Command::TradingStateControl(_)
+            | Command::ExpirySweep(_) => {}
             Command::Replace(order) => {
                 if replacement_retained_priority(report, order.order_id) {
                     self.insert_reservation(

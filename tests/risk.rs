@@ -3,10 +3,10 @@ use quotick::instrument::{
     QuantityRules, TradingState,
 };
 use quotick::matching::{
-    AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, Command,
-    CommandOutcome, CommandPreparation, MatchingHashIndex, NewOrder, OrderBookLimits,
-    OrderBookLimitsSpec, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, TimeInForce,
-    TradingStateControl, TradingStateControlAction,
+    AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
+    Command, CommandOutcome, CommandPreparation, EventKind, ExpirySweep, MatchingHashIndex,
+    NewOrder, OrderBookLimits, OrderBookLimitsSpec, OrderType, RejectReason, ReplaceOrder,
+    SelfTradePrevention, TimeInForce, TradingStateControl, TradingStateControlAction,
 };
 use quotick::risk::{
     AccountRiskState, RiskError, RiskHashIndex, RiskLimitSpec, RiskLimits, RiskManagedLimits,
@@ -175,6 +175,16 @@ fn trading_state_control(
     })
 }
 
+fn expiry_sweep(command_id: u64, through: u64, received_at: u64) -> Command {
+    Command::ExpirySweep(ExpirySweep {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        through: TimestampNs::from_unix_nanos(through),
+        received_at: TimestampNs::from_unix_nanos(received_at),
+    })
+}
+
 fn prepare_read_only(
     book: &RiskManagedOrderBook,
     command: Command,
@@ -319,6 +329,39 @@ fn risk_managed_state_control_releases_all_account_reservations() {
     assert_eq!(report.outcome, CommandOutcome::Accepted);
     assert_eq!(book.risk().reservation_count(), 0);
     assert_eq!(book.book().trading_state().state(), TradingState::Halted);
+    assert_eq!(book.book().active_order_count(), 0);
+    book.validate().unwrap();
+}
+
+#[test]
+fn risk_managed_expiry_sweep_releases_exact_gtd_reservations() {
+    let mut book = RiskManagedOrderBook::new(definition());
+    book.register_account(account(11), profile(AccountRiskState::Active, 0))
+        .unwrap();
+    book.submit(limit_order(
+        1,
+        1,
+        11,
+        Side::Buy,
+        5,
+        100,
+        TimeInForce::GoodTilTimestamp {
+            expires_at: TimestampNs::from_unix_nanos(10),
+        },
+    ))
+    .unwrap();
+    assert_eq!(book.risk().reservation_count(), 1);
+
+    let report = book.submit(expiry_sweep(2, 10, 10)).unwrap();
+    assert!(matches!(
+        report.events[0].kind,
+        EventKind::OrderCancelled {
+            reason: CancelReason::Expired,
+            quantity,
+            ..
+        } if quantity.lots() == 5
+    ));
+    assert_eq!(book.risk().reservation_count(), 0);
     assert_eq!(book.book().active_order_count(), 0);
     book.validate().unwrap();
 }

@@ -12,9 +12,9 @@ use quotick::market_data::{
 };
 use quotick::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
-    Command, CommandOutcome, Event, EventKind, ExecutionReport, MassCancel, MassCancelScope,
-    NewOrder, OrderBook, OrderDisplay, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention,
-    TimeInForce, Trade, TradingStateControl, TradingStateControlAction,
+    Command, CommandOutcome, Event, EventKind, ExecutionReport, ExpirySweep, MassCancel,
+    MassCancelScope, NewOrder, OrderBook, OrderDisplay, OrderType, RejectReason, ReplaceOrder,
+    SelfTradePrevention, TimeInForce, Trade, TradingStateControl, TradingStateControlAction,
 };
 use quotick::risk::{
     AccountRiskDefinition, AccountRiskState, RiskError, RiskLimitSpec, RiskLimits, RiskProfile,
@@ -163,6 +163,111 @@ fn trading_state_control_codec_has_a_stable_little_endian_layout() {
     expected.extend_from_slice(&13_u64.to_le_bytes());
     assert_eq!(encoded, expected);
     assert_eq!(Command::decode(&encoded).unwrap(), value);
+}
+
+#[test]
+fn gtd_and_expiry_sweep_tags_have_stable_little_endian_layouts() {
+    let gtd = Command::New(NewOrder {
+        command_id: id(CommandId::new(1)),
+        order_id: id(OrderId::new(2)),
+        account_id: id(AccountId::new(3)),
+        instrument_id: id(InstrumentId::new(4)),
+        instrument_version: version(),
+        side: Side::Buy,
+        quantity: Quantity::new(5).unwrap(),
+        display: OrderDisplay::FullyDisplayed,
+        order_type: OrderType::Limit(Price::from_raw(-7)),
+        time_in_force: TimeInForce::GoodTilTimestamp {
+            expires_at: TimestampNs::from_unix_nanos(12),
+        },
+        self_trade_prevention: SelfTradePrevention::CancelBoth,
+        received_at: TimestampNs::from_unix_nanos(9),
+    });
+    let mut expected_gtd = command(1, 2, Side::Buy).encode().unwrap();
+    expected_gtd[60] = 4;
+    expected_gtd.splice(61..61, 12_u64.to_le_bytes());
+    assert_eq!(gtd.encode().unwrap(), expected_gtd);
+    assert_eq!(Command::decode(&expected_gtd).unwrap(), gtd);
+
+    let mut book = OrderBook::new(definition());
+    book.submit(gtd).unwrap();
+    let checkpoint = book.checkpoint(1, 3).unwrap();
+    let decoded_checkpoint =
+        quotick::matching::OrderBookCheckpoint::decode(&checkpoint.encode().unwrap()).unwrap();
+    assert_eq!(decoded_checkpoint, checkpoint);
+    assert_eq!(
+        decoded_checkpoint.orders()[0].expires_at(),
+        Some(TimestampNs::from_unix_nanos(12))
+    );
+    let restored = OrderBook::from_checkpoint(&decoded_checkpoint).unwrap();
+    assert_eq!(
+        restored.order(id(OrderId::new(2))).unwrap().expires_at,
+        Some(TimestampNs::from_unix_nanos(12))
+    );
+
+    let sweep = Command::ExpirySweep(ExpirySweep {
+        command_id: id(CommandId::new(11)),
+        instrument_id: id(InstrumentId::new(4)),
+        instrument_version: version(),
+        through: TimestampNs::from_unix_nanos(12),
+        received_at: TimestampNs::from_unix_nanos(13),
+    });
+    let mut expected_sweep = vec![6];
+    expected_sweep.extend_from_slice(&11_u64.to_le_bytes());
+    expected_sweep.extend_from_slice(&4_u64.to_le_bytes());
+    expected_sweep.extend_from_slice(&1_u64.to_le_bytes());
+    expected_sweep.extend_from_slice(&12_u64.to_le_bytes());
+    expected_sweep.extend_from_slice(&13_u64.to_le_bytes());
+    assert_eq!(sweep.encode().unwrap(), expected_sweep);
+    assert_eq!(Command::decode(&expected_sweep).unwrap(), sweep);
+}
+
+#[test]
+fn expiry_report_tags_have_a_stable_canonical_layout() {
+    let command_id = id(CommandId::new(11));
+    let report = ExecutionReport {
+        command_id,
+        outcome: CommandOutcome::Accepted,
+        events: vec![
+            Event {
+                sequence: 1,
+                command_id,
+                occurred_at: TimestampNs::from_unix_nanos(13),
+                kind: EventKind::OrderCancelled {
+                    order_id: id(OrderId::new(20)),
+                    quantity: Quantity::new(5).unwrap(),
+                    reason: CancelReason::Expired,
+                },
+            },
+            Event {
+                sequence: 2,
+                command_id,
+                occurred_at: TimestampNs::from_unix_nanos(13),
+                kind: EventKind::ExpirySweepCompleted {
+                    previous_watermark: None,
+                    current_watermark: TimestampNs::from_unix_nanos(12),
+                    expired_order_count: 1,
+                    expired_quantity_lots: 5,
+                },
+            },
+        ]
+        .into(),
+        replayed: false,
+    };
+    let encoded = report.encode().unwrap();
+    assert_eq!(encoded[55], 7);
+    assert_eq!(encoded[80], 11);
+    assert_eq!(&encoded[81..90], &[0; 9]);
+    assert_eq!(ExecutionReport::decode(&encoded).unwrap(), report);
+
+    let mut noncanonical_absence = encoded;
+    noncanonical_absence[82] = 1;
+    assert_eq!(
+        ExecutionReport::decode(&noncanonical_absence),
+        Err(CodecError::InvalidValue(
+            "absent expiry watermark must have a zero value"
+        ))
+    );
 }
 
 #[test]
@@ -513,6 +618,31 @@ fn every_command_variant_round_trips() {
             scope: MassCancelScope::Side(Side::Sell),
             received_at: TimestampNs::from_unix_nanos(7),
         }),
+        Command::AccountControl(AccountControl {
+            command_id: id(CommandId::new(5)),
+            account_id: id(AccountId::new(6)),
+            instrument_id: id(InstrumentId::new(4)),
+            instrument_version: version(),
+            expected_revision: 0,
+            action: AccountControlAction::Enable,
+            received_at: TimestampNs::from_unix_nanos(8),
+        }),
+        Command::TradingStateControl(TradingStateControl {
+            command_id: id(CommandId::new(6)),
+            instrument_id: id(InstrumentId::new(4)),
+            instrument_version: version(),
+            expected_revision: 0,
+            target_state: TradingState::Halted,
+            action: TradingStateControlAction::Transition,
+            received_at: TimestampNs::from_unix_nanos(9),
+        }),
+        Command::ExpirySweep(ExpirySweep {
+            command_id: id(CommandId::new(7)),
+            instrument_id: id(InstrumentId::new(4)),
+            instrument_version: version(),
+            through: TimestampNs::from_unix_nanos(9),
+            received_at: TimestampNs::from_unix_nanos(9),
+        }),
     ];
 
     for value in commands {
@@ -647,9 +777,22 @@ fn every_rejection_reason_has_a_stable_round_trip() {
         RejectReason::RiskOpenNotionalLimit,
         RejectReason::RiskPositionLimit,
         RejectReason::RiskArithmeticOverflow,
+        RejectReason::ReserveOrderNotSupported,
+        RejectReason::DisplayQuantityOffGrid,
+        RejectReason::DisplayQuantityNotLessThanOrder,
+        RejectReason::ReserveReplenishmentLimit,
+        RejectReason::ReserveOrderCannotBeImmediate,
+        RejectReason::OrderDisplayModeChangeNotAllowed,
         RejectReason::AccountAdmissionBlocked,
         RejectReason::AccountControlRevisionMismatch,
         RejectReason::AccountControlRevisionExhausted,
+        RejectReason::TradingStateControlRevisionMismatch,
+        RejectReason::TradingStateControlRevisionExhausted,
+        RejectReason::TradingStateUnchanged,
+        RejectReason::TradingStateControlCannotCancelIntoOpen,
+        RejectReason::OrderAlreadyExpired,
+        RejectReason::ExpiryWatermarkRegression,
+        RejectReason::ExpiryHorizonAfterCommandTime,
     ];
     for (index, reason) in reasons.into_iter().enumerate() {
         let command_id = id(CommandId::new(
@@ -752,6 +895,19 @@ fn every_event_variant_round_trips() {
             revision: 1,
             cancelled_order_count: 2,
             cancelled_quantity_lots: 26,
+        },
+        EventKind::TradingStateControlApplied {
+            previous_state: TradingState::Open,
+            current_state: TradingState::Halted,
+            revision: 1,
+            cancelled_order_count: 2,
+            cancelled_quantity_lots: 26,
+        },
+        EventKind::ExpirySweepCompleted {
+            previous_watermark: Some(TimestampNs::from_unix_nanos(17)),
+            current_watermark: TimestampNs::from_unix_nanos(18),
+            expired_order_count: 2,
+            expired_quantity_lots: 26,
         },
     ];
     let events: Vec<Event> = kinds

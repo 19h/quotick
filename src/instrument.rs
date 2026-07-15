@@ -956,6 +956,9 @@ impl InstrumentDefinition {
             Command::TradingStateControl(value) => {
                 self.validate_identity(value.instrument_id, value.instrument_version)
             }
+            Command::ExpirySweep(value) => {
+                self.validate_identity(value.instrument_id, value.instrument_version)
+            }
         }
     }
 

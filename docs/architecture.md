@@ -89,6 +89,16 @@ shard, from command admission through checkpoint capture.
 11. A command identifier reused for different content cannot mutate state.
 12. Event sequences are strictly increasing within a book.
 13. Order identifiers cannot be reused after an accepted new order.
+    - A GTD qualifier is valid only for a resting-capable limit order. Its
+      absolute UTC nanosecond deadline must be strictly later than both the
+      command receive time and any committed expiry watermark.
+    - The engine never reads a wall clock. An explicit sequenced expiry sweep
+      supplies an inclusive watermark no later than its own receive time; a
+      watermark regression is a sequenced nonmutating rejection.
+    - Each active GTD order occurs exactly once in a fixed-capacity AVL keyed
+      by `(deadline, OrderId)`. A sweep cancels its qualifying prefix in that
+      order and emits exact count/quantity totals before committing the new
+      watermark. Replacement preserves the original deadline.
 
 ### Reserve orders
 
@@ -185,23 +195,25 @@ shard, from command admission through checkpoint capture.
     per execution report. Active accounts and per-side levels cannot exceed
     active-order capacity; accepted identity and ordinary history can establish
     every maximum active order. Report capacity is at least
-    `max_active_orders + 1`, so one maximum-size mass cancellation always fits.
+    `max_active_orders + 1`, so one maximum-size mass cancellation or expiry
+    sweep always fits.
 26. The tail of retained-command capacity reserves at least one slot per maximum
     active order. Once ordinary history fills, new and replace commands stop.
-    Only a cancel, mass cancel, revision-valid block-and-cancel account control,
-    or revision-valid instrument transition-and-cancel into an entry-closed
-    state that passes current core business validation may enter the reserve;
-    reopening remains ordinary admission; malformed, unknown, wrong-owner, or
-    wrong-instrument controls cannot consume it. Exact cached retries remain
-    available even at total exhaustion.
-27. Construction fallibly reserves both price-level AVL arenas, all five
-    matching hash indexes, and the coupled-risk profile and reservation indexes
-    through their complete configured maxima. It also constructs every
-    configured isolated order-selection vector.
+    Only a cancel, mass cancel, nonregressing expiry sweep, revision-valid
+    block-and-cancel account control, or revision-valid instrument
+    transition-and-cancel into an entry-closed state that passes current core
+    business validation may enter the reserve; reopening remains ordinary
+    admission; malformed, unknown, wrong-owner, or wrong-instrument controls
+    cannot consume it. Exact cached retries remain available even at total
+    exhaustion.
+27. Construction fallibly reserves both price-level AVL arenas, the GTD-expiry
+    AVL arena, all five matching hash indexes, and the coupled-risk profile and
+    reservation indexes through their complete configured maxima. It also
+    constructs every configured isolated order-selection vector.
     - `PreparedCommand` owns an optional lease for a non-empty
-      mass-cancel/account-control/instrument-control selection; preparation
-      borrows matching and coupled-risk state immutably, performs no
-      allocation, and changes no semantic state.
+      mass-cancel/expiry/account-control/instrument-control selection;
+      preparation borrows matching and coupled-risk state immutably, performs
+      no allocation, and changes no semantic state.
     - Durable wrappers complete that preflight before appending a command
       frame, so selection-pool exhaustion is an unsequenced operational result
       and cannot leave a dangling WAL command.
@@ -211,16 +223,19 @@ shard, from command admission through checkpoint capture.
       fixed-capacity dense entries plus open-addressed bucket arrays.
       Backward-shift deletion and dense `swap_remove` reuse constructor-owned
       storage without growth or rehash allocation under identity churn.
-28. Checkpoint restoration rejects current matching, account-control, or retained report
-    event counts above selected limits. Raw WAL replay reconstructs under the
-    selected limits and fails explicitly if any retained historical transition
-    exceeds them. Limits may be enlarged at restart; lowering them is valid only
-    when the selected recovery path fits. Semantic validation and selected-limit
-    admission use eight exact bounded scratch indexes for history command IDs,
-    accepted IDs, account controls, active IDs/accounts, and bid/ask prices.
-    Their complete dense/bucket layouts are reserved fallibly before use; failure
-    reports the exact scratch resource and maximum before restored state exists.
-29. A GTC/post-only capacity preview is invoked only when an active-order,
+28. Checkpoint restoration rejects current matching, account-control, or
+    retained report event counts above selected limits. Raw WAL replay
+    reconstructs under the selected limits and fails explicitly if any
+    retained historical transition exceeds them. Limits may be enlarged at
+    restart; lowering them is valid only when the selected recovery path fits.
+    GTD deadlines are retained in active rows; the expiry watermark is derived
+    from history, and no restored active deadline may be at or before it.
+    Semantic validation and selected-limit admission use eight exact bounded
+    scratch indexes for history command IDs, accepted IDs, account controls,
+    active IDs/accounts, and bid/ask prices. Their complete dense/bucket layouts
+    are reserved fallibly before use; failure reports the exact scratch resource
+    and maximum before restored state exists.
+29. A GTC/GTD/post-only capacity preview is invoked only when an active-order,
     active-account, or same-side price-level bound is already full.
     - It predicts whether a residual will rest without mutation or
       reserve-slice materialization: cancel-resting excludes self leaves;
@@ -314,8 +329,9 @@ shard, from command admission through checkpoint capture.
     unverified-to-verified type transition.
     - `capture_checkpoint_candidate` audits the live topology/event arena,
       captures canonical rows at one completed WAL boundary, derives accepted
-      identities, account controls, trading-state revision, and event/trade
-      counters from command history, and requires equality with live state.
+      identities, account controls, trading-state revision, expiry watermark,
+      and event/trade counters from command history, and requires equality with
+      live state.
       `OrderBookCheckpointCapture` exposes no rows and implements neither the
       stable codec nor snapshot payload contract.
     - Its consuming `verify` transition may execute on another thread, replays
@@ -347,6 +363,11 @@ lookup/insertion/deletion/successor/predecessor, `O(P)` deterministic ordered
 traversal, and `O(1)` best-price, best-FIFO-head, best-snapshot, and direct
 best-level aggregate mutation.
 
+One additional stable-slot AVL arena maps `(deadline, OrderId)` to every active
+GTD order. It is reserved through `max_active_orders`, supports ordered-prefix
+expiry without scanning unrelated resting orders, and uses the same
+`O(log(O + 1))` insertion/removal bound and intrusive free-slot reuse.
+
 It uses a fixed-capacity dense hash index from
 `OrderId` to `RestingOrder` for direct lookup and another from `AccountId` to
 `AccountOrderIndex` containing side-specific intrusive
@@ -358,15 +379,15 @@ selected links and sorts unique `OrderId` values in the already-prepared vector.
 `OrderBookLimits` bounds all monotonic and active matching indexes plus total
 retained events;
 `RiskManagedLimits` independently adds the registered-profile maximum. Mandatory
-construction-time reservation covers both complete price arenas, active orders,
-active accounts, accepted IDs, retained account controls, retained reports,
-retained-event slots, registered profiles, and
+construction-time reservation covers both complete price arenas, the complete
+GTD-expiry arena, active orders, active accounts, accepted IDs, retained account
+controls, retained reports, retained-event slots, registered profiles, and
 coupled-risk reservations. Construction also creates
 `max_prepared_order_selections` vectors, each requesting `max_active_orders`
-`OrderId` elements. Non-empty mass-cancel, block-and-cancel, and
-transition-and-cancel preparation leases one vector; zero-cardinality selection
-bypasses the pool. Read-only pool telemetry exposes configured, available, and
-per-lease allocated cardinalities.
+`OrderId` elements. Non-empty mass-cancel, expiry-sweep, block-and-cancel, and
+transition-and-cancel preparation leases one vector; zero-cardinality
+selection bypasses the pool. Read-only pool telemetry exposes configured,
+available, and per-lease allocated cardinalities.
 
 Each hash index initializes a power-of-two bucket
 array at least twice its semantic maximum, keeping load at or below 0.5; values
@@ -553,8 +574,8 @@ interest for discovery, allocation, and uncross preparation.
       preparation, stale commit, or committed result returns that set.
     - The book primitive itself has no command sequence, phase, idempotency,
       or durability semantics. `CallAuctionEngine` supplies the first three,
-      and the version-4 durable wrapper supplies stable wire encoding,
-      full-WAL recovery, and snapshot-version-4 checkpoint/cutover recovery.
+      and the version-5 durable wrapper supplies stable wire encoding,
+      full-WAL recovery, and snapshot-version-5 checkpoint/cutover recovery.
     - The separate `CallAuctionRiskManagedEngine` supplies optional profile
       admission, reservations, positions, and independently replayed coupled
       checkpoints; settlement, public/private auction transport, preventive
@@ -694,7 +715,7 @@ admission and tracks reservations and positions.
    coupled core-first risk gate; validation capacity includes historically
    risk-rejected submits because they still require core preparation.
 8. The coupled checkpoint has a stable complete-value little-endian codec and
-   direct restore under default or explicit limits. Snapshot version 4 assigns
+   direct restore under default or explicit limits. Snapshot version 5 assigns
    it `QSNP` kind `5`. `DurableCallAuctionRiskEngine` binds a canonical
    definition/profile prefix, persists command/report pairs, completes at most
    one dangling non-retry command, verifies risk-aware replay, and supports
@@ -706,14 +727,14 @@ admission and tracks reservations and positions.
 This section defines WAL persistence, recovery, and checkpoint rules for the
 call-auction engine.
 
-1. WAL version 4 assigns stable record-kind tags `9` and `10` to one
+1. WAL version 5 retains stable record-kind tags `9` and `10` for one
    call-auction command and its complete execution report. All multibyte fields
    are little-endian, enum tags are explicit, and decoding reconstructs and
    validates domain values, contiguous event sequencing, report outcome/event
    grammar, clearing totals, trade identity, and uncross body counts.
 2. An uncut auction journal contains one immutable instrument definition
    followed by strict command/report pairs. A compacted journal instead begins
-   with one kind-`8` anchor bound to snapshot-version-4 call-auction kind `4`,
+   with one kind-`8` anchor bound to snapshot-version-5 call-auction kind `4`,
    followed by the same suffix grammar. A report without a command, consecutive
    commands, a second definition, an interior anchor, a
    continuous-matching/risk/ledger record, or any other kind fails recovery. At
@@ -1012,12 +1033,12 @@ accounting for the continuous-matching risk layer.
    under decrement-and-cancel STP. Reserve risk and notional are based on total
    leaves; replenishing a displayed slice has no independent risk effect.
    Trades update buyer/seller positions once.
-10. Single-order, mass, and accepted block-and-cancel account controls bypass
-    numerical entry limits after instrument identity validation. Instrument
-    trading-state control is account-independent and also bypasses numerical
-    risk admission. Each cancelled order releases its complete total-
-    leaves reservation exactly once before the completion summary is ignored by
-    risk state.
+10. Single-order, mass, accepted GTD-expiry sweeps, and accepted
+    block-and-cancel account controls bypass numerical entry limits after
+    instrument identity validation. Expiry and instrument trading-state
+    controls are account-independent. Each cancelled order releases its
+    complete total-leaves reservation exactly once before the completion
+    summary is ignored by risk state.
 11. Exact command retries do not apply risk state twice. Risk rejections are
     normal sequenced and durable rejection events.
 12. Every account owns private intrusive reservation head/tail state, and every
@@ -1083,15 +1104,20 @@ market-data stream and its replicas.
    replica proves that aggregate maker quantity falls by exactly the printed
    quantity and that maker order count is unchanged or decreases by one.
 6. The publisher tracks active order side, price, total leaves, displayed
-   leaves, and display policy solely to translate private traces. It publishes
-   only displayed leaves, removes a depleted slice from visible order count,
-   restores that count on a separately sequenced reserve refresh, handles every
-   STP policy, and removes old exposure before non-priority-retaining replacement.
+   leaves, display policy, and optional GTD deadline solely to translate
+   private traces. It publishes only displayed leaves, removes a depleted
+   slice from visible order count, restores that count on a separately
+   sequenced reserve refresh, handles every STP policy, and removes old
+   exposure before non-priority-retaining replacement.
 7. Each mass-cancelled order produces the same absolute visible-level update as
    an individual cancel; the aggregate completion produces `NoBookChange`.
    Publisher validation proves account/scope membership, ascending order-ID
    trace order, and exact count/total agreement without exposing those private
    fields publicly.
+   - Each expired order produces the same absolute level transition. The
+     publisher privately validates canonical `(deadline, OrderId)` order,
+     exact sweep aggregates, and prior/current expiry watermarks; the completion
+     produces `NoBookChange`, and no expiry control state is public.
 8. Account-control cancellations use the same level transition as ordinary
    cancellation. The publisher privately mirrors prior/current fence state and
    revision, validates ordered cancellation aggregates and the final control
@@ -1290,7 +1316,7 @@ storage, and recovery grammar.
     generation and first-retained-sequence selector after the new generation is
     synchronized.
 22. Matching, coupled risk, ledger, and call-auction cutover publishes an inactive A/B
-    checkpoint slot before publishing a synchronized version-4 anchor and any
+    checkpoint slot before publishing a synchronized version-5 anchor and any
     retained suffix. Single-file storage atomically renames the complete
     anchor-plus-suffix file over the WAL. Segmented storage synchronizes every
     next-generation anchor/suffix segment, then atomically replaces and
@@ -1310,7 +1336,7 @@ storage, and recovery grammar.
 This section defines the semantic snapshot file format and the checkpoint
 capture, verification, and cutover rules.
 
-1. A version-4 `QSNP` file carries a fixed 28 B header with magic, typed payload
+1. A version-5 `QSNP` file carries a fixed 28 B header with magic, typed payload
    kind (`1` ledger, `2` matching, `3` coupled risk/matching, `4` call auction,
    `5` coupled call-auction risk),
    bounded `u64` length, CRC-32C, and semantic generation.
@@ -1335,8 +1361,8 @@ capture, verification, and cutover rules.
 8. CRC-32C is an accidental-corruption detector, not an authenticity proof.
 9. Ledger, matching, coupled risk, and call-auction checkpoints retain complete
    semantic history. Uncut recovery scans the complete WAL to prove the prefix.
-   Version-4 cutover in either physical layout replaces that prefix with an
-   anchor bound to one version-4 A/B snapshot slot, so reopen scans only the
+   Version-5 cutover in either physical layout replaces that prefix with an
+   anchor bound to one version-5 A/B snapshot slot, so reopen scans only the
    anchor and suffix. This does not bound checkpoint memory, capture pause,
    retained idempotency/audit history, or semantic shard-generation lifetime.
 10. Matching candidate capture requires exact live topology and command-derived
@@ -1390,8 +1416,8 @@ capture, verification, and cutover rules.
       namespace mutation.
 
 The authoritative persisted framing and payload schemas are
-[WAL format version 4](wal-v4.md) and
-[Semantic snapshot format version 4](snapshot-v4.md). Filesystem and device
+[WAL format version 5](wal-v5.md) and
+[Semantic snapshot format version 5](snapshot-v5.md). Filesystem and device
 assumptions are bounded by the [Local storage contract](storage.md).
 
 ## Failure model
@@ -1421,6 +1447,10 @@ Mass-cancel tests cover empty and side-scoped selection, canonical audit order,
 large-book sparse-account selection, intrusive-link continuity across reserve refresh,
 replacement and execution, hidden-total risk release, displayed-depth
 publication, malformed summaries, exact replay, and WAL reconstruction.
+GTD tests cover deadline intake, equal-deadline `OrderId` ordering, inclusive
+sweeps, empty advances, watermark regression and future-horizon rejection,
+replacement retention, risk release, private market-data validation, checkpoint
+restoration, WAL reopen, and exact retry without frame growth.
 Account-control tests cover stale/exhausted revisions, exact retry, atomic
 canonical cancellation, admission fencing, re-enable, protected-history use,
 constructor capacity stability/exhaustion, unprofiled risk rejection,
@@ -1663,7 +1693,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Snapshots and compaction | single-file and segmented matching/risk/ledger/call-auction WAL cutover plus off-thread direct and WAL-synchronized plain/coupled continuous-matching and call-auction replay verification are implemented; verified matching/risk/auction handles can retire an older prefix by cursor-streaming only its synchronized suffix. Remaining evidence is bounded checkpoint memory and writer audit-copy/projection/direct-reconstruction pause, bounded suffix-copy pause, semantic generation rollover, and externally retained audit/idempotency proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
-| High | Matching lifecycle expansion | basic revisioned instrument state changes, bounded crossed call-auction collection, aggregate depth queries, banded discovery with market interest, pure order-level price-time allocation, deterministic pairing/atomic uncross, sequenced auction phase/idempotency, live and durable risk reservations/positions, stable auction/private-public wire schemas, gap-repair snapshots, semantic engine checkpoints, and plain/coupled-risk full-WAL plus single/segmented cutover recovery are implemented; remaining work is reference and dynamic-band derivation, reserve/display and venue priority/allocation policies, preventive self-trade policies, ledger integration, calendar/session scheduling, volatility triggers and interruption auctions, stop, pegged, discretionary, day/GTD, venue-specific amendment/uncross/publication semantics, and authenticated market-data transport; cross-instrument/multi-leg execution with atomic ownership and replay proofs |
+| High | Matching lifecycle expansion | basic revisioned instrument state changes, explicit continuous GTD expiry sweeps, bounded crossed call-auction collection, aggregate depth queries, banded discovery with market interest, pure order-level price-time allocation, deterministic pairing/atomic uncross, sequenced auction phase/idempotency, live and durable risk reservations/positions, stable auction/private-public wire schemas, gap-repair snapshots, semantic engine checkpoints, and plain/coupled-risk full-WAL plus single/segmented cutover recovery are implemented; remaining work is reference and dynamic-band derivation, reserve/display and venue priority/allocation policies, preventive self-trade policies, ledger integration, calendar/session scheduling and day/session expiry, volatility triggers and interruption auctions, stop, pegged, discretionary, venue-specific amendment/uncross/publication semantics, and authenticated market-data transport; cross-instrument/multi-leg execution with atomic ownership and replay proofs |
 | High | Instrument lifecycle expansion | trading calendars, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |

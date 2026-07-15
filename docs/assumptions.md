@@ -64,12 +64,19 @@ identifier falsifies A4.
 ## A5 — receive timestamps and arrival priority
 
 **Assumption.** Receive timestamps are trace data, not matching-priority
-inputs; command arrival at the single writer defines priority.
+inputs; command arrival at the single writer defines priority. For continuous
+GTD controls, the supplied timestamp is also the authoritative temporal fence:
+an admitted deadline is later than intake, and an expiry-sweep horizon is no
+later than its command timestamp. The matching engine reads no wall clock.
 
-**Dependent results.** FIFO determinism and replay.
+**Dependent results.** FIFO determinism, replay, deterministic GTD intake, and
+controller-driven expiry-watermark advancement.
 
 **Falsification probe.** Feed decreasing/equal timestamps and confirm identical
-arrival-order matching. Timestamp-based reordering falsifies A5.
+arrival-order matching; submit deadlines at/before intake, future sweep
+horizons, equal/regressing watermarks, and replay after clock rollback. Priority
+reordering, accepted invalid temporal fences, or an engine clock read falsifies
+A5.
 
 ## A6 — negative balances and risk/ledger separation
 
@@ -118,8 +125,8 @@ A8.
 Retained command reports and their events, accepted order identifiers,
 account-control revisions, and the inline instrument-state revision do not
 evict within one shard generation. Ordinary admission stops independently
-before command and event cancellation reserves; total exhaustion requires a
-fenced generation rollover.
+before command and event cancellation reserves; valid expiry sweeps share
+those protected lanes. Total exhaustion requires a fenced generation rollover.
 
 **Dependent results.** Exact replay response, bounded
 history/event/identity/control cardinality, cancellation headroom, and memory
@@ -127,11 +134,11 @@ complexity `O(C_max + E_max)`.
 
 **Falsification probe.** Run beyond ordinary and total command/event
 boundaries; flood new/replace, unknown/wrong-owner cancel, valid cancel, empty
-mass-cancel, stale/valid account and instrument-state controls, and exact
-retries; restart from WAL/checkpoint under equal, larger, and insufficient
-limits. Growth past a bound, a business-invalid control consuming either
-reserve, mutation by an exact retry, or silent identity/control/event eviction
-falsifies A9.
+mass-cancel, empty/full/regressing expiry sweeps, stale/valid account and
+instrument-state controls, and exact retries; restart from WAL/checkpoint under
+equal, larger, and insufficient limits. Growth past a bound, a business-invalid
+control consuming either reserve, mutation by an exact retry, or silent
+identity/control/event eviction falsifies A9.
 
 ## A10 — unobservable hash iteration order
 
@@ -167,7 +174,8 @@ instrument-catalog, continuous matching/risk, continuous and call-auction
 market-data order/control/scratch, call-auction risk/history, and ledger
 balance/transaction/reversal hashes use constructor-owned dense entry vectors
 and fixed open-addressed bucket arrays. Instrument definitions, continuous
-matching price arenas, continuous and call-auction retained-event arenas,
+matching price and GTD-expiry arenas, continuous and call-auction retained-event
+arenas,
 continuous market-data, call-auction price/identity, and both public-projection
 price arenas, continuous and call-auction replica active/standby depth, the
 ledger journal vector, prepared auction/ledger buffers, the continuous
@@ -247,25 +255,26 @@ integrity; concern about the second requires authenticated records.
 
 ## A15 — format version immutability
 
-**Assumption.** WAL format version 4 and snapshot format version 4 are
-immutable. WAL versions 1/2/3 and snapshot versions 1/2/3 are expired and
-rejected explicitly rather than inferred or migrated. WAL v4 preserves v3
-record payloads `1`--`8` and adds auction kinds `9`/`10`. Snapshot v4 preserves
-v3 payload bytes for kinds `1`--`4` and assigns previously invalid kind `5` to
-coupled call-auction/risk checkpoints; no runtime interprets an expired
-envelope as current. Any future incompatible evolution uses a new explicit
-version and provenance-preserving migration when authoritative predecessors
-exist.
+**Assumption.** WAL format version 5 and snapshot format version 5 are
+immutable. WAL and snapshot versions `1` through `4` are expired and rejected
+explicitly rather than inferred or migrated. WAL v5 preserves v4 record-kind
+tags and payload bytes for kinds `3` through `10`; kinds `1`/`2` add continuous
+GTD command/report tags. Snapshot v5 preserves v4 payload bytes for kinds `1`,
+`4`, and `5`; kinds `2`/`3` add matching expirations and derive the expiry
+watermark from retained history. No runtime interprets an expired envelope as
+current. Any future incompatible evolution uses a new explicit version and
+provenance-preserving migration when authoritative predecessors exist.
 
 **Dependent results.** Deterministic decoding, historical replay, checkpoint
 recovery, anchor interpretation, stable auction records/images, and fail-closed
 format boundaries.
 
-**Falsification probe.** Byte-compare golden WAL-v4 and snapshot-v4 fixtures
-through every supported release; mutate valid WAL frames to versions
-`1`/`2`/`3` and images to versions `1`/`2`/`3`; verify raw auction record tags
-`9`/`10` and snapshot kinds `4`/`5`. Any changed supported bytes/interpretation
-or acceptance across an expired envelope boundary falsifies A15.
+**Falsification probe.** Byte-compare golden WAL-v5 and snapshot-v5 fixtures
+through every supported release; mutate valid WAL frames and images to versions
+`1`/`2`/`3`/`4`; verify continuous expiry tags, raw auction record tags
+`9`/`10`, and snapshot kinds `1` through `5`. Any changed supported
+bytes/interpretation or acceptance across an expired envelope boundary
+falsifies A15.
 
 ## A16 — at most one dangling command
 
@@ -332,36 +341,37 @@ falsifies A19.
 ## A20 — sole risk-managed mutation path
 
 **Assumption.** `RiskManagedOrderBook` is the sole mutation path for a
-risk-controlled shard; its accepted matching trace is sufficient to update
-every reservation and position without a second fallible business decision.
+risk-controlled shard; its accepted matching trace, including expiry
+cancellations, is sufficient to update every reservation and position without
+a second fallible business decision.
 
 **Dependent results.** In-process matching/risk atomicity and durable
 reconstruction.
 
 **Falsification probe.** Apply model-generated combinations of fills,
-individual/mass/account-control cancels, replacements, and all STP modes;
-cross-audit after every command and compare recovery byte-for-byte. Any active
-order without exactly one matching reservation or any duplicate
+individual/mass/expiry/account-control cancels, replacements, and all STP
+modes; cross-audit after every command and compare recovery byte-for-byte. Any
+active order without exactly one matching reservation or any duplicate
 position/control effect falsifies A20.
 
 ## A21 — single-publisher report stream
 
 **Assumption.** After bootstrap, one publisher receives every non-replayed
 report from its authoritative book in matching-event order; no second publisher
-state is merged into that sequence. The publisher privately mirrors
-account-control state/revision and instrument trading state/revision to
-validate traces; public payloads remain anonymous except for the instrument
-state itself.
+state is merged into that sequence. The publisher privately mirrors active GTD
+deadlines and the expiry watermark, account-control state/revision, and
+instrument trading state/revision to validate traces; public payloads remain
+anonymous except for the instrument state itself.
 
 **Dependent results.** One-to-one incremental publication, exact-retry
-suppression, control-cancellation validation, state-transition publication, and
-publisher/book cross-audit.
+suppression, expiry/control-cancellation validation, state-transition
+publication, and publisher/book cross-audit.
 
-**Falsification probe.** Drop, duplicate, reorder, corrupt control
-prior/current/revision/aggregates, and splice reports from another
-instrument/version. Any undetected sequence, identity, control, state, or depth
-discontinuity, or any aggregate/control mismatch that passes cross-audit,
-falsifies A21.
+**Falsification probe.** Drop, duplicate, reorder, corrupt expiry
+order/watermark/aggregates or control prior/current/revision/aggregates, and
+splice reports from another instrument/version. Any undetected sequence,
+identity, expiry, control, state, or depth discontinuity, or any
+aggregate/control mismatch that passes cross-audit, falsifies A21.
 
 ## A22 — native reserve policy
 
@@ -482,7 +492,7 @@ A28.
 
 **Assumption.** A ledger checkpoint and its recovery WAL represent one
 immutable ledger-record history; numeric generation is never treated as lineage
-without exact prefix equality or an exact version-4 checkpoint anchor. An
+without exact prefix equality or an exact version-5 checkpoint anchor. An
 anchored WAL separately binds semantic record count and physical retired-prefix
 sequence. Capture/audit resource or replay-constructor failure under A89 occurs
 before snapshot/cutover mutation and leaves the durable ledger unpoisoned; live
@@ -588,12 +598,12 @@ environment.
 **Assumption.** The dated 47 B fixed ledger-entry payload, ledger-correction
 WAL kind `6`, ledger-batch WAL kind `7`, and tagged record-based checkpoint
 schema first defined under version 3 are retained byte-for-byte by the
-deployable version-4 WAL/version-4 snapshot accounting formats; no earlier
+deployable version-5 WAL/version-5 snapshot accounting formats; no earlier
 undated or flat-entry expired `QWAL`/`QSNP` ledger artifact requires
 compatibility. Older development envelopes fail before payload interpretation
 rather than receiving inferred dates, times, or grouping.
 
-**Dependent results.** A version-4 WAL/version-4 snapshot dated atomic
+**Dependent results.** A version-5 WAL/version-5 snapshot dated atomic
 grouped-event accounting schema with an explicit rejection boundary for expired
 artifacts.
 
@@ -623,18 +633,22 @@ effect, accepted partial state, or incorrect final balance falsifies A36.
 ## A37 — retained matching payload formats
 
 **Assumption.** The reserve-, mass-cancel-, and account-control-enabled
-instrument, command, and execution-report payloads first defined under version
-3 are retained byte-for-byte by deployable WAL version 4; no earlier matching
-WAL requires compatibility. Expired envelopes fail before payload
-interpretation rather than receiving inferred display, mass-cancel, control, or
-anchor semantics.
+instrument, command, and execution-report variants first defined under version
+3 remain byte-for-byte variants inside deployable WAL version 5. Version 5 adds
+explicit continuous GTD time-in-force, expiry-sweep command, cancellation,
+rejection, and completion tags; it does not infer these fields from WAL version
+4. No earlier matching WAL requires runtime compatibility. Expired envelopes
+fail before payload interpretation rather than receiving inferred display,
+mass-cancel, control, expiry, watermark, or anchor semantics.
 
-**Dependent results.** Explicit fully-displayed/reserve state, refresh events,
-canonical mass cancellation, revisioned account fencing, and anchored cutover
-under WAL envelope version `4`.
+**Dependent results.** Explicit fully-displayed/reserve/GTD state, refresh and
+expiry events, canonical mass cancellation, revisioned account fencing, and
+anchored cutover under WAL envelope version `5`.
 
 **Falsification probe.** Inventory every persisted matching WAL and decode
-golden version-4 fixtures before deployment. Discovery of an authoritative
+golden version-5 fixtures before deployment. Reject version-4 artifacts with
+and without re-labelled headers, and mutate every expiry tag, deadline,
+watermark, aggregate, and ordering relation. Discovery of an authoritative
 predecessor that must remain readable falsifies A37 and requires a
 provenance-preserving migration; silently inferring absent fields is not
 permitted.
@@ -670,14 +684,16 @@ under A9. Capture and validation reservation or temporary replay-shard
 construction failure occurs before snapshot/cutover mutation and leaves the
 durable shard unpoisoned; semantic contradiction poisons it.
 
-**Dependent results.** Direct matching-state restoration, FIFO/reserve/STP
-continuity, exact retry after checkpoint, suffix-only matching replay,
-physical-prefix retirement in both layouts, checkpoint lineage ordering, and
-retryable pre-semantic resource failure under A88.
+**Dependent results.** Direct matching-state restoration,
+FIFO/reserve/STP/GTD-deadline continuity, expiry-watermark reconstruction,
+exact retry after checkpoint, suffix-only matching replay, physical-prefix
+retirement in both layouts, checkpoint lineage ordering, and retryable
+pre-semantic resource failure under A88.
 
 **Falsification probe.** Mutate boundary, definition, command/report order,
-event/trade sequence, active FIFO/display state, WAL prefix, generation
-selector, or anchor/slot identity; force each A88 resource and replay
+event/trade sequence, active FIFO/display/expiration state, expiry watermark,
+WAL prefix, generation selector, or anchor/slot identity; force each A88
+resource and replay
 constructor failure; test non-default WAL origins, same/higher-generation
 forks, ahead-of-WAL images, recomputed CRCs, and production-volume
 memory/restart limits. Any accepted accidental mutation, unproved lineage,
@@ -819,15 +835,15 @@ eligibility or trace disagreement falsifies A45.
 **Assumption.** Caller-selected finite `OrderBookLimits` and
 `RiskManagedLimits` are authoritative operational policy for the current shard
 process. Capacity failures are unsequenced operational errors: exact retries
-bypass gates, and only a currently business-valid cancel, mass-cancel,
-block-and-cancel account control, or instrument transition-and-cancel into an
-entry-closed state may enter either reserved command/event lane.
+bypass gates, and only a currently business-valid cancel, mass-cancel, expiry
+sweep, block-and-cancel account control, or instrument transition-and-cancel
+into an entry-closed state may enter either reserved command/event lane.
 `cancellation_reserve >= max_active_orders`, `max_report_events >=
 max_active_orders + 1`, and the derived event reserve is `max_active_orders +
 1`; ordinary retained-event capacity covers both `max_report_events` and `2 ×
 max_active_orders`.
 
-Both price-level arenas, the retained-event arena, and all
+Both price-level arenas, the GTD-expiry arena, the retained-event arena, and all
 matching/profile/reservation dense hashes are fallibly constructed through
 configured maxima before the shard exists. Limits are not financial
 WAL/snapshot payload semantics and may change at restart only when recovered
@@ -842,11 +858,12 @@ arena/hash layout or exhausted process-local book identity before state exists.
 
 **Falsification probe.** Exercise every bound at `N-1`, `N`, and `N+1`; fill
 ordinary command and event histories independently; perform individual, mass,
-account block-and-cancel, and instrument-wide cancellation through each
-reserve; exact-retry at exhaustion; recover raw/segmented WAL and checkpoints
-with equal/larger/smaller matching and profile limits; request `usize::MAX`
-layouts; assert dense, bucket, and event-arena capacities through sustained
-identity churn; inject historical peaks above a lowered policy. Any
+expiry, account block-and-cancel, and instrument-wide cancellation through
+each reserve; exact-retry at exhaustion; recover raw/segmented WAL and
+checkpoints with equal/larger/smaller matching and profile limits; request
+`usize::MAX` layouts; assert dense, bucket, AVL, and event-arena capacities
+through sustained identity churn; inject historical peaks above a lowered
+policy. Any
 mutation/WAL creation on semantic capacity failure, invalid command consuming
 reserve, cardinality excess, arena/index growth, accepted undersized
 restoration, unidentified construction failure, or replay divergence falsifies
@@ -865,8 +882,8 @@ completely removed. Replacement preview observes the pre-removal book, but the
 amended order is on the incoming side and therefore cannot alter inspected
 opposite-side liquidity.
 
-**Dependent results.** Exact allocation-free prediction of whether a valid GTC
-new order or non-priority-retaining replacement rests, the exact maker-order
+**Dependent results.** Exact allocation-free prediction of whether a valid
+GTC/GTD new order or non-priority-retaining replacement rests, the exact maker-order
 cardinality removed before append, and, for a new account, whether complete
 maker-account memberships disappear. Normal capacity admission remains expected
 `O(1)`. A full resting bound invokes an `O(O_c + P_c log P)` liquidity scan;
@@ -875,7 +892,7 @@ Both use `O(1)` auxiliary space. Final active-order, active-account, and
 same-side price-level admission is exact; a full same-side replacement level is
 charged only for a proved residual.
 
-**Falsification probe.** Differentially compare preview against actual GTC
+**Falsification probe.** Differentially compare preview against actual GTC/GTD
 new-order execution for at least 20,000 generated books spanning both sides,
 positive and negative prices, multiple levels, FIFO ownership patterns,
 full/reserve display, partial reserve slices, quantities, and all four STP
@@ -959,14 +976,15 @@ Per-level, per-side, and per-account/per-side sums of `e` are redundant
 mutation-maintained state. All admitted quantities and display peaks are
 positive multiples of the instrument lot increment.
 
-**Dependent results.** Preparation computes safe command-specific event and
-trade bounds in `O(1)` without a book scan. For incoming quantity `Q` and
-increment `q`, at most `Q/q` consuming interactions occur; cancel-resting
+**Dependent results.** Preparation computes safe incoming-matching event and
+trade bounds in `O(1)` without a book scan. An expiry sweep counts only its
+ordered `K`-order prefix in `O(K + 1)`. For incoming quantity `Q` and increment
+`q`, at most `Q/q` consuming interactions occur; cancel-resting
 additionally emits two events per opposite self order, cancel-aggressor at most
 two at its first self encounter, cancel-both at most three, and
 decrement-and-cancel consumes the total side work bound.
 Rejection/cancel/retained-priority replacement are one event; post-only
-acceptance is two; mass cancel and block-and-cancel are `K + 1`.
+acceptance is two; mass cancel, expiry sweep, and block-and-cancel are `K + 1`.
 Sequence/trade/per-report/total-event exhaustion is checked against these
 bounds; an event push beyond the prepared maximum is an invariant failure.
 Conservative aggregates can reject early at a boundary, but only actual
@@ -974,7 +992,7 @@ committed events advance the arena cursor.
 
 **Falsification probe.** Differentially execute at least 20,000 generated books
 across both sides, multiple prices, full/reserve orders, partial displayed
-slices, all four TIF modes, and all four STP modes; assert actual event/trade
+slices, all five TIF modes, and all four STP modes; assert actual event/trade
 counts never exceed preparation, retained-event count equals exact cached
 coverage, and complete invariant validation passes. Independently generate at
 least 20,000 non-priority replacements. Exercise final sequence/event slots,
@@ -1010,7 +1028,8 @@ before allocator rounding.
 **Falsification probe.** Validate zero, overflow, reserve, per-report,
 active-population, ordinary, total, default, and `usize::MAX` cases; force
 deterministic arena layout failure; fill the ordinary event lane, admit only
-valid protected cancellations, exhaust total capacity, and retry exact content;
+valid protected cancellations and expiry sweeps, exhaust total capacity, and
+retry exact content;
 prepare competing tokens and prove stale commit consumes nothing; compare
 state, sequence, arena telemetry, and WAL length on failure; restore
 direct/risk checkpoints and raw/segmented WAL under equal/larger/lower totals.
@@ -1104,9 +1123,9 @@ post-construction buffer growth, or noncanonical output falsifies A54.
 
 ## A55 — indexed AVL price arenas
 
-**Assumption.** The ordered-price implementation follows the height-balanced
-search-tree invariant introduced by Adel'son-Vel'skii and Landis ([primary
-paper,
+**Assumption.** The ordered-price and GTD-expiry implementations follow the
+height-balanced search-tree invariant introduced by Adel'son-Vel'skii and
+Landis ([primary paper,
 1962](https://www.mathnet.ru/php/archive.phtml?jrnid=dan&option_lang=eng&paperid=26964&wshow=paper)):
 every occupied node has strict binary-search ordering and left/right height
 difference at most one. Nodes live in a stable-index `Vec` arena whose complete
@@ -1125,9 +1144,12 @@ rebuild under different insertion orders. The structural auditor validates
 every child reference once, requires exactly `P - 1` tree edges, resolves every
 occupied key to its exact stable slot, and then validates reachability,
 ordering, balance, cached height, and free-list coverage in `O(P log(P + 1))`
-time and `O(1)` auxiliary space without allocating. Memory reservation is `2 ×
-P_max × size_of::<Slot<Price, PriceLevel>>()` bytes plus two vector headers,
-subject to allocator rounding. Double-ended traversal uses a fixed `256 ×
+time and `O(1)` auxiliary space without allocating. Price-arena memory
+reservation is `2 × P_max × size_of::<Slot<Price, PriceLevel>>()` bytes plus
+two vector headers; the expiry arena adds `O_max × S_expiry`, where `S_expiry`
+is the target ABI size of one `(deadline, OrderId)` index slot, subject to
+allocator rounding.
+Double-ended traversal uses a fixed `256 ×
 size_of::<usize>()`-byte stack (2,048 B on a 64-bit target).
 
 **Falsification probe.** Exercise LL/RR/LR/RL rotations; leaf, one-child, and
@@ -1196,8 +1218,8 @@ risk profiles remain immutable under A18. Authentication and authorization of
 the controller are external inputs; coupled risk requires the target profile to
 exist.
 
-**Dependent results.** Deterministic, idempotent, version-4
-WAL/version-2-checkpoint-recoverable local admission control; no active order
+**Dependent results.** Deterministic, idempotent, version-5
+WAL/version-5-checkpoint-recoverable local admission control; no active order
 survives an accepted block; blocked new/replacement admission fails while
 cancellation remains available. For `K` selected orders, block is `O(K(log K +
 log P))` time and `O(K)` constructor-leased scratch under A87; enable is
@@ -1265,7 +1287,7 @@ session identifiers, controller authentication, and venue transition graphs are
 external and currently unrepresented.
 
 **Dependent results.** Deterministic entry gating with cancel/control
-availability in every state; exact retry; version-4 WAL and version-2
+availability in every state; exact retry; version-5 WAL and version-5
 checkpoint reconstruction; account-independent risk bypass with
 cancellation-derived reservation release; public market-data state/revision
 recovery. For `O` active orders, transition-and-cancel is `O(O log O + O log
@@ -1485,7 +1507,7 @@ A65/A66.
 ## A65 — durable auction WAL grammar
 
 **Assumption.** One `DurableCallAuctionEngine` owns the only writer lease for
-one WAL-version-4 single-file or marker-selected segmented auction shard. Its
+one WAL-version-5 single-file or marker-selected segmented auction shard. Its
 uncut grammar is one immutable definition followed by command/report pairs and
 at most one final dangling command. Submission prepares before command append,
 commits the same token, then appends the exact report; acknowledgement strength
@@ -1512,13 +1534,13 @@ only a torn active tail; replay exact state/trade IDs/cache identity; retry
 before/after reopen and prove zero frame growth. Inject definition drift,
 unexpected records, consecutive/dangling duplicates, persisted `replayed =
 true`, report mutation, segment corruption, insufficient limits, and frame
-versions `1`/`2`/`3`. Any accepted divergent/noncanonical history, duplicate
+versions `1`/`2`/`3`/`4`. Any accepted divergent/noncanonical history, duplicate
 transition, retry frame, cross-layout semantic difference, or unaudited
 dangling completion falsifies A65.
 
 ## A66 — auction checkpoint lineage
 
-**Assumption.** A snapshot-version-4 call-auction checkpoint and its recovery
+**Assumption.** A snapshot-version-5 call-auction checkpoint and its recovery
 WAL represent one immutable A65 command/report lineage. The image retains the
 definition/WAL origin, completed report boundary, phase/cycle, book revision,
 next priority/trade counters, canonical accepted identities and active orders,
@@ -1526,7 +1548,7 @@ and complete exact-retry history. A completed checkpoint is released only after
 independent replay requires exact direct-state equality; A97/A98 separate
 non-replaying capture from that proof. Numeric generation is never accepted
 without exact uncut prefix equality or a kind/checksum/generation/slot-bound
-version-4 anchor. Capture/validation resource or temporary-constructor failure
+version-5 anchor. Capture/validation resource or temporary-constructor failure
 under A78 occurs before snapshot/cutover mutation and leaves the durable shard
 unpoisoned; semantic contradiction poisons it.
 
@@ -1637,7 +1659,7 @@ A66-style auction image, reconstructs reservations from active orders, and is
 released only after full history replay through the coupled gate; A99/A100
 stage that proof.
 
-Snapshot-v4 kind `5` and `DurableCallAuctionRiskEngine` bind a canonical
+Snapshot-v5 kind `5` and `DurableCallAuctionRiskEngine` bind a canonical
 definition/profile prefix, risk-aware command/report replay, one
 dangling-command completion, exact uncut prefix proof, and
 single-file/segmented A/B cutover. Dynamic profile/control mutation,
@@ -1801,22 +1823,24 @@ resolve to an order with the same side and price, and every account-list entry
 to the same owner and side. Because each price and account/side list is unique,
 any repeated identity or cycle within a list necessarily attempts more than the
 authoritative active-order cardinality. A55 independently proves each price
-arena's tree and free-list topology without scratch.
+and expiry arena's tree and free-list topology without scratch.
 
 **Dependent results.** [A72] Successful complete live-book audit is
-allocation-free `O(O + P log(P + 1))` time and `O(1)` auxiliary space for `O`
-active orders and at most `P` initialized AVL slots per side. Exact
-price/account coverage, forward/backward links, aggregates, accepted identity,
-account controls, spread, hash layouts, arena reservations, order-selection
+allocation-free `O(O + P log(P + 1) + X log(X + 1))` time and `O(1)` auxiliary
+space for `O` active orders, at most `P` initialized AVL slots per price side,
+and `X <= O` initialized expiry slots. Exact price/account/expiry coverage,
+forward/backward links, aggregates, accepted identity, account controls,
+watermark exclusion, spread, hash layouts, arena reservations, order-selection
 pool configuration/capacity, cached extrema/handles, and AVL topology remain
 checked. Human-readable formatting after an invariant failure can allocate
 under A12.
 
 **Falsification probe.** Build empty, single-level, multi-level, two-sided,
-multi-account, reserve, control, and churned books and audit after every
+multi-account, reserve, GTD, control, and churned books and audit after every
 transition. Inject price-FIFO and account-list self/multi-node cycles,
 duplicate membership, wrong side/price/owner, missing order, broken
-prior/next/head/tail, count/quantity/event-work drift, stale best handle, lost
+prior/next/head/tail, count/quantity/event-work drift, missing/duplicate/wrong
+expiry keys, active deadlines at/before the watermark, stale best handle, lost
 hash/arena/selection-pool reservation, shared AVL children, disconnected
 occupied cycles, and unlinked vacant slots. Any successful-audit allocation,
 missed corruption, unchecked traversal, panic before typed invariant rejection,
@@ -2297,11 +2321,11 @@ measurement.
 **Assumption.** A continuous `OrderBook` constructs `L =
 max_prepared_order_selections` isolated `OrderId` vectors before publishing the
 book; each requests `O = max_active_orders` elements and may receive more
-capacity. A core-accepted mass cancel, block-and-cancel, or
+capacity. A core-accepted mass cancel, expiry sweep, block-and-cancel, or
 transition-and-cancel with selected cardinality `K > 0` acquires one move-only
 lease during immutable preparation. `K <= O` follows from the authoritative
-active-order/account indexes. A selection with `K = 0` uses an allocation-free
-zero-capacity vector and consumes no lease, preserving empty
+active-order/account/expiry indexes. A selection with `K = 0` uses an
+allocation-free zero-capacity vector and consumes no lease, preserving empty
 cancellation/control availability even when all non-empty leases are retained.
 The default is `L = 2`.
 
@@ -2322,8 +2346,8 @@ block remains under A12.
 buffer and outer-pool reservations with exact resource identity; assert granted
 per-lease capacity covers `O`; acquire `L` distinct buffers, write different
 identities, and prove no cross-lease contamination; require typed `L + 1`
-exhaustion without state/sequence/event/WAL change; prepare an empty selection
-while exhausted; prove release on drop, normal commit, exact race, stale
+exhaustion without state/sequence/event/WAL change; prepare empty control and
+expiry selections while exhausted; prove release on drop, normal commit, exact race, stale
 commit, foreign commit, deterministic gate rejection, and durable retry;
 corrupt retained capacity and require audit rejection.
 
@@ -2338,7 +2362,9 @@ residency, and cache locality require target-specific measurement.
 **Assumption.** Continuous matching checkpoint capture owns exactly `C`
 chronological `CommandReportCheckpoint` rows and `O` canonical
 `RestingOrderCheckpoint` rows for the live retained-command and active-order
-cardinalities. Coupled risk capture additionally owns exactly `A`
+cardinalities. Each active row retains its optional GTD deadline, while the
+inclusive expiry watermark is reconstructed from chronological history.
+Coupled risk capture additionally owns exactly `A`
 account/profile/exposure rows. Each vector is empty and completes
 `try_reserve_exact` for its immutable source cardinality before its first push;
 live arena-backed event traces clone in `O(1)` without allocating or copying
@@ -2531,28 +2557,31 @@ API.
 `OrderBook::capture_checkpoint_candidate` observes one immutable completed
 report boundary. It audits the live bounded topology and event arena, captures
 canonical active rows plus chronological command/report handles, derives
-accepted-order identities, account controls, effective trading state,
-retained-event count, and next event/trade identifiers from that history, and
-requires exact equality with the corresponding live semantic state. The
-returned `OrderBookCheckpointCapture` exposes only metadata/cardinalities and
-has no `BinaryCodec` or snapshot-payload implementation. Its consuming `verify`
+accepted-order identities, account controls, effective trading state, the
+inclusive expiry watermark, retained-event count, and next event/trade
+identifiers from that history, and requires exact equality with the
+corresponding live semantic state. The returned `OrderBookCheckpointCapture`
+exposes only metadata/cardinalities and has no `BinaryCodec` or snapshot-payload
+implementation. Its consuming `verify`
 transition constructs an isolated book under the captured limits, reproduces
 every report, and requires a fresh canonical replay projection to equal the
 candidate before releasing `OrderBookCheckpoint`.
 
 **Dependent results.** [A3, A39, A73, A84, A88, A91, A93, A94] For `C` retained
-commands containing `E` events, `O` active orders, and `P` initialized price
-slots, writer-side capture is expected `O(C + E + O + P log(P + 1))` audit/copy
-work with the A73 bounded lineage scratch, but executes no matching transitions
-from history. Verification is independent of the source book and may run on
-another thread while that writer advances; it incurs complete deterministic
-replay plus a second `O(C + E + O + P log(P + 1))` canonical projection.
+commands containing `E` events, `O` active orders, `P` initialized price slots,
+and `X` initialized expiry slots, writer-side capture is expected
+`O(C + E + O + P log(P + 1) + X log(X + 1))` audit/copy work with the A73
+bounded lineage scratch, but executes no matching transitions from history.
+Verification is independent of the source book and may run on another thread
+while that writer advances; it incurs complete deterministic replay plus a
+second canonical projection with the same audit bound.
 Candidate clones are `O(1)` and share both checkpoint row images and nested
 event ranges. `OrderBook::checkpoint` delegates to capture plus verify. Durable
 staged publication is separately fenced by A94.
 
-**Falsification probe.** Capture before a suffix, advance the source book,
-verify the capture on another thread, and require its exact old boundary, value
+**Falsification probe.** Capture before a suffix, advance the source book
+through GTD admission and expiry, verify the capture on another thread, and
+require its exact old boundary, value
 equality, byte equality, retry behavior, `Send + Sync`, and shared clone
 storage. Corrupt each live lineage scalar/index and candidate boundary/row
 class in white-box tests; force all A73/A88 reservation and temporary-book
@@ -2922,16 +2951,18 @@ capability, a remaining risk, or an opportunity.
   ledger-backed available funds, cross-instrument portfolio netting,
   margin/scenario models, busts, transfers, and replicated ownership remain
   outside the boundary.
-- **High impact:** finite matching cardinalities and a protected cancellation
-  history lane are implemented, but no fenced generation rollover, durable
-  idempotency watermark, or history eviction exists. Ordinary admission stops
-  before the reserve; once total history or accepted-identity capacity is
-  exhausted, supervisory cutover is required. Checkpoints preserve complete
-  exact-retry lineage and do not conceal this lifecycle boundary.
+- **High impact:** finite matching cardinalities and a protected
+  cancellation/expiry history lane are implemented, but no fenced generation
+  rollover, durable idempotency watermark, or history eviction exists.
+  Ordinary admission stops before the reserve; once total history or
+  accepted-identity capacity is exhausted, supervisory cutover is required.
+  Checkpoints preserve complete exact-retry lineage and do not conceal this
+  lifecycle boundary.
 - **High impact:** matching includes one continuous single-instrument
-  price-time-priority book with market/limit, GTC/IOC/FOK/post-only, native
-  reserve, replace/cancel, mass cancellation, four STP policies, and revisioned
-  open/cancel-only/halted/closed controls. A separate bounded call-auction book
+  price-time-priority book with market/limit, GTC/GTD/IOC/FOK/post-only, native
+  reserve, replace/cancel, canonical explicit expiry sweeps, mass cancellation,
+  four STP policies, and revisioned open/cancel-only/halted/closed controls. A
+  separate bounded call-auction book
   now collects crossed market/limit interest, feeds statically banded aggregate
   discovery, produces one price-time order-level allocation plan, and consumes
   it through deterministic process-local pairing and one atomic book commit. A
@@ -2946,8 +2977,8 @@ capability, a remaining risk, or an opportunity.
   self-trade policies, auction-ledger integration, settlement, authenticated
   public/private transport, market-on-auction and imbalance-only order types,
   stop and pegged triggers, discretionary ranges,
-  day/GTD expiry, calendar/session scheduling, volatility-trigger logic and
-  interruption auctions,
+  day/session-calendar expiry, calendar/session scheduling,
+  volatility-trigger logic and interruption auctions,
   venue-specific amendment priority, and atomic multi-leg/cross-instrument
   execution require explicit sequenced state machines, new wire versions,
   differential venue fixtures, and crash/replay proofs; no existing enum
@@ -2997,6 +3028,15 @@ capability, a remaining risk, or an opportunity.
   calendar/session identity, reason codes, and cross-shard completion evidence
   are unknown external inputs; adding any of them changes command and audit
   semantics.
+- **High impact risk:** continuous GTD is driven only by an explicit sequenced
+  inclusive watermark. Clock selection, controller authentication, sweep
+  cadence, delayed-command policy, calendar/session mapping, and multi-shard
+  synchronization are external. An unsequenced local timer or inferred session
+  close would invalidate deterministic replay.
+- **Medium impact:** expiring `K` orders traverses the ordered expiry prefix and
+  then performs `K` price/expiry AVL removals, emitting `K + 1` events. The
+  asymptotic bound is deterministic; pinned-hardware p50/p99.9 latency, burst
+  cadence, and cache-residency effects at `K = O_max` remain unknown.
 - **Medium impact:** complete best-level caches and A83 key-checked stable-slot
   handles make best price/FIFO discovery, partial maker mutation, non-empty-
   level removal, and reserve FIFO-tail refresh allocation-free `O(1)` without
@@ -3022,11 +3062,12 @@ capability, a remaining risk, or an opportunity.
   differential test matches the prior literal slice/requeue model. Maximum-book
   scan latency and interaction with CPU cache residency remain unknown until
   measured on declared production capacities and hardware.
-- **Medium impact:** both price-level indexed AVL arenas are always fallibly
-  reserved to the configured per-side maximum during book construction. Their
-  reservation is `2 × P_max × S_slot` bytes before allocator rounding, where
-  `S_slot = size_of::<Slot<Price, PriceLevel>>()`; the exact ABI-dependent slot
-  size and resident-page behavior require target measurement. All five matching
+- **Medium impact:** both price-level indexed AVL arenas and the GTD-expiry AVL
+  arena are always fallibly reserved during book construction. Price
+  reservation is `2 × P_max × S_price` and expiry reservation is
+  `O_max × S_expiry` bytes before allocator rounding, where
+  `S_price` and `S_expiry` are the target ABI slot sizes; exact ABI-dependent
+  slot sizes and resident-page behavior require target measurement. All five matching
   fixed-capacity hashes and the coupled-risk profile/reservation maps also reserve their
   complete dense maxima and initialize lookup arrays at load at most 0.5 during
   construction. Exact ABI byte footprint, seed-dependent probe distribution,
@@ -3037,9 +3078,10 @@ capability, a remaining risk, or an opportunity.
   limits at construction. Live reports retain exact adjacent
   ranges, so conservative command bounds can reject near a boundary but do not
   retain per-report spare capacity. Non-empty mass cancellation,
-  block-and-cancel, and instrument transition-and-cancel preparations lease one
-  isolated constructor-owned identifier-selection vector under A87; empty
-  selections consume no lease. Execution, finalization, cache insertion, retry, and checkpoint clone
+  expiry sweep, block-and-cancel, and instrument transition-and-cancel
+  preparations lease one isolated constructor-owned identifier-selection vector
+  under A87; empty selections consume no lease. Execution, finalization, cache
+  insertion, retry, and checkpoint clone
   do not allocate or copy live events. The fixed arena footprint is
   `max_retained_events × size_of::<OnceLock<Event>>()` before allocator rounding;
   the current `aarch64-apple-darwin` layouts are
@@ -3081,8 +3123,9 @@ capability, a remaining risk, or an opportunity.
   rotation cost, page-fault behavior after virtual reservation, and p50/p99.9
   latency relative to representative price distributions remain unknown.
 - **Medium impact:** final active-order, active-account, and same-side price-level
-  capacity is exact for GTC/post-only new-order admission and price-changing GTC
-  replacement. A replacement at a full unchanged old level scans crossed
+  capacity is exact for GTC/GTD/post-only new-order admission and
+  price-changing GTC/GTD replacement. A replacement at a full unchanged old
+  level scans crossed
   opposite liquidity only when the absent target level would otherwise exceed
   the bound; full fill or STP termination consumes no target level. At a full
   new-account bound, a residual requires an allocation-free proof over as many

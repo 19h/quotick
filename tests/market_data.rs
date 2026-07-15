@@ -12,8 +12,9 @@ use quotick::market_data::{
     MarketDataError, MarketDataKind, MarketDataPublisher, MarketDataReplica, MarketDataUpdate,
 };
 use quotick::matching::{
-    AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, Command, EventKind,
-    NewOrder, OrderBook, OrderType, ReplaceOrder, SelfTradePrevention, TimeInForce,
+    AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
+    Command, EventKind, ExecutionReport, ExpirySweep, NewOrder, OrderBook, OrderType, ReplaceOrder,
+    SelfTradePrevention, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -122,6 +123,16 @@ fn account_control(
     })
 }
 
+fn expiry_sweep(command_id: u64, through: u64, received_at: u64) -> Command {
+    Command::ExpirySweep(ExpirySweep {
+        command_id: CommandId::new(command_id).expect("command"),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        through: TimestampNs::from_unix_nanos(through),
+        received_at: TimestampNs::from_unix_nanos(received_at),
+    })
+}
+
 fn publish(
     book: &mut OrderBook,
     publisher: &mut MarketDataPublisher,
@@ -212,6 +223,76 @@ fn incremental_updates_reconstruct_trades_replacements_and_cancellations() {
         .expect("publisher cross-audit passes");
     assert!(replica.depth(Side::Buy, 10).is_empty());
     assert!(replica.depth(Side::Sell, 10).is_empty());
+}
+
+#[test]
+fn expiry_sweep_reconstructs_depth_and_rejects_noncanonical_cancellation_order() {
+    let mut book = OrderBook::new(definition());
+    let mut publisher = MarketDataPublisher::from_book(&book).unwrap();
+    let mut replica = MarketDataReplica::new(instrument(), version(), TradingState::Open);
+    replica.apply_snapshot(&publisher.snapshot()).unwrap();
+
+    for (command_id, order_id, account_id, price) in [(1, 11, 101, 100), (2, 12, 102, 99)] {
+        let command = order(
+            command_id,
+            order_id,
+            account_id,
+            Side::Buy,
+            order_id - 10,
+            price,
+            TimeInForce::GoodTilTimestamp {
+                expires_at: TimestampNs::from_unix_nanos(10),
+            },
+            SelfTradePrevention::CancelAggressor,
+        );
+        replica
+            .apply_batch(&publish(&mut book, &mut publisher, command))
+            .unwrap();
+    }
+
+    let pre_sweep = OrderBook::from_checkpoint(&book.checkpoint(1, 5).unwrap()).unwrap();
+    let mut rejecting_publisher = MarketDataPublisher::from_book(&pre_sweep).unwrap();
+    let sweep = expiry_sweep(3, 10, 10);
+    let report = book.submit(sweep).unwrap();
+    assert!(matches!(
+        report.events[0].kind,
+        EventKind::OrderCancelled {
+            order_id,
+            reason: CancelReason::Expired,
+            ..
+        } if order_id == OrderId::new(11).unwrap()
+    ));
+    assert!(matches!(
+        report.events[1].kind,
+        EventKind::OrderCancelled {
+            order_id,
+            reason: CancelReason::Expired,
+            ..
+        } if order_id == OrderId::new(12).unwrap()
+    ));
+
+    let mut corrupted_events: Vec<_> = report.events.iter().copied().collect();
+    let (first, remainder) = corrupted_events.split_at_mut(1);
+    std::mem::swap(&mut first[0].kind, &mut remainder[0].kind);
+    let corrupted = ExecutionReport {
+        events: corrupted_events.into(),
+        ..report.clone()
+    };
+    assert!(matches!(
+        rejecting_publisher.publish(sweep, &corrupted, &book),
+        Err(MarketDataError::TraceMismatch(
+            "expiry cancellation is outside its sweep or not canonical"
+        ))
+    ));
+
+    let batch = publisher.publish(sweep, &report, &book).unwrap();
+    assert!(matches!(
+        batch.updates().last().unwrap().kind(),
+        MarketDataKind::NoBookChange
+    ));
+    replica.apply_batch(&batch).unwrap();
+    assert_mirrors(&book, &replica);
+    publisher.validate_against(&book).unwrap();
 }
 
 #[test]
