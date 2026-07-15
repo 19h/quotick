@@ -51,8 +51,8 @@ for a shard falsifies A3.
 ## A4 — identifier uniqueness scopes
 
 **Assumption.** `CommandId` is unique within a book, `OrderId` is never reused
-after acceptance, `TradeId` is book-local, and `TransactionId` is globally
-unique.
+after acceptance whether the order is resting or dormant, `TradeId` is book-
+local, and `TransactionId` is globally unique.
 
 **Dependent results.** Idempotency, trace correlation, exactly-once ledger
 effect.
@@ -68,15 +68,19 @@ inputs; command arrival at the single writer defines priority. For continuous
 GTD controls, the supplied timestamp is also the authoritative temporal fence:
 an admitted deadline is later than intake, and an expiry-sweep horizon is no
 later than its command timestamp. The matching engine reads no wall clock.
+Stop-reference sweeps carry a separately authoritative price value; neither
+receive time nor a locally produced trade implicitly changes it.
 
-**Dependent results.** FIFO determinism, replay, deterministic GTD intake, and
-controller-driven expiry-watermark advancement.
+**Dependent results.** FIFO determinism, replay, deterministic GTD intake,
+controller-driven expiry-watermark advancement, and explicit stop-reference
+sequencing.
 
 **Falsification probe.** Feed decreasing/equal timestamps and confirm identical
 arrival-order matching; submit deadlines at/before intake, future sweep
 horizons, equal/regressing watermarks, and replay after clock rollback. Priority
 reordering, accepted invalid temporal fences, or an engine clock read falsifies
-A5.
+A5. Any implicit stop-reference change from time or local matching also
+falsifies A5.
 
 ## A6 — negative balances and risk/ledger separation
 
@@ -126,7 +130,9 @@ Retained command reports and their events, accepted order identifiers,
 account-control revisions, and the inline instrument-state revision do not
 evict within one shard generation. Ordinary admission stops independently
 before command and event cancellation reserves; valid expiry sweeps share
-those protected lanes. Total exhaustion requires a fenced generation rollover.
+those protected lanes. Stop-trigger sweeps use the ordinary lane because one
+trigger can expand into matching work. Total exhaustion requires a fenced
+generation rollover.
 
 **Dependent results.** Exact replay response, bounded
 history/event/identity/control cardinality, cancellation headroom, and memory
@@ -134,11 +140,12 @@ complexity `O(C_max + E_max)`.
 
 **Falsification probe.** Run beyond ordinary and total command/event
 boundaries; flood new/replace, unknown/wrong-owner cancel, valid cancel, empty
-mass-cancel, empty/full/regressing expiry sweeps, stale/valid account and
-instrument-state controls, and exact retries; restart from WAL/checkpoint under
-equal, larger, and insufficient limits. Growth past a bound, a business-invalid
-control consuming either reserve, mutation by an exact retry, or silent
-identity/control/event eviction falsifies A9.
+mass-cancel, empty/full/regressing expiry sweeps, empty/partial/backlogged stop-
+trigger sweeps, stale/valid account and instrument-state controls, and exact
+retries; restart from WAL/checkpoint under equal, larger, and insufficient
+limits. Growth past a bound, a business-invalid control consuming either
+reserve, a stop sweep consuming protected history, mutation by an exact retry,
+or silent identity/control/event eviction falsifies A9.
 
 ## A10 — unobservable hash iteration order
 
@@ -255,24 +262,25 @@ integrity; concern about the second requires authenticated records.
 
 ## A15 — format version immutability
 
-**Assumption.** WAL format version 5 and snapshot format version 5 are
-immutable. WAL and snapshot versions `1` through `4` are expired and rejected
-explicitly rather than inferred or migrated. WAL v5 preserves v4 record-kind
+**Assumption.** WAL format version 6 and snapshot format version 6 are
+immutable. WAL and snapshot versions `1` through `5` are expired and rejected
+explicitly rather than inferred or migrated. WAL v6 preserves v5 record-kind
 tags and payload bytes for kinds `3` through `10`; kinds `1`/`2` add continuous
-GTD command/report tags. Snapshot v5 preserves v4 payload bytes for kinds `1`,
-`4`, and `5`; kinds `2`/`3` add matching expirations and derive the expiry
-watermark from retained history. No runtime interprets an expired envelope as
-current. Any future incompatible evolution uses a new explicit version and
-provenance-preserving migration when authoritative predecessors exist.
+stop order, reference-sweep, activation, rejection, and cancellation tags.
+Snapshot v6 preserves v5 payload bytes for kinds `1`, `4`, and `5`; kinds
+`2`/`3` add canonical dormant-stop rows and derive reference/trigger lineage
+from retained history. No runtime interprets an expired envelope as current.
+Any future incompatible evolution uses a new explicit version and provenance-
+preserving migration when authoritative predecessors exist.
 
 **Dependent results.** Deterministic decoding, historical replay, checkpoint
 recovery, anchor interpretation, stable auction records/images, and fail-closed
 format boundaries.
 
-**Falsification probe.** Byte-compare golden WAL-v5 and snapshot-v5 fixtures
+**Falsification probe.** Byte-compare golden WAL-v6 and snapshot-v6 fixtures
 through every supported release; mutate valid WAL frames and images to versions
-`1`/`2`/`3`/`4`; verify continuous expiry tags, raw auction record tags
-`9`/`10`, and snapshot kinds `1` through `5`. Any changed supported
+`1`/`2`/`3`/`4`/`5`; verify continuous expiry/stop tags, raw auction record
+tags `9`/`10`, and snapshot kinds `1` through `5`. Any changed supported
 bytes/interpretation or acceptance across an expired envelope boundary
 falsifies A15.
 
@@ -342,17 +350,20 @@ falsifies A19.
 
 **Assumption.** `RiskManagedOrderBook` is the sole mutation path for a
 risk-controlled shard; its accepted matching trace, including expiry
-cancellations, is sufficient to update every reservation and position without
-a second fallible business decision.
+cancellations and stop arm/trigger transitions, is sufficient to update every
+reservation and position without a second fallible business decision. A
+dormant stop owns exactly one reservation valued from its activation
+constraint; triggering changes reservation state without duplicating exposure.
 
 **Dependent results.** In-process matching/risk atomicity and durable
 reconstruction.
 
 **Falsification probe.** Apply model-generated combinations of fills,
-individual/mass/expiry/account-control cancels, replacements, and all STP
-modes; cross-audit after every command and compare recovery byte-for-byte. Any
-active order without exactly one matching reservation or any duplicate
-position/control effect falsifies A20.
+individual/mass/expiry/account-control cancels, stop arm/trigger/failure,
+replacements, and all STP modes; cross-audit after every command and compare
+recovery byte-for-byte. Any resting or dormant active order without exactly one
+matching reservation, or any duplicated activation/position/control effect,
+falsifies A20.
 
 ## A21 — single-publisher report stream
 
@@ -360,18 +371,20 @@ position/control effect falsifies A20.
 report from its authoritative book in matching-event order; no second publisher
 state is merged into that sequence. The publisher privately mirrors active GTD
 deadlines and the expiry watermark, account-control state/revision, and
-instrument trading state/revision to validate traces; public payloads remain
-anonymous except for the instrument state itself.
+instrument trading state/revision to validate traces. It also mirrors dormant
+stop identities, canonical buy/sell trigger indices, and the committed stop
+reference; public payloads remain anonymous except for instrument state.
 
 **Dependent results.** One-to-one incremental publication, exact-retry
-suppression, expiry/control-cancellation validation, state-transition
-publication, and publisher/book cross-audit.
+suppression, expiry/control/stop-cancellation validation, canonical trigger
+validation, state-transition publication, and publisher/book cross-audit.
 
 **Falsification probe.** Drop, duplicate, reorder, corrupt expiry
-order/watermark/aggregates or control prior/current/revision/aggregates, and
-splice reports from another instrument/version. Any undetected sequence,
-identity, expiry, control, state, or depth discontinuity, or any
-aggregate/control mismatch that passes cross-audit, falsifies A21.
+order/watermark/aggregates, stop arm/trigger/reference/backlog order, or control
+prior/current/revision/aggregates, and splice reports from another instrument/
+version. Any undetected sequence, identity, expiry, stop, control, state, or
+depth discontinuity, or any aggregate/control mismatch that passes cross-
+audit, falsifies A21.
 
 ## A22 — native reserve policy
 
@@ -492,7 +505,7 @@ A28.
 
 **Assumption.** A ledger checkpoint and its recovery WAL represent one
 immutable ledger-record history; numeric generation is never treated as lineage
-without exact prefix equality or an exact version-5 checkpoint anchor. An
+without exact prefix equality or an exact version-6 checkpoint anchor. An
 anchored WAL separately binds semantic record count and physical retired-prefix
 sequence. Capture/audit resource or replay-constructor failure under A89 occurs
 before snapshot/cutover mutation and leaves the durable ledger unpoisoned; live
@@ -598,12 +611,12 @@ environment.
 **Assumption.** The dated 47 B fixed ledger-entry payload, ledger-correction
 WAL kind `6`, ledger-batch WAL kind `7`, and tagged record-based checkpoint
 schema first defined under version 3 are retained byte-for-byte by the
-deployable version-5 WAL/version-5 snapshot accounting formats; no earlier
+deployable version-6 WAL/version-6 snapshot accounting formats; no earlier
 undated or flat-entry expired `QWAL`/`QSNP` ledger artifact requires
 compatibility. Older development envelopes fail before payload interpretation
 rather than receiving inferred dates, times, or grouping.
 
-**Dependent results.** A version-5 WAL/version-5 snapshot dated atomic
+**Dependent results.** A version-6 WAL/version-6 snapshot dated atomic
 grouped-event accounting schema with an explicit rejection boundary for expired
 artifacts.
 
@@ -632,23 +645,24 @@ effect, accepted partial state, or incorrect final balance falsifies A36.
 
 ## A37 — retained matching payload formats
 
-**Assumption.** The reserve-, mass-cancel-, and account-control-enabled
-instrument, command, and execution-report variants first defined under version
-3 remain byte-for-byte variants inside deployable WAL version 5. Version 5 adds
-explicit continuous GTD time-in-force, expiry-sweep command, cancellation,
-rejection, and completion tags; it does not infer these fields from WAL version
-4. No earlier matching WAL requires runtime compatibility. Expired envelopes
-fail before payload interpretation rather than receiving inferred display,
-mass-cancel, control, expiry, watermark, or anchor semantics.
+**Assumption.** The reserve-, mass-cancel-, account-control-, and GTD-enabled
+instrument, command, and execution-report variants defined through version 5
+remain byte-for-byte variants inside deployable WAL version 6. Version 6 adds
+explicit continuous stop order, reference-sweep, activation, cancellation,
+rejection, and completion tags; it does not infer them from WAL version 5. No
+earlier matching WAL requires runtime compatibility. Expired envelopes fail
+before payload interpretation rather than receiving inferred display, mass-
+cancel, control, expiry, stop, reference, trigger-priority, or anchor semantics.
 
-**Dependent results.** Explicit fully-displayed/reserve/GTD state, refresh and
-expiry events, canonical mass cancellation, revisioned account fencing, and
-anchored cutover under WAL envelope version `5`.
+**Dependent results.** Explicit fully-displayed/reserve/GTD/stop state, refresh,
+expiry, and trigger events, canonical mass cancellation, revisioned account
+fencing, and anchored cutover under WAL envelope version `6`.
 
 **Falsification probe.** Inventory every persisted matching WAL and decode
-golden version-5 fixtures before deployment. Reject version-4 artifacts with
-and without re-labelled headers, and mutate every expiry tag, deadline,
-watermark, aggregate, and ordering relation. Discovery of an authoritative
+golden version-6 fixtures before deployment. Reject version-5 artifacts with
+and without re-labelled headers, and mutate every expiry/stop tag, deadline,
+watermark, reference, trigger, activation, aggregate, and ordering relation.
+Discovery of an authoritative
 predecessor that must remain readable falsifies A37 and requires a
 provenance-preserving migration; silently inferring absent fields is not
 permitted.
@@ -685,14 +699,15 @@ construction failure occurs before snapshot/cutover mutation and leaves the
 durable shard unpoisoned; semantic contradiction poisons it.
 
 **Dependent results.** Direct matching-state restoration,
-FIFO/reserve/STP/GTD-deadline continuity, expiry-watermark reconstruction,
-exact retry after checkpoint, suffix-only matching replay, physical-prefix
-retirement in both layouts, checkpoint lineage ordering, and retryable
-pre-semantic resource failure under A88.
+FIFO/reserve/STP/GTD/dormant-stop continuity, expiry-watermark and stop-
+reference reconstruction, exact retry after checkpoint, suffix-only matching
+replay, physical-prefix retirement in both layouts, checkpoint lineage
+ordering, and retryable pre-semantic resource failure under A88.
 
 **Falsification probe.** Mutate boundary, definition, command/report order,
-event/trade sequence, active FIFO/display/expiration state, expiry watermark,
-WAL prefix, generation selector, or anchor/slot identity; force each A88
+event/trade sequence, active FIFO/display/expiration state, dormant rows,
+trigger priority, expiry watermark, stop reference/backlog, WAL prefix,
+generation selector, or anchor/slot identity; force each A88
 resource and replay
 constructor failure; test non-default WAL origins, same/higher-generation
 forks, ahead-of-WAL images, recomputed CRCs, and production-volume
@@ -843,7 +858,9 @@ max_active_orders + 1`, and the derived event reserve is `max_active_orders +
 1`; ordinary retained-event capacity covers both `max_report_events` and `2 ×
 max_active_orders`.
 
-Both price-level arenas, the GTD-expiry arena, the retained-event arena, and all
+Stop-trigger sweeps use ordinary history/event capacity and independently
+prove their full activation/matching report bound. Both price-level arenas, the
+GTD-expiry arena, both stop-trigger arenas, the retained-event arena, and all
 matching/profile/reservation dense hashes are fallibly constructed through
 configured maxima before the shard exists. Limits are not financial
 WAL/snapshot payload semantics and may change at restart only when recovered
@@ -859,7 +876,8 @@ arena/hash layout or exhausted process-local book identity before state exists.
 **Falsification probe.** Exercise every bound at `N-1`, `N`, and `N+1`; fill
 ordinary command and event histories independently; perform individual, mass,
 expiry, account block-and-cancel, and instrument-wide cancellation through
-each reserve; exact-retry at exhaustion; recover raw/segmented WAL and
+each reserve; require stop-trigger rejection from the protected lane; exact-
+retry at exhaustion; recover raw/segmented WAL and
 checkpoints with equal/larger/smaller matching and profile limits; request
 `usize::MAX` layouts; assert dense, bucket, AVL, and event-arena capacities
 through sustained identity churn; inject historical peaks above a lowered
@@ -978,13 +996,17 @@ positive multiples of the instrument lot increment.
 
 **Dependent results.** Preparation computes safe incoming-matching event and
 trade bounds in `O(1)` without a book scan. An expiry sweep counts only its
-ordered `K`-order prefix in `O(K + 1)`. For incoming quantity `Q` and increment
-`q`, at most `Q/q` consuming interactions occur; cancel-resting
+ordered `K`-order prefix in `O(K + 1)`. A stop-trigger sweep visits its bounded
+eligible prefix and sums one conservative incoming bound per activation before
+mutation. For incoming quantity `Q` and increment `q`, at most `Q/q` consuming
+interactions occur; cancel-resting
 additionally emits two events per opposite self order, cancel-aggressor at most
 two at its first self encounter, cancel-both at most three, and
 decrement-and-cancel consumes the total side work bound.
 Rejection/cancel/retained-priority replacement are one event; post-only
 acceptance is two; mass cancel, expiry sweep, and block-and-cancel are `K + 1`.
+A stop activation adds one trigger event, its ordinary execution bound, and one
+sweep completion shared across the batch.
 Sequence/trade/per-report/total-event exhaustion is checked against these
 bounds; an event push beyond the prepared maximum is an invariant failure.
 Conservative aggregates can reject early at a boundary, but only actual
@@ -996,8 +1018,9 @@ slices, all five TIF modes, and all four STP modes; assert actual event/trade
 counts never exceed preparation, retained-event count equals exact cached
 coverage, and complete invariant validation passes. Independently generate at
 least 20,000 non-priority replacements. Exercise final sequence/event slots,
-reserve refresh, partial/full fill, replacement, cancellation, STP,
-WAL/checkpoint recovery, and deliberate aggregate/range corruption. Any bound
+reserve refresh, partial/full fill, replacement, cancellation, STP, stop-
+market/limit activation, multi-stop batches, WAL/checkpoint recovery, and
+deliberate aggregate/range corruption. Any bound
 overrun, arena overwrite/growth, retained-count drift, false acceptance past
 identifier exhaustion, stale aggregate not detected by audit, or
 quantity/display state outside the instrument grid falsifies A50.
@@ -1028,8 +1051,8 @@ before allocator rounding.
 **Falsification probe.** Validate zero, overflow, reserve, per-report,
 active-population, ordinary, total, default, and `usize::MAX` cases; force
 deterministic arena layout failure; fill the ordinary event lane, admit only
-valid protected cancellations and expiry sweeps, exhaust total capacity, and
-retry exact content;
+valid protected cancellations and expiry sweeps, reject stop-trigger work from
+the protected tail, exhaust total capacity, and retry exact content;
 prepare competing tokens and prove stale commit consumes nothing; compare
 state, sequence, arena telemetry, and WAL length on failure; restore
 direct/risk checkpoints and raw/segmented WAL under equal/larger/lower totals.
@@ -1121,9 +1144,10 @@ IDs on both sides and assert ascending output. Equality that depends on
 reconstructed account-list order, undetected topology corruption,
 post-construction buffer growth, or noncanonical output falsifies A54.
 
-## A55 — indexed AVL price arenas
+## A55 — indexed AVL matching arenas
 
-**Assumption.** The ordered-price and GTD-expiry implementations follow the
+**Assumption.** The ordered-price, GTD-expiry, and buy/sell stop-trigger
+implementations follow the
 height-balanced search-tree invariant introduced by Adel'son-Vel'skii and
 Landis ([primary paper,
 1962](https://www.mathnet.ru/php/archive.phtml?jrnid=dan&option_lang=eng&paperid=26964&wshow=paper)):
@@ -1147,8 +1171,9 @@ ordering, balance, cached height, and free-list coverage in `O(P log(P + 1))`
 time and `O(1)` auxiliary space without allocating. Price-arena memory
 reservation is `2 × P_max × size_of::<Slot<Price, PriceLevel>>()` bytes plus
 two vector headers; the expiry arena adds `O_max × S_expiry`, where `S_expiry`
-is the target ABI size of one `(deadline, OrderId)` index slot, subject to
-allocator rounding.
+is the target ABI size of one `(deadline, OrderId)` index slot. The two stop
+arenas add at most `2 × O_max × S_stop`, where `S_stop` is the target ABI slot
+size; all byte bounds remain subject to allocator rounding.
 Double-ended traversal uses a fixed `256 ×
 size_of::<usize>()`-byte stack (2,048 B on a 64-bit target).
 
@@ -1218,8 +1243,8 @@ risk profiles remain immutable under A18. Authentication and authorization of
 the controller are external inputs; coupled risk requires the target profile to
 exist.
 
-**Dependent results.** Deterministic, idempotent, version-5
-WAL/version-5-checkpoint-recoverable local admission control; no active order
+**Dependent results.** Deterministic, idempotent, version-6
+WAL/version-6-checkpoint-recoverable local admission control; no active order
 survives an accepted block; blocked new/replacement admission fails while
 cancellation remains available. For `K` selected orders, block is `O(K(log K +
 log P))` time and `O(K)` constructor-leased scratch under A87; enable is
@@ -1287,7 +1312,7 @@ session identifiers, controller authentication, and venue transition graphs are
 external and currently unrepresented.
 
 **Dependent results.** Deterministic entry gating with cancel/control
-availability in every state; exact retry; version-5 WAL and version-5
+availability in every state; exact retry; version-6 WAL and version-6
 checkpoint reconstruction; account-independent risk bypass with
 cancellation-derived reservation release; public market-data state/revision
 recovery. For `O` active orders, transition-and-cancel is `O(O log O + O log
@@ -1507,7 +1532,7 @@ A65/A66.
 ## A65 — durable auction WAL grammar
 
 **Assumption.** One `DurableCallAuctionEngine` owns the only writer lease for
-one WAL-version-5 single-file or marker-selected segmented auction shard. Its
+one WAL-version-6 single-file or marker-selected segmented auction shard. Its
 uncut grammar is one immutable definition followed by command/report pairs and
 at most one final dangling command. Submission prepares before command append,
 commits the same token, then appends the exact report; acknowledgement strength
@@ -1534,13 +1559,13 @@ only a torn active tail; replay exact state/trade IDs/cache identity; retry
 before/after reopen and prove zero frame growth. Inject definition drift,
 unexpected records, consecutive/dangling duplicates, persisted `replayed =
 true`, report mutation, segment corruption, insufficient limits, and frame
-versions `1`/`2`/`3`/`4`. Any accepted divergent/noncanonical history, duplicate
+versions `1`/`2`/`3`/`4`/`5`. Any accepted divergent/noncanonical history, duplicate
 transition, retry frame, cross-layout semantic difference, or unaudited
 dangling completion falsifies A65.
 
 ## A66 — auction checkpoint lineage
 
-**Assumption.** A snapshot-version-5 call-auction checkpoint and its recovery
+**Assumption.** A snapshot-version-6 call-auction checkpoint and its recovery
 WAL represent one immutable A65 command/report lineage. The image retains the
 definition/WAL origin, completed report boundary, phase/cycle, book revision,
 next priority/trade counters, canonical accepted identities and active orders,
@@ -1548,7 +1573,7 @@ and complete exact-retry history. A completed checkpoint is released only after
 independent replay requires exact direct-state equality; A97/A98 separate
 non-replaying capture from that proof. Numeric generation is never accepted
 without exact uncut prefix equality or a kind/checksum/generation/slot-bound
-version-5 anchor. Capture/validation resource or temporary-constructor failure
+version-6 anchor. Capture/validation resource or temporary-constructor failure
 under A78 occurs before snapshot/cutover mutation and leaves the durable shard
 unpoisoned; semantic contradiction poisons it.
 
@@ -1659,7 +1684,7 @@ A66-style auction image, reconstructs reservations from active orders, and is
 released only after full history replay through the coupled gate; A99/A100
 stage that proof.
 
-Snapshot-v5 kind `5` and `DurableCallAuctionRiskEngine` bind a canonical
+Snapshot-v6 kind `5` and `DurableCallAuctionRiskEngine` bind a canonical
 definition/profile prefix, risk-aware command/report replay, one
 dangling-command completion, exact uncut prefix proof, and
 single-file/segmented A/B cutover. Dynamic profile/control mutation,
@@ -1732,13 +1757,14 @@ A12/A43/A90 and the storage assumptions.
 
 **Assumption.** One continuous-market-data publisher is constructed under one
 immutable validated `MarketDataLimits` envelope that covers the authoritative
-matching shard's configured active-order, per-side price-level,
+matching shard's configured active-order (including dormant-stop), per-side price-level,
 account-control, and per-report event maxima—not merely its current
 cardinality. One replica independently selects a finite envelope and consumes
 only same-instrument/version snapshots and contiguous updates under A21/A23.
 
-**Dependent results.** [A70] Publisher bid/ask AVL arenas, order/control dense
-hashes, and affected-level scratch own complete storage before bootstrap.
+**Dependent results.** [A70] Publisher bid/ask and buy/sell stop-trigger AVL
+arenas, resting-order/dormant-stop/control dense hashes, and affected-level
+scratch own complete storage before bootstrap.
 Replica active/standby bid/ask arenas and batch-level scratch are also
 constructor-owned. Default maxima are 4,096 active orders, 4,096 prices per
 side, 65,536 account controls, and 65,536 updates per batch; ABI bytes and page
@@ -1762,6 +1788,9 @@ valid image while proving active/standby allocation stability. Run at least
 1,000 distinct order/price cycles with periodic publisher cross-audit, snapshot
 swaps, and replica structural validation; assert every AVL, dense, bucket, and
 scratch allocation remains fixed and scratch is empty between calls.
+Exercise stop arm/replace/cancel/expiry/trigger traces at full identity capacity,
+corrupt canonical trigger order/reference/backlog, and require publisher
+rejection without public-depth divergence.
 
 Deliberately discard active-arena and scratch reservations and require
 invariant rejection. Any accepted undersized publisher, post-construction state
@@ -1822,13 +1851,15 @@ construct temporary order-identity sets. Every traversed price FIFO entry must
 resolve to an order with the same side and price, and every account-list entry
 to the same owner and side. Because each price and account/side list is unique,
 any repeated identity or cycle within a list necessarily attempts more than the
-authoritative active-order cardinality. A55 independently proves each price
-and expiry arena's tree and free-list topology without scratch.
+authoritative active-order cardinality. Each dormant identity instead resolves
+to exactly one side-derived stop key. A55 independently proves each price,
+expiry, and stop arena's tree and free-list topology without scratch.
 
-**Dependent results.** [A72] Successful complete live-book audit is
-allocation-free `O(O + P log(P + 1) + X log(X + 1))` time and `O(1)` auxiliary
-space for `O` active orders, at most `P` initialized AVL slots per price side,
-and `X <= O` initialized expiry slots. Exact price/account/expiry coverage,
+**Dependent results.** [A72] Successful complete live-book audit is allocation-
+free `O(O + P log(P + 1) + X log(X + 1) + S log(S + 1))` time and `O(1)`
+auxiliary space for `O` active orders, at most `P` initialized AVL slots per
+price side, `X <= O` initialized expiry slots, and `S <= O` initialized stop
+slots. Exact price/account/expiry/trigger coverage,
 forward/backward links, aggregates, accepted identity, account controls,
 watermark exclusion, spread, hash layouts, arena reservations, order-selection
 pool configuration/capacity, cached extrema/handles, and AVL topology remain
@@ -1836,11 +1867,13 @@ checked. Human-readable formatting after an invariant failure can allocate
 under A12.
 
 **Falsification probe.** Build empty, single-level, multi-level, two-sided,
-multi-account, reserve, GTD, control, and churned books and audit after every
-transition. Inject price-FIFO and account-list self/multi-node cycles,
+multi-account, reserve, GTD, dormant-stop, triggered-stop, control, and churned
+books and audit after every transition. Inject price-FIFO and account-list self/
+multi-node cycles,
 duplicate membership, wrong side/price/owner, missing order, broken
 prior/next/head/tail, count/quantity/event-work drift, missing/duplicate/wrong
-expiry keys, active deadlines at/before the watermark, stale best handle, lost
+expiry keys, active deadlines at/before the watermark, missing/wrong/duplicate
+stop keys, ineligible trigger/reference state, stale best handle, lost
 hash/arena/selection-pool reservation, shared AVL children, disconnected
 occupied cycles, and unlinked vacant slots. Any successful-audit allocation,
 missed corruption, unchecked traversal, panic before typed invariant rejection,
@@ -1860,8 +1893,9 @@ maximum }` without constructing an owned diagnostic string; temporary
 book-construction failure preserves its `MatchingError`.
 
 **Dependent results.** [A73, A88] History validation reserves command-ID,
-accepted-order-ID, and account-control indexes through `C`, plus active-order
-IDs through `O`, for peak semantic maxima `3C + O`. Capacity validation
+accepted-order-ID, account-control, and dormant-stop-lineage indexes through
+`C`, plus active-order IDs through `O`, for peak semantic maxima `4C + O`.
+Capacity validation
 reserves controlled accounts through `C` and active accounts/bid prices/ask
 prices through `O`, for `C + 3O`. For `E` retained events, expected validation
 is `O(C + E + O)` outside collision clusters; adversarial hash work is bounded
@@ -1872,7 +1906,8 @@ propagated invalid-detail strings remain under A12/A39.
 **Falsification probe.** Force `usize::MAX` construction for every
 set/map/vector resource and require exact resource/maximum equality. Exercise
 empty and maximum semantic histories, duplicate IDs, account-control revision
-chains, canonical active rows, insufficient/equal/larger restoration limits,
+chains, canonical resting/dormant rows, corrupted trigger priority/reference,
+insufficient/equal/larger restoration limits,
 full and compacted WALs, A/B cutover, segmented recovery, and coupled-risk
 restoration. Any standard growing map/set in matching checkpoint validation,
 insertion before that resource's complete reservation, untyped
@@ -2321,10 +2356,10 @@ measurement.
 **Assumption.** A continuous `OrderBook` constructs `L =
 max_prepared_order_selections` isolated `OrderId` vectors before publishing the
 book; each requests `O = max_active_orders` elements and may receive more
-capacity. A core-accepted mass cancel, expiry sweep, block-and-cancel, or
-transition-and-cancel with selected cardinality `K > 0` acquires one move-only
+capacity. A core-accepted mass cancel, expiry sweep, stop-trigger sweep, block-
+and-cancel, or transition-and-cancel with selected cardinality `K > 0` acquires one move-only
 lease during immutable preparation. `K <= O` follows from the authoritative
-active-order/account/expiry indexes. A selection with `K = 0` uses an
+active-order/account/expiry/trigger indexes. A selection with `K = 0` uses an
 allocation-free zero-capacity vector and consumes no lease, preserving empty
 cancellation/control availability even when all non-empty leases are retained.
 The default is `L = 2`.
@@ -2346,8 +2381,9 @@ block remains under A12.
 buffer and outer-pool reservations with exact resource identity; assert granted
 per-lease capacity covers `O`; acquire `L` distinct buffers, write different
 identities, and prove no cross-lease contamination; require typed `L + 1`
-exhaustion without state/sequence/event/WAL change; prepare empty control and
-expiry selections while exhausted; prove release on drop, normal commit, exact race, stale
+exhaustion without state/sequence/event/WAL change; prepare empty control,
+expiry, and stop-trigger selections while exhausted; prove release on drop,
+normal commit, exact race, stale
 commit, foreign commit, deterministic gate rejection, and durable retry;
 corrupt retained capacity and require audit rejection.
 
@@ -2360,10 +2396,12 @@ residency, and cache locality require target-specific measurement.
 ## A88 — matching/risk capture vectors
 
 **Assumption.** Continuous matching checkpoint capture owns exactly `C`
-chronological `CommandReportCheckpoint` rows and `O` canonical
-`RestingOrderCheckpoint` rows for the live retained-command and active-order
-cardinalities. Each active row retains its optional GTD deadline, while the
-inclusive expiry watermark is reconstructed from chronological history.
+chronological `CommandReportCheckpoint` rows, `R` canonical
+`RestingOrderCheckpoint` rows, and `S` canonical `DormantStopCheckpoint` rows
+for the live retained-command and active-order cardinalities, where
+`R + S = O`. Each resting or dormant row retains its optional GTD deadline, while the
+inclusive expiry watermark, stop reference, and trigger lineage are
+reconstructed from chronological history.
 Coupled risk capture additionally owns exactly `A`
 account/profile/exposure rows. Each vector is empty and completes
 `try_reserve_exact` for its immutable source cardinality before its first push;
@@ -2375,17 +2413,18 @@ checkpoint and does not clone its vectors.
 
 **Dependent results.** [A39, A73, A88, A93, A95, A96] Capture performs `O(C +
 O + A)` row-copy work and owns `O(C + O + A)` output memory before
-codec/snapshot framing. Minimum element storage is `C S_history + O S_order`
-bytes for direct matching and adds `A S_account` bytes for coupled risk, before
-vector headers, allocator rounding, shared-owner control blocks, and snapshot
-encoding. Exact ABI sizes and resident memory are target-dependent.
-`CaptureHistory`, `CaptureActiveOrders`, and `CaptureAccounts` failures report
-the exact requested cardinality. Durable matching/risk checkpoint orchestration
+codec/snapshot framing. Minimum element storage is
+`C S_history + R S_order + S S_stop` bytes for direct matching and adds
+`A S_account` bytes for coupled risk, before vector headers, allocator rounding,
+shared-owner control blocks, and snapshot encoding. Exact ABI sizes and
+resident memory are target-dependent. `CaptureHistory`, `CaptureActiveOrders`,
+`CaptureDormantStops`, and `CaptureAccounts` failures report the exact requested
+cardinality. Durable matching/risk checkpoint orchestration
 has already synchronized the WAL but performs no snapshot or cutover mutation
 on these failures and leaves the shard unpoisoned; `Invalid` semantic
 contradictions remain poison-worthy.
 
-**Falsification probe.** Force `usize::MAX` for all three capture vector
+**Falsification probe.** Force `usize::MAX` for all four capture vector
 classes and every A73 validation resource; force temporary matching/risk
 constructor failures and preserve the nested resource identity; capture empty
 and maximum configured live states; verify canonical row order, trace backing
@@ -2479,8 +2518,9 @@ implementation or stable allocator API.
 ## A91 — immutable matching checkpoints
 
 **Assumption.** `OrderBookCheckpoint` is an immutable value object. Its
-canonical active-order image and chronological command/report history are
-private `Arc<Vec<_>>` values exposed only as immutable slices; nested live
+canonical resting-order image, dormant-stop image, and chronological command/
+report history are private `Arc<Vec<_>>` values exposed only as immutable
+slices; nested live
 report events already reference immutable A84 arena ranges. Equality,
 lineage-prefix comparison, validation, and stable codecs depend only on ordered
 values, never allocation capacity, pointer identity, or reference count.
@@ -2489,8 +2529,8 @@ values, never allocation capacity, pointer identity, or reference count.
 matching-checkpoint clone is `O(1)` time/space per outer value and allocates no
 row or event storage. Under A92, cloning a `RiskManagedCheckpoint` also shares
 its canonical account image. Capture and decode first construct exactly
-reserved row vectors and then create two `Arc` control blocks; stable Rust
-exposes no stable fallible `Arc::new`, so those two allocations remain under
+reserved row vectors and then create three `Arc` control blocks; stable Rust
+exposes no stable fallible `Arc::new`, so those three allocations remain under
 A12. Direct restoration borrows the checkpoint and deliberately copies `E`
 event values once into the newly constructed book's independent fixed arena.
 Atomic reference-count increments and long-lived checkpoint handles can retain
@@ -2498,7 +2538,7 @@ the complete matching history/event arena and add target-dependent cache
 contention.
 
 **Falsification probe.** Clone checkpoints captured from empty, active, and
-maximum states; require public pointer-sharing inspectors for both row images
+maximum states; require public pointer-sharing inspectors for all three images
 and `EventTrace::shares_storage_with` for nested live traces; drop source
 book/report/checkpoint owners in every order; restore and retry after the
 source owners are gone; send/share checkpoints across threads; byte-compare
@@ -2556,10 +2596,10 @@ API.
 **Assumption.** Under the serialized-writer contract A3,
 `OrderBook::capture_checkpoint_candidate` observes one immutable completed
 report boundary. It audits the live bounded topology and event arena, captures
-canonical active rows plus chronological command/report handles, derives
+canonical resting and dormant rows plus chronological command/report handles, derives
 accepted-order identities, account controls, effective trading state, the
-inclusive expiry watermark, retained-event count, and next event/trade
-identifiers from that history, and requires exact equality with the
+inclusive expiry watermark, stop reference/trigger lineage, retained-event
+count, and next event/trade identifiers from that history, and requires exact equality with the
 corresponding live semantic state. The returned `OrderBookCheckpointCapture`
 exposes only metadata/cardinalities and has no `BinaryCodec` or snapshot-payload
 implementation. Its consuming `verify`
@@ -2569,21 +2609,23 @@ candidate before releasing `OrderBookCheckpoint`.
 
 **Dependent results.** [A3, A39, A73, A84, A88, A91, A93, A94] For `C` retained
 commands containing `E` events, `O` active orders, `P` initialized price slots,
-and `X` initialized expiry slots, writer-side capture is expected
-`O(C + E + O + P log(P + 1) + X log(X + 1))` audit/copy work with the A73
-bounded lineage scratch, but executes no matching transitions from history.
+`X` initialized expiry slots, and `S` initialized stop slots, writer-side
+capture is expected
+`O(C + E + O + P log(P + 1) + X log(X + 1) + S log(S + 1))` audit/copy work
+with the A73 bounded lineage scratch, but executes no matching transitions from
+history.
 Verification is independent of the source book and may run on another thread
 while that writer advances; it incurs complete deterministic replay plus a
 second canonical projection with the same audit bound.
-Candidate clones are `O(1)` and share both checkpoint row images and nested
+Candidate clones are `O(1)` and share all three checkpoint images and nested
 event ranges. `OrderBook::checkpoint` delegates to capture plus verify. Durable
 staged publication is separately fenced by A94.
 
 **Falsification probe.** Capture before a suffix, advance the source book
-through GTD admission and expiry, verify the capture on another thread, and
+through GTD admission/expiry and stop arm/trigger, verify the capture on another thread, and
 require its exact old boundary, value
 equality, byte equality, retry behavior, `Send + Sync`, and shared clone
-storage. Corrupt each live lineage scalar/index and candidate boundary/row
+storage. Corrupt each live lineage scalar/index and candidate boundary/resting/dormant row
 class in white-box tests; force all A73/A88 reservation and temporary-book
 constructor failures; require that only `OrderBookCheckpoint` satisfies the
 codec/snapshot APIs. Any public candidate-row escape, stable candidate codec,
@@ -2875,6 +2917,37 @@ advance on failed publication falsifies A101.
 Hard-link alias exclusion, external archival, filesystem/device power-loss
 qualification, and bounded suffix size remain outside this local protocol.
 
+## A102 — explicit continuous stop-reference authority
+
+**Assumption.** One upstream authority supplies every continuous stop-reference
+price as a serialized `StopTriggerSweep` command for the exact instrument
+version. The value represents the intended last-trade reference at that command
+boundary. The matching engine does not infer reference movement from its own
+trades, timestamps, wall time, market data, or restart context. A sweep activates
+only the configured canonical bounded prefix; if eligible stops remain, the
+authority repeats the identical reference until the backlog is zero before
+advancing it. Ordering among equal thresholds is the priority sequence carried
+by the arm event—initially the accepted-order sequence, or the replacement
+event sequence after reprioritization—followed by `OrderId`.
+
+**Dependent results.** [A3, A5, A9, A15, A20, A21, A37, A39, A50, A70, A102]
+Stop intake, activation, risk reservation, public invisibility, checkpoint
+lineage, WAL recovery, and exact retry are deterministic without an engine
+clock or inferred trade-to-trigger coupling. A missed or duplicated upstream
+reference remains detectable as a command-sequence/idempotency or semantic
+history difference rather than an unrecorded local state change.
+
+**Falsification probe.** Replay identical new-order and sweep streams while
+varying wall time, receive timestamps, local matching trades, process restarts,
+and publication timing; require byte-identical reports and checkpoints. Submit
+buy/sell thresholds on both sides of the reference, equal trigger priorities,
+partial batches, a different reference with backlog, and exact/differing-content
+retries. Compare the upstream authoritative trade-reference series with the
+committed sweep series. Any implicit reference change, activation without a
+persisted sweep, noncanonical equal-threshold order, accepted reference advance
+over backlog, second retry effect, or inability to identify a missing upstream
+reference falsifies A102 and requires a different versioned trigger authority.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -2960,8 +3033,9 @@ capability, a remaining risk, or an opportunity.
   lifecycle boundary.
 - **High impact:** matching includes one continuous single-instrument
   price-time-priority book with market/limit, GTC/GTD/IOC/FOK/post-only, native
-  reserve, replace/cancel, canonical explicit expiry sweeps, mass cancellation,
-  four STP policies, and revisioned open/cancel-only/halted/closed controls. A
+  reserve, stop-market/stop-limit, replace/cancel, canonical explicit expiry and
+  stop-reference sweeps, mass cancellation, four STP policies, and revisioned
+  open/cancel-only/halted/closed controls. A
   separate bounded call-auction book
   now collects crossed market/limit interest, feeds statically banded aggregate
   discovery, produces one price-time order-level allocation plan, and consumes
@@ -2976,13 +3050,24 @@ capability, a remaining risk, or an opportunity.
   reserve/display and pro-rata/size/venue allocation policies, preventive
   self-trade policies, auction-ledger integration, settlement, authenticated
   public/private transport, market-on-auction and imbalance-only order types,
-  stop and pegged triggers, discretionary ranges,
+  authoritative external continuous stop-reference ingestion, pegged triggers,
+  discretionary ranges,
   day/session-calendar expiry, calendar/session scheduling,
   volatility-trigger logic and interruption auctions,
   venue-specific amendment priority, and atomic multi-leg/cross-instrument
   execution require explicit sequenced state machines, new wire versions,
   differential venue fixtures, and crash/replay proofs; no existing enum
   silently approximates those semantics.
+- **High impact risk:** dormant-stop determinism proves only the behavior after
+  a reference command is sequenced. Feed selection, trade correction/bust
+  handling, reference-source authentication, missed-reference recovery, and
+  cross-shard ordering are external. A stale but structurally valid reference
+  can deterministically produce a state different from the intended venue
+  state without violating the local matching grammar.
+- **Medium impact opportunity:** the explicit reference, trigger-priority, and
+  remaining-backlog trace permits exact activation-latency and counterfactual
+  trigger analysis without exposing dormant identity in public depth. Joining
+  it to an authoritative reference feed requires a versioned provenance key.
 - **High impact:** the instrument catalog, continuous matching, continuous risk, continuous and
   call-auction market-data publisher/replica state and scratch, call-auction risk, uncross-netting
   scratch, auction retry/event history, and ledger balance/transaction/reversal state
@@ -3062,11 +3147,13 @@ capability, a remaining risk, or an opportunity.
   differential test matches the prior literal slice/requeue model. Maximum-book
   scan latency and interaction with CPU cache residency remain unknown until
   measured on declared production capacities and hardware.
-- **Medium impact:** both price-level indexed AVL arenas and the GTD-expiry AVL
-  arena are always fallibly reserved during book construction. Price
+- **Medium impact:** both price-level indexed AVL arenas, the GTD-expiry AVL,
+  and both stop-trigger AVL arenas are always fallibly reserved during book
+  construction. Price
   reservation is `2 × P_max × S_price` and expiry reservation is
-  `O_max × S_expiry` bytes before allocator rounding, where
-  `S_price` and `S_expiry` are the target ABI slot sizes; exact ABI-dependent
+  `O_max × S_expiry` bytes; stop reservation is
+  `2 × O_max × S_stop` bytes before allocator rounding, where `S_price`,
+  `S_expiry`, and `S_stop` are the target ABI slot sizes; exact ABI-dependent
   slot sizes and resident-page behavior require target measurement. All five matching
   fixed-capacity hashes and the coupled-risk profile/reservation maps also reserve their
   complete dense maxima and initialize lookup arrays at load at most 0.5 during
@@ -3078,7 +3165,7 @@ capability, a remaining risk, or an opportunity.
   limits at construction. Live reports retain exact adjacent
   ranges, so conservative command bounds can reject near a boundary but do not
   retain per-report spare capacity. Non-empty mass cancellation,
-  expiry sweep, block-and-cancel, and instrument transition-and-cancel
+  expiry sweep, stop-trigger sweep, block-and-cancel, and instrument transition-and-cancel
   preparations lease one isolated constructor-owned identifier-selection vector
   under A87; empty selections consume no lease. Execution, finalization, cache
   insertion, retry, and checkpoint clone

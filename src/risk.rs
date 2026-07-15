@@ -694,8 +694,29 @@ impl RiskManagedCheckpoint {
                 order.order_id(),
                 order.account_id(),
                 order.side(),
-                order.price(),
+                RiskPriceConstraint::Limit(order.price()),
                 order.leaves().lots(),
+                false,
+            );
+        }
+        for order in self.matching.dormant_stops() {
+            if !risk.accounts.contains_key(&order.account_id()) {
+                return Err(RiskManagedCheckpointError::new(format!(
+                    "risk checkpoint dormant stop {} has no account profile",
+                    order.order_id()
+                )));
+            }
+            let constraint = match order.activation() {
+                crate::matching::StopActivation::Market => RiskPriceConstraint::Market,
+                crate::matching::StopActivation::Limit(price) => RiskPriceConstraint::Limit(price),
+            };
+            risk.insert_reservation(
+                order.order_id(),
+                order.account_id(),
+                order.side(),
+                constraint,
+                order.leaves().lots(),
+                true,
             );
         }
         for account in self.accounts.iter() {
@@ -1052,7 +1073,8 @@ pub struct RiskHashIndexStatus {
 pub struct ReservationSnapshot {
     account_id: AccountId,
     side: Side,
-    price: Price,
+    constraint: RiskPriceConstraint,
+    dormant_stop: bool,
     valuation_per_lot: u64,
     quantity_lots: u64,
     notional: u128,
@@ -1086,10 +1108,25 @@ impl ReservationSnapshot {
         self.side
     }
 
-    /// Returns the resting limit price.
+    /// Returns the conservative market or limit execution constraint.
     #[must_use]
-    pub const fn price(self) -> Price {
-        self.price
+    pub const fn constraint(self) -> RiskPriceConstraint {
+        self.constraint
+    }
+
+    /// Returns the limit price, or `None` for market-constrained dormant stops.
+    #[must_use]
+    pub const fn price(self) -> Option<Price> {
+        match self.constraint {
+            RiskPriceConstraint::Market => None,
+            RiskPriceConstraint::Limit(price) => Some(price),
+        }
+    }
+
+    /// Returns whether this reservation belongs to a dormant stop.
+    #[must_use]
+    pub const fn is_dormant_stop(self) -> bool {
+        self.dormant_stop
     }
 
     /// Returns the maximum reachable absolute price magnitude reserved per lot.
@@ -1263,7 +1300,8 @@ impl RiskEngine {
             Command::Cancel(_)
             | Command::MassCancel(_)
             | Command::TradingStateControl(_)
-            | Command::ExpirySweep(_) => Ok(()),
+            | Command::ExpirySweep(_)
+            | Command::StopTriggerSweep(_) => Ok(()),
             Command::Replace(order) => self.authorize_replace(order),
             Command::AccountControl(control) => self
                 .accounts
@@ -1285,7 +1323,9 @@ impl RiskEngine {
             order.side,
             order.quantity.lots(),
             notional,
-            matches!(order.order_type, OrderType::Limit(_)) && order.time_in_force.may_rest(),
+            order.order_type.stop().is_some()
+                || (matches!(order.order_type, OrderType::Limit(_))
+                    && order.time_in_force.may_rest()),
         )
     }
 
@@ -1347,26 +1387,34 @@ impl RiskEngine {
         let constraint = match order_type {
             OrderType::Market => RiskPriceConstraint::Market,
             OrderType::Limit(price) => RiskPriceConstraint::Limit(price),
+            OrderType::Stop { activation, .. } => match activation {
+                crate::matching::StopActivation::Market => RiskPriceConstraint::Market,
+                crate::matching::StopActivation::Limit(price) => RiskPriceConstraint::Limit(price),
+            },
         };
         conservative_order_notional(self.definition, side, constraint, quantity)
             .map_err(matching_risk_rejection)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one trace reducer keeps every matching event's reservation transition exhaustive"
+    )]
     fn apply(&mut self, command: Command, report: &ExecutionReport) {
         if !matches!(report.outcome, CommandOutcome::Accepted) {
             return;
         }
-        let replacement_side = if let Command::Replace(order) = command {
+        let old_reservation = if let Command::Replace(order) = command {
             Some(
                 self.reservations
                     .get(&order.order_id)
                     .expect("accepted replacement must have an existing reservation")
-                    .snapshot
-                    .side,
+                    .snapshot,
             )
         } else {
             None
         };
+        let replacement_side = old_reservation.map(|reservation| reservation.side);
         if let Command::Replace(order) = command {
             self.remove_reservation(order.order_id);
         }
@@ -1374,30 +1422,63 @@ impl RiskEngine {
         for event in &report.events {
             match event.kind {
                 EventKind::Trade(trade) => self.apply_trade(trade),
+                EventKind::StopOrderTriggered { order_id, .. } => {
+                    self.activate_reservation(order_id);
+                }
                 EventKind::OrderCancelled { order_id, .. } => {
                     if self.reservations.contains_key(&order_id) {
                         self.remove_reservation(order_id);
                     }
                 }
                 EventKind::SelfTradePrevented {
+                    aggressor_order_id,
                     resting_order_id,
                     quantity,
                     policy: SelfTradePrevention::DecrementAndCancel,
                     ..
-                } => self.decrement_reservation(resting_order_id, quantity.lots()),
+                } => {
+                    self.decrement_reservation(resting_order_id, quantity.lots());
+                    self.decrement_reservation(aggressor_order_id, quantity.lots());
+                }
                 _ => {}
             }
         }
 
         match command {
             Command::New(order) => {
-                if let Some((price, quantity)) = rested_order(report, order.order_id) {
+                if report.events.iter().any(|event| {
+                    matches!(
+                        event.kind,
+                        EventKind::StopOrderArmed { order_id, .. } if order_id == order.order_id
+                    )
+                }) {
+                    let constraint = match order.order_type {
+                        OrderType::Stop { activation, .. } => match activation {
+                            crate::matching::StopActivation::Market => RiskPriceConstraint::Market,
+                            crate::matching::StopActivation::Limit(price) => {
+                                RiskPriceConstraint::Limit(price)
+                            }
+                        },
+                        OrderType::Market | OrderType::Limit(_) => {
+                            unreachable!("StopOrderArmed requires a stop command")
+                        }
+                    };
                     self.insert_reservation(
                         order.order_id,
                         order.account_id,
                         order.side,
-                        price,
+                        constraint,
+                        order.quantity.lots(),
+                        true,
+                    );
+                } else if let Some((price, quantity)) = rested_order(report, order.order_id) {
+                    self.insert_reservation(
+                        order.order_id,
+                        order.account_id,
+                        order.side,
+                        RiskPriceConstraint::Limit(price),
                         quantity,
+                        false,
                     );
                 }
             }
@@ -1405,23 +1486,27 @@ impl RiskEngine {
             | Command::MassCancel(_)
             | Command::AccountControl(_)
             | Command::TradingStateControl(_)
-            | Command::ExpirySweep(_) => {}
+            | Command::ExpirySweep(_)
+            | Command::StopTriggerSweep(_) => {}
             Command::Replace(order) => {
-                if replacement_retained_priority(report, order.order_id) {
+                let dormant = old_reservation.is_some_and(|reservation| reservation.dormant_stop);
+                if dormant || replacement_retained_priority(report, order.order_id) {
                     self.insert_reservation(
                         order.order_id,
                         order.account_id,
                         replacement_side.expect("replacement side was captured before removal"),
-                        order.new_price,
+                        RiskPriceConstraint::Limit(order.new_price),
                         order.new_quantity.lots(),
+                        dormant,
                     );
                 } else if let Some((price, quantity)) = rested_order(report, order.order_id) {
                     self.insert_reservation(
                         order.order_id,
                         order.account_id,
                         replacement_side.expect("replacement side was captured before removal"),
-                        price,
+                        RiskPriceConstraint::Limit(price),
                         quantity,
+                        false,
                     );
                 }
             }
@@ -1430,6 +1515,7 @@ impl RiskEngine {
 
     fn apply_trade(&mut self, trade: Trade) {
         self.decrement_reservation(trade.maker_order_id, trade.quantity.lots());
+        self.decrement_reservation(trade.taker_order_id, trade.quantity.lots());
         let quantity = i128::from(trade.quantity.lots());
         let buyer = self
             .accounts
@@ -1456,18 +1542,19 @@ impl RiskEngine {
         order_id: OrderId,
         account_id: AccountId,
         side: Side,
-        price: Price,
+        constraint: RiskPriceConstraint,
         quantity_lots: u64,
+        dormant_stop: bool,
     ) {
-        let valuation_per_lot =
-            conservative_price_magnitude(self.definition, side, RiskPriceConstraint::Limit(price));
+        let valuation_per_lot = conservative_price_magnitude(self.definition, side, constraint);
         let notional = u128::from(valuation_per_lot)
             .checked_mul(u128::from(quantity_lots))
             .expect("pre-trade notional capacity must cover resting leaves");
         let reservation = ReservationSnapshot {
             account_id,
             side,
-            price,
+            constraint,
+            dormant_stop,
             valuation_per_lot,
             quantity_lots,
             notional,
@@ -1560,9 +1647,19 @@ impl RiskEngine {
             order_id,
             current.account_id,
             current.side,
-            current.price,
+            current.constraint,
             current.quantity_lots - quantity_lots,
+            current.dormant_stop,
         );
+    }
+
+    fn activate_reservation(&mut self, order_id: OrderId) {
+        let reservation = self
+            .reservations
+            .get_mut(&order_id)
+            .expect("triggered stop must retain its risk reservation");
+        assert!(reservation.snapshot.dormant_stop);
+        reservation.snapshot.dormant_stop = false;
     }
 
     fn remove_reservation(&mut self, order_id: OrderId) -> ReservationSnapshot {
@@ -1665,7 +1762,7 @@ impl RiskEngine {
             let expected_valuation = conservative_price_magnitude(
                 self.definition,
                 reservation.side,
-                RiskPriceConstraint::Limit(reservation.price),
+                reservation.constraint,
             );
             let expected_notional = u128::from(expected_valuation)
                 .checked_mul(u128::from(reservation.quantity_lots))
@@ -2088,11 +2185,40 @@ impl RiskManagedOrderBook {
                 })?;
             if order.account_id != reservation.account_id
                 || order.side != reservation.side
-                || order.price != reservation.price
+                || RiskPriceConstraint::Limit(order.price) != reservation.constraint
+                || reservation.dormant_stop
                 || order.leaves_quantity.lots() != reservation.quantity_lots
             {
                 return Err(RiskInvariantViolation::new(format!(
                     "reservation {} differs from matching order",
+                    order.order_id
+                )));
+            }
+        }
+        for order in self.book.dormant_stop_states() {
+            let reservation = self
+                .risk
+                .reservations
+                .get(&order.order_id)
+                .map(|active| active.snapshot)
+                .ok_or_else(|| {
+                    RiskInvariantViolation::new(format!(
+                        "dormant stop {} has no risk reservation",
+                        order.order_id
+                    ))
+                })?;
+            let constraint = match order.activation {
+                crate::matching::StopActivation::Market => RiskPriceConstraint::Market,
+                crate::matching::StopActivation::Limit(price) => RiskPriceConstraint::Limit(price),
+            };
+            if order.account_id != reservation.account_id
+                || order.side != reservation.side
+                || constraint != reservation.constraint
+                || !reservation.dormant_stop
+                || order.leaves_quantity.lots() != reservation.quantity_lots
+            {
+                return Err(RiskInvariantViolation::new(format!(
+                    "reservation {} differs from dormant stop",
                     order.order_id
                 )));
             }
@@ -2360,8 +2486,8 @@ fn checked_audit_add(current: u128, quantity: u64) -> Result<u128, RiskInvariant
 mod reservation_capacity_tests {
     use super::{
         AccountRiskState, MatchingCapacity, MatchingError, RiskEngine, RiskLimitSpec, RiskLimits,
-        RiskManagedLimits, RiskManagedLimitsSpec, RiskProfile, RiskSnapshot, try_new_risk_accounts,
-        try_new_risk_reservations,
+        RiskManagedLimits, RiskManagedLimitsSpec, RiskPriceConstraint, RiskProfile, RiskSnapshot,
+        try_new_risk_accounts, try_new_risk_reservations,
     };
     use crate::instrument::{
         InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -2420,8 +2546,9 @@ mod reservation_capacity_tests {
                 OrderId::new(order_id).unwrap(),
                 account_id,
                 Side::Buy,
-                Price::from_raw(100),
+                RiskPriceConstraint::Limit(Price::from_raw(100)),
                 2,
+                false,
             );
         }
         risk.validate().unwrap();
@@ -2533,8 +2660,9 @@ mod reservation_capacity_tests {
             third,
             AccountId::new(1).unwrap(),
             Side::Buy,
-            Price::from_raw(100),
+            RiskPriceConstraint::Limit(Price::from_raw(100)),
             4,
+            false,
         );
         reordered.remove_reservation(OrderId::new(20).unwrap());
         reordered.validate().unwrap();

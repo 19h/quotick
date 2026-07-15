@@ -80,7 +80,7 @@ fn snapshot_round_trip_has_stable_header_and_detects_corruption() {
         receipt.payload_length() + 28
     );
     assert_eq!(&bytes[0..4], b"QSNP");
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 5);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 6);
     assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 1);
     assert_eq!(
         u64::from_le_bytes(bytes[8..16].try_into().unwrap()),

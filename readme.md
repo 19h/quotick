@@ -208,6 +208,10 @@ book applies it.
 - GTD orders use absolute UTC nanosecond deadlines and expire only through an
   explicit sequenced inclusive watermark advance. Expiry order is canonical
   `(deadline, OrderId)` order; no wall clock is read by the matching engine.
+- Stop-market and stop-limit orders remain dormant and absent from public
+  depth until an explicit sequenced last-trade reference reaches their trigger.
+  Bounded sweeps activate a canonical `(trigger, priority, OrderId)` prefix;
+  eligible backlog must drain at the same reference before it can advance.
 - Cancel and replace with ownership checks and explicit priority-retention
   rules; account-scoped mass cancellation emitted in ascending `OrderId`
   order with exact final counts and cancelled-lot totals.
@@ -223,11 +227,11 @@ book applies it.
 - A `prepare()`/`commit()` split that validates a command once against an
   immutable borrow so it can be persisted before mutating the book; stale or
   foreign preparations cannot commit.
-- Constructor-reserved everything: stable-slot AVL price and GTD-expiry arenas,
-  one
-  append-only event arena shared in `O(1)` by reports, the retry cache, and
-  checkpoints, and fixed dense/open-addressed hash indexes — the matching hot
-  path never allocates, grows, or rehashes, including under deletion churn.
+- Constructor-reserved everything: stable-slot AVL price, GTD-expiry, and
+  buy/sell stop-trigger arenas, one append-only event arena shared in `O(1)` by
+  reports, the retry cache, checkpoints, and fixed dense/open-addressed hash
+  indexes — the matching hot path never allocates, grows, or rehashes,
+  including under deletion churn.
 - Protected command-history and event tails that keep cancellation, expiry
   sweeps, block-and-cancel, and entry-closing transitions available when
   ordinary capacity is exhausted; residual-aware admission proves whether a
@@ -267,9 +271,11 @@ book applies it.
   business rejections always precede risk, and risk rejections are ordinary
   sequenced reports, never errors.
 - Reservation lifecycle derived from the sequenced trace across fills,
-  cancellation, GTD expiry, replacement, mass cancellation, account controls,
-  and self-trade prevention; auction uncross releases both paired reservations
-  and nets buys against sells once per account.
+  cancellation, GTD expiry, stop arming/activation, replacement, mass
+  cancellation, account controls, and self-trade prevention; dormant stops
+  reserve against their activation constraint without appearing in depth.
+  Auction uncross releases both paired reservations and nets buys against sells
+  once per account.
 - Full cross-audits between active orders, reservations, aggregates, and
   positions.
 
@@ -283,6 +289,10 @@ book applies it.
 - Full-depth snapshots in canonical market-priority order; replicas detect
   missing, duplicated, and reordered updates and recover from gaps by
   atomically swapping double-buffered, pre-reserved snapshot arenas.
+- Continuous publishers mirror dormant stop identities, trigger indices, and
+  the committed reference privately to validate canonical activation. Stop-only
+  state changes publish `NoBookChange`; triggered execution publishes ordinary
+  depth, refresh, cancellation, and trade updates.
 - Independent publisher/replica stacks for the continuous and auction paths
   with validated limit envelopes; publisher construction proves its envelope
   covers the source shard, and publishers cross-audit against the source.
@@ -308,7 +318,7 @@ book applies it.
 
 ### Durability and recovery
 
-- Versioned CRC-32C WAL frames (format 5) with bounded payloads and
+- Versioned CRC-32C WAL frames (format 6) with bounded payloads and
   contiguous sequences, as a single-file `Journal` or a size-bounded
   `SegmentedJournal` rotating whole frames and batches under one global
   sequence.
@@ -318,7 +328,7 @@ book applies it.
   writer leases with explicit abandoned-writer recovery.
 - Strict corruption detection: only a physically incomplete final frame may be
   repaired, and closed segments are always scanned strictly.
-- Versioned, bounded `QSNP` semantic snapshots (format 5) with monotonic
+- Versioned, bounded `QSNP` semantic snapshots (format 6) with monotonic
   exact-prefix lineage and synchronized atomic replacement.
 - Durable runtimes for matching, coupled risk/matching, call auctions, and
   coupled auction/risk record every command before committing the in-memory
@@ -356,7 +366,7 @@ never grows it afterward. The defaults:
 | Component | Defaults |
 | --- | --- |
 | Instrument catalog | 4,096 assets; 16,384 instruments; 65,536 definitions |
-| `OrderBookLimits` | 4,096 active orders; 4,096 active accounts; 4,096 price levels per side; 65,536 accepted order IDs; 65,536 account controls; 65,536 retained commands (final 4,096 reserved for cancellation-capable commands); 65,536 events per report; 262,144 retained events (final 4,097 protected); 2 order-selection buffers |
+| `OrderBookLimits` | 4,096 active orders, including dormant stops; 4,096 active accounts; 4,096 price levels per side; 65,536 accepted order IDs; 65,536 account controls; 65,536 retained commands (final 4,096 reserved for cancellation-capable commands); 65,536 events per report; 262,144 retained events (final 4,097 protected); 2 order-selection buffers |
 | Risk | 65,536 registered accounts (continuous and auction) |
 | Call auction | 4,096 active orders; 4,096 limit prices per side; 65,536 accepted order IDs; 2 prepared-uncross buffer sets; 65,536 retained commands (final 4,098 terminal); 73,730 retained events (final 8,194 terminal); 8,193 events per report; 65,536 orders per side in the allocation kernel |
 | Market data | 65,536 updates per continuous batch; 8,193 per auction batch; mirror envelopes default to the source components' limits |
@@ -378,8 +388,10 @@ market-data transport, administrative interfaces, or reporting systems.
 The matching model is a continuous price-time-priority book with sequenced
 instrument-wide trading-state controls, plus a separate bounded call-auction
 path with banded aggregate discovery, price-time allocation, and a
-process-local atomic uncross. The platform does not implement stop or pegged
-orders, discretionary ranges, day/session-calendar expiry, cross-instrument or
+process-local atomic uncross. Continuous stop orders require an authoritative
+external source to submit each sequenced reference; matching never infers one
+from local trades or wall time. The platform does not implement pegged orders,
+discretionary ranges, day/session-calendar expiry, cross-instrument or
 multi-leg execution, volatility-interruption trigger logic, or venue-specific
 priority rule sets. The auction path additionally provides no ledger effects,
 reference or dynamic-band derivation, preventive self-trade policies, calendar
@@ -395,11 +407,11 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 101 tagged assumptions (A1–A101), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 102 tagged assumptions (A1–A102), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
-| [WAL format v5](docs/wal-v5.md) | Current write-ahead-log frame and record schema |
-| [Snapshot format v5](docs/snapshot-v5.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
+| [WAL format v6](docs/wal-v6.md) | Current write-ahead-log frame and record schema |
+| [Snapshot format v6](docs/snapshot-v6.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
 | [Market-data payload v2](docs/market-data-v2.md) | Current continuous market-data update/snapshot payloads |
 | [Auction market-data payload v1](docs/auction-market-data-v1.md) | Current call-auction market-data payloads |
 | [Auction-risk checkpoint payload v1](docs/auction-risk-checkpoint-v1.md) | Current coupled call-auction risk checkpoint payload |
@@ -407,9 +419,11 @@ assumptions are documented in
 Historical formats whose envelopes the runtime rejects are retained as
 byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/wal-v4.md](docs/wal-v4.md),
+[docs/wal-v5.md](docs/wal-v5.md),
 [docs/snapshot-v2.md](docs/snapshot-v2.md), and
 [docs/snapshot-v3.md](docs/snapshot-v3.md), and
-[docs/snapshot-v4.md](docs/snapshot-v4.md).
+[docs/snapshot-v4.md](docs/snapshot-v4.md), and
+[docs/snapshot-v5.md](docs/snapshot-v5.md).
 
 ## Build and verify
 
@@ -426,9 +440,11 @@ fixed-seed PRNGs against independent in-test reference models. Coverage
 includes:
 
 - **Matching and risk:** priority and FIFO boundaries, reserve admission and
-  replenishment, GTD intake and canonical expiry sweeps, mass cancellation,
-  account and trading-state controls, every self-trade policy, risk rejection
-  and reservation release, and capacity behavior at every configured bound.
+  replenishment, GTD intake and canonical expiry sweeps, dormant stop intake,
+  canonical bounded trigger sweeps, activation-time failures, mass
+  cancellation, account and trading-state controls, every self-trade policy,
+  risk rejection and reservation release, and capacity behavior at every
+  configured bound.
 - **Call auctions:** discovery differentially checked against exhaustive
   tick-grid enumeration, allocation against literal order-priority walks,
   20,000 mixed book mutations and 10,000 uncross cases against independent

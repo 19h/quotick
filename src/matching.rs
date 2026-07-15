@@ -17,6 +17,7 @@
 //! active order in crossed levels at most once; it never materializes reserve
 //! replenishment slices.
 
+use std::cmp::Reverse;
 use std::fmt;
 use std::hash::Hash;
 use std::ops::Index;
@@ -52,13 +53,70 @@ fn next_order_book_instance_id() -> Result<u64, MatchingError> {
     }
 }
 
-/// The price constraint attached to a new order.
+/// Execution constraint applied when an order is immediately active or a stop
+/// order is triggered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StopActivation {
+    /// Execute at available prices and cancel any unfilled remainder.
+    Market,
+    /// Execute at the specified price or better and apply the order lifetime
+    /// to any residual.
+    Limit(Price),
+}
+
+impl StopActivation {
+    const fn order_type(self) -> OrderType {
+        match self {
+            Self::Market => OrderType::Market,
+            Self::Limit(price) => OrderType::Limit(price),
+        }
+    }
+
+    const fn risk_price(self) -> Option<Price> {
+        match self {
+            Self::Market => None,
+            Self::Limit(price) => Some(price),
+        }
+    }
+}
+
+/// The price and trigger constraint attached to a new order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OrderType {
     /// Execute at available prices and never rest.
     Market,
     /// Execute at the specified price or better.
     Limit(Price),
+    /// Remain dormant until the explicit last-trade reference reaches the
+    /// side-derived trigger condition, then apply the supplied constraint.
+    Stop {
+        /// Buy stops trigger at or above this price; sell stops trigger at or
+        /// below it.
+        trigger_price: Price,
+        /// Constraint applied after deterministic activation.
+        activation: StopActivation,
+    },
+}
+
+impl OrderType {
+    /// Returns the dormant stop instruction, if this is a stop order.
+    #[must_use]
+    pub const fn stop(self) -> Option<(Price, StopActivation)> {
+        match self {
+            Self::Stop {
+                trigger_price,
+                activation,
+            } => Some((trigger_price, activation)),
+            Self::Market | Self::Limit(_) => None,
+        }
+    }
+
+    const fn active(self) -> Self {
+        match self {
+            Self::Market | Self::Limit(_) => self,
+            Self::Stop { activation, .. } => activation.order_type(),
+        }
+    }
 }
 
 /// Quantity exposure policy for a resting limit order.
@@ -176,7 +234,7 @@ pub struct NewOrder {
     pub quantity: Quantity,
     /// Fully displayed or fixed-peak reserve exposure while resting.
     pub display: OrderDisplay,
-    /// Market or limit constraint.
+    /// Immediate market/limit or dormant stop constraint.
     pub order_type: OrderType,
     /// Lifetime constraint.
     pub time_in_force: TimeInForce,
@@ -186,7 +244,7 @@ pub struct NewOrder {
     pub received_at: TimestampNs,
 }
 
-/// A request to cancel a resting order.
+/// A request to cancel a resting or dormant order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CancelOrder {
     /// Idempotency key for the command.
@@ -206,9 +264,9 @@ pub struct CancelOrder {
 /// Selection applied by one account-scoped mass-cancel command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MassCancelScope {
-    /// Cancel every resting order owned by the account in this instrument shard.
+    /// Cancel every active order owned by the account in this instrument shard.
     All,
-    /// Cancel only resting orders on one side.
+    /// Cancel only active orders on one side.
     Side(Side),
 }
 
@@ -223,7 +281,7 @@ impl MassCancelScope {
     }
 }
 
-/// A request to cancel a canonical account-scoped set of resting orders.
+/// A request to cancel a canonical account-scoped set of active orders.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MassCancel {
     /// Idempotency key for the mass-cancel control.
@@ -240,7 +298,7 @@ pub struct MassCancel {
     pub received_at: TimestampNs,
 }
 
-/// A request to replace the leaves quantity and limit price of a resting order.
+/// A request to replace a resting limit or dormant stop-limit order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplaceOrder {
     /// Idempotency key for the command.
@@ -279,7 +337,7 @@ pub enum AccountAdmissionState {
 /// Revisioned administrative transition for one account admission fence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccountControlAction {
-    /// Close entry atomically and cancel every resting order for the account.
+    /// Close entry atomically and cancel every active order for the account.
     BlockAndCancel,
     /// Reopen entry without creating or modifying any order.
     Enable,
@@ -316,9 +374,9 @@ pub struct AccountControl {
 /// Mutation applied by one instrument-wide trading-state control.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TradingStateControlAction {
-    /// Change state without cancelling resting orders.
+    /// Change state without cancelling active orders.
     Transition,
-    /// Change to an entry-closed state and atomically cancel every resting order.
+    /// Change to an entry-closed state and atomically cancel every active order.
     TransitionAndCancel,
 }
 
@@ -353,6 +411,24 @@ pub struct ExpirySweep {
     /// Inclusive absolute expiration horizon.
     pub through: TimestampNs,
     /// Gateway/controller receive time; the horizon cannot exceed this value.
+    pub received_at: TimestampNs,
+}
+
+/// Advances the deterministic last-trade stop reference and activates a
+/// bounded canonical prefix of newly eligible dormant stops.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StopTriggerSweep {
+    /// Globally unique idempotency key within the shard generation.
+    pub command_id: CommandId,
+    /// Routed instrument.
+    pub instrument_id: InstrumentId,
+    /// Immutable instrument-definition version expected by the controller.
+    pub instrument_version: InstrumentVersion,
+    /// New authoritative last-trade reference price.
+    pub reference_price: Price,
+    /// Maximum dormant orders this command may activate.
+    pub maximum_orders: u32,
+    /// Gateway/controller receive time.
     pub received_at: TimestampNs,
 }
 
@@ -411,18 +487,20 @@ impl AccountControlSnapshot {
 pub enum Command {
     /// Submit a new order.
     New(NewOrder),
-    /// Cancel a resting order.
+    /// Cancel a resting or dormant order.
     Cancel(CancelOrder),
-    /// Replace a resting order.
+    /// Replace a resting limit or dormant stop-limit order.
     Replace(ReplaceOrder),
-    /// Cancel an account-scoped set of resting orders.
+    /// Cancel an account-scoped set of active orders.
     MassCancel(MassCancel),
-    /// Change an account admission fence, optionally cancelling all resting orders atomically.
+    /// Change an account admission fence, optionally cancelling all active orders atomically.
     AccountControl(AccountControl),
     /// Change the instrument-wide effective trading state.
     TradingStateControl(TradingStateControl),
     /// Expire every GTD order at or before an inclusive absolute horizon.
     ExpirySweep(ExpirySweep),
+    /// Advance the last-trade stop reference and activate a bounded prefix.
+    StopTriggerSweep(StopTriggerSweep),
 }
 
 impl Command {
@@ -435,6 +513,7 @@ impl Command {
             Self::AccountControl(command) => command.command_id,
             Self::TradingStateControl(command) => command.command_id,
             Self::ExpirySweep(command) => command.command_id,
+            Self::StopTriggerSweep(command) => command.command_id,
         }
     }
 
@@ -447,6 +526,7 @@ impl Command {
             Self::AccountControl(command) => command.received_at,
             Self::TradingStateControl(command) => command.received_at,
             Self::ExpirySweep(command) => command.received_at,
+            Self::StopTriggerSweep(command) => command.received_at,
         }
     }
 }
@@ -536,6 +616,20 @@ pub enum RejectReason {
     ExpiryWatermarkRegression,
     /// An expiry sweep horizon was later than the command's own receive time.
     ExpiryHorizonAfterCommandTime,
+    /// A stop order was submitted before any authoritative reference price.
+    StopReferenceUnavailable,
+    /// A stop condition was already satisfied by the committed reference.
+    StopAlreadyTriggered,
+    /// A stop-trigger command requested no activations.
+    StopTriggerBatchEmpty,
+    /// A stop-trigger command requested more orders than the active-order bound.
+    StopTriggerBatchExceedsActiveOrderCapacity,
+    /// Eligible stops at the current reference must be drained before it moves.
+    StopTriggerBacklog,
+    /// A dormant stop-market order cannot use post-only behavior.
+    StopMarketCannotPost,
+    /// The replacement schema cannot amend a dormant stop-market constraint.
+    StopMarketCannotBeReplaced,
 }
 
 impl From<AdmissionError> for RejectReason {
@@ -577,6 +671,12 @@ pub enum CancelReason {
     TradingStateControl,
     /// Resting GTD quantity reached an explicit inclusive expiry watermark.
     Expired,
+    /// A triggered FOK stop could not fill completely at activation.
+    TriggeredFokUnfilled,
+    /// A triggered post-only stop-limit would remove liquidity.
+    TriggeredPostOnlyWouldCross,
+    /// A triggered stop-limit residual could not enter its bounded price arena.
+    TriggeredCapacityUnavailable,
 }
 
 /// Whether a filled order supplied or removed liquidity.
@@ -655,7 +755,7 @@ pub enum EventKind {
         account_id: AccountId,
         /// Selection applied within the instrument shard.
         scope: MassCancelScope,
-        /// Number of cancelled resting orders.
+        /// Number of cancelled active orders.
         cancelled_order_count: u64,
         /// Sum of cancelled total leaves in lots, including hidden reserve leaves.
         cancelled_quantity_lots: u128,
@@ -670,7 +770,7 @@ pub enum EventKind {
         current_state: AccountAdmissionState,
         /// Newly committed monotonically increasing account-control revision.
         revision: u64,
-        /// Number of resting orders atomically removed by the transition.
+        /// Number of active orders atomically removed by the transition.
         cancelled_order_count: u64,
         /// Sum of removed total leaves in lots, including hidden reserve leaves.
         cancelled_quantity_lots: u128,
@@ -683,7 +783,7 @@ pub enum EventKind {
         current_state: TradingState,
         /// Newly committed monotonically increasing control revision.
         revision: u64,
-        /// Number of resting orders atomically removed by the transition.
+        /// Number of active orders atomically removed by the transition.
         cancelled_order_count: u64,
         /// Sum of removed total leaves in lots, including hidden reserve leaves.
         cancelled_quantity_lots: u128,
@@ -694,10 +794,43 @@ pub enum EventKind {
         previous_watermark: Option<TimestampNs>,
         /// Newly committed inclusive watermark.
         current_watermark: TimestampNs,
-        /// Number of resting GTD orders removed by this sweep.
+        /// Number of resting or dormant GTD orders removed by this sweep.
         expired_order_count: u64,
         /// Sum of removed total leaves in lots, including hidden reserve leaves.
         expired_quantity_lots: u128,
+    },
+    /// A validated stop order entered the dormant trigger index.
+    StopOrderArmed {
+        /// Dormant order identifier.
+        order_id: OrderId,
+        /// Side-derived trigger threshold.
+        trigger_price: Price,
+        /// Constraint applied after triggering.
+        activation: StopActivation,
+        /// Monotonic matching-event sequence used as same-price trigger priority.
+        priority_sequence: u64,
+    },
+    /// One dormant stop left the trigger index and became an incoming order.
+    StopOrderTriggered {
+        /// Activated order identifier.
+        order_id: OrderId,
+        /// Original trigger threshold.
+        trigger_price: Price,
+        /// Reference price that satisfied the trigger.
+        reference_price: Price,
+        /// Retained same-price trigger priority.
+        priority_sequence: u64,
+    },
+    /// A bounded stop-reference advance completed atomically.
+    StopTriggerSweepCompleted {
+        /// Previously committed reference, absent before initialization.
+        previous_reference_price: Option<Price>,
+        /// Newly committed authoritative reference.
+        current_reference_price: Price,
+        /// Number of stops activated by this command.
+        triggered_order_count: u64,
+        /// Eligible stops retained for a same-reference continuation.
+        remaining_eligible_order_count: u64,
     },
     /// A trade occurred.
     Trade(Trade),
@@ -710,7 +843,7 @@ pub enum EventKind {
         /// Cancellation cause.
         reason: CancelReason,
     },
-    /// A resting order was amended.
+    /// A resting limit or dormant stop-limit order was amended.
     OrderReplaced {
         /// Amended order.
         order_id: OrderId,
@@ -1351,6 +1484,33 @@ pub struct OrderSnapshot {
     pub expires_at: Option<TimestampNs>,
 }
 
+/// Private state of one accepted stop order that has not yet triggered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DormantStopSnapshot {
+    /// Order identifier.
+    pub order_id: OrderId,
+    /// Owner account.
+    pub account_id: AccountId,
+    /// Buy or sell trigger direction.
+    pub side: Side,
+    /// Total dormant leaves quantity.
+    pub leaves_quantity: Quantity,
+    /// Persistent display policy applied if a stop-limit residual rests.
+    pub display: OrderDisplay,
+    /// Side-derived trigger threshold.
+    pub trigger_price: Price,
+    /// Constraint applied after activation.
+    pub activation: StopActivation,
+    /// Activation-time lifetime policy.
+    pub time_in_force: TimeInForce,
+    /// Self-trade prevention applied after activation.
+    pub self_trade_prevention: SelfTradePrevention,
+    /// Monotonic same-price trigger priority.
+    pub priority_sequence: u64,
+    /// Absolute GTD expiration, if present.
+    pub expires_at: Option<TimestampNs>,
+}
+
 /// Complete private state of one resting order in a semantic checkpoint.
 ///
 /// Entries are stored in canonical side/price order and FIFO order within a
@@ -1425,6 +1585,94 @@ impl RestingOrderCheckpoint {
     }
 }
 
+/// Complete private state of one dormant stop in a semantic checkpoint.
+///
+/// Rows are canonical: buy stops precede sell stops; buy triggers ascend,
+/// sell triggers descend, and each equal trigger follows priority sequence
+/// then order identifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DormantStopCheckpoint {
+    pub(crate) order_id: OrderId,
+    pub(crate) account_id: AccountId,
+    pub(crate) side: Side,
+    pub(crate) leaves: Quantity,
+    pub(crate) display: OrderDisplay,
+    pub(crate) self_trade_prevention: SelfTradePrevention,
+    pub(crate) expires_at: Option<TimestampNs>,
+    pub(crate) trigger_price: Price,
+    pub(crate) activation: StopActivation,
+    pub(crate) time_in_force: TimeInForce,
+    pub(crate) priority_sequence: u64,
+}
+
+impl DormantStopCheckpoint {
+    /// Returns the private order identifier.
+    #[must_use]
+    pub const fn order_id(self) -> OrderId {
+        self.order_id
+    }
+
+    /// Returns the owning account.
+    #[must_use]
+    pub const fn account_id(self) -> AccountId {
+        self.account_id
+    }
+
+    /// Returns the stop side.
+    #[must_use]
+    pub const fn side(self) -> Side {
+        self.side
+    }
+
+    /// Returns total dormant leaves.
+    #[must_use]
+    pub const fn leaves(self) -> Quantity {
+        self.leaves
+    }
+
+    /// Returns the activation-time display policy.
+    #[must_use]
+    pub const fn display(self) -> OrderDisplay {
+        self.display
+    }
+
+    /// Returns the activation-time self-trade policy.
+    #[must_use]
+    pub const fn self_trade_prevention(self) -> SelfTradePrevention {
+        self.self_trade_prevention
+    }
+
+    /// Returns the absolute GTD expiration, if present.
+    #[must_use]
+    pub const fn expires_at(self) -> Option<TimestampNs> {
+        self.expires_at
+    }
+
+    /// Returns the side-derived trigger threshold.
+    #[must_use]
+    pub const fn trigger_price(self) -> Price {
+        self.trigger_price
+    }
+
+    /// Returns the constraint applied after triggering.
+    #[must_use]
+    pub const fn activation(self) -> StopActivation {
+        self.activation
+    }
+
+    /// Returns the activation-time lifetime policy.
+    #[must_use]
+    pub const fn time_in_force(self) -> TimeInForce {
+        self.time_in_force
+    }
+
+    /// Returns same-trigger activation priority.
+    #[must_use]
+    pub const fn priority_sequence(self) -> u64 {
+        self.priority_sequence
+    }
+}
+
 /// One chronologically ordered idempotency entry in a matching checkpoint.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandReportCheckpoint {
@@ -1457,6 +1705,7 @@ pub struct OrderBookCheckpoint {
     wal_sequence: u64,
     definition: InstrumentDefinition,
     orders: Arc<Vec<RestingOrderCheckpoint>>,
+    dormant_stops: Arc<Vec<DormantStopCheckpoint>>,
     history: Arc<Vec<CommandReportCheckpoint>>,
 }
 
@@ -1466,6 +1715,7 @@ struct OrderBookCheckpointLineage {
     account_controls: BoundedHashMap<AccountId, AccountControlSnapshot>,
     trading_state: TradingStateSnapshot,
     expiry_watermark: Option<TimestampNs>,
+    stop_reference_price: Option<Price>,
     retained_event_count: usize,
     next_sequence: u64,
     next_trade_id: u64,
@@ -1502,7 +1752,7 @@ impl OrderBookCheckpoint {
     /// Returns the number of active private orders.
     #[must_use]
     pub fn active_order_count(&self) -> usize {
-        self.orders.len()
+        self.orders.len().saturating_add(self.dormant_stops.len())
     }
 
     /// Returns the number of completed commands retained for exact retry.
@@ -1511,10 +1761,16 @@ impl OrderBookCheckpoint {
         self.history.len()
     }
 
-    /// Returns canonical private active-order state.
+    /// Returns canonical private resting-order state.
     #[must_use]
     pub fn orders(&self) -> &[RestingOrderCheckpoint] {
         self.orders.as_slice()
+    }
+
+    /// Returns canonical private dormant-stop state.
+    #[must_use]
+    pub fn dormant_stops(&self) -> &[DormantStopCheckpoint] {
+        self.dormant_stops.as_slice()
     }
 
     /// Returns chronological command/report idempotency state.
@@ -1523,10 +1779,11 @@ impl OrderBookCheckpoint {
         self.history.as_slice()
     }
 
-    /// Returns whether two checkpoints share the identical immutable active-order image.
+    /// Returns whether two checkpoints share both immutable order-state images.
     #[must_use]
     pub fn shares_order_storage_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.orders, &other.orders)
+            && Arc::ptr_eq(&self.dormant_stops, &other.dormant_stops)
     }
 
     /// Returns whether two checkpoints share the identical immutable history image.
@@ -1540,6 +1797,7 @@ impl OrderBookCheckpoint {
         wal_sequence: u64,
         definition: InstrumentDefinition,
         orders: Vec<RestingOrderCheckpoint>,
+        dormant_stops: Vec<DormantStopCheckpoint>,
         history: Vec<CommandReportCheckpoint>,
     ) -> Result<Self, OrderBookCheckpointError> {
         Self::from_parts_with_lineage(
@@ -1547,6 +1805,7 @@ impl OrderBookCheckpoint {
             wal_sequence,
             definition,
             orders,
+            dormant_stops,
             history,
         )
         .map(|(checkpoint, _)| checkpoint)
@@ -1557,6 +1816,7 @@ impl OrderBookCheckpoint {
         wal_sequence: u64,
         definition: InstrumentDefinition,
         orders: Vec<RestingOrderCheckpoint>,
+        dormant_stops: Vec<DormantStopCheckpoint>,
         history: Vec<CommandReportCheckpoint>,
     ) -> Result<(Self, OrderBookCheckpointLineage), OrderBookCheckpointError> {
         let checkpoint = Self {
@@ -1564,6 +1824,7 @@ impl OrderBookCheckpoint {
             wal_sequence,
             definition,
             orders: Arc::new(orders),
+            dormant_stops: Arc::new(dormant_stops),
             history: Arc::new(history),
         };
         let lineage = checkpoint.validate_lineage()?;
@@ -1611,9 +1872,15 @@ impl OrderBookCheckpoint {
                 self.history.len(),
                 OrderBookCheckpointResource::HistoryAccountControls,
             )?;
+        let mut dormant_lineage: BoundedHashMap<OrderId, DormantStopCheckpoint> =
+            reserve_checkpoint_map(
+                self.history.len(),
+                OrderBookCheckpointResource::HistoryDormantStops,
+            )?;
         let mut trading_state =
             TradingStateSnapshot::from_parts(self.definition.trading_state(), 0);
         let mut expiry_watermark = None;
+        let mut stop_reference_price = None;
         let mut retained_event_count = 0_usize;
         let mut expected_event_sequence = 1_u64;
         let mut expected_trade_id = 1_u64;
@@ -1676,6 +1943,127 @@ impl OrderBookCheckpoint {
                         "checkpoint accepts an order identifier more than once",
                     ));
                 }
+                if let Some((trigger_price, activation)) = order.order_type.stop() {
+                    let reference = stop_reference_price.ok_or_else(|| {
+                        OrderBookCheckpointError::new(
+                            "checkpoint accepts a stop before reference initialization",
+                        )
+                    })?;
+                    let trigger_is_satisfied = match order.side {
+                        Side::Buy => reference >= trigger_price,
+                        Side::Sell => reference <= trigger_price,
+                    };
+                    let (Some(accepted), Some(armed)) =
+                        (entry.report.events.get(0), entry.report.events.get(1))
+                    else {
+                        return Err(OrderBookCheckpointError::new(
+                            "checkpoint accepted stop trace is not arm-only",
+                        ));
+                    };
+                    if entry.report.events.len() != 2
+                        || trigger_is_satisfied
+                        || !matches!(
+                            accepted.kind,
+                            EventKind::OrderAccepted {
+                                order_id,
+                                quantity,
+                                display,
+                            } if order_id == order.order_id
+                                && quantity == order.quantity
+                                && display == order.display
+                        )
+                        || !matches!(
+                            armed.kind,
+                            EventKind::StopOrderArmed {
+                                order_id,
+                                trigger_price: observed_trigger,
+                                activation: observed_activation,
+                                priority_sequence,
+                            } if order_id == order.order_id
+                                && observed_trigger == trigger_price
+                                && observed_activation == activation
+                                && priority_sequence == accepted.sequence
+                        )
+                    {
+                        return Err(OrderBookCheckpointError::new(
+                            "checkpoint accepted stop trace contradicts its command",
+                        ));
+                    }
+                    let checkpoint = DormantStopCheckpoint {
+                        order_id: order.order_id,
+                        account_id: order.account_id,
+                        side: order.side,
+                        leaves: order.quantity,
+                        display: order.display,
+                        trigger_price,
+                        activation,
+                        time_in_force: order.time_in_force,
+                        self_trade_prevention: order.self_trade_prevention,
+                        priority_sequence: accepted.sequence,
+                        expires_at: order.time_in_force.expires_at(),
+                    };
+                    validate_checkpoint_stop(self.definition, checkpoint)?;
+                    dormant_lineage.insert(order.order_id, checkpoint);
+                }
+            }
+            if let (Command::Replace(replace), CommandOutcome::Accepted) =
+                (entry.command, entry.report.outcome)
+                && let Some(previous) = dormant_lineage.get(&replace.order_id).copied()
+            {
+                let Some(event) = entry.report.events.first() else {
+                    return Err(OrderBookCheckpointError::new(
+                        "checkpoint dormant replacement trace has extra transitions",
+                    ));
+                };
+                let StopActivation::Limit(old_price) = previous.activation else {
+                    return Err(OrderBookCheckpointError::new(
+                        "checkpoint replaces a dormant stop-market order",
+                    ));
+                };
+                let priority_retained = old_price == replace.new_price
+                    && replace.new_quantity.lots() <= previous.leaves.lots()
+                    && replace.new_display == previous.display;
+                if entry.report.events.len() != 1
+                    || replace.account_id != previous.account_id
+                    || !matches!(
+                        event.kind,
+                        EventKind::OrderReplaced {
+                            order_id,
+                            old_price: observed_old_price,
+                            new_price,
+                            old_quantity,
+                            new_quantity,
+                            old_display,
+                            new_display,
+                            priority_retained: observed_priority,
+                        } if order_id == replace.order_id
+                            && observed_old_price == old_price
+                            && new_price == replace.new_price
+                            && old_quantity == previous.leaves
+                            && new_quantity == replace.new_quantity
+                            && old_display == previous.display
+                            && new_display == replace.new_display
+                            && observed_priority == priority_retained
+                    )
+                {
+                    return Err(OrderBookCheckpointError::new(
+                        "checkpoint dormant replacement trace contradicts its command",
+                    ));
+                }
+                dormant_lineage.insert(
+                    replace.order_id,
+                    DormantStopCheckpoint {
+                        leaves: replace.new_quantity,
+                        display: replace.new_display,
+                        activation: StopActivation::Limit(replace.new_price),
+                        priority_sequence: if priority_retained {
+                            previous.priority_sequence
+                        } else {
+                            event.sequence
+                        },
+                        ..previous
+                    },
+                );
             }
             if let (Command::AccountControl(control), CommandOutcome::Accepted) =
                 (entry.command, entry.report.outcome)
@@ -1900,10 +2288,115 @@ impl OrderBookCheckpoint {
                 }
                 expiry_watermark = Some(sweep.through);
             }
+            if let (Command::StopTriggerSweep(sweep), CommandOutcome::Accepted) =
+                (entry.command, entry.report.outcome)
+            {
+                if sweep.maximum_orders == 0 {
+                    return Err(OrderBookCheckpointError::new(
+                        "checkpoint accepts an empty stop-trigger batch",
+                    ));
+                }
+                if let Some(current) = stop_reference_price
+                    && current != sweep.reference_price
+                    && eligible_checkpoint_stop_count(&dormant_lineage, current)? != 0
+                {
+                    return Err(OrderBookCheckpointError::new(
+                        "checkpoint advances a stop reference with an eligible backlog",
+                    ));
+                }
+                let initial_eligible =
+                    eligible_checkpoint_stop_count(&dormant_lineage, sweep.reference_price)?;
+                let mut triggered = 0_u64;
+                for event in entry
+                    .report
+                    .events
+                    .iter()
+                    .take(entry.report.events.len() - 1)
+                {
+                    let EventKind::StopOrderTriggered {
+                        order_id,
+                        trigger_price,
+                        reference_price,
+                        priority_sequence,
+                    } = event.kind
+                    else {
+                        continue;
+                    };
+                    let expected =
+                        first_eligible_checkpoint_stop(&dormant_lineage, sweep.reference_price)?
+                            .ok_or_else(|| {
+                                OrderBookCheckpointError::new(
+                                    "checkpoint triggers an absent or ineligible stop",
+                                )
+                            })?;
+                    if expected.order_id != order_id
+                        || expected.trigger_price != trigger_price
+                        || expected.priority_sequence != priority_sequence
+                        || reference_price != sweep.reference_price
+                    {
+                        return Err(OrderBookCheckpointError::new(
+                            "checkpoint stop activation order is not canonical",
+                        ));
+                    }
+                    dormant_lineage.remove(&order_id);
+                    triggered = triggered.checked_add(1).ok_or_else(|| {
+                        OrderBookCheckpointError::new("checkpoint stop-trigger count is exhausted")
+                    })?;
+                }
+                let remaining =
+                    eligible_checkpoint_stop_count(&dormant_lineage, sweep.reference_price)?;
+                if triggered != initial_eligible.min(u64::from(sweep.maximum_orders))
+                    || !matches!(
+                        entry.report.events.last().map(|event| event.kind),
+                        Some(EventKind::StopTriggerSweepCompleted {
+                            previous_reference_price,
+                            current_reference_price,
+                            triggered_order_count,
+                            remaining_eligible_order_count,
+                        }) if previous_reference_price == stop_reference_price
+                            && current_reference_price == sweep.reference_price
+                            && triggered_order_count == triggered
+                            && remaining_eligible_order_count == remaining
+                    )
+                {
+                    return Err(OrderBookCheckpointError::new(
+                        "checkpoint stop-reference lineage is invalid",
+                    ));
+                }
+                stop_reference_price = Some(sweep.reference_price);
+            }
+            for event in &entry.report.events {
+                let EventKind::OrderCancelled {
+                    order_id,
+                    quantity,
+                    reason,
+                } = event.kind
+                else {
+                    continue;
+                };
+                let Some(stop) = dormant_lineage.get(&order_id).copied() else {
+                    continue;
+                };
+                if quantity != stop.leaves
+                    || !matches!(
+                        reason,
+                        CancelReason::UserRequested
+                            | CancelReason::MassCancel
+                            | CancelReason::AccountControl
+                            | CancelReason::TradingStateControl
+                            | CancelReason::Expired
+                    )
+                {
+                    return Err(OrderBookCheckpointError::new(
+                        "checkpoint dormant-stop cancellation is invalid",
+                    ));
+                }
+                dormant_lineage.remove(&order_id);
+            }
         }
 
         let mut active_ids = reserve_checkpoint_set(
-            self.orders.len(),
+            self.active_order_count(),
             OrderBookCheckpointResource::ActiveOrderIdentifiers,
         )?;
         let mut previous_key = None;
@@ -1938,11 +2431,59 @@ impl OrderBookCheckpoint {
                 ));
             }
         }
+        let mut previous_stop_key = None;
+        for order in self.dormant_stops.iter() {
+            if !active_ids.insert(order.order_id) || !seen_order_ids.contains(&order.order_id) {
+                return Err(OrderBookCheckpointError::new(
+                    "checkpoint dormant-stop identity is duplicated or absent from accepted history",
+                ));
+            }
+            let key = dormant_checkpoint_sort_key(*order);
+            if previous_stop_key.is_some_and(|previous| previous > key) {
+                return Err(OrderBookCheckpointError::new(
+                    "checkpoint dormant stops are not in canonical trigger order",
+                ));
+            }
+            previous_stop_key = Some(key);
+            validate_checkpoint_stop(self.definition, *order)?;
+            if order
+                .expires_at
+                .is_some_and(|expires_at| expiry_watermark.is_some_and(|value| expires_at <= value))
+            {
+                return Err(OrderBookCheckpointError::new(
+                    "checkpoint retains a dormant stop at or before its expiry watermark",
+                ));
+            }
+            if account_controls
+                .get(&order.account_id)
+                .is_some_and(|control| control.state == AccountAdmissionState::Blocked)
+            {
+                return Err(OrderBookCheckpointError::new(
+                    "checkpoint retains a dormant stop for a blocked account",
+                ));
+            }
+            if dormant_lineage.get(&order.order_id) != Some(order) {
+                return Err(OrderBookCheckpointError::new(
+                    "checkpoint dormant-stop state diverges from command history",
+                ));
+            }
+        }
+        if dormant_lineage.len() != self.dormant_stops.len() {
+            return Err(OrderBookCheckpointError::new(
+                "checkpoint omits dormant-stop state reconstructed from history",
+            ));
+        }
+        if !self.dormant_stops.is_empty() && stop_reference_price.is_none() {
+            return Err(OrderBookCheckpointError::new(
+                "checkpoint retains dormant stops without a reference price",
+            ));
+        }
         Ok(OrderBookCheckpointLineage {
             seen_order_ids,
             account_controls,
             trading_state,
             expiry_watermark,
+            stop_reference_price,
             retained_event_count,
             next_sequence: expected_event_sequence,
             next_trade_id: expected_trade_id,
@@ -2071,14 +2612,18 @@ impl OrderBookCheckpointCapture {
 pub enum OrderBookCheckpointResource {
     /// Chronological command/report rows owned by a newly captured checkpoint.
     CaptureHistory,
-    /// Canonical active-order rows owned by a newly captured checkpoint.
+    /// Canonical resting-order rows owned by a newly captured checkpoint.
     CaptureActiveOrders,
+    /// Canonical dormant-stop rows owned by a newly captured checkpoint.
+    CaptureDormantStops,
     /// Unique command identifiers in retained history.
     HistoryCommandIdentifiers,
     /// Never-reused accepted order identifiers reconstructed from history.
     HistoryAcceptedOrderIdentifiers,
     /// Latest accepted account-control state reconstructed from history.
     HistoryAccountControls,
+    /// Dormant-stop state reconstructed from chronological history.
+    HistoryDormantStops,
     /// Unique active-order identities in the direct checkpoint image.
     ActiveOrderIdentifiers,
     /// Unique controlled accounts counted against restoration limits.
@@ -2096,6 +2641,7 @@ impl OrderBookCheckpointResource {
         match self {
             Self::CaptureHistory => "checkpoint history capture reservation failed",
             Self::CaptureActiveOrders => "checkpoint active-order capture reservation failed",
+            Self::CaptureDormantStops => "checkpoint dormant-stop capture reservation failed",
             Self::HistoryCommandIdentifiers => {
                 "checkpoint command-identifier scratch reservation failed"
             }
@@ -2103,6 +2649,7 @@ impl OrderBookCheckpointResource {
                 "checkpoint accepted-order-identifier scratch reservation failed"
             }
             Self::HistoryAccountControls => "checkpoint account-control scratch reservation failed",
+            Self::HistoryDormantStops => "checkpoint dormant-stop lineage reservation failed",
             Self::ActiveOrderIdentifiers => {
                 "checkpoint active-order-identifier scratch reservation failed"
             }
@@ -2123,9 +2670,11 @@ impl fmt::Display for OrderBookCheckpointResource {
         formatter.write_str(match self {
             Self::CaptureHistory => "captured history rows",
             Self::CaptureActiveOrders => "captured active-order rows",
+            Self::CaptureDormantStops => "captured dormant-stop rows",
             Self::HistoryCommandIdentifiers => "history command identifiers",
             Self::HistoryAcceptedOrderIdentifiers => "history accepted order identifiers",
             Self::HistoryAccountControls => "history account controls",
+            Self::HistoryDormantStops => "history dormant stops",
             Self::ActiveOrderIdentifiers => "active order identifiers",
             Self::CapacityControlledAccounts => "capacity controlled accounts",
             Self::CapacityActiveAccounts => "capacity active accounts",
@@ -2264,8 +2813,9 @@ fn reserve_checkpoint_vec<T>(
 mod checkpoint_resource_tests {
     use super::{
         AccountControlSnapshot, AccountId, CommandId, CommandReportCheckpoint,
-        OrderBookCheckpointError, OrderBookCheckpointResource, RestingOrderCheckpoint,
-        reserve_checkpoint_map, reserve_checkpoint_set, reserve_checkpoint_vec,
+        DormantStopCheckpoint, OrderBookCheckpointError, OrderBookCheckpointResource, OrderId,
+        RestingOrderCheckpoint, reserve_checkpoint_map, reserve_checkpoint_set,
+        reserve_checkpoint_vec,
     };
 
     #[test]
@@ -2273,6 +2823,7 @@ mod checkpoint_resource_tests {
         for resource in [
             OrderBookCheckpointResource::HistoryCommandIdentifiers,
             OrderBookCheckpointResource::HistoryAcceptedOrderIdentifiers,
+            OrderBookCheckpointResource::HistoryDormantStops,
             OrderBookCheckpointResource::ActiveOrderIdentifiers,
             OrderBookCheckpointResource::CapacityControlledAccounts,
             OrderBookCheckpointResource::CapacityActiveAccounts,
@@ -2298,9 +2849,21 @@ mod checkpoint_resource_tests {
                 maximum: usize::MAX,
             }
         );
+        assert_eq!(
+            reserve_checkpoint_map::<OrderId, DormantStopCheckpoint>(
+                usize::MAX,
+                OrderBookCheckpointResource::HistoryDormantStops,
+            )
+            .unwrap_err(),
+            OrderBookCheckpointError::ResourceReservationFailed {
+                resource: OrderBookCheckpointResource::HistoryDormantStops,
+                maximum: usize::MAX,
+            }
+        );
         for resource in [
             OrderBookCheckpointResource::CaptureHistory,
             OrderBookCheckpointResource::CaptureActiveOrders,
+            OrderBookCheckpointResource::CaptureDormantStops,
         ] {
             let error = match resource {
                 OrderBookCheckpointResource::CaptureHistory => {
@@ -2309,6 +2872,10 @@ mod checkpoint_resource_tests {
                 }
                 OrderBookCheckpointResource::CaptureActiveOrders => {
                     reserve_checkpoint_vec::<RestingOrderCheckpoint>(usize::MAX, resource)
+                        .unwrap_err()
+                }
+                OrderBookCheckpointResource::CaptureDormantStops => {
+                    reserve_checkpoint_vec::<DormantStopCheckpoint>(usize::MAX, resource)
                         .unwrap_err()
                 }
                 _ => unreachable!("capture resource set is exhaustive"),
@@ -2450,6 +3017,121 @@ fn validate_checkpoint_order(
     }
 }
 
+fn dormant_checkpoint_sort_key(order: DormantStopCheckpoint) -> (u8, i128, u64, OrderId) {
+    let trigger = match order.side {
+        Side::Buy => i128::from(order.trigger_price.raw()),
+        Side::Sell => -i128::from(order.trigger_price.raw()),
+    };
+    (
+        side_wire_order(order.side),
+        trigger,
+        order.priority_sequence,
+        order.order_id,
+    )
+}
+
+fn first_eligible_checkpoint_stop(
+    stops: &BoundedHashMap<OrderId, DormantStopCheckpoint>,
+    reference_price: Price,
+) -> Result<Option<DormantStopCheckpoint>, OrderBookCheckpointError> {
+    let mut buy = None;
+    let mut sell = None;
+    for stop in stops.values().copied() {
+        let eligible = match stop.side {
+            Side::Buy => stop.trigger_price <= reference_price,
+            Side::Sell => reference_price <= stop.trigger_price,
+        };
+        if !eligible {
+            continue;
+        }
+        let selected = match stop.side {
+            Side::Buy => &mut buy,
+            Side::Sell => &mut sell,
+        };
+        if selected.is_none_or(|current| {
+            dormant_checkpoint_sort_key(stop) < dormant_checkpoint_sort_key(current)
+        }) {
+            *selected = Some(stop);
+        }
+    }
+    match (buy, sell) {
+        (Some(_), Some(_)) => Err(OrderBookCheckpointError::new(
+            "checkpoint makes buy and sell stops simultaneously eligible",
+        )),
+        (Some(stop), None) | (None, Some(stop)) => Ok(Some(stop)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn eligible_checkpoint_stop_count(
+    stops: &BoundedHashMap<OrderId, DormantStopCheckpoint>,
+    reference_price: Price,
+) -> Result<u64, OrderBookCheckpointError> {
+    let mut buys = 0_u64;
+    let mut sells = 0_u64;
+    for stop in stops.values() {
+        let count = match stop.side {
+            Side::Buy if stop.trigger_price <= reference_price => &mut buys,
+            Side::Sell if reference_price <= stop.trigger_price => &mut sells,
+            Side::Buy | Side::Sell => continue,
+        };
+        *count = count.checked_add(1).ok_or_else(|| {
+            OrderBookCheckpointError::new("checkpoint eligible-stop count is exhausted")
+        })?;
+    }
+    if buys != 0 && sells != 0 {
+        return Err(OrderBookCheckpointError::new(
+            "checkpoint makes buy and sell stops simultaneously eligible",
+        ));
+    }
+    buys.checked_add(sells)
+        .ok_or_else(|| OrderBookCheckpointError::new("checkpoint eligible-stop count is exhausted"))
+}
+
+fn validate_checkpoint_stop(
+    definition: InstrumentDefinition,
+    order: DormantStopCheckpoint,
+) -> Result<(), OrderBookCheckpointError> {
+    if order.priority_sequence == 0 {
+        return Err(OrderBookCheckpointError::new(
+            "checkpoint dormant stop has zero trigger priority",
+        ));
+    }
+    let command = Command::New(NewOrder {
+        command_id: CommandId::new(1).expect("one is non-zero"),
+        order_id: order.order_id,
+        account_id: order.account_id,
+        instrument_id: definition.instrument_id(),
+        instrument_version: definition.version(),
+        side: order.side,
+        quantity: order.leaves,
+        display: order.display,
+        order_type: OrderType::Stop {
+            trigger_price: order.trigger_price,
+            activation: order.activation,
+        },
+        time_in_force: order.time_in_force,
+        self_trade_prevention: order.self_trade_prevention,
+        received_at: TimestampNs::from_unix_nanos(0),
+    });
+    definition.admit(command).map_err(|_| {
+        OrderBookCheckpointError::new("checkpoint dormant stop violates instrument definition")
+    })?;
+    if order.activation == StopActivation::Market && order.time_in_force == TimeInForce::PostOnly {
+        return Err(OrderBookCheckpointError::new(
+            "checkpoint dormant stop-market is post-only",
+        ));
+    }
+    if order.display.is_reserve()
+        && !(matches!(order.activation, StopActivation::Limit(_)) && order.time_in_force.may_rest())
+    {
+        return Err(OrderBookCheckpointError::new(
+            "checkpoint dormant stop has an invalid reserve qualifier",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_checkpoint_capacity(
     checkpoint: &OrderBookCheckpoint,
     limits: OrderBookLimits,
@@ -2507,13 +3189,13 @@ fn validate_checkpoint_capacity(
             "checkpoint account-control capacity is insufficient",
         ));
     }
-    if checkpoint.orders.len() > limits.max_active_orders() {
+    if checkpoint.active_order_count() > limits.max_active_orders() {
         return Err(OrderBookCheckpointError::new(
             "checkpoint active-order capacity is insufficient",
         ));
     }
     let mut accounts = reserve_checkpoint_set(
-        checkpoint.orders.len(),
+        checkpoint.active_order_count(),
         OrderBookCheckpointResource::CapacityActiveAccounts,
     )?;
     let mut bids = reserve_checkpoint_set(
@@ -2530,6 +3212,9 @@ fn validate_checkpoint_capacity(
             Side::Buy => bids.insert(order.price),
             Side::Sell => asks.insert(order.price),
         };
+    }
+    for order in checkpoint.dormant_stops.iter() {
+        accounts.insert(order.account_id);
     }
     if accounts.len() > limits.max_active_accounts() {
         return Err(OrderBookCheckpointError::new(
@@ -2561,11 +3246,15 @@ pub enum MatchingCapacity {
     AcceptedOrderIds,
     /// Never-evicted account admission-control revisions.
     AccountControls,
-    /// Simultaneously active resting orders.
+    /// Simultaneously active resting or dormant orders.
     ActiveOrders,
     /// Ordered GTD-expiration index bounded by active orders.
     ExpiryIndex,
-    /// Accounts with at least one active resting order.
+    /// Dormant buy-stop trigger index bounded by active orders.
+    BuyStopIndex,
+    /// Dormant sell-stop trigger index bounded by active orders.
+    SellStopIndex,
+    /// Accounts with at least one active resting or dormant order.
     ActiveAccounts,
     /// Occupied bid price levels.
     BidPriceLevels,
@@ -2594,6 +3283,8 @@ impl fmt::Display for MatchingCapacity {
             Self::AccountControls => "account admission controls",
             Self::ActiveOrders => "active orders",
             Self::ExpiryIndex => "GTD expiry index",
+            Self::BuyStopIndex => "buy-stop trigger index",
+            Self::SellStopIndex => "sell-stop trigger index",
             Self::ActiveAccounts => "active accounts",
             Self::BidPriceLevels => "bid price levels",
             Self::AskPriceLevels => "ask price levels",
@@ -2677,7 +3368,7 @@ impl std::error::Error for MatchingError {}
 /// Raw construction values for a bounded [`OrderBook`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OrderBookLimitsSpec {
-    /// Maximum simultaneous resting orders.
+    /// Maximum simultaneous resting or dormant orders.
     pub max_active_orders: usize,
     /// Maximum accounts represented in the active-order index.
     pub max_active_accounts: usize,
@@ -2811,9 +3502,9 @@ pub struct OrderBookLimits {
 }
 
 impl OrderBookLimits {
-    /// Default maximum simultaneous resting orders.
+    /// Default maximum simultaneous resting or dormant orders.
     pub const DEFAULT_MAX_ACTIVE_ORDERS: usize = 4_096;
-    /// Default maximum accounts with resting orders.
+    /// Default maximum accounts with active resting or dormant orders.
     pub const DEFAULT_MAX_ACTIVE_ACCOUNTS: usize = 4_096;
     /// Default maximum occupied prices independently on each side.
     pub const DEFAULT_MAX_PRICE_LEVELS_PER_SIDE: usize = 4_096;
@@ -2917,13 +3608,13 @@ impl OrderBookLimits {
         })
     }
 
-    /// Maximum simultaneous resting orders.
+    /// Maximum simultaneous resting or dormant orders.
     #[must_use]
     pub const fn max_active_orders(self) -> usize {
         self.max_active_orders
     }
 
-    /// Maximum accounts with resting orders.
+    /// Maximum accounts with active resting or dormant orders.
     #[must_use]
     pub const fn max_active_accounts(self) -> usize {
         self.max_active_accounts
@@ -3053,6 +3744,7 @@ struct RestingOrder {
     display: OrderDisplay,
     self_trade_prevention: SelfTradePrevention,
     expires_at: Option<TimestampNs>,
+    stop: Option<DormantStopState>,
     previous: Option<OrderId>,
     next: Option<OrderId>,
     account_previous: Option<OrderId>,
@@ -3070,6 +3762,7 @@ impl PartialEq for RestingOrder {
             && self.display == other.display
             && self.self_trade_prevention == other.self_trade_prevention
             && self.expires_at == other.expires_at
+            && self.stop == other.stop
             && self.previous == other.previous
             && self.next == other.next
     }
@@ -3081,10 +3774,35 @@ struct ExpiryKey {
     order_id: OrderId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DormantStopState {
+    trigger_price: Price,
+    activation: StopActivation,
+    time_in_force: TimeInForce,
+    priority_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct BuyStopKey {
+    trigger_price: Price,
+    priority_sequence: u64,
+    order_id: OrderId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SellStopKey {
+    trigger_price: Reverse<Price>,
+    priority_sequence: u64,
+    order_id: OrderId,
+}
+
 impl Eq for RestingOrder {}
 
 impl RestingOrder {
     fn remaining_event_units(self) -> u128 {
+        if self.stop.is_some() {
+            return 0;
+        }
         let slices = match self.display {
             OrderDisplay::FullyDisplayed => 1,
             OrderDisplay::Reserve { peak } => {
@@ -3097,6 +3815,28 @@ impl RestingOrder {
             .checked_mul(2)
             .and_then(|value| value.checked_sub(1))
             .expect("u64 order quantity has representable event work")
+    }
+
+    fn is_dormant_stop(self) -> bool {
+        self.stop.is_some()
+    }
+
+    fn stop_snapshot(self) -> Option<DormantStopSnapshot> {
+        let stop = self.stop?;
+        Some(DormantStopSnapshot {
+            order_id: self.order_id,
+            account_id: self.account_id,
+            side: self.side,
+            leaves_quantity: Quantity::new(self.leaves)
+                .expect("dormant stop leaves must be non-zero"),
+            display: self.display,
+            trigger_price: stop.trigger_price,
+            activation: stop.activation,
+            time_in_force: stop.time_in_force,
+            self_trade_prevention: self.self_trade_prevention,
+            priority_sequence: stop.priority_sequence,
+            expires_at: self.expires_at,
+        })
     }
 }
 
@@ -3523,6 +4263,9 @@ pub struct OrderBook {
     orders: BoundedHashMap<OrderId, RestingOrder>,
     expiries: IndexedAvlMap<ExpiryKey, OrderId>,
     expiry_watermark: Option<TimestampNs>,
+    buy_stops: IndexedAvlMap<BuyStopKey, OrderId>,
+    sell_stops: IndexedAvlMap<SellStopKey, OrderId>,
+    stop_reference_price: Option<Price>,
     account_orders: BoundedHashMap<AccountId, AccountOrderIndex>,
     seen_order_ids: BoundedHashSet<OrderId>,
     account_controls: BoundedHashMap<AccountId, AccountControlSnapshot>,
@@ -3544,6 +4287,9 @@ impl PartialEq for OrderBook {
             && self.orders == other.orders
             && self.expiries == other.expiries
             && self.expiry_watermark == other.expiry_watermark
+            && self.buy_stops == other.buy_stops
+            && self.sell_stops == other.sell_stops
+            && self.stop_reference_price == other.stop_reference_price
             && self.account_orders == other.account_orders
             && self.seen_order_ids == other.seen_order_ids
             && self.account_controls == other.account_controls
@@ -3585,6 +4331,9 @@ impl Clone for OrderBook {
             orders: self.orders.clone(),
             expiries: self.expiries.clone(),
             expiry_watermark: self.expiry_watermark,
+            buy_stops: self.buy_stops.clone(),
+            sell_stops: self.sell_stops.clone(),
+            stop_reference_price: self.stop_reference_price,
             account_orders: self.account_orders.clone(),
             seen_order_ids: self.seen_order_ids.clone(),
             account_controls: self.account_controls.clone(),
@@ -3649,6 +4398,14 @@ impl OrderBook {
         })?;
         let expiries = IndexedAvlMap::try_with_capacity(limits.max_active_orders())
             .map_err(|_| MatchingError::CapacityReservationFailed(MatchingCapacity::ExpiryIndex))?;
+        let buy_stops =
+            IndexedAvlMap::try_with_capacity(limits.max_active_orders()).map_err(|_| {
+                MatchingError::CapacityReservationFailed(MatchingCapacity::BuyStopIndex)
+            })?;
+        let sell_stops =
+            IndexedAvlMap::try_with_capacity(limits.max_active_orders()).map_err(|_| {
+                MatchingError::CapacityReservationFailed(MatchingCapacity::SellStopIndex)
+            })?;
         let account_orders =
             BoundedHashMap::try_new(limits.max_active_accounts()).map_err(|_| {
                 MatchingError::CapacityReservationFailed(MatchingCapacity::ActiveAccounts)
@@ -3681,6 +4438,9 @@ impl OrderBook {
             orders,
             expiries,
             expiry_watermark: None,
+            buy_stops,
+            sell_stops,
+            stop_reference_price: None,
             account_orders,
             seen_order_ids,
             account_controls,
@@ -3721,9 +4481,10 @@ impl OrderBook {
     ///
     /// The writer-side phase audits live topology, event-arena layout, complete
     /// command-derived lineage, and the WAL boundary, then copies `C`
-    /// command/report handles and `O` canonical active-order rows. Active orders
-    /// are emitted in buy-then-sell, ascending-price, FIFO order. The returned
-    /// value is not encodable or persistable until consumed by
+    /// command/report handles plus canonical resting and dormant rows. Resting
+    /// orders are emitted in buy-then-sell, ascending-price, FIFO order;
+    /// dormant stops use canonical trigger priority. The returned value is not
+    /// encodable or persistable until consumed by
     /// [`OrderBookCheckpointCapture::verify`].
     ///
     /// # Errors
@@ -3741,6 +4502,10 @@ impl OrderBook {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "checkpoint capture audits and copies each canonical state class in one boundary"
+    )]
     pub(crate) fn checkpoint_state(
         &self,
         wal_metadata_sequence: u64,
@@ -3753,8 +4518,12 @@ impl OrderBook {
             OrderBookCheckpointResource::CaptureHistory,
         )?;
         let mut orders = reserve_checkpoint_vec(
-            self.orders.len(),
+            self.resting_order_count(),
             OrderBookCheckpointResource::CaptureActiveOrders,
+        )?;
+        let mut dormant_stops = reserve_checkpoint_vec(
+            self.dormant_stop_count(),
+            OrderBookCheckpointResource::CaptureDormantStops,
         )?;
         for (command_id, cached) in self.reports.iter() {
             if *command_id != cached.command.command_id() {
@@ -3800,11 +4569,28 @@ impl OrderBook {
                 }
             }
         }
+        self.for_each_dormant_stop_in_canonical_order(|order| {
+            let stop = order.stop.expect("canonical dormant order has stop state");
+            dormant_stops.push(DormantStopCheckpoint {
+                order_id: order.order_id,
+                account_id: order.account_id,
+                side: order.side,
+                leaves: Quantity::new(order.leaves).expect("live dormant stop has non-zero leaves"),
+                display: order.display,
+                self_trade_prevention: order.self_trade_prevention,
+                expires_at: order.expires_at,
+                trigger_price: stop.trigger_price,
+                activation: stop.activation,
+                time_in_force: stop.time_in_force,
+                priority_sequence: stop.priority_sequence,
+            });
+        })?;
         let (checkpoint, lineage) = OrderBookCheckpoint::from_parts_with_lineage(
             wal_metadata_sequence,
             wal_sequence,
             self.definition,
             orders,
+            dormant_stops,
             history,
         )?;
         if lineage.seen_order_ids != self.seen_order_ids {
@@ -3825,6 +4611,11 @@ impl OrderBook {
         if lineage.expiry_watermark != self.expiry_watermark {
             return Err(OrderBookCheckpointError::new(
                 "live expiry watermark differs from command history",
+            ));
+        }
+        if lineage.stop_reference_price != self.stop_reference_price {
+            return Err(OrderBookCheckpointError::new(
+                "live stop reference differs from command history",
             ));
         }
         if lineage.retained_event_count != self.retained_event_count {
@@ -3867,6 +4658,10 @@ impl OrderBook {
     /// Returns [`OrderBookCheckpointError`] when the checkpoint is invalid, its
     /// current state exceeds a selected limit, a validation resource cannot be
     /// reserved, or temporary book construction fails.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "direct restoration rebuilds and cross-audits every derived bounded index"
+    )]
     pub fn from_checkpoint_with_limits(
         checkpoint: &OrderBookCheckpoint,
         limits: OrderBookLimits,
@@ -3913,6 +4708,11 @@ impl OrderBook {
                 (entry.command, entry.report.outcome)
             {
                 book.expiry_watermark = Some(sweep.through);
+            }
+            if let (Command::StopTriggerSweep(sweep), CommandOutcome::Accepted) =
+                (entry.command, entry.report.outcome)
+            {
+                book.stop_reference_price = Some(sweep.reference_price);
             }
             for event in &entry.report.events {
                 book.next_sequence = event.sequence.checked_add(1).ok_or_else(|| {
@@ -3961,6 +4761,31 @@ impl OrderBook {
                 display: state.display,
                 self_trade_prevention: state.self_trade_prevention,
                 expires_at: state.expires_at,
+                stop: None,
+                previous: None,
+                next: None,
+                account_previous: None,
+                account_next: None,
+            });
+        }
+        for &state in checkpoint.dormant_stops.iter() {
+            let displayed = state.display.displayed_lots(state.leaves.lots());
+            book.append_dormant_stop(RestingOrder {
+                order_id: state.order_id,
+                account_id: state.account_id,
+                side: state.side,
+                price: state.activation.risk_price().unwrap_or(state.trigger_price),
+                leaves: state.leaves.lots(),
+                displayed,
+                display: state.display,
+                self_trade_prevention: state.self_trade_prevention,
+                expires_at: state.expires_at,
+                stop: Some(DormantStopState {
+                    trigger_price: state.trigger_price,
+                    activation: state.activation,
+                    time_in_force: state.time_in_force,
+                    priority_sequence: state.priority_sequence,
+                }),
                 previous: None,
                 next: None,
                 account_previous: None,
@@ -4000,6 +4825,12 @@ impl OrderBook {
     #[must_use]
     pub const fn expiry_watermark(&self) -> Option<TimestampNs> {
         self.expiry_watermark
+    }
+
+    /// Returns the committed authoritative last-trade stop reference, if initialized.
+    #[must_use]
+    pub const fn stop_reference_price(&self) -> Option<Price> {
+        self.stop_reference_price
     }
 
     /// Applies a command exactly once and returns its complete trace.
@@ -4057,13 +4888,39 @@ impl OrderBook {
                 {
                     return Err(RejectReason::OrderAlreadyExpired);
                 }
+                if let Some((trigger_price, activation)) = command.order_type.stop() {
+                    let reference = self
+                        .stop_reference_price
+                        .ok_or(RejectReason::StopReferenceUnavailable)?;
+                    let satisfied = match command.side {
+                        Side::Buy => reference >= trigger_price,
+                        Side::Sell => reference <= trigger_price,
+                    };
+                    if satisfied {
+                        return Err(RejectReason::StopAlreadyTriggered);
+                    }
+                    if activation == StopActivation::Market
+                        && command.time_in_force == TimeInForce::PostOnly
+                    {
+                        return Err(RejectReason::StopMarketCannotPost);
+                    }
+                }
+                let active_order_type = command.order_type.active();
                 if command.display.is_reserve()
-                    && !(matches!(command.order_type, OrderType::Limit(_))
+                    && !(matches!(active_order_type, OrderType::Limit(_))
                         && command.time_in_force.may_rest())
                 {
                     return Err(RejectReason::ReserveOrderCannotBeImmediate);
                 }
-                match (command.order_type, command.time_in_force) {
+                if command.order_type.stop().is_some() {
+                    if command.time_in_force == TimeInForce::FillOrKill
+                        && command.self_trade_prevention == SelfTradePrevention::DecrementAndCancel
+                    {
+                        return Err(RejectReason::UnsupportedFokSelfTradePolicy);
+                    }
+                    return Ok(());
+                }
+                match (active_order_type, command.time_in_force) {
                     (
                         OrderType::Market,
                         TimeInForce::GoodTilCancelled | TimeInForce::GoodTilTimestamp { .. },
@@ -4081,7 +4938,7 @@ impl OrderBook {
                     return Err(RejectReason::UnsupportedFokSelfTradePolicy);
                 }
                 if command.time_in_force == TimeInForce::PostOnly
-                    && self.would_cross(command.side, command.order_type)
+                    && self.would_cross(command.side, active_order_type)
                 {
                     return Err(RejectReason::PostOnlyWouldCross);
                 }
@@ -4118,6 +4975,12 @@ impl OrderBook {
                 }
                 if order.display.is_reserve() != command.new_display.is_reserve() {
                     return Err(RejectReason::OrderDisplayModeChangeNotAllowed);
+                }
+                if order
+                    .stop
+                    .is_some_and(|stop| stop.activation == StopActivation::Market)
+                {
+                    return Err(RejectReason::StopMarketCannotBeReplaced);
                 }
             }
             Command::MassCancel(command) => {
@@ -4168,6 +5031,29 @@ impl OrderBook {
                     .is_some_and(|watermark| command.through < watermark)
                 {
                     return Err(RejectReason::ExpiryWatermarkRegression);
+                }
+            }
+            Command::StopTriggerSweep(command) => {
+                self.definition
+                    .admit(Command::StopTriggerSweep(command))
+                    .map_err(RejectReason::from)?;
+                if command.maximum_orders == 0 {
+                    return Err(RejectReason::StopTriggerBatchEmpty);
+                }
+                if usize::try_from(command.maximum_orders)
+                    .map_or(true, |maximum| maximum > self.limits.max_active_orders())
+                {
+                    return Err(RejectReason::StopTriggerBatchExceedsActiveOrderCapacity);
+                }
+                if self.stop_reference_price.is_some_and(|current| {
+                    current != command.reference_price && self.eligible_stop_count(current) != 0
+                }) {
+                    return Err(RejectReason::StopTriggerBacklog);
+                }
+                if self.trading_state.state != TradingState::Open
+                    && self.eligible_stop_count(command.reference_price) != 0
+                {
+                    return Err(RejectReason::InstrumentNotOpen);
                 }
             }
         }
@@ -4269,6 +5155,14 @@ impl OrderBook {
             (None, Command::ExpirySweep(command)) => {
                 Some(self.acquire_order_selection(self.expiring_order_count(command.through))?)
             }
+            (None, Command::StopTriggerSweep(command)) => Some(
+                self.acquire_order_selection(
+                    self.eligible_stop_count(command.reference_price).min(
+                        usize::try_from(command.maximum_orders)
+                            .map_err(|_| MatchingError::InternalInvariantViolation)?,
+                    ),
+                )?,
+            ),
             _ => None,
         };
         Ok(CommandPreparation::Ready(PreparedCommand {
@@ -4313,6 +5207,7 @@ impl OrderBook {
         }
 
         let (events, trades) = match command {
+            Command::New(order) if order.order_type.stop().is_some() => (2_u128, 0),
             Command::New(order) if order.time_in_force == TimeInForce::PostOnly => (2_u128, 0),
             Command::New(order) => {
                 let terminal_events = u128::from(order.time_in_force != TimeInForce::FillOrKill);
@@ -4355,27 +5250,34 @@ impl OrderBook {
                     .ok_or(MatchingError::SequenceExhausted)?;
                 return Ok((events, 0));
             }
+            Command::StopTriggerSweep(command) => {
+                return self.maximum_stop_trigger_work(command);
+            }
             Command::Replace(command) => {
                 let old = self
                     .orders
                     .get(&command.order_id)
                     .expect("accepted replacement must reference an active order");
-                let priority_retained = old.price == command.new_price
-                    && command.new_quantity.lots() <= old.leaves
-                    && old.display == command.new_display;
-                if priority_retained {
+                if old.is_dormant_stop() {
                     (1, 0)
                 } else {
-                    self.maximum_matching_work(
-                        IncomingPreview {
-                            account_id: old.account_id,
-                            side: old.side,
-                            order_type: OrderType::Limit(command.new_price),
-                            leaves: command.new_quantity.lots(),
-                            self_trade_prevention: old.self_trade_prevention,
-                        },
-                        1,
-                    )?
+                    let priority_retained = old.price == command.new_price
+                        && command.new_quantity.lots() <= old.leaves
+                        && old.display == command.new_display;
+                    if priority_retained {
+                        (1, 0)
+                    } else {
+                        self.maximum_matching_work(
+                            IncomingPreview {
+                                account_id: old.account_id,
+                                side: old.side,
+                                order_type: OrderType::Limit(command.new_price),
+                                leaves: command.new_quantity.lots(),
+                                self_trade_prevention: old.self_trade_prevention,
+                            },
+                            1,
+                        )?
+                    }
                 }
             }
         };
@@ -4438,6 +5340,134 @@ impl OrderBook {
         let maximum_trades =
             u64::try_from(maximum_trades).map_err(|_| MatchingError::TradeIdExhausted)?;
         Ok((events, maximum_trades))
+    }
+
+    fn maximum_stop_trigger_work(
+        &self,
+        command: StopTriggerSweep,
+    ) -> Result<(usize, u64), MatchingError> {
+        let limit = self.eligible_stop_count(command.reference_price).min(
+            usize::try_from(command.maximum_orders)
+                .map_err(|_| MatchingError::InternalInvariantViolation)?,
+        );
+        let mut events = 1_u128;
+        let mut trades = 0_u64;
+        self.for_each_eligible_stop(command.reference_price, limit, |order_id| {
+            let order = self
+                .orders
+                .get(&order_id)
+                .copied()
+                .ok_or(MatchingError::InternalInvariantViolation)?;
+            let stop = order
+                .stop
+                .ok_or(MatchingError::InternalInvariantViolation)?;
+            let (order_events, order_trades) = if stop.time_in_force == TimeInForce::PostOnly {
+                (2_u128, 0)
+            } else {
+                let terminal = u128::from(stop.time_in_force != TimeInForce::FillOrKill);
+                let (candidate_events, candidate_trades) = self.maximum_matching_work(
+                    IncomingPreview {
+                        account_id: order.account_id,
+                        side: order.side,
+                        order_type: stop.activation.order_type(),
+                        leaves: order.leaves,
+                        self_trade_prevention: order.self_trade_prevention,
+                    },
+                    terminal,
+                )?;
+                if stop.time_in_force == TimeInForce::FillOrKill {
+                    (candidate_events.max(2), candidate_trades)
+                } else {
+                    (candidate_events, candidate_trades)
+                }
+            };
+            events = events
+                .checked_add(order_events)
+                .ok_or(MatchingError::SequenceExhausted)?;
+            trades = trades
+                .checked_add(order_trades)
+                .ok_or(MatchingError::TradeIdExhausted)?;
+            Ok(())
+        })?;
+        Ok((
+            usize::try_from(events).map_err(|_| MatchingError::SequenceExhausted)?,
+            trades,
+        ))
+    }
+
+    fn eligible_stop_count(&self, reference_price: Price) -> usize {
+        let buys = self
+            .buy_stops
+            .iter()
+            .take_while(|(key, _)| key.trigger_price <= reference_price)
+            .count();
+        let sells = self
+            .sell_stops
+            .iter()
+            .take_while(|(key, _)| key.trigger_price.0 >= reference_price)
+            .count();
+        debug_assert!(
+            buys == 0 || sells == 0,
+            "valid stop state cannot have eligible stops on both sides"
+        );
+        buys.saturating_add(sells)
+    }
+
+    fn for_each_eligible_stop<E>(
+        &self,
+        reference_price: Price,
+        limit: usize,
+        mut visit: impl FnMut(OrderId) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let buy_count = self
+            .buy_stops
+            .iter()
+            .take_while(|(key, _)| key.trigger_price <= reference_price)
+            .count();
+        if buy_count != 0 {
+            for &order_id in self
+                .buy_stops
+                .iter()
+                .take(buy_count.min(limit))
+                .map(|(_, order_id)| order_id)
+            {
+                visit(order_id)?;
+            }
+            return Ok(());
+        }
+        for &order_id in self
+            .sell_stops
+            .iter()
+            .take_while(|(key, _)| key.trigger_price.0 >= reference_price)
+            .take(limit)
+            .map(|(_, order_id)| order_id)
+        {
+            visit(order_id)?;
+        }
+        Ok(())
+    }
+
+    fn for_each_dormant_stop_in_canonical_order(
+        &self,
+        mut visit: impl FnMut(RestingOrder),
+    ) -> Result<(), OrderBookCheckpointError> {
+        for &order_id in self.buy_stops.iter().map(|(_, order_id)| order_id) {
+            let order = self.orders.get(&order_id).copied().ok_or_else(|| {
+                OrderBookCheckpointError::new(
+                    "buy-stop index references an absent order during checkpoint",
+                )
+            })?;
+            visit(order);
+        }
+        for &order_id in self.sell_stops.iter().map(|(_, order_id)| order_id) {
+            let order = self.orders.get(&order_id).copied().ok_or_else(|| {
+                OrderBookCheckpointError::new(
+                    "sell-stop index references an absent order during checkpoint",
+                )
+            })?;
+            visit(order);
+        }
+        Ok(())
     }
 
     /// Commits one prepared command without repeating preflight.
@@ -4517,6 +5547,12 @@ impl OrderBook {
                     sweep,
                     events,
                     selected_order_ids.expect("accepted expiry sweep must own selection storage"),
+                )?,
+                Command::StopTriggerSweep(sweep) => self.apply_stop_trigger_sweep(
+                    sweep,
+                    events,
+                    selected_order_ids
+                        .expect("accepted stop trigger sweep must own selection storage"),
                 )?,
             }
         };
@@ -4608,7 +5644,8 @@ impl OrderBook {
             Command::Cancel(_)
             | Command::MassCancel(_)
             | Command::TradingStateControl(_)
-            | Command::ExpirySweep(_) => Ok(()),
+            | Command::ExpirySweep(_)
+            | Command::StopTriggerSweep(_) => Ok(()),
             Command::AccountControl(command) => {
                 if core_rejection.is_some()
                     || self.account_controls.contains_key(&command.account_id)
@@ -4632,6 +5669,21 @@ impl OrderBook {
             return Err(MatchingError::CapacityExhausted(
                 MatchingCapacity::AcceptedOrderIds,
             ));
+        }
+        if command.order_type.stop().is_some() {
+            if self.orders.len() >= self.limits.max_active_orders() {
+                return Err(MatchingError::CapacityExhausted(
+                    MatchingCapacity::ActiveOrders,
+                ));
+            }
+            if !self.account_orders.contains_key(&command.account_id)
+                && self.account_orders.len() >= self.limits.max_active_accounts()
+            {
+                return Err(MatchingError::CapacityExhausted(
+                    MatchingCapacity::ActiveAccounts,
+                ));
+            }
+            return Ok(());
         }
         let OrderType::Limit(price) = command.order_type else {
             return Ok(());
@@ -4691,6 +5743,9 @@ impl OrderBook {
         let Some(order) = self.orders.get(&command.order_id) else {
             return Ok(());
         };
+        if order.is_dormant_stop() {
+            return Ok(());
+        }
         let levels = self.levels(order.side);
         if levels.get(command.new_price).is_some() {
             return Ok(());
@@ -4851,6 +5906,9 @@ impl OrderBook {
     #[must_use]
     pub fn order(&self, order_id: OrderId) -> Option<OrderSnapshot> {
         self.orders.get(&order_id).and_then(|order| {
+            if order.is_dormant_stop() {
+                return None;
+            }
             Quantity::new(order.leaves)
                 .ok()
                 .and_then(|leaves_quantity| {
@@ -4870,7 +5928,7 @@ impl OrderBook {
         })
     }
 
-    /// Returns every active order in ascending identifier order.
+    /// Returns every visible resting order in ascending identifier order.
     ///
     /// This allocates and sorts in `O(O log O)` time. It is intended for
     /// snapshots, recovered-state bootstrap, and diagnostics rather than the
@@ -4878,10 +5936,10 @@ impl OrderBook {
     ///
     /// # Errors
     ///
-    /// Returns [`InvariantViolation`] if an active order contains an impossible
+    /// Returns [`InvariantViolation`] if a resting order contains an impossible
     /// zero total or displayed leaves quantity.
     pub fn active_orders(&self) -> Result<Vec<OrderSnapshot>, InvariantViolation> {
-        let mut orders = Vec::with_capacity(self.orders.len());
+        let mut orders = Vec::with_capacity(self.resting_order_count());
         for order in self.active_order_states() {
             orders.push(order?);
         }
@@ -4889,34 +5947,65 @@ impl OrderBook {
         Ok(orders)
     }
 
-    /// Iterates active-order state in dense process-local order without allocating.
+    /// Iterates resting-order state in dense process-local order without allocating.
     pub(crate) fn active_order_states(
         &self,
-    ) -> impl ExactSizeIterator<Item = Result<OrderSnapshot, InvariantViolation>> + '_ {
-        self.orders.values().map(|order| {
-            let leaves_quantity = Quantity::new(order.leaves).map_err(|_| {
-                InvariantViolation::new(format!(
-                    "active order {} has zero leaves quantity",
-                    order.order_id
-                ))
-            })?;
-            let displayed_quantity = Quantity::new(order.displayed).map_err(|_| {
-                InvariantViolation::new(format!(
-                    "active order {} has zero displayed quantity",
-                    order.order_id
-                ))
-            })?;
-            Ok(OrderSnapshot {
-                order_id: order.order_id,
-                account_id: order.account_id,
-                side: order.side,
-                price: order.price,
-                leaves_quantity,
-                displayed_quantity,
-                display: order.display,
-                expires_at: order.expires_at,
+    ) -> impl Iterator<Item = Result<OrderSnapshot, InvariantViolation>> + '_ {
+        self.orders
+            .values()
+            .filter(|order| !order.is_dormant_stop())
+            .map(|order| {
+                let leaves_quantity = Quantity::new(order.leaves).map_err(|_| {
+                    InvariantViolation::new(format!(
+                        "active order {} has zero leaves quantity",
+                        order.order_id
+                    ))
+                })?;
+                let displayed_quantity = Quantity::new(order.displayed).map_err(|_| {
+                    InvariantViolation::new(format!(
+                        "active order {} has zero displayed quantity",
+                        order.order_id
+                    ))
+                })?;
+                Ok(OrderSnapshot {
+                    order_id: order.order_id,
+                    account_id: order.account_id,
+                    side: order.side,
+                    price: order.price,
+                    leaves_quantity,
+                    displayed_quantity,
+                    display: order.display,
+                    expires_at: order.expires_at,
+                })
             })
-        })
+    }
+
+    /// Returns one dormant stop by identifier.
+    #[must_use]
+    pub fn dormant_stop(&self, order_id: OrderId) -> Option<DormantStopSnapshot> {
+        self.orders
+            .get(&order_id)
+            .copied()
+            .and_then(RestingOrder::stop_snapshot)
+    }
+
+    /// Iterates dormant stop state in dense process-local order without allocating.
+    pub(crate) fn dormant_stop_states(&self) -> impl Iterator<Item = DormantStopSnapshot> + '_ {
+        self.orders
+            .values()
+            .filter_map(|order| order.stop_snapshot())
+    }
+
+    /// Returns the number of dormant stops excluded from displayed depth.
+    #[must_use]
+    pub fn dormant_stop_count(&self) -> usize {
+        self.buy_stops.len().saturating_add(self.sell_stops.len())
+    }
+
+    /// Returns the number of orders currently represented in price levels.
+    #[must_use]
+    pub fn resting_order_count(&self) -> usize {
+        self.orders.len().saturating_sub(self.dormant_stop_count())
     }
 
     /// Returns the most recently allocated event sequence, or zero at genesis.
@@ -4933,7 +6022,7 @@ impl OrderBook {
         TradeId::new(value).ok()
     }
 
-    /// Returns the number of currently resting orders.
+    /// Returns the number of currently resting or dormant stop orders.
     #[must_use]
     pub fn active_order_count(&self) -> usize {
         self.orders.len()
@@ -5067,10 +6156,11 @@ impl OrderBook {
                 "price levels reference an active order more than once",
             ));
         }
-        if indexed_by_price != self.orders.len() {
+        let expected_resting = self.resting_order_count();
+        if indexed_by_price != expected_resting {
             return Err(InvariantViolation::new(format!(
                 "{} active orders are absent from price levels",
-                self.orders.len() - indexed_by_price
+                expected_resting.abs_diff(indexed_by_price)
             )));
         }
         if self
@@ -5084,6 +6174,7 @@ impl OrderBook {
         }
         self.validate_account_order_index()?;
         self.validate_expiry_index()?;
+        self.validate_stop_indexes()?;
         if self.orders.values().any(|order| {
             self.account_control(order.account_id).state == AccountAdmissionState::Blocked
         }) {
@@ -5214,7 +6305,118 @@ impl OrderBook {
                 "GTD expiry-index reservation is below the active-order maximum",
             ));
         }
+        if self.buy_stops.maximum() != self.limits.max_active_orders()
+            || self.buy_stops.allocation_capacity() < self.limits.max_active_orders()
+        {
+            return Err(InvariantViolation::new(
+                "buy-stop trigger-index reservation is below the active-order maximum",
+            ));
+        }
+        if self.sell_stops.maximum() != self.limits.max_active_orders()
+            || self.sell_stops.allocation_capacity() < self.limits.max_active_orders()
+        {
+            return Err(InvariantViolation::new(
+                "sell-stop trigger-index reservation is below the active-order maximum",
+            ));
+        }
         Ok(())
+    }
+
+    fn validate_stop_indexes(&self) -> Result<(), InvariantViolation> {
+        self.buy_stops.validate().map_err(|detail| {
+            InvariantViolation::new(format!("buy-stop trigger index is invalid: {detail}"))
+        })?;
+        self.sell_stops.validate().map_err(|detail| {
+            InvariantViolation::new(format!("sell-stop trigger index is invalid: {detail}"))
+        })?;
+        let mut indexed = 0_usize;
+        for (key, &order_id) in self.buy_stops.iter() {
+            let order = self.validate_stop_index_entry(order_id, Side::Buy)?;
+            let stop = order.stop.expect("validated dormant stop state exists");
+            if key.trigger_price != stop.trigger_price
+                || key.priority_sequence != stop.priority_sequence
+                || key.order_id != order_id
+            {
+                return Err(InvariantViolation::new(format!(
+                    "buy-stop index disagrees with order {order_id}"
+                )));
+            }
+            indexed = indexed
+                .checked_add(1)
+                .ok_or_else(|| InvariantViolation::new("stop-index count is exhausted"))?;
+        }
+        for (key, &order_id) in self.sell_stops.iter() {
+            let order = self.validate_stop_index_entry(order_id, Side::Sell)?;
+            let stop = order.stop.expect("validated dormant stop state exists");
+            if key.trigger_price.0 != stop.trigger_price
+                || key.priority_sequence != stop.priority_sequence
+                || key.order_id != order_id
+            {
+                return Err(InvariantViolation::new(format!(
+                    "sell-stop index disagrees with order {order_id}"
+                )));
+            }
+            indexed = indexed
+                .checked_add(1)
+                .ok_or_else(|| InvariantViolation::new("stop-index count is exhausted"))?;
+        }
+        if indexed != self.dormant_stop_count()
+            || indexed
+                != self
+                    .orders
+                    .values()
+                    .filter(|order| order.is_dormant_stop())
+                    .count()
+        {
+            return Err(InvariantViolation::new(
+                "dormant stop cardinality differs from trigger-index coverage",
+            ));
+        }
+        if indexed != 0 && self.stop_reference_price.is_none() {
+            return Err(InvariantViolation::new(
+                "dormant stops exist before stop-reference initialization",
+            ));
+        }
+        let eligible_buys = self.stop_reference_price.map_or(0, |reference| {
+            self.buy_stops
+                .iter()
+                .take_while(|(key, _)| key.trigger_price <= reference)
+                .count()
+        });
+        let eligible_sells = self.stop_reference_price.map_or(0, |reference| {
+            self.sell_stops
+                .iter()
+                .take_while(|(key, _)| key.trigger_price.0 >= reference)
+                .count()
+        });
+        if eligible_buys != 0 && eligible_sells != 0 {
+            return Err(InvariantViolation::new(
+                "eligible stop backlog exists on both sides",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_stop_index_entry(
+        &self,
+        order_id: OrderId,
+        side: Side,
+    ) -> Result<RestingOrder, InvariantViolation> {
+        let order = self.orders.get(&order_id).copied().ok_or_else(|| {
+            InvariantViolation::new(format!("stop index references missing order {order_id}"))
+        })?;
+        if order.side != side
+            || order.stop.is_none()
+            || order.previous.is_some()
+            || order.next.is_some()
+            || order.displayed == 0
+            || order.displayed > order.leaves
+        {
+            return Err(InvariantViolation::new(format!(
+                "stop index references invalid dormant order {order_id}"
+            )));
+        }
+        Ok(order)
     }
 
     fn validate_expiry_index(&self) -> Result<(), InvariantViolation> {
@@ -5457,6 +6659,11 @@ impl OrderBook {
                         "order {order_id} is indexed under the wrong side or price"
                     )));
                 }
+                if order.is_dormant_stop() {
+                    return Err(InvariantViolation::new(format!(
+                        "dormant stop {order_id} appears in a price level"
+                    )));
+                }
                 if order.previous != previous {
                     return Err(InvariantViolation::new(format!(
                         "order {order_id} has a broken previous FIFO link"
@@ -5523,6 +6730,7 @@ impl OrderBook {
             self.seen_order_ids.insert(command.order_id),
             "business preflight must reject reused order identifiers"
         );
+        let priority_sequence = self.next_sequence;
         self.push_event(
             &mut events,
             command.command_id,
@@ -5534,11 +6742,57 @@ impl OrderBook {
             },
         )?;
 
+        if let OrderType::Stop {
+            trigger_price,
+            activation,
+        } = command.order_type
+        {
+            let displayed = command.display.displayed_lots(command.quantity.lots());
+            self.append_dormant_stop(RestingOrder {
+                order_id: command.order_id,
+                account_id: command.account_id,
+                side: command.side,
+                price: activation.risk_price().unwrap_or(trigger_price),
+                leaves: command.quantity.lots(),
+                displayed,
+                display: command.display,
+                self_trade_prevention: command.self_trade_prevention,
+                expires_at: command.time_in_force.expires_at(),
+                stop: Some(DormantStopState {
+                    trigger_price,
+                    activation,
+                    time_in_force: command.time_in_force,
+                    priority_sequence,
+                }),
+                previous: None,
+                next: None,
+                account_previous: None,
+                account_next: None,
+            });
+            self.push_event(
+                &mut events,
+                command.command_id,
+                command.received_at,
+                EventKind::StopOrderArmed {
+                    order_id: command.order_id,
+                    trigger_price,
+                    activation,
+                    priority_sequence,
+                },
+            )?;
+            return Ok(ExecutionReport {
+                command_id: command.command_id,
+                outcome: CommandOutcome::Accepted,
+                events: events.finish(),
+                replayed: false,
+            });
+        }
+
         let incoming = IncomingOrder {
             order_id: command.order_id,
             account_id: command.account_id,
             side: command.side,
-            order_type: command.order_type,
+            order_type: command.order_type.active(),
             leaves: command.quantity.lots(),
             display: command.display,
             self_trade_prevention: command.self_trade_prevention,
@@ -5896,6 +7150,168 @@ impl OrderBook {
             .count()
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one atomic trigger command applies the complete activation-time execution grammar"
+    )]
+    fn apply_stop_trigger_sweep(
+        &mut self,
+        command: StopTriggerSweep,
+        mut events: EventTraceBuilder,
+        mut selected: PooledOrderSelection,
+    ) -> Result<ExecutionReport, MatchingError> {
+        let previous_reference_price = self.stop_reference_price;
+        let selected_count = self.eligible_stop_count(command.reference_price).min(
+            usize::try_from(command.maximum_orders)
+                .map_err(|_| MatchingError::InternalInvariantViolation)?,
+        );
+        if selected.capacity() < selected_count {
+            return Err(MatchingError::InternalInvariantViolation);
+        }
+        let selected_values = selected.values_mut();
+        let selected_buffer = selected_values.as_ptr();
+        self.for_each_eligible_stop(command.reference_price, selected_count, |order_id| {
+            selected_values.push(order_id);
+            Ok::<(), MatchingError>(())
+        })?;
+        debug_assert_eq!(selected_values.len(), selected_count);
+        debug_assert_eq!(selected_values.as_ptr(), selected_buffer);
+
+        for order_id in selected_values.drain(..) {
+            let removed = self.remove_order(order_id);
+            let stop = removed
+                .stop
+                .expect("selected trigger target must be a dormant stop");
+            self.push_event(
+                &mut events,
+                command.command_id,
+                command.received_at,
+                EventKind::StopOrderTriggered {
+                    order_id,
+                    trigger_price: stop.trigger_price,
+                    reference_price: command.reference_price,
+                    priority_sequence: stop.priority_sequence,
+                },
+            )?;
+
+            let active_order_type = stop.activation.order_type();
+            let incoming = IncomingOrder {
+                order_id,
+                account_id: removed.account_id,
+                side: removed.side,
+                order_type: active_order_type,
+                leaves: removed.leaves,
+                display: removed.display,
+                self_trade_prevention: removed.self_trade_prevention,
+            };
+            if stop.time_in_force == TimeInForce::FillOrKill {
+                let candidate = NewOrder {
+                    command_id: command.command_id,
+                    order_id,
+                    account_id: removed.account_id,
+                    instrument_id: command.instrument_id,
+                    instrument_version: command.instrument_version,
+                    side: removed.side,
+                    quantity: Quantity::new(removed.leaves)
+                        .expect("dormant stop leaves must be non-zero"),
+                    display: removed.display,
+                    order_type: active_order_type,
+                    time_in_force: TimeInForce::FillOrKill,
+                    self_trade_prevention: removed.self_trade_prevention,
+                    received_at: command.received_at,
+                };
+                if !self.can_fill(&candidate) {
+                    self.push_cancelled(
+                        &mut events,
+                        command.command_id,
+                        command.received_at,
+                        order_id,
+                        removed.leaves,
+                        CancelReason::TriggeredFokUnfilled,
+                    )?;
+                    continue;
+                }
+            }
+            if stop.time_in_force == TimeInForce::PostOnly
+                && self.would_cross(removed.side, active_order_type)
+            {
+                self.push_cancelled(
+                    &mut events,
+                    command.command_id,
+                    command.received_at,
+                    order_id,
+                    removed.leaves,
+                    CancelReason::TriggeredPostOnlyWouldCross,
+                )?;
+                continue;
+            }
+            if !self.triggered_residual_has_capacity(incoming, stop.time_in_force) {
+                self.push_cancelled(
+                    &mut events,
+                    command.command_id,
+                    command.received_at,
+                    order_id,
+                    removed.leaves,
+                    CancelReason::TriggeredCapacityUnavailable,
+                )?;
+                continue;
+            }
+            self.execute_incoming(
+                incoming,
+                stop.time_in_force,
+                command.command_id,
+                command.received_at,
+                &mut events,
+            )?;
+        }
+
+        self.stop_reference_price = Some(command.reference_price);
+        let remaining = self.eligible_stop_count(command.reference_price);
+        self.push_event(
+            &mut events,
+            command.command_id,
+            command.received_at,
+            EventKind::StopTriggerSweepCompleted {
+                previous_reference_price,
+                current_reference_price: command.reference_price,
+                triggered_order_count: u64::try_from(selected_count)
+                    .map_err(|_| MatchingError::SequenceExhausted)?,
+                remaining_eligible_order_count: u64::try_from(remaining)
+                    .map_err(|_| MatchingError::SequenceExhausted)?,
+            },
+        )?;
+        Ok(ExecutionReport {
+            command_id: command.command_id,
+            outcome: CommandOutcome::Accepted,
+            events: events.finish(),
+            replayed: false,
+        })
+    }
+
+    fn triggered_residual_has_capacity(
+        &self,
+        incoming: IncomingOrder,
+        time_in_force: TimeInForce,
+    ) -> bool {
+        let OrderType::Limit(price) = incoming.order_type else {
+            return true;
+        };
+        if !time_in_force.may_rest() || self.levels(incoming.side).get(price).is_some() {
+            return true;
+        }
+        if self.levels(incoming.side).len() < self.limits.max_price_levels_per_side() {
+            return true;
+        }
+        self.resting_residual_removed_orders(IncomingPreview {
+            account_id: incoming.account_id,
+            side: incoming.side,
+            order_type: incoming.order_type,
+            leaves: incoming.leaves,
+            self_trade_prevention: incoming.self_trade_prevention,
+        })
+        .is_none()
+    }
+
     fn apply_replace(
         &mut self,
         command: ReplaceOrder,
@@ -5906,6 +7322,9 @@ impl OrderBook {
             .get(&command.order_id)
             .copied()
             .expect("prechecked replacement order must exist");
+        if old.is_dormant_stop() {
+            return self.apply_replace_dormant_stop(command, old, events);
+        }
         let new_quantity = command.new_quantity.lots();
         let priority_retained = old.price == command.new_price
             && new_quantity <= old.leaves
@@ -5979,6 +7398,111 @@ impl OrderBook {
             )?;
         }
 
+        Ok(ExecutionReport {
+            command_id: command.command_id,
+            outcome: CommandOutcome::Accepted,
+            events: events.finish(),
+            replayed: false,
+        })
+    }
+
+    fn apply_replace_dormant_stop(
+        &mut self,
+        command: ReplaceOrder,
+        old: RestingOrder,
+        mut events: EventTraceBuilder,
+    ) -> Result<ExecutionReport, MatchingError> {
+        let old_stop = old
+            .stop
+            .expect("dormant replacement must retain stop state");
+        debug_assert!(matches!(old_stop.activation, StopActivation::Limit(_)));
+        let new_quantity = command.new_quantity.lots();
+        let priority_retained = old.price == command.new_price
+            && new_quantity <= old.leaves
+            && old.display == command.new_display;
+        let replacement_sequence = self.next_sequence;
+        self.push_event(
+            &mut events,
+            command.command_id,
+            command.received_at,
+            EventKind::OrderReplaced {
+                order_id: command.order_id,
+                old_price: old.price,
+                new_price: command.new_price,
+                old_quantity: Quantity::new(old.leaves)
+                    .expect("dormant stop leaves must be non-zero"),
+                new_quantity: command.new_quantity,
+                old_display: old.display,
+                new_display: command.new_display,
+                priority_retained,
+            },
+        )?;
+
+        let mut updated = old;
+        updated.price = command.new_price;
+        updated.leaves = new_quantity;
+        updated.displayed = command.new_display.displayed_lots(new_quantity);
+        updated.display = command.new_display;
+        let updated_priority = if priority_retained {
+            old_stop.priority_sequence
+        } else {
+            replacement_sequence
+        };
+        updated.stop = Some(DormantStopState {
+            activation: StopActivation::Limit(command.new_price),
+            priority_sequence: updated_priority,
+            ..old_stop
+        });
+
+        if !priority_retained {
+            let removed = match old.side {
+                Side::Buy => self.buy_stops.remove(&BuyStopKey {
+                    trigger_price: old_stop.trigger_price,
+                    priority_sequence: old_stop.priority_sequence,
+                    order_id: old.order_id,
+                }),
+                Side::Sell => self.sell_stops.remove(&SellStopKey {
+                    trigger_price: Reverse(old_stop.trigger_price),
+                    priority_sequence: old_stop.priority_sequence,
+                    order_id: old.order_id,
+                }),
+            };
+            assert_eq!(removed, Some(old.order_id));
+            match old.side {
+                Side::Buy => {
+                    assert!(
+                        self.buy_stops
+                            .insert(
+                                BuyStopKey {
+                                    trigger_price: old_stop.trigger_price,
+                                    priority_sequence: updated_priority,
+                                    order_id: old.order_id,
+                                },
+                                old.order_id,
+                            )
+                            .is_none()
+                    );
+                }
+                Side::Sell => {
+                    assert!(
+                        self.sell_stops
+                            .insert(
+                                SellStopKey {
+                                    trigger_price: Reverse(old_stop.trigger_price),
+                                    priority_sequence: updated_priority,
+                                    order_id: old.order_id,
+                                },
+                                old.order_id,
+                            )
+                            .is_none()
+                    );
+                }
+            }
+        }
+        *self
+            .orders
+            .get_mut(&command.order_id)
+            .expect("dormant replacement target must remain active") = updated;
         Ok(ExecutionReport {
             command_id: command.command_id,
             outcome: CommandOutcome::Accepted,
@@ -6102,6 +7626,7 @@ impl OrderBook {
                     display: incoming.display,
                     self_trade_prevention: incoming.self_trade_prevention,
                     expires_at: time_in_force.expires_at(),
+                    stop: None,
                     previous: None,
                     next: None,
                     account_previous: None,
@@ -6341,6 +7866,9 @@ impl OrderBook {
             (Side::Sell, OrderType::Limit(limit)) => {
                 self.best_price(Side::Buy).is_some_and(|bid| limit <= bid)
             }
+            (_, OrderType::Stop { .. }) => {
+                unreachable!("dormant stop constraint cannot enter active crossing")
+            }
         }
     }
 
@@ -6356,6 +7884,9 @@ impl OrderBook {
             (_, OrderType::Market) => true,
             (Side::Buy, OrderType::Limit(limit)) => limit >= price,
             (Side::Sell, OrderType::Limit(limit)) => limit <= price,
+            (_, OrderType::Stop { .. }) => {
+                unreachable!("dormant stop constraint cannot enter active matching")
+            }
         };
         crosses.then_some((level.head, handle))
     }
@@ -6378,6 +7909,9 @@ impl OrderBook {
                 (_, OrderType::Market) => true,
                 (Side::Buy, OrderType::Limit(limit)) => limit >= current_price,
                 (Side::Sell, OrderType::Limit(limit)) => limit <= current_price,
+                (_, OrderType::Stop { .. }) => {
+                    unreachable!("dormant stop constraint cannot enter residual preview")
+                }
             };
             if !crosses {
                 break;
@@ -6447,6 +7981,9 @@ impl OrderBook {
                         (_, OrderType::Market) => true,
                         (Side::Buy, OrderType::Limit(limit)) => limit >= order.price,
                         (Side::Sell, OrderType::Limit(limit)) => limit <= order.price,
+                        (_, OrderType::Stop { .. }) => {
+                            unreachable!("dormant stop constraint cannot enter account preview")
+                        }
                     }
                 {
                     return false;
@@ -6469,6 +8006,9 @@ impl OrderBook {
                 (_, OrderType::Market) => true,
                 (Side::Buy, OrderType::Limit(limit)) => limit >= current_price,
                 (Side::Sell, OrderType::Limit(limit)) => limit <= current_price,
+                (_, OrderType::Stop { .. }) => {
+                    unreachable!("dormant stop constraint cannot enter FOK inspection")
+                }
             };
             if !crosses {
                 return false;
@@ -6666,6 +8206,10 @@ impl OrderBook {
 
     fn append_order(&mut self, mut order: RestingOrder) {
         assert!(
+            order.stop.is_none(),
+            "resting order cannot retain a stop instruction"
+        );
+        assert!(
             self.orders.len() < self.limits.max_active_orders(),
             "resting-order preflight must reserve active-order capacity"
         );
@@ -6679,6 +8223,66 @@ impl OrderBook {
                 || self.levels(order.side).len() < self.limits.max_price_levels_per_side(),
             "resting-order preflight must reserve price-level capacity"
         );
+        self.append_account_membership(&mut order);
+        self.append_order_preserving_account_index(order);
+    }
+
+    fn append_dormant_stop(&mut self, mut order: RestingOrder) {
+        assert!(
+            order.stop.is_some(),
+            "dormant stop must retain its trigger state"
+        );
+        assert!(
+            self.orders.len() < self.limits.max_active_orders(),
+            "stop-order preflight must reserve active-order capacity"
+        );
+        assert!(
+            self.account_orders.contains_key(&order.account_id)
+                || self.account_orders.len() < self.limits.max_active_accounts(),
+            "stop-order preflight must reserve active-account capacity"
+        );
+        self.append_account_membership(&mut order);
+        let stop = order.stop.expect("dormant stop state exists");
+        assert!(
+            self.orders.insert(order.order_id, order).is_none(),
+            "active order identifier must be unique"
+        );
+        self.insert_expiry(order);
+        match order.side {
+            Side::Buy => {
+                assert!(
+                    self.buy_stops
+                        .insert(
+                            BuyStopKey {
+                                trigger_price: stop.trigger_price,
+                                priority_sequence: stop.priority_sequence,
+                                order_id: order.order_id,
+                            },
+                            order.order_id,
+                        )
+                        .is_none(),
+                    "buy-stop trigger identity must be unique"
+                );
+            }
+            Side::Sell => {
+                assert!(
+                    self.sell_stops
+                        .insert(
+                            SellStopKey {
+                                trigger_price: Reverse(stop.trigger_price),
+                                priority_sequence: stop.priority_sequence,
+                                order_id: order.order_id,
+                            },
+                            order.order_id,
+                        )
+                        .is_none(),
+                    "sell-stop trigger identity must be unique"
+                );
+            }
+        }
+    }
+
+    fn append_account_membership(&mut self, order: &mut RestingOrder) {
         let event_units = order.remaining_event_units();
         assert!(
             order.account_previous.is_none() && order.account_next.is_none(),
@@ -6713,10 +8317,10 @@ impl OrderBook {
             .expect("active account index must exist after insertion")
             .append(order.side, order.order_id, event_units);
         assert_eq!(indexed_previous, previous);
-        self.append_order_preserving_account_index(order);
     }
 
     fn append_order_preserving_account_index(&mut self, mut order: RestingOrder) {
+        assert!(order.stop.is_none(), "price-level member cannot be dormant");
         let event_units = order.remaining_event_units();
         let existing_level = self.levels(order.side).handle(order.price).map(|handle| {
             let tail = self
@@ -6757,6 +8361,10 @@ impl OrderBook {
             self.orders.insert(order.order_id, order).is_none(),
             "active order identifier must be unique"
         );
+        self.insert_expiry(order);
+    }
+
+    fn insert_expiry(&mut self, order: RestingOrder) {
         if let Some(expires_at) = order.expires_at {
             assert!(
                 self.expiries
@@ -6890,6 +8498,11 @@ impl OrderBook {
             .orders
             .get(&order_id)
             .expect("validated removal target must exist");
+        if order.is_dormant_stop() {
+            let removed = self.remove_dormant_stop_preserving_account_index(order_id);
+            self.remove_account_membership(removed);
+            return removed;
+        }
         let level_handle = self
             .levels(order.side)
             .handle(order.price)
@@ -6903,6 +8516,11 @@ impl OrderBook {
         level_handle: PriceLevelHandle,
     ) -> RestingOrder {
         let order = self.remove_order_preserving_account_index_at(order_id, level_handle);
+        self.remove_account_membership(order);
+        order
+    }
+
+    fn remove_account_membership(&mut self, order: RestingOrder) {
         if let Some(previous) = order.account_previous {
             self.orders
                 .get_mut(&previous)
@@ -6921,7 +8539,7 @@ impl OrderBook {
             .expect("active order account index must exist");
         index.remove(
             order.side,
-            order_id,
+            order.order_id,
             order.account_previous,
             order.account_next,
             order.remaining_event_units(),
@@ -6929,7 +8547,6 @@ impl OrderBook {
         if index.is_empty() {
             self.account_orders.remove(&order.account_id);
         }
-        order
     }
 
     fn remove_order_preserving_account_index(&mut self, order_id: OrderId) -> RestingOrder {
@@ -6937,6 +8554,9 @@ impl OrderBook {
             .orders
             .get(&order_id)
             .expect("validated removal target must exist");
+        if order.is_dormant_stop() {
+            return self.remove_dormant_stop_preserving_account_index(order_id);
+        }
         let level_handle = self
             .levels(order.side)
             .handle(order.price)
@@ -7001,6 +8621,42 @@ impl OrderBook {
                 .remove_by_handle(level_handle)
                 .expect("empty resting level handle must remain valid");
         }
+        order
+    }
+
+    fn remove_dormant_stop_preserving_account_index(&mut self, order_id: OrderId) -> RestingOrder {
+        let order = self
+            .orders
+            .remove(&order_id)
+            .expect("validated dormant-stop removal target must exist");
+        let stop = order.stop.expect("dormant stop must retain trigger state");
+        if let Some(expires_at) = order.expires_at {
+            assert_eq!(
+                self.expiries.remove(&ExpiryKey {
+                    expires_at,
+                    order_id,
+                }),
+                Some(order_id),
+                "active GTD stop must have one expiry-index entry"
+            );
+        }
+        let removed = match order.side {
+            Side::Buy => self.buy_stops.remove(&BuyStopKey {
+                trigger_price: stop.trigger_price,
+                priority_sequence: stop.priority_sequence,
+                order_id,
+            }),
+            Side::Sell => self.sell_stops.remove(&SellStopKey {
+                trigger_price: Reverse(stop.trigger_price),
+                priority_sequence: stop.priority_sequence,
+                order_id,
+            }),
+        };
+        assert_eq!(
+            removed,
+            Some(order_id),
+            "dormant stop must have one trigger-index entry"
+        );
         order
     }
 }
@@ -7130,6 +8786,9 @@ mod price_level_index_tests {
                 (_, OrderType::Market) => true,
                 (Side::Buy, OrderType::Limit(limit)) => limit >= current_price,
                 (Side::Sell, OrderType::Limit(limit)) => limit <= current_price,
+                (_, OrderType::Stop { .. }) => {
+                    unreachable!("dormant stop constraint cannot enter test FOK model")
+                }
             };
             if !crosses {
                 return false;
@@ -7232,6 +8891,7 @@ mod price_level_index_tests {
                     display,
                     self_trade_prevention: SelfTradePrevention::CancelAggressor,
                     expires_at: None,
+                    stop: None,
                     previous: None,
                     next: None,
                     account_previous: None,
@@ -7286,6 +8946,7 @@ mod price_level_index_tests {
             display: OrderDisplay::FullyDisplayed,
             self_trade_prevention: incoming.self_trade_prevention,
             expires_at: incoming.time_in_force.expires_at(),
+            stop: None,
             previous: None,
             next: None,
             account_previous: None,
@@ -7305,6 +8966,7 @@ mod price_level_index_tests {
             display: OrderDisplay::FullyDisplayed,
             self_trade_prevention: SelfTradePrevention::CancelAggressor,
             expires_at: None,
+            stop: None,
             previous: None,
             next: None,
             account_previous: None,
@@ -7328,6 +8990,7 @@ mod price_level_index_tests {
                 display: OrderDisplay::FullyDisplayed,
                 self_trade_prevention: SelfTradePrevention::CancelAggressor,
                 expires_at: None,
+                stop: None,
                 previous: None,
                 next: None,
                 account_previous: None,
@@ -7428,6 +9091,7 @@ mod price_level_index_tests {
                 },
                 self_trade_prevention: SelfTradePrevention::CancelAggressor,
                 expires_at: None,
+                stop: None,
                 previous: None,
                 next: None,
                 account_previous: None,
@@ -7443,6 +9107,7 @@ mod price_level_index_tests {
                 display: OrderDisplay::FullyDisplayed,
                 self_trade_prevention: SelfTradePrevention::CancelAggressor,
                 expires_at: None,
+                stop: None,
                 previous: None,
                 next: None,
                 account_previous: None,
@@ -7458,6 +9123,7 @@ mod price_level_index_tests {
                 display: OrderDisplay::FullyDisplayed,
                 self_trade_prevention: SelfTradePrevention::CancelAggressor,
                 expires_at: None,
+                stop: None,
                 previous: None,
                 next: None,
                 account_previous: None,
@@ -7595,6 +9261,7 @@ mod price_level_index_tests {
                 display: OrderDisplay::FullyDisplayed,
                 self_trade_prevention: SelfTradePrevention::CancelAggressor,
                 expires_at: None,
+                stop: None,
                 previous: None,
                 next: None,
                 account_previous: None,
@@ -7629,6 +9296,7 @@ mod price_level_index_tests {
                 display: OrderDisplay::FullyDisplayed,
                 self_trade_prevention: SelfTradePrevention::CancelAggressor,
                 expires_at: None,
+                stop: None,
                 previous: None,
                 next: None,
                 account_previous: None,
@@ -7680,6 +9348,7 @@ mod price_level_index_tests {
                 display: OrderDisplay::FullyDisplayed,
                 self_trade_prevention: SelfTradePrevention::CancelAggressor,
                 expires_at: None,
+                stop: None,
                 previous: None,
                 next: None,
                 account_previous: None,

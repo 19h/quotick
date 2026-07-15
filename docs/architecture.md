@@ -73,12 +73,15 @@ shard, from command admission through checkpoint capture.
    inclusive size bounds; limit prices satisfy the signed tick grid and collar.
 3. New orders and replacements require `Open`; cancellation remains available
    in `Open`, `CancelOnly`, `Halted`, and `Closed` states after identity checks.
-4. An active order appears in exactly one hash-index entry and one FIFO level.
+4. A non-dormant active order appears in exactly one hash-index entry and one
+   FIFO level. A dormant stop appears in the same identity/account topology and
+   exactly one side-specific trigger index, but in no price FIFO.
 5. A level head has no previous order; a level tail has no next order.
-6. Every active order has non-zero total and displayed leaves. Fully displayed
-   orders expose all total leaves; reserve orders expose at most their fixed
-   peak. Level quantity is the `u128` sum of displayed leaves, not hidden total
-   leaves.
+6. Every active order has non-zero total leaves. Every non-dormant active order
+   has non-zero displayed leaves: fully displayed orders expose all total
+   leaves; reserve orders expose at most their fixed peak. Dormant stops expose
+   zero public leaves. Level quantity is the `u128` sum of displayed leaves,
+   not hidden or dormant total leaves.
 7. Bids execute from highest price to lowest; asks execute from lowest price to
    highest; equal-price orders execute in insertion order.
 8. Trade price is the resting order price and every trade carries the book's
@@ -99,6 +102,20 @@ shard, from command admission through checkpoint capture.
       by `(deadline, OrderId)`. A sweep cancels its qualifying prefix in that
       order and emits exact count/quantity totals before committing the new
       watermark. Replacement preserves the original deadline.
+    - A stop order is admitted only after an explicit reference exists. A buy
+      trigger is strictly above that reference and a sell trigger strictly
+      below it; an already-satisfied trigger is rejected rather than executed
+      implicitly during intake.
+    - Dormant stops count against active-order, active-account, accepted-ID,
+      cancellation, expiry, control, and risk capacity, but occur in neither
+      price FIFO nor public depth. Stop-market post-only and replacement are
+      rejected; stop-limit replacement retains its trigger and follows explicit
+      trigger-priority retention rules.
+    - A sequenced stop-trigger sweep supplies the authoritative last-trade
+      reference. It activates at most its positive configured bound in
+      canonical trigger/priority/ID order. Eligible backlog must drain through
+      same-reference sweeps before the reference can change. Matching trades do
+      not advance this reference implicitly.
 
 ### Reserve orders
 
@@ -196,7 +213,9 @@ shard, from command admission through checkpoint capture.
     active-order capacity; accepted identity and ordinary history can establish
     every maximum active order. Report capacity is at least
     `max_active_orders + 1`, so one maximum-size mass cancellation or expiry
-    sweep always fits.
+    sweep always fits. Stop-trigger preparation separately proves the complete
+    activation/matching trace against the configured per-report and retained-
+    event bounds before mutation.
 26. The tail of retained-command capacity reserves at least one slot per maximum
     active order. Once ordinary history fills, new and replace commands stop.
     Only a cancel, mass cancel, nonregressing expiry sweep, revision-valid
@@ -204,12 +223,14 @@ shard, from command admission through checkpoint capture.
     transition-and-cancel into an entry-closed state that passes current core
     business validation may enter the reserve; reopening remains ordinary
     admission; malformed, unknown, wrong-owner, or wrong-instrument controls
-    cannot consume it. Exact cached retries remain available even at total
-    exhaustion.
+    cannot consume it. Stop-trigger sweeps use ordinary history capacity and
+    cannot consume this protected tail. Exact cached retries remain available
+    even at total exhaustion.
 27. Construction fallibly reserves both price-level AVL arenas, the GTD-expiry
-    AVL arena, all five matching hash indexes, and the coupled-risk profile and
-    reservation indexes through their complete configured maxima. It also
-    constructs every configured isolated order-selection vector.
+    AVL arena, both stop-trigger AVL arenas, all five matching hash indexes,
+    and the coupled-risk profile and reservation indexes through their complete
+    configured maxima. It also constructs every configured isolated order-
+    selection vector.
     - `PreparedCommand` owns an optional lease for a non-empty
       mass-cancel/expiry/account-control/instrument-control selection;
       preparation borrows matching and coupled-risk state immutably, performs
@@ -228,13 +249,15 @@ shard, from command admission through checkpoint capture.
     reconstructs under the selected limits and fails explicitly if any
     retained historical transition exceeds them. Limits may be enlarged at
     restart; lowering them is valid only when the selected recovery path fits.
-    GTD deadlines are retained in active rows; the expiry watermark is derived
-    from history, and no restored active deadline may be at or before it.
-    Semantic validation and selected-limit admission use eight exact bounded
-    scratch indexes for history command IDs, accepted IDs, account controls,
-    active IDs/accounts, and bid/ask prices. Their complete dense/bucket layouts
-    are reserved fallibly before use; failure reports the exact scratch resource
-    and maximum before restored state exists.
+    GTD deadlines are retained in active and dormant rows; the expiry watermark
+    and stop reference are derived from history, and no restored deadline may
+    be at or before the watermark. Dormant rows must equal history-derived stop
+    lineage and canonical trigger priority. Semantic validation and selected-
+    limit admission use nine exact bounded scratch indexes for history command
+    IDs, accepted IDs, account controls, active IDs/accounts, bid/ask prices,
+    and dormant-stop lineage. Their complete dense/bucket layouts are reserved
+    fallibly before use; failure reports the exact scratch resource and maximum
+    before restored state exists.
 29. A GTC/GTD/post-only capacity preview is invoked only when an active-order,
     active-account, or same-side price-level bound is already full.
     - It predicts whether a residual will rest without mutation or
@@ -252,6 +275,10 @@ shard, from command admission through checkpoint capture.
       and the same-side level bound is full. Full execution or an
       aggressor-terminating STP encounter proves that no target level is
       created; only a proved resting residual consumes the new level.
+    - Dormant stop intake consumes no price level. Trigger preparation proves
+      whether each stop-limit residual needs a level; unavailable residual
+      capacity cancels that complete triggered order with a typed reason and
+      leaves no partial state mutation.
 30. Command preparation binds the command, completed core business result,
     process-local non-reused book identity, retained-command cardinality, and
     safe maximum event count in one opaque token. It proves constructor-owned
@@ -303,12 +330,12 @@ shard, from command admission through checkpoint capture.
       validation, and encoding depend only on ordered event values. Arena
       ranges support `O(1)` indexing and ordered iteration but are not exposed
       as one contiguous `&[Event]`.
-    - An immutable matching checkpoint retains its canonical active-order and
-      chronological-history vectors behind two shared owners. Checkpoint clone
-      therefore copies only two handles in `O(1)` time and allocates no
-      row/event storage; equality and stable encoding remain ordered-value
-      operations. Initial capture/decoding still constructs the two
-      shared-owner control blocks.
+    - An immutable matching checkpoint retains its canonical resting-order,
+      dormant-stop, and chronological-history vectors behind three shared
+      owners. Checkpoint clone therefore copies only three handles in `O(1)`
+      time and allocates no row/event storage; equality and stable encoding
+      remain ordered-value operations. Initial capture/decoding still
+      constructs the three shared-owner control blocks.
 34. Every resting order contributes mutation-maintained future event work.
     - A fully displayed order contributes one unit. A reserve order with
       leaves `L`, displayed leaves `D`, and peak `p` has
@@ -325,13 +352,17 @@ shard, from command admission through checkpoint capture.
     - Side-wide aggregates include uncrossed prices and may therefore reject
       early near a sequence or event-arena boundary, but only actual committed
       events advance retained storage.
+    - Stop-trigger preparation bounds the selected canonical prefix and every
+      possible activation-time matching, STP, refresh, residual, cancellation,
+      and completion event. The configured batch maximum is not a substitute
+      for the per-report or retained-event checks.
 35. Continuous matching checkpoint publication has an explicit
     unverified-to-verified type transition.
     - `capture_checkpoint_candidate` audits the live topology/event arena,
       captures canonical rows at one completed WAL boundary, derives accepted
       identities, account controls, trading-state revision, expiry watermark,
-      and event/trade counters from command history, and requires equality with
-      live state.
+      stop reference, dormant-stop lineage, and event/trade counters from
+      command history, and requires equality with live state.
       `OrderBookCheckpointCapture` exposes no rows and implements neither the
       stable codec nor snapshot payload contract.
     - Its consuming `verify` transition may execute on another thread, replays
@@ -368,6 +399,12 @@ GTD order. It is reserved through `max_active_orders`, supports ordered-prefix
 expiry without scanning unrelated resting orders, and uses the same
 `O(log(O + 1))` insertion/removal bound and intrusive free-slot reuse.
 
+Two additional stable-slot AVL arenas index dormant buy and sell stops. Buy
+keys order ascending `(trigger price, priority sequence, OrderId)`; sell keys
+reverse trigger price while retaining ascending priority and identity. Both are
+reserved through `max_active_orders`, and activation/removal is
+`O(log(O + 1))` per stop without allocator-owned nodes.
+
 It uses a fixed-capacity dense hash index from
 `OrderId` to `RestingOrder` for direct lookup and another from `AccountId` to
 `AccountOrderIndex` containing side-specific intrusive
@@ -380,9 +417,9 @@ selected links and sorts unique `OrderId` values in the already-prepared vector.
 retained events;
 `RiskManagedLimits` independently adds the registered-profile maximum. Mandatory
 construction-time reservation covers both complete price arenas, the complete
-GTD-expiry arena, active orders, active accounts, accepted IDs, retained account
-controls, retained reports, retained-event slots, registered profiles, and
-coupled-risk reservations. Construction also creates
+GTD-expiry and stop-trigger arenas, active orders, active accounts, accepted
+IDs, retained account controls, retained reports, retained-event slots,
+registered profiles, and coupled-risk reservations. Construction also creates
 `max_prepared_order_selections` vectors, each requesting `max_active_orders`
 `OrderId` elements. Non-empty mass-cancel, expiry-sweep, block-and-cancel, and
 transition-and-cancel preparation leases one vector; zero-cardinality
@@ -574,8 +611,8 @@ interest for discovery, allocation, and uncross preparation.
       preparation, stale commit, or committed result returns that set.
     - The book primitive itself has no command sequence, phase, idempotency,
       or durability semantics. `CallAuctionEngine` supplies the first three,
-      and the version-5 durable wrapper supplies stable wire encoding,
-      full-WAL recovery, and snapshot-version-5 checkpoint/cutover recovery.
+      and the version-6 durable wrapper supplies stable wire encoding,
+      full-WAL recovery, and snapshot-version-6 checkpoint/cutover recovery.
     - The separate `CallAuctionRiskManagedEngine` supplies optional profile
       admission, reservations, positions, and independently replayed coupled
       checkpoints; settlement, public/private auction transport, preventive
@@ -715,7 +752,7 @@ admission and tracks reservations and positions.
    coupled core-first risk gate; validation capacity includes historically
    risk-rejected submits because they still require core preparation.
 8. The coupled checkpoint has a stable complete-value little-endian codec and
-   direct restore under default or explicit limits. Snapshot version 5 assigns
+   direct restore under default or explicit limits. Snapshot version 6 assigns
    it `QSNP` kind `5`. `DurableCallAuctionRiskEngine` binds a canonical
    definition/profile prefix, persists command/report pairs, completes at most
    one dangling non-retry command, verifies risk-aware replay, and supports
@@ -727,14 +764,14 @@ admission and tracks reservations and positions.
 This section defines WAL persistence, recovery, and checkpoint rules for the
 call-auction engine.
 
-1. WAL version 5 retains stable record-kind tags `9` and `10` for one
+1. WAL version 6 retains stable record-kind tags `9` and `10` for one
    call-auction command and its complete execution report. All multibyte fields
    are little-endian, enum tags are explicit, and decoding reconstructs and
    validates domain values, contiguous event sequencing, report outcome/event
    grammar, clearing totals, trade identity, and uncross body counts.
 2. An uncut auction journal contains one immutable instrument definition
    followed by strict command/report pairs. A compacted journal instead begins
-   with one kind-`8` anchor bound to snapshot-version-5 call-auction kind `4`,
+   with one kind-`8` anchor bound to snapshot-version-6 call-auction kind `4`,
    followed by the same suffix grammar. A report without a command, consecutive
    commands, a second definition, an interior anchor, a
    continuous-matching/risk/ledger record, or any other kind fails recovery. At
@@ -1007,23 +1044,27 @@ accounting for the continuous-matching risk layer.
    limits after matching ownership and identity validation.
 2. Core instrument and matching business checks precede risk checks; a core
    rejection cannot be replaced by a risk rejection.
-3. Per-order quantity/notional, resting-order count, aggregate resting
+3. Per-order quantity/notional, active-order count, aggregate active
    quantity/notional, and worst-case long/short position are independently
    bounded with checked integer arithmetic.
 4. Incoming notional covers every reachable execution price: buy limits use
    the maximum absolute magnitude over `[collar minimum, limit]`, sell limits
-   over `[limit, collar maximum]`, and market orders over the full collar.
-   Units are raw price quanta multiplied by lots (`u128`).
+   over `[limit, collar maximum]`, and market orders over the full collar. A
+   dormant stop uses the identical rule for its activation constraint, not its
+   trigger threshold. Units are raw price quanta multiplied by lots (`u128`).
 5. IOC, FOK, and market commands cannot retain a reservation and therefore do
-   not consume resting-order count/quantity/notional capacity. Their complete
-   quantity still consumes worst-case position and per-order capacity.
-6. Once an order rests, its reservation retains the conservative per-lot
+   not consume active count/quantity/notional capacity when immediately
+   executed. A dormant stop retains a reservation regardless of activation
+   TIF; its complete quantity consumes worst-case position and per-order
+   capacity.
+6. Once an order rests or becomes dormant, its reservation retains the
+   conservative per-lot
    reachable-price magnitude used at admission. This can exceed
    `abs(resting price)` for a maker-only future fill, but it prevents aggregate
    open-notional utilization from dropping merely because the command crossed
    the acceptance boundary. Partial fills multiply the retained magnitude by
    current total leaves.
-7. Worst-case long exposure is executed position plus all resting buy lots plus
+7. Worst-case long exposure is executed position plus all active buy lots plus
    the incoming buy quantity; short exposure is the executed position minus
    equivalent sell exposure.
 8. `ReduceOnly` permits only the side opposing a non-zero position and requires
@@ -1031,12 +1072,15 @@ accounting for the continuous-matching risk layer.
 9. Matching traces release maker reservations on fills, all reservations on
    cancellation, old exposure before replacement, and prevented resting lots
    under decrement-and-cancel STP. Reserve risk and notional are based on total
-   leaves; replenishing a displayed slice has no independent risk effect.
-   Trades update buyer/seller positions once.
+   leaves; replenishing a displayed slice has no independent risk effect. Stop
+   arming creates one dormant reservation; triggering changes its state without
+   duplicating exposure, after which ordinary trade/cancel/residual transitions
+   apply. Trades update buyer/seller positions once.
 10. Single-order, mass, accepted GTD-expiry sweeps, and accepted
     block-and-cancel account controls bypass numerical entry limits after
     instrument identity validation. Expiry and instrument trading-state
-    controls are account-independent. Each cancelled order releases its
+    controls and stop-trigger sweeps are account-independent. Each cancelled
+    order releases its
     complete total-leaves reservation exactly once before the completion
     summary is ignored by risk state.
 11. Exact command retries do not apply risk state twice. Risk rejections are
@@ -1048,7 +1092,8 @@ accounting for the continuous-matching risk layer.
     - Cross-audit walks each account list with a global cardinality guard,
       validates ownership and bidirectional links, recomputes exact account
       aggregates, proves complete reservation coverage, and verifies a
-      one-to-one structural match with every active book order.
+      one-to-one structural match with every resting or dormant active book
+      order.
     - Successful risk-only validation is expected `O(A + O)` with `O(1)`
       auxiliary space and no heap allocation for `A` accounts and `O`
       reservations. Complete coupled validation adds the allocation-free
@@ -1095,15 +1140,16 @@ market-data stream and its replicas.
    sequence hole.
 2. Public updates contain instrument ID and immutable definition version. They
    contain no account, order, or command identifiers.
-3. Events without a public depth, trade, or instrument-state effect emit `NoBookChange`; market-data version 2
-   performs no conflation or sequence renumbering.
+3. Events without a public depth, trade, or instrument-state effect emit
+   `NoBookChange`; market-data version 2 performs no conflation or sequence
+   renumbering.
 4. Level updates contain absolute post-event aggregate quantity and order count,
    not relative deltas. Both fields are zero only for level deletion.
 5. Trade updates contain monotonic trade ID, signed execution price, positive
    quantity, aggressor side, and the absolute maker level after execution. A
    replica proves that aggregate maker quantity falls by exactly the printed
    quantity and that maker order count is unchanged or decreases by one.
-6. The publisher tracks active order side, price, total leaves, displayed
+6. The publisher tracks resting order side, price, total leaves, displayed
    leaves, display policy, and optional GTD deadline solely to translate
    private traces. It publishes only displayed leaves, removes a depleted
    slice from visible order count, restores that count on a separately
@@ -1118,6 +1164,13 @@ market-data stream and its replicas.
      publisher privately validates canonical `(deadline, OrderId)` order,
      exact sweep aggregates, and prior/current expiry watermarks; the completion
      produces `NoBookChange`, and no expiry control state is public.
+   - Dormant stops occupy a private fixed-capacity identity map and side-
+     specific trigger AVL arenas. The publisher validates arm priority,
+     replacement, cancellation/expiry/control removal, canonical bounded
+     activation, backlog, and reference transitions. Arm, trigger, and sweep
+     completion emit `NoBookChange`; activation-time execution emits ordinary
+     public effects. Dormant state and reference price are absent from public
+     snapshots.
 8. Account-control cancellations use the same level transition as ordinary
    cancellation. The publisher privately mirrors prior/current fence state and
    revision, validates ordered cancellation aggregates and the final control
@@ -1128,9 +1181,9 @@ market-data stream and its replicas.
    current state, and revision. Publisher and replica require exact prior state
    and next revision; snapshots carry the same effective state boundary.
 10. Exact command retries produce no second public update.
-11. Publisher bootstrap from a live or WAL-recovered book captures all active
-   orders, depth, final event sequence, and final trade ID, then cross-audits
-   the private and public aggregates.
+11. Publisher bootstrap from a live or WAL-recovered book captures all resting
+    orders, dormant stops, trigger/reference state, depth, final event sequence,
+    and final trade ID, then cross-audits private and public state.
 12. A full-depth snapshot contains occupied bids in descending price order and
    asks in ascending price order at one source sequence. Locked or crossed
    snapshots are invalid.
@@ -1144,15 +1197,17 @@ market-data stream and its replicas.
     [Market-data payload format version 2](market-data-v2.md). Network framing,
     fanout, entitlement, and retransmission sessions are outside this boundary.
 16. One immutable validated `MarketDataLimits` envelope bounds publisher active
-    orders, account controls, occupied prices per side, and updates per command.
+    orders including dormant stops, account controls, occupied prices per side,
+    and updates per command.
     Default publisher construction derives the matching shard's exact limits;
     explicit construction rejects any dimension below the source maximum rather
     than accepting only the source's current low-water state.
-17. Publisher bids/asks use constructor-reserved stable-slot AVL arenas. The
-    private order/control mirrors and unique affected-level validation scratch
-    use fixed dense/open-addressed indexes. These structures do not allocate,
-    grow, shrink, or rehash after construction; removed identities and price
-    slots are reused under bounded churn.
+17. Publisher bids/asks and buy/sell stop triggers use constructor-reserved
+    stable-slot AVL arenas. The private resting-order, dormant-stop, control,
+    and unique affected-level mirrors use fixed dense/open-addressed indexes.
+    These structures do not allocate, grow, shrink, or rehash after
+    construction; removed identities and price/trigger slots are reused under
+    bounded churn.
 18. A non-replayed publication rejects a report above its update bound and
     fallibly reserves the complete owned update vector before applying the first
     event. Unique affected levels are collected in fixed scratch and checked
@@ -1316,7 +1371,7 @@ storage, and recovery grammar.
     generation and first-retained-sequence selector after the new generation is
     synchronized.
 22. Matching, coupled risk, ledger, and call-auction cutover publishes an inactive A/B
-    checkpoint slot before publishing a synchronized version-5 anchor and any
+    checkpoint slot before publishing a synchronized version-6 anchor and any
     retained suffix. Single-file storage atomically renames the complete
     anchor-plus-suffix file over the WAL. Segmented storage synchronizes every
     next-generation anchor/suffix segment, then atomically replaces and
@@ -1336,7 +1391,7 @@ storage, and recovery grammar.
 This section defines the semantic snapshot file format and the checkpoint
 capture, verification, and cutover rules.
 
-1. A version-5 `QSNP` file carries a fixed 28 B header with magic, typed payload
+1. A version-6 `QSNP` file carries a fixed 28 B header with magic, typed payload
    kind (`1` ledger, `2` matching, `3` coupled risk/matching, `4` call auction,
    `5` coupled call-auction risk),
    bounded `u64` length, CRC-32C, and semantic generation.
@@ -1361,8 +1416,8 @@ capture, verification, and cutover rules.
 8. CRC-32C is an accidental-corruption detector, not an authenticity proof.
 9. Ledger, matching, coupled risk, and call-auction checkpoints retain complete
    semantic history. Uncut recovery scans the complete WAL to prove the prefix.
-   Version-5 cutover in either physical layout replaces that prefix with an
-   anchor bound to one version-5 A/B snapshot slot, so reopen scans only the
+   Version-6 cutover in either physical layout replaces that prefix with an
+   anchor bound to one version-6 A/B snapshot slot, so reopen scans only the
    anchor and suffix. This does not bound checkpoint memory, capture pause,
    retained idempotency/audit history, or semantic shard-generation lifetime.
 10. Matching candidate capture requires exact live topology and command-derived
@@ -1416,8 +1471,8 @@ capture, verification, and cutover rules.
       namespace mutation.
 
 The authoritative persisted framing and payload schemas are
-[WAL format version 5](wal-v5.md) and
-[Semantic snapshot format version 5](snapshot-v5.md). Filesystem and device
+[WAL format version 6](wal-v6.md) and
+[Semantic snapshot format version 6](snapshot-v6.md). Filesystem and device
 assumptions are bounded by the [Local storage contract](storage.md).
 
 ## Failure model
@@ -1451,6 +1506,12 @@ GTD tests cover deadline intake, equal-deadline `OrderId` ordering, inclusive
 sweeps, empty advances, watermark regression and future-horizon rejection,
 replacement retention, risk release, private market-data validation, checkpoint
 restoration, WAL reopen, and exact retry without frame growth.
+Stop tests cover reference initialization, side-derived admission, dormant
+public invisibility, buy/sell trigger ordering, bounded continuation backlog,
+market/limit activation, FOK/post-only/capacity terminal cancellation,
+replacement priority, cancellation/expiry/control removal, risk reservation,
+publisher canonical-order rejection, checkpoint lineage corruption, durable
+reopen, and exact retry without frame growth.
 Account-control tests cover stale/exhausted revisions, exact retry, atomic
 canonical cancellation, admission fencing, re-enable, protected-history use,
 constructor capacity stability/exhaustion, unprofiled risk rejection,
@@ -1693,7 +1754,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Snapshots and compaction | single-file and segmented matching/risk/ledger/call-auction WAL cutover plus off-thread direct and WAL-synchronized plain/coupled continuous-matching and call-auction replay verification are implemented; verified matching/risk/auction handles can retire an older prefix by cursor-streaming only its synchronized suffix. Remaining evidence is bounded checkpoint memory and writer audit-copy/projection/direct-reconstruction pause, bounded suffix-copy pause, semantic generation rollover, and externally retained audit/idempotency proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
-| High | Matching lifecycle expansion | basic revisioned instrument state changes, explicit continuous GTD expiry sweeps, bounded crossed call-auction collection, aggregate depth queries, banded discovery with market interest, pure order-level price-time allocation, deterministic pairing/atomic uncross, sequenced auction phase/idempotency, live and durable risk reservations/positions, stable auction/private-public wire schemas, gap-repair snapshots, semantic engine checkpoints, and plain/coupled-risk full-WAL plus single/segmented cutover recovery are implemented; remaining work is reference and dynamic-band derivation, reserve/display and venue priority/allocation policies, preventive self-trade policies, ledger integration, calendar/session scheduling and day/session expiry, volatility triggers and interruption auctions, stop, pegged, discretionary, venue-specific amendment/uncross/publication semantics, and authenticated market-data transport; cross-instrument/multi-leg execution with atomic ownership and replay proofs |
+| High | Matching lifecycle expansion | basic revisioned instrument state changes, explicit continuous GTD expiry sweeps, explicit-reference continuous stop-market/stop-limit activation, bounded crossed call-auction collection, aggregate depth queries, banded discovery with market interest, pure order-level price-time allocation, deterministic pairing/atomic uncross, sequenced auction phase/idempotency, live and durable risk reservations/positions, stable auction/private-public wire schemas, gap-repair snapshots, semantic engine checkpoints, and plain/coupled-risk full-WAL plus single/segmented cutover recovery are implemented; remaining work is authoritative external stop-reference ingestion, auction reference and dynamic-band derivation, reserve/display and venue priority/allocation policies, preventive self-trade policies, ledger integration, calendar/session scheduling and day/session expiry, volatility triggers and interruption auctions, pegged, discretionary, venue-specific amendment/uncross/publication semantics, and authenticated market-data transport; cross-instrument/multi-leg execution with atomic ownership and replay proofs |
 | High | Instrument lifecycle expansion | trading calendars, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |

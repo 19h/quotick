@@ -1,7 +1,7 @@
 # Coupled Call-Auction Risk Checkpoint Payload Version 1
 
 `CallAuctionRiskCheckpoint` is a complete-value, little-endian semantic codec
-and the payload retained by snapshot-version-5 `QSNP` kind `5`. It has no WAL
+and the payload retained by snapshot-version-6 `QSNP` kind `5`. It has no WAL
 record kind of its own. Version 1 names the current immutable payload contract;
 any incompatible change requires a new explicit format or enclosing version.
 
@@ -12,7 +12,7 @@ Fields occur in this exact order:
 | Order | Width | Field |
 |---:|---:|---|
 | 1 | 8 B | physical WAL first sequence `F` occupied by the instrument definition |
-| 2 | variable | embedded call-auction checkpoint length `u32`, then the complete [snapshot-v3 kind-4 payload](snapshot-v3.md#call-auction-checkpoint-payload-kind-4) preserved by snapshot v5, without a `QSNP` header |
+| 2 | variable | embedded call-auction checkpoint length `u32`, then the complete [snapshot-v3 kind-4 payload](snapshot-v3.md#call-auction-checkpoint-payload-kind-4) preserved by snapshot v6, without a `QSNP` header |
 | 3 | 4 B | canonical account count `N` as `u32` |
 | 4 | variable | `N` account rows in strictly increasing `AccountId` order |
 
@@ -20,7 +20,7 @@ Each account row is:
 
 | Order | Width | Field |
 |---:|---:|---|
-| 1 | variable | account-risk-definition length `u32`, then its stable WAL-v5 kind-5 payload without a WAL header |
+| 1 | variable | account-risk-definition length `u32`, then its stable WAL-v6 kind-5 payload without a WAL header |
 | 2 | 16 B | current signed executed position lots `i128` |
 | 3 | 16 B | aggregate active buy lots `u128` |
 | 4 | 16 B | aggregate active sell lots `u128` |
@@ -94,7 +94,7 @@ embedded indexed-book audit; independent validation re-executes the complete
 command history. Constructor-owned live profile, reservation, and account-net
 maps remain bounded by the selected `CallAuctionRiskLimits`.
 
-- `SnapshotFile` supplies version-5 framing, CRC protection, synchronized
+- `SnapshotFile` supplies version-6 framing, CRC protection, synchronized
   atomic replacement, and A/B slot publication.
 - `DurableCallAuctionRiskEngine` supplies profile-prefixed WAL
   acknowledgement, full replay, one dangling-command completion, exact prefix

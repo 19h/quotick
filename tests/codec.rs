@@ -14,7 +14,8 @@ use quotick::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
     Command, CommandOutcome, Event, EventKind, ExecutionReport, ExpirySweep, MassCancel,
     MassCancelScope, NewOrder, OrderBook, OrderDisplay, OrderType, RejectReason, ReplaceOrder,
-    SelfTradePrevention, TimeInForce, Trade, TradingStateControl, TradingStateControlAction,
+    SelfTradePrevention, StopActivation, StopTriggerSweep, TimeInForce, Trade, TradingStateControl,
+    TradingStateControlAction,
 };
 use quotick::risk::{
     AccountRiskDefinition, AccountRiskState, RiskError, RiskLimitSpec, RiskLimits, RiskProfile,
@@ -92,6 +93,63 @@ fn command_codec_has_a_stable_little_endian_layout() {
         Command::decode(&encoded).expect("valid command"),
         command(1, 2, Side::Buy)
     );
+}
+
+#[test]
+fn stop_command_codecs_have_stable_little_endian_layouts() {
+    let stop = Command::New(NewOrder {
+        command_id: id(CommandId::new(1)),
+        order_id: id(OrderId::new(2)),
+        account_id: id(AccountId::new(3)),
+        instrument_id: id(InstrumentId::new(4)),
+        instrument_version: version(),
+        side: Side::Sell,
+        quantity: Quantity::new(5).unwrap(),
+        display: OrderDisplay::FullyDisplayed,
+        order_type: OrderType::Stop {
+            trigger_price: Price::from_raw(-7),
+            activation: StopActivation::Limit(Price::from_raw(-8)),
+        },
+        time_in_force: TimeInForce::GoodTilCancelled,
+        self_trade_prevention: SelfTradePrevention::CancelBoth,
+        received_at: TimestampNs::from_unix_nanos(9),
+    });
+    let mut expected = vec![0];
+    expected.extend_from_slice(&1_u64.to_le_bytes());
+    expected.extend_from_slice(&2_u64.to_le_bytes());
+    expected.extend_from_slice(&3_u64.to_le_bytes());
+    expected.extend_from_slice(&4_u64.to_le_bytes());
+    expected.extend_from_slice(&1_u64.to_le_bytes());
+    expected.push(1);
+    expected.extend_from_slice(&5_u64.to_le_bytes());
+    expected.push(0);
+    expected.push(2);
+    expected.extend_from_slice(&(-7_i64).to_le_bytes());
+    expected.push(1);
+    expected.extend_from_slice(&(-8_i64).to_le_bytes());
+    expected.push(0);
+    expected.push(2);
+    expected.extend_from_slice(&9_u64.to_le_bytes());
+    assert_eq!(stop.encode().unwrap(), expected);
+    assert_eq!(Command::decode(&expected).unwrap(), stop);
+
+    let sweep = Command::StopTriggerSweep(StopTriggerSweep {
+        command_id: id(CommandId::new(10)),
+        instrument_id: id(InstrumentId::new(4)),
+        instrument_version: version(),
+        reference_price: Price::from_raw(-11),
+        maximum_orders: 12,
+        received_at: TimestampNs::from_unix_nanos(13),
+    });
+    let mut expected = vec![7];
+    expected.extend_from_slice(&10_u64.to_le_bytes());
+    expected.extend_from_slice(&4_u64.to_le_bytes());
+    expected.extend_from_slice(&1_u64.to_le_bytes());
+    expected.extend_from_slice(&(-11_i64).to_le_bytes());
+    expected.extend_from_slice(&12_u32.to_le_bytes());
+    expected.extend_from_slice(&13_u64.to_le_bytes());
+    assert_eq!(sweep.encode().unwrap(), expected);
+    assert_eq!(Command::decode(&expected).unwrap(), sweep);
 }
 
 #[test]
@@ -643,6 +701,14 @@ fn every_command_variant_round_trips() {
             through: TimestampNs::from_unix_nanos(9),
             received_at: TimestampNs::from_unix_nanos(9),
         }),
+        Command::StopTriggerSweep(StopTriggerSweep {
+            command_id: id(CommandId::new(8)),
+            instrument_id: id(InstrumentId::new(4)),
+            instrument_version: version(),
+            reference_price: Price::from_raw(-10),
+            maximum_orders: 11,
+            received_at: TimestampNs::from_unix_nanos(12),
+        }),
     ];
 
     for value in commands {
@@ -793,6 +859,13 @@ fn every_rejection_reason_has_a_stable_round_trip() {
         RejectReason::OrderAlreadyExpired,
         RejectReason::ExpiryWatermarkRegression,
         RejectReason::ExpiryHorizonAfterCommandTime,
+        RejectReason::StopReferenceUnavailable,
+        RejectReason::StopAlreadyTriggered,
+        RejectReason::StopTriggerBatchEmpty,
+        RejectReason::StopTriggerBatchExceedsActiveOrderCapacity,
+        RejectReason::StopTriggerBacklog,
+        RejectReason::StopMarketCannotPost,
+        RejectReason::StopMarketCannotBeReplaced,
     ];
     for (index, reason) in reasons.into_iter().enumerate() {
         let command_id = id(CommandId::new(
@@ -908,6 +981,39 @@ fn every_event_variant_round_trips() {
             current_watermark: TimestampNs::from_unix_nanos(18),
             expired_order_count: 2,
             expired_quantity_lots: 26,
+        },
+        EventKind::StopOrderArmed {
+            order_id,
+            trigger_price: Price::from_raw(19),
+            activation: StopActivation::Limit(Price::from_raw(20)),
+            priority_sequence: 21,
+        },
+        EventKind::StopOrderTriggered {
+            order_id,
+            trigger_price: Price::from_raw(19),
+            reference_price: Price::from_raw(22),
+            priority_sequence: 21,
+        },
+        EventKind::StopTriggerSweepCompleted {
+            previous_reference_price: Some(Price::from_raw(18)),
+            current_reference_price: Price::from_raw(22),
+            triggered_order_count: 1,
+            remaining_eligible_order_count: 0,
+        },
+        EventKind::OrderCancelled {
+            order_id,
+            quantity,
+            reason: CancelReason::TriggeredFokUnfilled,
+        },
+        EventKind::OrderCancelled {
+            order_id,
+            quantity,
+            reason: CancelReason::TriggeredPostOnlyWouldCross,
+        },
+        EventKind::OrderCancelled {
+            order_id,
+            quantity,
+            reason: CancelReason::TriggeredCapacityUnavailable,
         },
     ];
     let events: Vec<Event> = kinds

@@ -10,6 +10,7 @@
 //! are finitely bounded and completely reserved before usable state exists.
 //! Incremental state mutation never grows or rehashes authoritative storage.
 
+use std::cmp::Reverse;
 use std::fmt;
 use std::hash::Hash;
 
@@ -23,8 +24,8 @@ use crate::instrument::TradingState;
 use crate::matching::{
     AccountAdmissionState, AccountControlAction, AccountControlSnapshot, CancelReason, Command,
     CommandOutcome, Event, EventKind, ExecutionReport, LevelSnapshot, MassCancelScope, OrderBook,
-    OrderBookLimits, OrderDisplay, OrderType, SelfTradePrevention, Trade,
-    TradingStateControlAction, TradingStateSnapshot,
+    OrderBookLimits, OrderDisplay, OrderType, SelfTradePrevention, StopActivation, TimeInForce,
+    Trade, TradingStateControlAction, TradingStateSnapshot,
 };
 
 /// One finite market-data state or preparation resource.
@@ -32,6 +33,12 @@ use crate::matching::{
 pub enum MarketDataResource {
     /// Resting-order identities mirrored by a publisher.
     TrackedOrders,
+    /// Dormant-stop identities mirrored by a publisher.
+    TrackedStops,
+    /// Canonical buy-stop trigger index.
+    BuyStopIndex,
+    /// Canonical sell-stop trigger index.
+    SellStopIndex,
     /// Occupied bid prices.
     BidPriceLevels,
     /// Occupied ask prices.
@@ -48,6 +55,9 @@ impl fmt::Display for MarketDataResource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::TrackedOrders => "tracked orders",
+            Self::TrackedStops => "tracked stops",
+            Self::BuyStopIndex => "buy stop index",
+            Self::SellStopIndex => "sell stop index",
             Self::BidPriceLevels => "bid price levels",
             Self::AskPriceLevels => "ask price levels",
             Self::AccountControls => "account controls",
@@ -713,6 +723,8 @@ type DepthMap = IndexedAvlMap<Price, Aggregate>;
 pub enum MarketDataHashIndex {
     /// Publisher active-order mirror.
     TrackedOrders,
+    /// Publisher dormant-stop mirror.
+    TrackedStops,
     /// Publisher account-control mirror.
     AccountControls,
     /// Publisher affected-level validation scratch identities.
@@ -760,6 +772,49 @@ struct TrackedOrder {
     expires_at: Option<TimestampNs>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TrackedStop {
+    account_id: AccountId,
+    side: Side,
+    trigger_price: Price,
+    activation: StopActivation,
+    leaves: u64,
+    display: OrderDisplay,
+    time_in_force: TimeInForce,
+    self_trade_prevention: SelfTradePrevention,
+    priority_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct BuyStopKey {
+    trigger_price: Price,
+    priority_sequence: u64,
+    order_id: OrderId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SellStopKey {
+    trigger_price: Reverse<Price>,
+    priority_sequence: u64,
+    order_id: OrderId,
+}
+
+type BuyStopMap = IndexedAvlMap<BuyStopKey, OrderId>;
+type SellStopMap = IndexedAvlMap<SellStopKey, OrderId>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TriggeredStop {
+    order_id: OrderId,
+    stop: TrackedStop,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StopTriggerProgress {
+    active: Option<TriggeredStop>,
+    triggered_count: u64,
+    completed: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MassCancelProgress {
     order_count: u64,
@@ -778,10 +833,14 @@ pub struct MarketDataPublisher {
     bids: DepthMap,
     asks: DepthMap,
     orders: BoundedHashMap<OrderId, TrackedOrder>,
+    stops: BoundedHashMap<OrderId, TrackedStop>,
+    buy_stops: BuyStopMap,
+    sell_stops: SellStopMap,
     account_controls: BoundedHashMap<AccountId, AccountControlSnapshot>,
     affected_levels: BoundedHashMap<(Side, Price), ()>,
     trading_state: TradingStateSnapshot,
     expiry_watermark: Option<TimestampNs>,
+    stop_reference_price: Option<Price>,
     last_sequence: u64,
     last_trade_id: Option<TradeId>,
     poisoned: bool,
@@ -812,6 +871,10 @@ impl MarketDataPublisher {
         Self::construct(book, limits)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "construction reserves and bootstraps every private/public mirror before audit"
+    )]
     fn construct(
         book: &OrderBook,
         limits: MarketDataLimits,
@@ -828,6 +891,19 @@ impl MarketDataPublisher {
                 limits.max_active_orders(),
                 MarketDataResource::TrackedOrders,
             )?,
+            stops: try_hash_map(limits.max_active_orders(), MarketDataResource::TrackedStops)?,
+            buy_stops: IndexedAvlMap::try_with_capacity(limits.max_active_orders()).map_err(
+                |_| MarketDataConstructionError::ReservationFailed {
+                    resource: MarketDataResource::BuyStopIndex,
+                    maximum: limits.max_active_orders(),
+                },
+            )?,
+            sell_stops: IndexedAvlMap::try_with_capacity(limits.max_active_orders()).map_err(
+                |_| MarketDataConstructionError::ReservationFailed {
+                    resource: MarketDataResource::SellStopIndex,
+                    maximum: limits.max_active_orders(),
+                },
+            )?,
             account_controls: try_hash_map(
                 limits.max_account_controls(),
                 MarketDataResource::AccountControls,
@@ -838,6 +914,7 @@ impl MarketDataPublisher {
             )?,
             trading_state: book.trading_state(),
             expiry_watermark: book.expiry_watermark(),
+            stop_reference_price: book.stop_reference_price(),
             last_sequence: book.last_event_sequence(),
             last_trade_id: book.last_trade_id(),
             poisoned: false,
@@ -880,6 +957,27 @@ impl MarketDataPublisher {
                 },
             );
         }
+        for stop in book.dormant_stop_states() {
+            let tracked = TrackedStop {
+                account_id: stop.account_id,
+                side: stop.side,
+                trigger_price: stop.trigger_price,
+                activation: stop.activation,
+                leaves: stop.leaves_quantity.lots(),
+                display: stop.display,
+                time_in_force: stop.time_in_force,
+                self_trade_prevention: stop.self_trade_prevention,
+                priority_sequence: stop.priority_sequence,
+            };
+            publisher.stops.insert(stop.order_id, tracked);
+            publisher
+                .insert_stop_key(stop.order_id, tracked)
+                .map_err(|_| {
+                    MarketDataConstructionError::Source(MarketDataError::SourceDivergence(
+                        "matching book contains duplicate dormant-stop priority",
+                    ))
+                })?;
+        }
         for (account_id, snapshot) in book.account_controls() {
             publisher.account_controls.insert(account_id, snapshot);
         }
@@ -909,6 +1007,7 @@ impl MarketDataPublisher {
     ) -> Option<MarketDataHashIndexStatus> {
         match index {
             MarketDataHashIndex::TrackedOrders => Some(hash_status(&self.orders)),
+            MarketDataHashIndex::TrackedStops => Some(hash_status(&self.stops)),
             MarketDataHashIndex::AccountControls => Some(hash_status(&self.account_controls)),
             MarketDataHashIndex::PublisherBatchLevels => Some(hash_status(&self.affected_levels)),
             MarketDataHashIndex::ReplicaBatchLevels => None,
@@ -1063,6 +1162,7 @@ impl MarketDataPublisher {
             })?;
         let mut replacement_state = None;
         let mut mass_cancel_progress = MassCancelProgress::default();
+        let mut stop_trigger_progress = StopTriggerProgress::default();
         for event in &report.events {
             let expected = self
                 .last_sequence
@@ -1083,6 +1183,7 @@ impl MarketDataPublisher {
                 *event,
                 &mut replacement_state,
                 &mut mass_cancel_progress,
+                &mut stop_trigger_progress,
             ) {
                 Ok(kind) => kind,
                 Err(error) => return self.fail(error),
@@ -1107,6 +1208,15 @@ impl MarketDataPublisher {
         if requires_completion != mass_cancel_progress.completed {
             return self.fail(MarketDataError::TraceMismatch(
                 "aggregate cancellation/control command and completion event disagree",
+            ));
+        }
+        let requires_stop_completion = report.outcome == CommandOutcome::Accepted
+            && matches!(command, Command::StopTriggerSweep(_));
+        if requires_stop_completion != stop_trigger_progress.completed
+            || stop_trigger_progress.active.is_some()
+        {
+            return self.fail(MarketDataError::TraceMismatch(
+                "stop-trigger command and activation completion disagree",
             ));
         }
         if let Err(error) = self.validate_publication(&updates, book) {
@@ -1137,12 +1247,16 @@ impl MarketDataPublisher {
             || self.last_trade_id != book.last_trade_id()
             || self.trading_state != book.trading_state()
             || self.expiry_watermark != book.expiry_watermark()
+            || self.stop_reference_price != book.stop_reference_price()
         {
             return Err(MarketDataError::SourceDivergence(
                 "publisher source sequences differ from the matching book",
             ));
         }
-        if self.orders.len() != book.active_order_count() {
+        if self.orders.len() != book.resting_order_count()
+            || self.stops.len() != book.dormant_stop_count()
+            || self.orders.len().saturating_add(self.stops.len()) != book.active_order_count()
+        {
             return Err(MarketDataError::SourceDivergence(
                 "publisher active-order count differs from the matching book",
             ));
@@ -1177,6 +1291,24 @@ impl MarketDataPublisher {
                 ));
             }
         }
+        for stop in book.dormant_stop_states() {
+            let expected = TrackedStop {
+                account_id: stop.account_id,
+                side: stop.side,
+                trigger_price: stop.trigger_price,
+                activation: stop.activation,
+                leaves: stop.leaves_quantity.lots(),
+                display: stop.display,
+                time_in_force: stop.time_in_force,
+                self_trade_prevention: stop.self_trade_prevention,
+                priority_sequence: stop.priority_sequence,
+            };
+            if self.stops.get(&stop.order_id) != Some(&expected) {
+                return Err(MarketDataError::SourceDivergence(
+                    "publisher dormant-stop mirror differs from the matching book",
+                ));
+            }
+        }
         if !depth_matches(&self.bids, book.depth_levels(Side::Buy))
             || !depth_matches(&self.asks, book.depth_levels(Side::Sell))
         {
@@ -1192,11 +1324,17 @@ impl MarketDataPublisher {
         if self.bids.maximum() != self.limits.max_price_levels_per_side()
             || self.asks.maximum() != self.limits.max_price_levels_per_side()
             || self.orders.maximum() != self.limits.max_active_orders()
+            || self.stops.maximum() != self.limits.max_active_orders()
+            || self.buy_stops.maximum() != self.limits.max_active_orders()
+            || self.sell_stops.maximum() != self.limits.max_active_orders()
             || self.account_controls.maximum() != self.limits.max_account_controls()
             || self.affected_levels.maximum() != self.limits.max_batch_updates()
             || !self.affected_levels.is_empty()
             || self.bids.allocation_capacity() < self.limits.max_price_levels_per_side()
             || self.asks.allocation_capacity() < self.limits.max_price_levels_per_side()
+            || self.buy_stops.allocation_capacity() < self.limits.max_active_orders()
+            || self.sell_stops.allocation_capacity() < self.limits.max_active_orders()
+            || self.buy_stops.len().saturating_add(self.sell_stops.len()) != self.stops.len()
         {
             return Err(MarketDataError::SourceDivergence(
                 "publisher fixed storage contradicts its configured limits",
@@ -1211,6 +1349,41 @@ impl MarketDataPublisher {
         self.orders.validate_layout().map_err(|_| {
             MarketDataError::SourceDivergence("publisher order hash layout is invalid")
         })?;
+        self.stops.validate_layout().map_err(|_| {
+            MarketDataError::SourceDivergence("publisher stop hash layout is invalid")
+        })?;
+        self.buy_stops.validate().map_err(|_| {
+            MarketDataError::SourceDivergence("publisher buy-stop arena is structurally invalid")
+        })?;
+        self.sell_stops.validate().map_err(|_| {
+            MarketDataError::SourceDivergence("publisher sell-stop arena is structurally invalid")
+        })?;
+        for (&key, &order_id) in self.buy_stops.iter() {
+            if key.order_id != order_id
+                || self.stops.get(&order_id).is_none_or(|stop| {
+                    stop.side != Side::Buy
+                        || stop.trigger_price != key.trigger_price
+                        || stop.priority_sequence != key.priority_sequence
+                })
+            {
+                return Err(MarketDataError::SourceDivergence(
+                    "publisher buy-stop index differs from its identity mirror",
+                ));
+            }
+        }
+        for (&key, &order_id) in self.sell_stops.iter() {
+            if key.order_id != order_id
+                || self.stops.get(&order_id).is_none_or(|stop| {
+                    stop.side != Side::Sell
+                        || stop.trigger_price != key.trigger_price.0
+                        || stop.priority_sequence != key.priority_sequence
+                })
+            {
+                return Err(MarketDataError::SourceDivergence(
+                    "publisher sell-stop index differs from its identity mirror",
+                ));
+            }
+        }
         self.account_controls.validate_layout().map_err(|_| {
             MarketDataError::SourceDivergence("publisher account-control hash layout is invalid")
         })?;
@@ -1230,6 +1403,7 @@ impl MarketDataPublisher {
         event: Event,
         replacement_state: &mut Option<(Side, Option<TimestampNs>)>,
         mass_cancel_progress: &mut MassCancelProgress,
+        stop_trigger_progress: &mut StopTriggerProgress,
     ) -> Result<MarketDataKind, MarketDataError> {
         match event.kind {
             EventKind::OrderAccepted {
@@ -1252,16 +1426,23 @@ impl MarketDataPublisher {
                 command,
                 order_id,
                 price,
-                leaves_quantity,
-                displayed_quantity,
+                (leaves_quantity, displayed_quantity),
                 replacement_state,
+                stop_trigger_progress,
             ),
-            EventKind::Trade(trade) => self.handle_trade(command, trade),
+            EventKind::Trade(trade) => self.handle_trade(command, trade, stop_trigger_progress),
             EventKind::OrderCancelled {
                 order_id,
                 quantity,
                 reason,
-            } => self.handle_cancel(command, order_id, quantity, reason, mass_cancel_progress),
+            } => self.handle_cancel(
+                command,
+                order_id,
+                quantity,
+                reason,
+                mass_cancel_progress,
+                stop_trigger_progress,
+            ),
             EventKind::OrderReplaced {
                 order_id,
                 old_price,
@@ -1281,6 +1462,7 @@ impl MarketDataPublisher {
                 old_display,
                 new_display,
                 priority_retained,
+                event.sequence,
                 replacement_state,
             ),
             EventKind::SelfTradePrevented {
@@ -1294,6 +1476,7 @@ impl MarketDataPublisher {
                 resting_order_id,
                 quantity,
                 policy,
+                stop_trigger_progress,
             ),
             EventKind::MassCancelCompleted {
                 account_id,
@@ -1353,6 +1536,45 @@ impl MarketDataPublisher {
                 expired_quantity_lots,
                 mass_cancel_progress,
             ),
+            EventKind::StopOrderArmed {
+                order_id,
+                trigger_price,
+                activation,
+                priority_sequence,
+            } => self.handle_stop_armed(
+                command,
+                event.sequence,
+                order_id,
+                trigger_price,
+                activation,
+                priority_sequence,
+            ),
+            EventKind::StopOrderTriggered {
+                order_id,
+                trigger_price,
+                reference_price,
+                priority_sequence,
+            } => self.handle_stop_triggered(
+                command,
+                order_id,
+                trigger_price,
+                reference_price,
+                priority_sequence,
+                stop_trigger_progress,
+            ),
+            EventKind::StopTriggerSweepCompleted {
+                previous_reference_price,
+                current_reference_price,
+                triggered_order_count,
+                remaining_eligible_order_count,
+            } => self.handle_stop_trigger_sweep_completed(
+                command,
+                previous_reference_price,
+                current_reference_price,
+                triggered_order_count,
+                remaining_eligible_order_count,
+                stop_trigger_progress,
+            ),
             EventKind::CommandRejected(_) => Ok(MarketDataKind::NoBookChange),
         }
     }
@@ -1384,45 +1606,70 @@ impl MarketDataPublisher {
         command: Command,
         order_id: OrderId,
         price: Price,
-        leaves_quantity: Quantity,
-        displayed_quantity: Quantity,
+        quantities: (Quantity, Quantity),
         replacement_state: &mut Option<(Side, Option<TimestampNs>)>,
+        stop_trigger_progress: &mut StopTriggerProgress,
     ) -> Result<MarketDataKind, MarketDataError> {
-        let (account_id, side, display, expires_at) = match command {
-            Command::New(new_order) if new_order.order_id == order_id => {
-                if new_order.order_type != OrderType::Limit(price) {
+        let (leaves_quantity, displayed_quantity) = quantities;
+        let (account_id, side, display, expires_at) =
+            match command {
+                Command::New(new_order) if new_order.order_id == order_id => {
+                    if new_order.order_type != OrderType::Limit(price) {
+                        return Err(MarketDataError::TraceMismatch(
+                            "resting price differs from the new limit",
+                        ));
+                    }
+                    (
+                        new_order.account_id,
+                        new_order.side,
+                        new_order.display,
+                        new_order.time_in_force.expires_at(),
+                    )
+                }
+                Command::Replace(replace) if replace.order_id == order_id => {
+                    if replace.new_price != price {
+                        return Err(MarketDataError::TraceMismatch(
+                            "resting price differs from the replacement limit",
+                        ));
+                    }
+                    let (side, expires_at) =
+                        replacement_state
+                            .take()
+                            .ok_or(MarketDataError::TraceMismatch(
+                                "replacement rested without losing its previous priority",
+                            ))?;
+                    (replace.account_id, side, replace.new_display, expires_at)
+                }
+                Command::StopTriggerSweep(_) => {
+                    let triggered = stop_trigger_progress.active.take().ok_or(
+                        MarketDataError::TraceMismatch(
+                            "stop-triggered residual rested without an activation",
+                        ),
+                    )?;
+                    if triggered.order_id != order_id
+                        || triggered.stop.leaves != leaves_quantity.lots()
+                        || triggered.stop.activation != StopActivation::Limit(price)
+                        || !triggered.stop.time_in_force.may_rest()
+                    {
+                        stop_trigger_progress.active = Some(triggered);
+                        return Err(MarketDataError::TraceMismatch(
+                            "stop-triggered residual differs from dormant state",
+                        ));
+                    }
+                    (
+                        triggered.stop.account_id,
+                        triggered.stop.side,
+                        triggered.stop.display,
+                        triggered.stop.time_in_force.expires_at(),
+                    )
+                }
+                _ => {
                     return Err(MarketDataError::TraceMismatch(
-                        "resting price differs from the new limit",
+                        "OrderRested differs from the source command",
                     ));
                 }
-                (
-                    new_order.account_id,
-                    new_order.side,
-                    new_order.display,
-                    new_order.time_in_force.expires_at(),
-                )
-            }
-            Command::Replace(replace) if replace.order_id == order_id => {
-                if replace.new_price != price {
-                    return Err(MarketDataError::TraceMismatch(
-                        "resting price differs from the replacement limit",
-                    ));
-                }
-                let (side, expires_at) =
-                    replacement_state
-                        .take()
-                        .ok_or(MarketDataError::TraceMismatch(
-                            "replacement rested without losing its previous priority",
-                        ))?;
-                (replace.account_id, side, replace.new_display, expires_at)
-            }
-            _ => {
-                return Err(MarketDataError::TraceMismatch(
-                    "OrderRested differs from the source command",
-                ));
-            }
-        };
-        if self.orders.contains_key(&order_id) {
+            };
+        if self.orders.contains_key(&order_id) || self.stops.contains_key(&order_id) {
             return Err(MarketDataError::TraceMismatch(
                 "OrderRested duplicated an active order",
             ));
@@ -1490,6 +1737,7 @@ impl MarketDataPublisher {
         &mut self,
         command: Command,
         trade: Trade,
+        stop_trigger_progress: &mut StopTriggerProgress,
     ) -> Result<MarketDataKind, MarketDataError> {
         if trade.instrument_id != self.instrument_id {
             return Err(MarketDataError::WrongInstrument);
@@ -1497,7 +1745,14 @@ impl MarketDataPublisher {
         if trade.instrument_version != self.instrument_version {
             return Err(MarketDataError::WrongInstrumentVersion);
         }
-        if command_order_id(command) != Some(trade.taker_order_id) {
+        let triggered = if matches!(command, Command::StopTriggerSweep(_)) {
+            stop_trigger_progress.active
+        } else {
+            None
+        };
+        let taker_order_id =
+            triggered.map_or_else(|| command_order_id(command), |value| Some(value.order_id));
+        if taker_order_id != Some(trade.taker_order_id) {
             return Err(MarketDataError::TraceMismatch(
                 "trade taker differs from the source command order",
             ));
@@ -1513,10 +1768,16 @@ impl MarketDataPublisher {
             Side::Buy => (trade.buyer_account_id, trade.seller_account_id),
             Side::Sell => (trade.seller_account_id, trade.buyer_account_id),
         };
+        let taker_account_id = triggered.map_or_else(
+            || command_account_id(command),
+            |value| Some(value.stop.account_id),
+        );
+        let taker_side = triggered.map_or(maker.side.opposite(), |value| value.stop.side);
         if expected_maker != trade.maker_order_id
             || maker.price != trade.price
             || maker.account_id != maker_account
-            || command_account_id(command) != Some(taker_account)
+            || taker_account_id != Some(taker_account)
+            || taker_side != maker.side.opposite()
         {
             return Err(MarketDataError::TraceMismatch(
                 "trade identity, owner, side, or price contradicts tracked state",
@@ -1524,6 +1785,16 @@ impl MarketDataPublisher {
         }
         self.advance_trade_id(trade.trade_id)?;
         let level = self.decrement_order(trade.maker_order_id, trade.quantity.lots())?;
+        if let Some(mut active) = triggered {
+            active.stop.leaves = active
+                .stop
+                .leaves
+                .checked_sub(trade.quantity.lots())
+                .ok_or(MarketDataError::TraceMismatch(
+                    "triggered-stop trade exceeds its leaves quantity",
+                ))?;
+            stop_trigger_progress.active = (active.stop.leaves != 0).then_some(active);
+        }
         Ok(MarketDataKind::Trade {
             print: TradePrint {
                 trade_id: trade.trade_id,
@@ -1546,7 +1817,20 @@ impl MarketDataPublisher {
         quantity: Quantity,
         reason: CancelReason,
         mass_cancel_progress: &mut MassCancelProgress,
+        stop_trigger_progress: &mut StopTriggerProgress,
     ) -> Result<MarketDataKind, MarketDataError> {
+        if let Some(stop) = self.stops.get(&order_id).copied() {
+            Self::validate_dormant_cancel(
+                command,
+                order_id,
+                quantity,
+                reason,
+                stop,
+                mass_cancel_progress,
+            )?;
+            self.remove_stop(order_id, quantity.lots())?;
+            return Ok(MarketDataKind::NoBookChange);
+        }
         if let Some(order) = self.orders.get(&order_id).copied() {
             match reason {
                 CancelReason::UserRequested => {
@@ -1562,9 +1846,14 @@ impl MarketDataPublisher {
                     }
                 }
                 CancelReason::SelfTradeResting => {
-                    if command_order_id(command).is_none()
-                        || command_account_id(command) != Some(order.account_id)
-                    {
+                    let aggressor_account = if matches!(command, Command::StopTriggerSweep(_)) {
+                        stop_trigger_progress
+                            .active
+                            .map(|active| active.stop.account_id)
+                    } else {
+                        command_account_id(command)
+                    };
+                    if aggressor_account != Some(order.account_id) {
                         return Err(MarketDataError::TraceMismatch(
                             "self-trade cancellation targeted another account",
                         ));
@@ -1686,21 +1975,313 @@ impl MarketDataPublisher {
                         "an incoming-only cancellation targeted a resting order",
                     ));
                 }
+                CancelReason::TriggeredFokUnfilled
+                | CancelReason::TriggeredPostOnlyWouldCross
+                | CancelReason::TriggeredCapacityUnavailable => {
+                    return Err(MarketDataError::TraceMismatch(
+                        "an incoming triggered-stop cancellation targeted a resting order",
+                    ));
+                }
             }
             self.remove_tracked_order(order_id, quantity.lots())
                 .map(MarketDataKind::Level)
         } else {
-            if !matches!(
+            let incoming_reason = matches!(
                 reason,
                 CancelReason::UnfilledRemainder | CancelReason::SelfTradeAggressor
-            ) || command_order_id(command) != Some(order_id)
-            {
+            );
+            if let Command::StopTriggerSweep(_) = command {
+                let active = stop_trigger_progress
+                    .active
+                    .ok_or(MarketDataError::TraceMismatch(
+                        "triggered-stop cancellation has no active trigger",
+                    ))?;
+                if active.order_id != order_id
+                    || active.stop.leaves != quantity.lots()
+                    || !(incoming_reason
+                        || matches!(
+                            reason,
+                            CancelReason::TriggeredFokUnfilled
+                                | CancelReason::TriggeredPostOnlyWouldCross
+                                | CancelReason::TriggeredCapacityUnavailable
+                        ))
+                {
+                    return Err(MarketDataError::TraceMismatch(
+                        "triggered-stop cancellation contradicts its active state",
+                    ));
+                }
+                stop_trigger_progress.active = None;
+                return Ok(MarketDataKind::NoBookChange);
+            }
+            if !incoming_reason || command_order_id(command) != Some(order_id) {
                 return Err(MarketDataError::TraceMismatch(
                     "resting-order cancellation target is absent",
                 ));
             }
             Ok(MarketDataKind::NoBookChange)
         }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive dormant-cancellation grammar validates every reason against its command"
+    )]
+    fn validate_dormant_cancel(
+        command: Command,
+        order_id: OrderId,
+        quantity: Quantity,
+        reason: CancelReason,
+        stop: TrackedStop,
+        progress: &mut MassCancelProgress,
+    ) -> Result<(), MarketDataError> {
+        if quantity.lots() != stop.leaves {
+            return Err(MarketDataError::TraceMismatch(
+                "dormant-stop cancellation quantity differs from its leaves",
+            ));
+        }
+        let aggregate = match reason {
+            CancelReason::UserRequested => {
+                let Command::Cancel(cancel) = command else {
+                    return Err(MarketDataError::TraceMismatch(
+                        "non-cancel command emitted a dormant user cancellation",
+                    ));
+                };
+                if cancel.order_id != order_id || cancel.account_id != stop.account_id {
+                    return Err(MarketDataError::TraceMismatch(
+                        "dormant user cancellation differs from its source command",
+                    ));
+                }
+                None
+            }
+            CancelReason::MassCancel => {
+                let Command::MassCancel(cancel) = command else {
+                    return Err(MarketDataError::TraceMismatch(
+                        "non-mass-cancel command cancelled a dormant stop",
+                    ));
+                };
+                if cancel.account_id != stop.account_id || !cancel.scope.includes(stop.side) {
+                    return Err(MarketDataError::TraceMismatch(
+                        "mass cancellation targeted a dormant stop outside its scope",
+                    ));
+                }
+                Some(false)
+            }
+            CancelReason::AccountControl => {
+                let Command::AccountControl(control) = command else {
+                    return Err(MarketDataError::TraceMismatch(
+                        "non-control command cancelled a dormant stop",
+                    ));
+                };
+                if control.action != AccountControlAction::BlockAndCancel
+                    || control.account_id != stop.account_id
+                {
+                    return Err(MarketDataError::TraceMismatch(
+                        "account control targeted a dormant stop outside its account",
+                    ));
+                }
+                Some(false)
+            }
+            CancelReason::TradingStateControl => {
+                let Command::TradingStateControl(control) = command else {
+                    return Err(MarketDataError::TraceMismatch(
+                        "non-state-control command cancelled a dormant stop",
+                    ));
+                };
+                if control.action != TradingStateControlAction::TransitionAndCancel
+                    || control.target_state == TradingState::Open
+                {
+                    return Err(MarketDataError::TraceMismatch(
+                        "state control cannot cancel this dormant stop",
+                    ));
+                }
+                Some(false)
+            }
+            CancelReason::Expired => {
+                let Command::ExpirySweep(sweep) = command else {
+                    return Err(MarketDataError::TraceMismatch(
+                        "non-expiry command expired a dormant stop",
+                    ));
+                };
+                let expires_at =
+                    stop.time_in_force
+                        .expires_at()
+                        .ok_or(MarketDataError::TraceMismatch(
+                            "expiry cancellation targeted a non-GTD dormant stop",
+                        ))?;
+                let key = (expires_at, order_id);
+                if progress.completed
+                    || expires_at > sweep.through
+                    || progress.last_expiry.is_some_and(|previous| key <= previous)
+                {
+                    return Err(MarketDataError::TraceMismatch(
+                        "dormant expiry cancellation is outside its canonical sweep",
+                    ));
+                }
+                progress.last_expiry = Some(key);
+                Some(true)
+            }
+            CancelReason::SelfTradeAggressor
+            | CancelReason::SelfTradeResting
+            | CancelReason::UnfilledRemainder
+            | CancelReason::TriggeredFokUnfilled
+            | CancelReason::TriggeredPostOnlyWouldCross
+            | CancelReason::TriggeredCapacityUnavailable => {
+                return Err(MarketDataError::TraceMismatch(
+                    "incoming or self-trade cancellation targeted a dormant stop",
+                ));
+            }
+        };
+        if let Some(expiry) = aggregate {
+            if progress.completed
+                || (!expiry
+                    && progress
+                        .last_order_id
+                        .is_some_and(|previous| order_id <= previous))
+            {
+                return Err(MarketDataError::TraceMismatch(
+                    "dormant aggregate cancellation is not canonical",
+                ));
+            }
+            progress.order_count = progress
+                .order_count
+                .checked_add(1)
+                .ok_or(MarketDataError::ArithmeticOverflow)?;
+            progress.quantity_lots = progress
+                .quantity_lots
+                .checked_add(u128::from(quantity.lots()))
+                .ok_or(MarketDataError::ArithmeticOverflow)?;
+            if !expiry {
+                progress.last_order_id = Some(order_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_stop_armed(
+        &mut self,
+        command: Command,
+        event_sequence: u64,
+        order_id: OrderId,
+        trigger_price: Price,
+        activation: StopActivation,
+        priority_sequence: u64,
+    ) -> Result<MarketDataKind, MarketDataError> {
+        let Command::New(new_order) = command else {
+            return Err(MarketDataError::TraceMismatch(
+                "non-new command emitted StopOrderArmed",
+            ));
+        };
+        if new_order.order_id != order_id
+            || new_order.order_type.stop() != Some((trigger_price, activation))
+            || priority_sequence.checked_add(1) != Some(event_sequence)
+            || self.orders.contains_key(&order_id)
+            || self.stops.contains_key(&order_id)
+            || self.orders.len().saturating_add(self.stops.len()) >= self.limits.max_active_orders()
+        {
+            return Err(MarketDataError::TraceMismatch(
+                "StopOrderArmed contradicts its source command or accepted priority",
+            ));
+        }
+        let stop = TrackedStop {
+            account_id: new_order.account_id,
+            side: new_order.side,
+            trigger_price,
+            activation,
+            leaves: new_order.quantity.lots(),
+            display: new_order.display,
+            time_in_force: new_order.time_in_force,
+            self_trade_prevention: new_order.self_trade_prevention,
+            priority_sequence,
+        };
+        self.stops
+            .try_insert(order_id, stop)
+            .map_err(|_| MarketDataError::CapacityExceeded {
+                resource: MarketDataResource::TrackedStops,
+                maximum: self.limits.max_active_orders(),
+                attempted: self.stops.len().saturating_add(1),
+            })?;
+        self.insert_stop_key(order_id, stop)?;
+        Ok(MarketDataKind::NoBookChange)
+    }
+
+    fn handle_stop_triggered(
+        &mut self,
+        command: Command,
+        order_id: OrderId,
+        trigger_price: Price,
+        reference_price: Price,
+        priority_sequence: u64,
+        progress: &mut StopTriggerProgress,
+    ) -> Result<MarketDataKind, MarketDataError> {
+        let Command::StopTriggerSweep(sweep) = command else {
+            return Err(MarketDataError::TraceMismatch(
+                "non-trigger command emitted StopOrderTriggered",
+            ));
+        };
+        if progress.completed
+            || progress.active.is_some()
+            || sweep.reference_price != reference_price
+            || self.first_eligible_stop(reference_price)? != Some(order_id)
+        {
+            return Err(MarketDataError::TraceMismatch(
+                "StopOrderTriggered is absent, ineligible, or not canonical",
+            ));
+        }
+        let stop = self
+            .stops
+            .get(&order_id)
+            .copied()
+            .ok_or(MarketDataError::TraceMismatch(
+                "triggered dormant stop is absent",
+            ))?;
+        if stop.trigger_price != trigger_price || stop.priority_sequence != priority_sequence {
+            return Err(MarketDataError::TraceMismatch(
+                "StopOrderTriggered differs from dormant trigger state",
+            ));
+        }
+        self.remove_stop(order_id, stop.leaves)?;
+        progress.active = Some(TriggeredStop { order_id, stop });
+        progress.triggered_count = progress
+            .triggered_count
+            .checked_add(1)
+            .ok_or(MarketDataError::ArithmeticOverflow)?;
+        Ok(MarketDataKind::NoBookChange)
+    }
+
+    fn handle_stop_trigger_sweep_completed(
+        &mut self,
+        command: Command,
+        previous_reference_price: Option<Price>,
+        current_reference_price: Price,
+        triggered_order_count: u64,
+        remaining_eligible_order_count: u64,
+        progress: &mut StopTriggerProgress,
+    ) -> Result<MarketDataKind, MarketDataError> {
+        let Command::StopTriggerSweep(sweep) = command else {
+            return Err(MarketDataError::TraceMismatch(
+                "non-trigger command emitted StopTriggerSweepCompleted",
+            ));
+        };
+        let remaining = self.eligible_stop_count(current_reference_price)?;
+        let total = progress
+            .triggered_count
+            .checked_add(remaining)
+            .ok_or(MarketDataError::ArithmeticOverflow)?;
+        if progress.completed
+            || progress.active.is_some()
+            || previous_reference_price != self.stop_reference_price
+            || current_reference_price != sweep.reference_price
+            || progress.triggered_count != triggered_order_count
+            || remaining != remaining_eligible_order_count
+            || triggered_order_count != total.min(u64::from(sweep.maximum_orders))
+        {
+            return Err(MarketDataError::TraceMismatch(
+                "StopTriggerSweepCompleted contradicts its command or activation trace",
+            ));
+        }
+        self.stop_reference_price = Some(current_reference_price);
+        progress.completed = true;
+        Ok(MarketDataKind::NoBookChange)
     }
 
     fn handle_mass_cancel_completed(
@@ -1855,7 +2436,9 @@ impl MarketDataPublisher {
             || (control.action == TradingStateControlAction::Transition
                 && (cancelled_order_count != 0 || cancelled_quantity_lots != 0))
             || (control.action == TradingStateControlAction::TransitionAndCancel
-                && (control.target_state == TradingState::Open || !self.orders.is_empty()))
+                && (control.target_state == TradingState::Open
+                    || !self.orders.is_empty()
+                    || !self.stops.is_empty()))
         {
             return Err(MarketDataError::TraceMismatch(
                 "TradingStateControlApplied contradicts its command or cancellations",
@@ -1885,6 +2468,7 @@ impl MarketDataPublisher {
         old_display: OrderDisplay,
         new_display: OrderDisplay,
         priority_retained: bool,
+        event_sequence: u64,
         replacement_state: &mut Option<(Side, Option<TimestampNs>)>,
     ) -> Result<MarketDataKind, MarketDataError> {
         let Command::Replace(replace) = command else {
@@ -1900,6 +2484,21 @@ impl MarketDataPublisher {
             return Err(MarketDataError::TraceMismatch(
                 "OrderReplaced differs from its source command",
             ));
+        }
+        if let Some(stop) = self.stops.get(&order_id).copied() {
+            return self.handle_replace_dormant(
+                replace,
+                order_id,
+                stop,
+                old_price,
+                new_price,
+                old_quantity,
+                new_quantity,
+                old_display,
+                new_display,
+                priority_retained,
+                event_sequence,
+            );
         }
         let old = self
             .orders
@@ -1944,6 +2543,59 @@ impl MarketDataPublisher {
         Ok(MarketDataKind::Level(level))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the dormant replacement event is a fixed state transition"
+    )]
+    fn handle_replace_dormant(
+        &mut self,
+        replace: crate::matching::ReplaceOrder,
+        order_id: OrderId,
+        old: TrackedStop,
+        old_price: Price,
+        new_price: Price,
+        old_quantity: Quantity,
+        new_quantity: Quantity,
+        old_display: OrderDisplay,
+        new_display: OrderDisplay,
+        priority_retained: bool,
+        event_sequence: u64,
+    ) -> Result<MarketDataKind, MarketDataError> {
+        let expected_retained = old_price == new_price
+            && new_quantity.lots() <= old.leaves
+            && old_display == new_display;
+        if old.account_id != replace.account_id
+            || old.activation != StopActivation::Limit(old_price)
+            || old.leaves != old_quantity.lots()
+            || old.display != old_display
+            || priority_retained != expected_retained
+        {
+            return Err(MarketDataError::TraceMismatch(
+                "dormant OrderReplaced differs from its private state",
+            ));
+        }
+        self.remove_stop_key(order_id, old)?;
+        let updated = TrackedStop {
+            activation: StopActivation::Limit(new_price),
+            leaves: new_quantity.lots(),
+            display: new_display,
+            priority_sequence: if priority_retained {
+                old.priority_sequence
+            } else {
+                event_sequence
+            },
+            ..old
+        };
+        *self
+            .stops
+            .get_mut(&order_id)
+            .ok_or(MarketDataError::TraceMismatch(
+                "dormant replacement target disappeared",
+            ))? = updated;
+        self.insert_stop_key(order_id, updated)?;
+        Ok(MarketDataKind::NoBookChange)
+    }
+
     fn handle_self_trade(
         &mut self,
         command: Command,
@@ -1951,27 +2603,186 @@ impl MarketDataPublisher {
         resting_order_id: OrderId,
         quantity: Quantity,
         policy: SelfTradePrevention,
+        stop_trigger_progress: &mut StopTriggerProgress,
     ) -> Result<MarketDataKind, MarketDataError> {
-        if command_order_id(command) != Some(aggressor_order_id) {
+        let triggered = if matches!(command, Command::StopTriggerSweep(_)) {
+            stop_trigger_progress.active
+        } else {
+            None
+        };
+        let aggressor =
+            triggered.map_or_else(|| command_order_id(command), |value| Some(value.order_id));
+        let aggressor_account = triggered.map_or_else(
+            || command_account_id(command),
+            |value| Some(value.stop.account_id),
+        );
+        if aggressor != Some(aggressor_order_id)
+            || triggered.is_some_and(|active| active.stop.self_trade_prevention != policy)
+        {
             return Err(MarketDataError::TraceMismatch(
                 "self-trade aggressor differs from the source command",
             ));
         }
-        if self
-            .orders
-            .get(&resting_order_id)
-            .is_none_or(|resting| Some(resting.account_id) != command_account_id(command))
-        {
+        if self.orders.get(&resting_order_id).is_none_or(|resting| {
+            Some(resting.account_id) != aggressor_account || quantity.lots() > resting.displayed
+        }) {
             return Err(MarketDataError::TraceMismatch(
                 "self-trade resting order is absent or owned by another account",
             ));
         }
         if policy == SelfTradePrevention::DecrementAndCancel {
-            self.decrement_order(resting_order_id, quantity.lots())
-                .map(MarketDataKind::Level)
+            let level = self.decrement_order(resting_order_id, quantity.lots())?;
+            if let Some(mut active) = triggered {
+                active.stop.leaves = active.stop.leaves.checked_sub(quantity.lots()).ok_or(
+                    MarketDataError::TraceMismatch(
+                        "self-trade decrement exceeds triggered-stop leaves",
+                    ),
+                )?;
+                stop_trigger_progress.active = (active.stop.leaves != 0).then_some(active);
+            }
+            Ok(MarketDataKind::Level(level))
         } else {
             Ok(MarketDataKind::NoBookChange)
         }
+    }
+
+    fn insert_stop_key(
+        &mut self,
+        order_id: OrderId,
+        stop: TrackedStop,
+    ) -> Result<(), MarketDataError> {
+        let inserted = match stop.side {
+            Side::Buy => {
+                if !self.buy_stops.has_insertion_capacity() {
+                    return Err(MarketDataError::CapacityExceeded {
+                        resource: MarketDataResource::BuyStopIndex,
+                        maximum: self.limits.max_active_orders(),
+                        attempted: self.buy_stops.len().saturating_add(1),
+                    });
+                }
+                self.buy_stops.insert(
+                    BuyStopKey {
+                        trigger_price: stop.trigger_price,
+                        priority_sequence: stop.priority_sequence,
+                        order_id,
+                    },
+                    order_id,
+                )
+            }
+            Side::Sell => {
+                if !self.sell_stops.has_insertion_capacity() {
+                    return Err(MarketDataError::CapacityExceeded {
+                        resource: MarketDataResource::SellStopIndex,
+                        maximum: self.limits.max_active_orders(),
+                        attempted: self.sell_stops.len().saturating_add(1),
+                    });
+                }
+                self.sell_stops.insert(
+                    SellStopKey {
+                        trigger_price: Reverse(stop.trigger_price),
+                        priority_sequence: stop.priority_sequence,
+                        order_id,
+                    },
+                    order_id,
+                )
+            }
+        };
+        if inserted.is_some() {
+            return Err(MarketDataError::TraceMismatch(
+                "dormant-stop priority key is duplicated",
+            ));
+        }
+        Ok(())
+    }
+
+    fn remove_stop_key(
+        &mut self,
+        order_id: OrderId,
+        stop: TrackedStop,
+    ) -> Result<(), MarketDataError> {
+        let removed = match stop.side {
+            Side::Buy => self.buy_stops.remove(&BuyStopKey {
+                trigger_price: stop.trigger_price,
+                priority_sequence: stop.priority_sequence,
+                order_id,
+            }),
+            Side::Sell => self.sell_stops.remove(&SellStopKey {
+                trigger_price: Reverse(stop.trigger_price),
+                priority_sequence: stop.priority_sequence,
+                order_id,
+            }),
+        };
+        if removed != Some(order_id) {
+            return Err(MarketDataError::TraceMismatch(
+                "dormant-stop identity is absent from its trigger index",
+            ));
+        }
+        Ok(())
+    }
+
+    fn remove_stop(
+        &mut self,
+        order_id: OrderId,
+        leaves: u64,
+    ) -> Result<TrackedStop, MarketDataError> {
+        let stop = self
+            .stops
+            .get(&order_id)
+            .copied()
+            .ok_or(MarketDataError::TraceMismatch(
+                "removed dormant stop is absent",
+            ))?;
+        if stop.leaves != leaves {
+            return Err(MarketDataError::TraceMismatch(
+                "removed dormant-stop quantity differs from its leaves",
+            ));
+        }
+        self.remove_stop_key(order_id, stop)?;
+        self.stops.remove(&order_id);
+        Ok(stop)
+    }
+
+    fn first_eligible_stop(
+        &self,
+        reference_price: Price,
+    ) -> Result<Option<OrderId>, MarketDataError> {
+        let bid_stop = self
+            .buy_stops
+            .first_key_value()
+            .filter(|(key, _)| key.trigger_price <= reference_price)
+            .map(|(_, &order_id)| order_id);
+        let ask_stop = self
+            .sell_stops
+            .first_key_value()
+            .filter(|(key, _)| reference_price <= key.trigger_price.0)
+            .map(|(_, &order_id)| order_id);
+        match (bid_stop, ask_stop) {
+            (Some(_), Some(_)) => Err(MarketDataError::TraceMismatch(
+                "buy and sell stops are simultaneously eligible",
+            )),
+            (Some(order_id), None) | (None, Some(order_id)) => Ok(Some(order_id)),
+            (None, None) => Ok(None),
+        }
+    }
+
+    fn eligible_stop_count(&self, reference_price: Price) -> Result<u64, MarketDataError> {
+        let bid_count = self
+            .buy_stops
+            .iter()
+            .take_while(|(key, _)| key.trigger_price <= reference_price)
+            .count();
+        let ask_count = self
+            .sell_stops
+            .iter()
+            .take_while(|(key, _)| reference_price <= key.trigger_price.0)
+            .count();
+        if bid_count != 0 && ask_count != 0 {
+            return Err(MarketDataError::TraceMismatch(
+                "buy and sell stops are simultaneously eligible",
+            ));
+        }
+        u64::try_from(bid_count.saturating_add(ask_count))
+            .map_err(|_| MarketDataError::ArithmeticOverflow)
     }
 
     fn add_level(
@@ -2156,8 +2967,10 @@ impl MarketDataPublisher {
         }
         if book.last_event_sequence() != self.last_sequence
             || book.last_trade_id() != self.last_trade_id
-            || book.active_order_count() != self.orders.len()
+            || book.resting_order_count() != self.orders.len()
+            || book.dormant_stop_count() != self.stops.len()
             || book.trading_state() != self.trading_state
+            || book.stop_reference_price() != self.stop_reference_price
         {
             return Err(MarketDataError::SourceDivergence(
                 "published sequence, trade, or order count differs from the matching book",
@@ -2856,6 +3669,21 @@ fn ensure_source_limits(
             source.max_active_orders(),
         ),
         (
+            MarketDataResource::TrackedStops,
+            selected.max_active_orders(),
+            source.max_active_orders(),
+        ),
+        (
+            MarketDataResource::BuyStopIndex,
+            selected.max_active_orders(),
+            source.max_active_orders(),
+        ),
+        (
+            MarketDataResource::SellStopIndex,
+            selected.max_active_orders(),
+            source.max_active_orders(),
+        ),
+        (
             MarketDataResource::BidPriceLevels,
             selected.max_price_levels_per_side(),
             source.max_price_levels_per_side(),
@@ -3011,6 +3839,7 @@ const fn command_id(command: Command) -> CommandId {
         Command::AccountControl(value) => value.command_id,
         Command::TradingStateControl(value) => value.command_id,
         Command::ExpirySweep(value) => value.command_id,
+        Command::StopTriggerSweep(value) => value.command_id,
     }
 }
 
@@ -3022,7 +3851,8 @@ const fn command_order_id(command: Command) -> Option<OrderId> {
         Command::MassCancel(_)
         | Command::AccountControl(_)
         | Command::TradingStateControl(_)
-        | Command::ExpirySweep(_) => None,
+        | Command::ExpirySweep(_)
+        | Command::StopTriggerSweep(_) => None,
     }
 }
 
@@ -3033,7 +3863,9 @@ const fn command_account_id(command: Command) -> Option<AccountId> {
         Command::Replace(value) => Some(value.account_id),
         Command::MassCancel(value) => Some(value.account_id),
         Command::AccountControl(value) => Some(value.account_id),
-        Command::TradingStateControl(_) | Command::ExpirySweep(_) => None,
+        Command::TradingStateControl(_)
+        | Command::ExpirySweep(_)
+        | Command::StopTriggerSweep(_) => None,
     }
 }
 
@@ -3046,6 +3878,7 @@ const fn command_instrument(command: Command) -> InstrumentId {
         Command::AccountControl(value) => value.instrument_id,
         Command::TradingStateControl(value) => value.instrument_id,
         Command::ExpirySweep(value) => value.instrument_id,
+        Command::StopTriggerSweep(value) => value.instrument_id,
     }
 }
 
@@ -3058,6 +3891,7 @@ const fn command_version(command: Command) -> InstrumentVersion {
         Command::AccountControl(value) => value.instrument_version,
         Command::TradingStateControl(value) => value.instrument_version,
         Command::ExpirySweep(value) => value.instrument_version,
+        Command::StopTriggerSweep(value) => value.instrument_version,
     }
 }
 
@@ -3070,6 +3904,7 @@ const fn command_time(command: Command) -> TimestampNs {
         Command::AccountControl(value) => value.received_at,
         Command::TradingStateControl(value) => value.received_at,
         Command::ExpirySweep(value) => value.received_at,
+        Command::StopTriggerSweep(value) => value.received_at,
     }
 }
 

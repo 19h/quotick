@@ -12,7 +12,7 @@ use quotick::journal::{
 };
 use quotick::matching::{
     CancelReason, Command, EventKind, ExpirySweep, MatchingError, NewOrder, OrderBook, OrderType,
-    SelfTradePrevention, TimeInForce,
+    SelfTradePrevention, StopActivation, StopTriggerSweep, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -117,6 +117,28 @@ fn expiry_sweep(command_id: u64, through: u64, received_at: u64) -> Command {
     })
 }
 
+fn stop_trigger(command_id: u64, reference_price: i64) -> Command {
+    Command::StopTriggerSweep(StopTriggerSweep {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        reference_price: Price::from_raw(reference_price),
+        maximum_orders: 4,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+fn stop_limit(command_id: u64, order_id: u64) -> Command {
+    let Command::New(mut value) = command(command_id, order_id, 5) else {
+        unreachable!("command fixture is always new")
+    };
+    value.order_type = OrderType::Stop {
+        trigger_price: Price::from_raw(110),
+        activation: StopActivation::Limit(Price::from_raw(105)),
+    };
+    Command::New(value)
+}
+
 fn options() -> JournalOptions {
     JournalOptions {
         durability: Durability::Buffered,
@@ -199,6 +221,61 @@ fn durable_gtd_expiry_restores_the_watermark_and_exact_retry() {
         frames_before_retry
     );
     reopened.book().validate().unwrap();
+}
+
+#[test]
+fn durable_recovery_restores_dormant_stop_reference_and_activation() {
+    let file = TestFile::new("stop-recovery");
+    let reference = stop_trigger(1, 100);
+    let stop = stop_limit(2, 1);
+    let mut durable = DurableOrderBook::open(file.path(), definition(), options()).unwrap();
+    durable.submit(reference).unwrap();
+    let armed = durable.submit(stop).unwrap();
+    durable.sync_all().unwrap();
+    drop(durable);
+
+    let mut reopened = DurableOrderBook::open(file.path(), definition(), options()).unwrap();
+    assert_eq!(
+        reopened.book().stop_reference_price(),
+        Some(Price::from_raw(100))
+    );
+    assert_eq!(reopened.book().dormant_stop_count(), 1);
+    assert!(reopened.submit(stop).unwrap().replayed);
+    assert_eq!(reopened.submit(stop).unwrap().events, armed.events);
+    reopened.submit(stop_trigger(3, 110)).unwrap();
+    assert!(
+        reopened
+            .book()
+            .dormant_stop(OrderId::new(1).unwrap())
+            .is_none()
+    );
+    assert_eq!(
+        reopened
+            .book()
+            .order(OrderId::new(1).unwrap())
+            .unwrap()
+            .price,
+        Price::from_raw(105)
+    );
+    reopened.sync_all().unwrap();
+    drop(reopened);
+
+    let recovered = DurableOrderBook::open(file.path(), definition(), options()).unwrap();
+    assert_eq!(
+        recovered.book().stop_reference_price(),
+        Some(Price::from_raw(110))
+    );
+    assert_eq!(recovered.book().dormant_stop_count(), 0);
+    assert_eq!(
+        recovered
+            .book()
+            .order(OrderId::new(1).unwrap())
+            .unwrap()
+            .leaves_quantity
+            .lots(),
+        5
+    );
+    recovered.book().validate().unwrap();
 }
 
 #[test]

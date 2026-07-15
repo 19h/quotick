@@ -96,7 +96,7 @@ fn append_reopen_and_typed_decode_preserve_sequence_and_payload() {
 
     let bytes = fs::read(file.path()).expect("journal bytes read");
     assert_eq!(&bytes[..4], b"QWAL");
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 5);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 6);
 
     let frames = read_frames(file.path());
     assert_eq!(frames.len(), 2);

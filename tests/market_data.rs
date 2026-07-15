@@ -14,7 +14,7 @@ use quotick::market_data::{
 use quotick::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
     Command, EventKind, ExecutionReport, ExpirySweep, NewOrder, OrderBook, OrderType, ReplaceOrder,
-    SelfTradePrevention, TimeInForce,
+    SelfTradePrevention, StopActivation, StopTriggerSweep, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -133,6 +133,50 @@ fn expiry_sweep(command_id: u64, through: u64, received_at: u64) -> Command {
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test fixtures expose every independent stop-order dimension at the call site"
+)]
+fn stop_order(
+    command_id: u64,
+    order_id: u64,
+    account_id: u64,
+    side: Side,
+    quantity: u64,
+    trigger_price: i64,
+    activation: StopActivation,
+    stp: SelfTradePrevention,
+) -> Command {
+    let Command::New(mut value) = order(
+        command_id,
+        order_id,
+        account_id,
+        side,
+        quantity,
+        1,
+        TimeInForce::ImmediateOrCancel,
+        stp,
+    ) else {
+        unreachable!("order fixture is always new")
+    };
+    value.order_type = OrderType::Stop {
+        trigger_price: Price::from_raw(trigger_price),
+        activation,
+    };
+    Command::New(value)
+}
+
+fn stop_trigger(command_id: u64, reference_price: i64, maximum_orders: u32) -> Command {
+    Command::StopTriggerSweep(StopTriggerSweep {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        reference_price: Price::from_raw(reference_price),
+        maximum_orders,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
 fn publish(
     book: &mut OrderBook,
     publisher: &mut MarketDataPublisher,
@@ -223,6 +267,157 @@ fn incremental_updates_reconstruct_trades_replacements_and_cancellations() {
         .expect("publisher cross-audit passes");
     assert!(replica.depth(Side::Buy, 10).is_empty());
     assert!(replica.depth(Side::Sell, 10).is_empty());
+}
+
+#[test]
+fn dormant_stop_publication_is_depth_neutral_and_triggered_trades_are_mirrored() {
+    let mut book = OrderBook::new(definition());
+    let mut publisher = MarketDataPublisher::from_book(&book).unwrap();
+    let mut replica = MarketDataReplica::new(instrument(), version(), TradingState::Open);
+    replica.apply_snapshot(&publisher.snapshot()).unwrap();
+
+    for command in [
+        stop_trigger(1, 100, 1),
+        order(
+            2,
+            1,
+            21,
+            Side::Sell,
+            2,
+            105,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ),
+    ] {
+        replica
+            .apply_batch(&publish(&mut book, &mut publisher, command))
+            .unwrap();
+    }
+    let depth_before = replica.depth(Side::Sell, usize::MAX);
+    let armed = stop_order(
+        3,
+        2,
+        11,
+        Side::Buy,
+        3,
+        110,
+        StopActivation::Market,
+        SelfTradePrevention::CancelAggressor,
+    );
+    let armed_batch = publish(&mut book, &mut publisher, armed);
+    assert!(
+        armed_batch
+            .updates()
+            .iter()
+            .all(|update| matches!(update.kind(), MarketDataKind::NoBookChange))
+    );
+    replica.apply_batch(&armed_batch).unwrap();
+    assert_eq!(replica.depth(Side::Sell, usize::MAX), depth_before);
+    MarketDataPublisher::from_book(&book)
+        .unwrap()
+        .validate_against(&book)
+        .unwrap();
+
+    let triggered = publish(&mut book, &mut publisher, stop_trigger(4, 110, 1));
+    assert!(
+        triggered
+            .updates()
+            .iter()
+            .any(|update| matches!(update.kind(), MarketDataKind::Trade { .. }))
+    );
+    replica.apply_batch(&triggered).unwrap();
+    assert_mirrors(&book, &replica);
+    publisher.validate_against(&book).unwrap();
+    assert_eq!(book.dormant_stop_count(), 0);
+}
+
+#[test]
+fn publisher_rejects_noncanonical_stop_activation_and_handles_triggered_stp() {
+    let mut book = OrderBook::new(definition());
+    book.submit(stop_trigger(1, 100, 1)).unwrap();
+    for command in [
+        stop_order(
+            2,
+            1,
+            11,
+            Side::Buy,
+            1,
+            105,
+            StopActivation::Market,
+            SelfTradePrevention::CancelAggressor,
+        ),
+        stop_order(
+            3,
+            2,
+            12,
+            Side::Buy,
+            1,
+            110,
+            StopActivation::Market,
+            SelfTradePrevention::CancelAggressor,
+        ),
+    ] {
+        book.submit(command).unwrap();
+    }
+    let pre_trigger = OrderBook::from_checkpoint(&book.checkpoint(1, 7).unwrap()).unwrap();
+    let mut rejecting = MarketDataPublisher::from_book(&pre_trigger).unwrap();
+    let sweep = stop_trigger(4, 110, 2);
+    let report = book.submit(sweep).unwrap();
+    let mut corrupted = report.clone();
+    let first_trigger = corrupted
+        .events
+        .make_mut()
+        .iter_mut()
+        .find(|event| matches!(event.kind, EventKind::StopOrderTriggered { .. }))
+        .unwrap();
+    let EventKind::StopOrderTriggered { order_id, .. } = &mut first_trigger.kind else {
+        unreachable!()
+    };
+    *order_id = OrderId::new(2).unwrap();
+    assert_eq!(
+        rejecting.publish(sweep, &corrupted, &book),
+        Err(MarketDataError::TraceMismatch(
+            "StopOrderTriggered is absent, ineligible, or not canonical"
+        ))
+    );
+
+    let mut book = OrderBook::new(definition());
+    let mut publisher = MarketDataPublisher::from_book(&book).unwrap();
+    publish(&mut book, &mut publisher, stop_trigger(10, 100, 1));
+    publish(
+        &mut book,
+        &mut publisher,
+        order(
+            11,
+            11,
+            7,
+            Side::Sell,
+            2,
+            105,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ),
+    );
+    publish(
+        &mut book,
+        &mut publisher,
+        stop_order(
+            12,
+            12,
+            7,
+            Side::Buy,
+            3,
+            110,
+            StopActivation::Market,
+            SelfTradePrevention::CancelResting,
+        ),
+    );
+    let batch = publish(&mut book, &mut publisher, stop_trigger(13, 110, 1));
+    assert!(batch.updates().iter().any(|update| matches!(
+        update.kind(),
+        MarketDataKind::Level(level) if level.price == Price::from_raw(105) && level.quantity == 0
+    )));
+    publisher.validate_against(&book).unwrap();
 }
 
 #[test]

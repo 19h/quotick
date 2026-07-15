@@ -6,11 +6,13 @@ use quotick::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
     Command, CommandOutcome, CommandPreparation, EventKind, ExpirySweep, MatchingHashIndex,
     NewOrder, OrderBookLimits, OrderBookLimitsSpec, OrderType, RejectReason, ReplaceOrder,
-    SelfTradePrevention, TimeInForce, TradingStateControl, TradingStateControlAction,
+    SelfTradePrevention, StopActivation, StopTriggerSweep, TimeInForce, TradingStateControl,
+    TradingStateControlAction,
 };
 use quotick::risk::{
     AccountRiskState, RiskError, RiskHashIndex, RiskLimitSpec, RiskLimits, RiskManagedLimits,
-    RiskManagedLimitsError, RiskManagedLimitsSpec, RiskManagedOrderBook, RiskProfile,
+    RiskManagedLimitsError, RiskManagedLimitsSpec, RiskManagedOrderBook, RiskPriceConstraint,
+    RiskProfile,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -182,6 +184,17 @@ fn expiry_sweep(command_id: u64, through: u64, received_at: u64) -> Command {
         instrument_version: version(),
         through: TimestampNs::from_unix_nanos(through),
         received_at: TimestampNs::from_unix_nanos(received_at),
+    })
+}
+
+fn stop_trigger(command_id: u64, reference_price: i64) -> Command {
+    Command::StopTriggerSweep(StopTriggerSweep {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        reference_price: Price::from_raw(reference_price),
+        maximum_orders: 4,
+        received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
 
@@ -787,6 +800,67 @@ fn open_order_count_excludes_nonresting_ioc_commands() {
 }
 
 #[test]
+fn dormant_stop_risk_reservations_persist_then_activate_or_release() {
+    let mut book = RiskManagedOrderBook::new(definition());
+    book.register_account(account(11), profile(AccountRiskState::Active, 0))
+        .unwrap();
+    book.submit(stop_trigger(1, 100)).unwrap();
+
+    book.submit(order(
+        2,
+        1,
+        11,
+        Side::Buy,
+        5,
+        OrderType::Stop {
+            trigger_price: Price::from_raw(110),
+            activation: StopActivation::Limit(Price::from_raw(120)),
+        },
+        TimeInForce::GoodTilCancelled,
+        SelfTradePrevention::CancelAggressor,
+    ))
+    .unwrap();
+    let dormant = book.risk().reservation(OrderId::new(1).unwrap()).unwrap();
+    assert!(dormant.is_dormant_stop());
+    assert_eq!(
+        dormant.constraint(),
+        RiskPriceConstraint::Limit(Price::from_raw(120))
+    );
+    assert_eq!(book.risk().snapshot(account(11)).unwrap().open_orders(), 1);
+
+    book.submit(stop_trigger(3, 110)).unwrap();
+    let active = book.risk().reservation(OrderId::new(1).unwrap()).unwrap();
+    assert!(!active.is_dormant_stop());
+    assert_eq!(active.constraint(), dormant.constraint());
+    assert_eq!(
+        book.book().order(OrderId::new(1).unwrap()).unwrap().price,
+        Price::from_raw(120)
+    );
+
+    book.submit(order(
+        4,
+        2,
+        11,
+        Side::Sell,
+        3,
+        OrderType::Stop {
+            trigger_price: Price::from_raw(100),
+            activation: StopActivation::Market,
+        },
+        TimeInForce::ImmediateOrCancel,
+        SelfTradePrevention::CancelAggressor,
+    ))
+    .unwrap();
+    let market = book.risk().reservation(OrderId::new(2).unwrap()).unwrap();
+    assert!(market.is_dormant_stop());
+    assert_eq!(market.constraint(), RiskPriceConstraint::Market);
+    book.submit(stop_trigger(5, 100)).unwrap();
+    assert!(book.risk().reservation(OrderId::new(2).unwrap()).is_none());
+    assert_eq!(book.risk().snapshot(account(11)).unwrap().open_orders(), 1);
+    book.validate().unwrap();
+}
+
+#[test]
 fn aggregate_open_quantity_limit_is_independent_of_per_order_quantity() {
     let mut book = managed_with_limits(
         RiskLimits::new(RiskLimitSpec {
@@ -1126,7 +1200,7 @@ fn rejected_replace_preserves_the_original_book_and_reservation() {
     assert_eq!(live.price, Price::from_raw(100));
     assert_eq!(live.leaves_quantity.lots(), 5);
     let reservation = book.risk().reservation(OrderId::new(1).unwrap()).unwrap();
-    assert_eq!(reservation.price(), Price::from_raw(100));
+    assert_eq!(reservation.price(), Some(Price::from_raw(100)));
     assert_eq!(reservation.quantity_lots(), 5);
 
     book.submit(replace(3, 1, 11, 3, 100)).unwrap();

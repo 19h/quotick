@@ -27,6 +27,15 @@ public updates and snapshots defined in the sections below.
   renumbering or conflation in version 2.
 - `NoBookChange` preserves continuity for private lifecycle events that do not
   modify public depth, print a trade, or change instrument state.
+- Stop arming, triggering, and sweep completion are private lifecycle events.
+  The publisher mirrors dormant stop identities, both canonical trigger
+  indices, and the committed reference solely to validate the source trace;
+  these events emit `NoBookChange`. Execution caused by a trigger emits the
+  same ordinary trade, absolute-level, refresh, and cancellation updates as an
+  immediately active order.
+- Dormant stops contribute neither displayed quantity nor public order count.
+  An explicit trigger sweep can therefore advance private state without
+  changing a public full-depth snapshot.
 - Reserve hidden leaves are never included in public quantity or order count.
   A depleted visible slice can delete an order/level in its trade update; a
   following source-sequenced level update publishes the replenished slice after
@@ -177,7 +186,8 @@ The decoder rejects:
 - crossed or locked snapshots
 
 Snapshots contain displayed aggregate quantity only. Total hidden reserve
-leaves and private reserve order identifiers are intentionally absent.
+leaves, private reserve order identifiers, dormant stops, stop triggers, and
+the committed stop reference are intentionally absent.
 
 ## Gap recovery protocol
 

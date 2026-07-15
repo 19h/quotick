@@ -81,18 +81,33 @@ expiry AVL. With `P` occupied prices and `X` active GTD orders, commit is
 `O(K(log(P + 1) + log(X + 1)))`; its report contains exactly `K + 1` events.
 An empty sweep is `O(1)`, consumes no lease, and still advances the watermark.
 
-Active matching state uses `O(O + P + C + T)` memory for `O` resting orders,
-`C` retained idempotency reports, and `T` never-evicted controlled accounts;
-the fixed GTD index contributes at most one AVL entry per active order, and
-account indexing adds two links per active order plus fixed
+For `K` stops activated by one explicit reference, preparation counts the
+eligible prefix and derives matching work before mutation. It leases `O(K)`
+selection scratch and selects canonical buy/sell trigger heads. If those
+activations cause `E` maker-slice interactions and exhaust `L` price levels,
+commit is bounded by
+`O(K log(O + 1) + E + (L + K) log(P + 1))`; this includes trigger-index
+removal and possible stop-limit residual insertion. FOK activation can add its
+ordinary crossed-order inspection. Counting retained eligible backlog is
+`O(R + 1)` for `R` stops remaining at the committed reference. A sweep with no
+eligible stop is `O(1)` and still records the reference; a partial sweep
+requires same-reference continuation before advancement.
+
+Active matching state uses `O(O + P + C + T)` memory for `O` resting or
+dormant orders, `C` retained idempotency reports, and `T` never-evicted
+controlled accounts; the fixed GTD index and two stop-trigger indexes each
+contribute at most one AVL entry per active order, and account indexing adds
+two links per active order plus fixed
 head/tail/count/aggregate state per active account, within the same `O(O)`
 bound. The two complete best-level caches add `O(1)` space.
 
-Successful full-book validation traverses all price FIFO and account lists in
-`O(O)`, audits both initialized price AVL arenas in `O(P log(P + 1))`, and
-audits `X_i` initialized expiry-arena slots in `O(X_i log(X_i + 1))`, using
-`O(1)` auxiliary space and no heap allocation. Human-readable failure-detail
-formatting may allocate after corruption is detected.
+Successful full-book validation traverses all price FIFO, dormant stop, and
+account lists in `O(O)`, audits both initialized price AVL arenas in
+`O(P log(P + 1))`, audits `X_i` initialized expiry-arena slots in
+`O(X_i log(X_i + 1))`, and audits `S_i` initialized slots across the two stop
+arenas in `O(S_i log(S_i + 1))`, using `O(1)` auxiliary space and no heap
+allocation. Human-readable failure-detail formatting may allocate after
+corruption is detected.
 
 ## Call-auction discovery and allocation
 
@@ -213,7 +228,7 @@ Default matching limits are:
 
 | Resource                 | Default |
 | ------------------------ | ------- |
-| Active orders            | 4,096   |
+| Active orders, including dormant stops | 4,096 |
 | Active accounts          | 4,096   |
 | Occupied prices per side | 4,096   |
 | Accepted order IDs       | 65,536  |
@@ -225,7 +240,8 @@ The final 4,096 history slots are reserved for valid cancellation-capable
 commands.
 The report limit must be at least `max_active_orders + 1`, preserving one
 cancellation event per maximally active order plus the mass-cancel completion
-event or one complete expiry sweep.
+event or one complete expiry sweep. Stop-trigger sweeps remain ordinary-lane
+commands and must pass their derived activation/matching report bound.
 
 ### Order-selection buffer pool
 
@@ -236,7 +252,8 @@ order-selection buffers.
 - The measured minimum element payload is
   `2 × 4,096 × 8 B = 65,536 B = 0.065536 MB`, before vector headers, the
   pool vector, Arc/mutex, allocator rounding, and resident pages.
-- A zero-cardinality control selection or expiry sweep requires no lease.
+- A zero-cardinality control, expiry, or stop-trigger selection requires no
+  lease.
 - Holding two non-empty preparations exhausts the pool and produces an
   unsequenced typed preparation failure; dropping or consuming a preparation
   returns its cleared buffer.
@@ -307,14 +324,14 @@ On the current `aarch64-apple-darwin` build:
 
 ### Constructor reservations
 
-Every constructor fallibly reserves three stable-slot indexed AVL arenas (two
-price indexes and one GTD-expiry index), one
+Every constructor fallibly reserves five stable-slot indexed AVL arenas (two
+price indexes, one GTD-expiry index, and two stop-trigger indexes), one
 262,144-slot default continuous retained-event arena, one 73,730-slot default
 call-auction retained-event arena, all five fixed-capacity matching hash
 indexes, and the coupled-risk profile and reservation indexes to their
 complete applicable bounds, plus every configured continuous order-selection
 and call-auction uncross lease. `try_with_limits` reports the exact
-price/event/selection arena or hash resource when a requested reservation
+AVL/event/selection arena or hash resource when a requested reservation
 cannot be represented or allocated.
 
 ### Command preparation and capacity preflight
@@ -322,9 +339,9 @@ cannot be represented or allocated.
 Command preparation therefore borrows matching and coupled-risk state
 immutably; it proves the report bound against existing event headroom and
 acquires one constructor-owned selection lease for a non-empty mass-cancel,
-expiry sweep, block-and-cancel, or instrument transition-and-cancel before
-durable command append. Empty selections bypass the pool; non-empty pool
-exhaustion is typed before sequencing or append.
+expiry sweep, stop-trigger sweep, block-and-cancel, or instrument transition-
+and-cancel before durable command append. Empty selections bypass the pool;
+non-empty pool exhaustion is typed before sequencing or append.
 
 - Capacity preflight is expected `O(1)` on the normal path, except for
   validating a reserve-lane control through the ordinary core lookup.
@@ -338,6 +355,10 @@ exhaustion is typed before sequencing or append.
   time and `O(1)` auxiliary space.
 - Active-order, active-account, and same-side price-level decisions use the
   exact final cardinalities.
+- Dormant stop intake consumes active-order/account capacity but no price-level
+  slot. Trigger preparation removes each dormant identity before activation;
+  a stop-limit residual that cannot fit its side's fixed price arena is fully
+  cancelled with a typed event instead of partially executing.
 - A price-changing replacement whose old level remains occupied uses the
   same allocation-free liquidity proof only at a full same-side level bound:
   a full fill or aggressor-terminating STP result creates no target level,
@@ -348,7 +369,8 @@ exhaustion is typed before sequencing or append.
 
 One `PreparedCommand` carries the completed operational/core proof through
 risk authorization and WAL append, together with the safe report bound and
-optional mass-cancel/expiry/account-control/instrument-control selection lease.
+optional mass-cancel/expiry/stop-trigger/account-control/instrument-control
+selection lease.
 Matching hash-table insertion uses constructor-owned dense entries plus a
 fixed open-addressed bucket array; backward-shift deletion and dense
 `swap_remove` reuse that storage without growth. Commit validates book
@@ -374,14 +396,17 @@ encoding emits the unchanged ordered event sequence.
 
 Incoming matching preparation computes a safe event/trade bound in `O(1)` from
 mutation-maintained side/account work aggregates; expiry preparation uses the
-`O(K + 1)` prefix count stated above. Both check the per-report limit and total
-arena headroom. Preparation consumes no slot; only actual commit events advance
-the cursor. The protected event tail has `O_max + 1`
+`O(K + 1)` prefix count stated above, while stop-trigger preparation visits the
+bounded eligible prefix and sums each activation's conservative matching work.
+All check the per-report limit and total arena headroom. Preparation consumes no
+slot; only actual commit events advance the cursor. The protected event tail has
+`O_max + 1`
 slots, so ordinary capacity is `E_max - (O_max + 1)`. The conservative bound
 includes uncrossed opposite-side work and may reject early near a boundary,
 but retains no per-command unused capacity. A sweep over `K <= O_max` active
 GTD orders has the exact bound `K + 1` and therefore fits the same protected
-tail.
+tail. Stop-trigger sweeps cannot use that tail and may require more than
+`K + 1` events because every activation can match or refresh reserve slices.
 
 ## Risk engine
 
@@ -398,24 +423,30 @@ bounded storage.
 
 Risk state uses `O(A + O)` memory. Profile registration is expected `O(1)`,
 allocation-free within the constructor-owned bound, and disabled after the
-first sequenced command.
+first sequenced command. Dormant stops retain one reservation valued from the
+activation limit or market collar. Arming and triggering are expected `O(1)`
+risk-map transitions; triggering changes the dormant flag without duplicating
+account exposure.
 
 ## Market data
 
 Market-data trace and replica application are `O(log P)` for level-changing
-events and `O(1)` for no-change events. For `E` updates and `U <= E` affected
-prices, publication reserves `O(E)` output before mutation and validates
-unique affected prices in expected `O(E + U log P)` time using fixed hash
-scratch. Replica batch capacity preflight is expected `O(E)` before
-`O(E log P)` application.
+events. Ordinary no-change events are `O(1)`; stop arm, removal, replacement,
+and trigger validation are `O(log(O + 1))` in the private stop arenas. For `E`
+updates and `U <= E` affected prices, publication reserves `O(E)` output before
+mutation and validates unique affected prices in expected
+`O(E + U log P)` time using fixed hash scratch. Replica batch capacity
+preflight is expected `O(E)` before `O(E log P)` application.
 
-- Publisher bootstrap is expected `O(O + P log P + T)`.
+- Publisher bootstrap is expected `O(O + P log P + S log(O + 1) + T)` for `S`
+  dormant stops.
 - A full-depth snapshot output is `O(P)`.
 - Allocation-free double-buffered snapshot application is `O(P log P)`.
-- A complete publisher cross-audit is expected `O(O + P + T)` outside
-  adversarial hash collision clusters.
+- A complete publisher cross-audit is expected
+  `O(O + P + S log(O + 1) + T)` outside adversarial hash collision clusters.
 
-State is `O(O_max + T_max + P_max + E_max)` for one publisher and
+State is `O(O_max + T_max + P_max + E_max)` for one publisher, including the
+private dormant-stop map and two trigger arenas, and
 `O(P_max + E_max)` for one replica, with the replica reserving four per-side
 depth arenas in total (active and standby for bids and asks).
 
@@ -455,12 +486,13 @@ payload rather than the complete WAL.
 
 ## Matching checkpoints
 
-For `C` retained matching commands containing `E` events, `O` active orders,
-and `P` initialized price slots, a matching checkpoint retains
-`O(C + E + O + P)` state. `OrderBook::capture_checkpoint_candidate` performs
-canonical row copying plus structural and command-derived lineage audits in
-expected `O(C + E + O + P log(P + 1))` under exclusive book access, without
-re-executing matching history. Its immutable, nonencodable result can be
+For `C` retained matching commands containing `E` events, `O` active resting
+or dormant orders, `P` initialized price slots, and `S` initialized stop-index
+slots, a matching checkpoint retains `O(C + E + O + P + S)` state.
+`OrderBook::capture_checkpoint_candidate` performs canonical row copying plus
+structural and command-derived lineage audits in expected
+`O(C + E + O + P log(P + 1) + S log(S + 1))` under exclusive book access,
+without re-executing matching history. Its immutable, nonencodable result can be
 moved to another thread; consuming `verify` performs the independent
 full-history replay and a fresh canonical projection before returning the
 stable `OrderBookCheckpoint`. `OrderBook::checkpoint` invokes both phases
@@ -478,26 +510,28 @@ the later suffix behind `anchor(G)`.
 Uncut checkpoint open scans every WAL byte and decodes the exact
 command/report prefix. Anchored open in either physical layout instead
 validates the selected A/B checkpoint and scans only current anchor and
-suffix bytes, then reconstructs indices in `O(O log P)` and executes matching
+suffix bytes, then reconstructs price/stop indices in
+`O(O(log(P + 1) + log(O + 1)))` and executes matching
 transitions only for the suffix. Cutover bounds physical WAL-prefix storage
 and scan work per cutover; retained history and writer-side capture
 audit/copy remain history-dependent. Physical migration is
 `O(B_suffix + S_suffix)` in retained suffix bytes and segments, with one
 bounded frame buffer; semantic replay remains off-thread.
 
-Capture exactly reserves `C` command/report rows and `O` canonical
-active-order rows before their first push. Arena-backed event traces share
+Capture exactly reserves `C` command/report rows plus canonical resting and
+dormant rows whose combined count is `O` before their first push. Arena-backed
+event traces share
 their existing storage without copying events. Append-only audited dense
 report order is already chronological, so capture copies it in `O(C)` without
-sorting. The immutable history and active-order images are retained behind
-shared owners; cloning an `OrderBookCheckpoint` is `O(1)` and allocates no
-row or event storage. Cloning the staged capture has the same property.
-Initial capture/decoding still creates two shared-owner control blocks after
-the exactly reserved vectors exist.
+sorting. The immutable history, resting-order, and dormant-stop images are
+retained behind shared owners; cloning an `OrderBookCheckpoint` is `O(1)` and
+allocates no row or event storage. Cloning the staged capture has the same
+property. Initial capture/decoding still creates three shared-owner control
+blocks after the exactly reserved vectors exist.
 
 Temporary replay-book construction and every capture/validation allocation
 preserve typed resource identity. Checkpoint validation owns bounded
-dense/open-addressed scratch with peak semantic maxima `3C + O` for history
+dense/open-addressed scratch with peak semantic maxima `4C + O` for history
 validation and `C + 3O` for selected-limit cardinality validation. Expected
 validation work is `O(C + E + O)`; a full adversarial collision cluster is
 bounded `O(C^2 + E + O^2)`. Resource failure before snapshot or cutover
@@ -508,7 +542,7 @@ boundary.
 ## Coupled risk checkpoints
 
 For `C` retained risk-managed commands containing `E` events, `O` active
-orders, `P` price levels, and `A` accounts, a coupled risk checkpoint retains
+resting or dormant orders, `P` price levels, and `A` accounts, a coupled risk checkpoint retains
 `O(C + E + O + P + A)` state. Capture performs matching structural/lineage
 audit, exactly reserves and sorts `A` account rows, reconstructs positions
 and total-leaves reservations directly, and requires exact live equality

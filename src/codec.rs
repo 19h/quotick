@@ -32,11 +32,11 @@ use crate::market_data::{
 };
 use crate::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
-    Command, CommandOutcome, CommandReportCheckpoint, Event, EventKind, ExecutionReport,
-    ExpirySweep, MassCancel, MassCancelScope, NewOrder, OrderBookCheckpoint,
+    Command, CommandOutcome, CommandReportCheckpoint, DormantStopCheckpoint, Event, EventKind,
+    ExecutionReport, ExpirySweep, MassCancel, MassCancelScope, NewOrder, OrderBookCheckpoint,
     OrderBookCheckpointError, OrderDisplay, OrderType, RejectReason, ReplaceOrder,
-    RestingOrderCheckpoint, SelfTradePrevention, TimeInForce, Trade, TradingStateControl,
-    TradingStateControlAction, TradingStateSnapshot,
+    RestingOrderCheckpoint, SelfTradePrevention, StopActivation, StopTriggerSweep, TimeInForce,
+    Trade, TradingStateControl, TradingStateControlAction, TradingStateSnapshot,
 };
 use crate::risk::{
     AccountRiskDefinition, AccountRiskState, RiskAccountCheckpoint, RiskError, RiskLimitSpec,
@@ -591,6 +591,14 @@ fn encode_order_type(encoder: &mut Encoder, order_type: OrderType) {
             encoder.u8(1);
             encoder.i64(price.raw());
         }
+        OrderType::Stop {
+            trigger_price,
+            activation,
+        } => {
+            encoder.u8(2);
+            encoder.i64(trigger_price.raw());
+            encode_stop_activation(encoder, activation);
+        }
     }
 }
 
@@ -598,8 +606,33 @@ fn decode_order_type(decoder: &mut Decoder<'_>) -> Result<OrderType, CodecError>
     match decoder.u8()? {
         0 => Ok(OrderType::Market),
         1 => Ok(OrderType::Limit(Price::from_raw(decoder.i64()?))),
+        2 => Ok(OrderType::Stop {
+            trigger_price: Price::from_raw(decoder.i64()?),
+            activation: decode_stop_activation(decoder)?,
+        }),
         tag => Err(CodecError::InvalidTag {
             type_name: "OrderType",
+            tag,
+        }),
+    }
+}
+
+fn encode_stop_activation(encoder: &mut Encoder, activation: StopActivation) {
+    match activation {
+        StopActivation::Market => encoder.u8(0),
+        StopActivation::Limit(price) => {
+            encoder.u8(1);
+            encoder.i64(price.raw());
+        }
+    }
+}
+
+fn decode_stop_activation(decoder: &mut Decoder<'_>) -> Result<StopActivation, CodecError> {
+    match decoder.u8()? {
+        0 => Ok(StopActivation::Market),
+        1 => Ok(StopActivation::Limit(Price::from_raw(decoder.i64()?))),
+        tag => Err(CodecError::InvalidTag {
+            type_name: "StopActivation",
             tag,
         }),
     }
@@ -803,6 +836,13 @@ fn encode_reject_reason(encoder: &mut Encoder, value: RejectReason) {
         RejectReason::OrderAlreadyExpired => 38,
         RejectReason::ExpiryWatermarkRegression => 39,
         RejectReason::ExpiryHorizonAfterCommandTime => 40,
+        RejectReason::StopReferenceUnavailable => 41,
+        RejectReason::StopAlreadyTriggered => 42,
+        RejectReason::StopTriggerBatchEmpty => 43,
+        RejectReason::StopTriggerBatchExceedsActiveOrderCapacity => 44,
+        RejectReason::StopTriggerBacklog => 45,
+        RejectReason::StopMarketCannotPost => 46,
+        RejectReason::StopMarketCannotBeReplaced => 47,
     });
 }
 
@@ -849,6 +889,13 @@ fn decode_reject_reason(decoder: &mut Decoder<'_>) -> Result<RejectReason, Codec
         38 => Ok(RejectReason::OrderAlreadyExpired),
         39 => Ok(RejectReason::ExpiryWatermarkRegression),
         40 => Ok(RejectReason::ExpiryHorizonAfterCommandTime),
+        41 => Ok(RejectReason::StopReferenceUnavailable),
+        42 => Ok(RejectReason::StopAlreadyTriggered),
+        43 => Ok(RejectReason::StopTriggerBatchEmpty),
+        44 => Ok(RejectReason::StopTriggerBatchExceedsActiveOrderCapacity),
+        45 => Ok(RejectReason::StopTriggerBacklog),
+        46 => Ok(RejectReason::StopMarketCannotPost),
+        47 => Ok(RejectReason::StopMarketCannotBeReplaced),
         tag => Err(CodecError::InvalidTag {
             type_name: "RejectReason",
             tag,
@@ -866,6 +913,9 @@ fn encode_cancel_reason(encoder: &mut Encoder, value: CancelReason) {
         CancelReason::AccountControl => 5,
         CancelReason::TradingStateControl => 6,
         CancelReason::Expired => 7,
+        CancelReason::TriggeredFokUnfilled => 8,
+        CancelReason::TriggeredPostOnlyWouldCross => 9,
+        CancelReason::TriggeredCapacityUnavailable => 10,
     });
 }
 
@@ -879,6 +929,9 @@ fn decode_cancel_reason(decoder: &mut Decoder<'_>) -> Result<CancelReason, Codec
         5 => Ok(CancelReason::AccountControl),
         6 => Ok(CancelReason::TradingStateControl),
         7 => Ok(CancelReason::Expired),
+        8 => Ok(CancelReason::TriggeredFokUnfilled),
+        9 => Ok(CancelReason::TriggeredPostOnlyWouldCross),
+        10 => Ok(CancelReason::TriggeredCapacityUnavailable),
         tag => Err(CodecError::InvalidTag {
             type_name: "CancelReason",
             tag,
@@ -937,6 +990,23 @@ fn decode_optional_timestamp(
         return Err(CodecError::InvalidValue(field));
     }
     Ok(present.then(|| TimestampNs::from_unix_nanos(value)))
+}
+
+fn encode_optional_price(encoder: &mut Encoder, value: Option<Price>) {
+    encoder.bool(value.is_some());
+    encoder.i64(value.map_or(0, Price::raw));
+}
+
+fn decode_optional_price(
+    decoder: &mut Decoder<'_>,
+    field: &'static str,
+) -> Result<Option<Price>, CodecError> {
+    let present = decoder.bool()?;
+    let value = decoder.i64()?;
+    if !present && value != 0 {
+        return Err(CodecError::InvalidValue(field));
+    }
+    Ok(present.then(|| Price::from_raw(value)))
 }
 
 fn encode_command(encoder: &mut Encoder, command: Command) {
@@ -1014,6 +1084,15 @@ fn encode_command(encoder: &mut Encoder, command: Command) {
             encoder.u64(value.through.as_unix_nanos());
             encoder.u64(value.received_at.as_unix_nanos());
         }
+        Command::StopTriggerSweep(value) => {
+            encoder.u8(7);
+            encoder.u64(value.command_id.get());
+            encoder.u64(value.instrument_id.get());
+            encoder.u64(value.instrument_version.get());
+            encoder.i64(value.reference_price.raw());
+            encoder.u32(value.maximum_orders);
+            encoder.u64(value.received_at.as_unix_nanos());
+        }
     }
 }
 
@@ -1083,6 +1162,14 @@ fn decode_command(decoder: &mut Decoder<'_>) -> Result<Command, CodecError> {
             instrument_id: instrument(decoder)?,
             instrument_version: instrument_version(decoder)?,
             through: TimestampNs::from_unix_nanos(decoder.u64()?),
+            received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
+        })),
+        7 => Ok(Command::StopTriggerSweep(StopTriggerSweep {
+            command_id: command_id(decoder)?,
+            instrument_id: instrument(decoder)?,
+            instrument_version: instrument_version(decoder)?,
+            reference_price: Price::from_raw(decoder.i64()?),
+            maximum_orders: decoder.u32()?,
             received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
         })),
         tag => Err(CodecError::InvalidTag {
@@ -1505,6 +1592,42 @@ fn encode_event_kind(encoder: &mut Encoder, kind: EventKind) {
             encoder.u64(expired_order_count);
             encoder.u128(expired_quantity_lots);
         }
+        EventKind::StopOrderArmed {
+            order_id,
+            trigger_price,
+            activation,
+            priority_sequence,
+        } => {
+            encoder.u8(12);
+            encoder.u64(order_id.get());
+            encoder.i64(trigger_price.raw());
+            encode_stop_activation(encoder, activation);
+            encoder.u64(priority_sequence);
+        }
+        EventKind::StopOrderTriggered {
+            order_id,
+            trigger_price,
+            reference_price,
+            priority_sequence,
+        } => {
+            encoder.u8(13);
+            encoder.u64(order_id.get());
+            encoder.i64(trigger_price.raw());
+            encoder.i64(reference_price.raw());
+            encoder.u64(priority_sequence);
+        }
+        EventKind::StopTriggerSweepCompleted {
+            previous_reference_price,
+            current_reference_price,
+            triggered_order_count,
+            remaining_eligible_order_count,
+        } => {
+            encoder.u8(14);
+            encode_optional_price(encoder, previous_reference_price);
+            encoder.i64(current_reference_price.raw());
+            encoder.u64(triggered_order_count);
+            encoder.u64(remaining_eligible_order_count);
+        }
     }
 }
 
@@ -1579,6 +1702,27 @@ fn decode_event_kind(decoder: &mut Decoder<'_>) -> Result<EventKind, CodecError>
             current_watermark: TimestampNs::from_unix_nanos(decoder.u64()?),
             expired_order_count: decoder.u64()?,
             expired_quantity_lots: decoder.u128()?,
+        }),
+        12 => Ok(EventKind::StopOrderArmed {
+            order_id: order(decoder)?,
+            trigger_price: Price::from_raw(decoder.i64()?),
+            activation: decode_stop_activation(decoder)?,
+            priority_sequence: decoder.u64()?,
+        }),
+        13 => Ok(EventKind::StopOrderTriggered {
+            order_id: order(decoder)?,
+            trigger_price: Price::from_raw(decoder.i64()?),
+            reference_price: Price::from_raw(decoder.i64()?),
+            priority_sequence: decoder.u64()?,
+        }),
+        14 => Ok(EventKind::StopTriggerSweepCompleted {
+            previous_reference_price: decode_optional_price(
+                decoder,
+                "absent stop reference must have a zero value",
+            )?,
+            current_reference_price: Price::from_raw(decoder.i64()?),
+            triggered_order_count: decoder.u64()?,
+            remaining_eligible_order_count: decoder.u64()?,
         }),
         tag => Err(CodecError::InvalidTag {
             type_name: "EventKind",
@@ -1689,6 +1833,23 @@ impl BinaryCodec for OrderBookCheckpoint {
             encode_stp(&mut encoder, order.self_trade_prevention());
             encode_optional_timestamp(&mut encoder, order.expires_at());
         }
+        encoder.length(
+            "matching checkpoint dormant stops",
+            self.dormant_stops().len(),
+        )?;
+        for order in self.dormant_stops() {
+            encoder.u64(order.order_id().get());
+            encoder.u64(order.account_id().get());
+            encode_side(&mut encoder, order.side());
+            encoder.u64(order.leaves().lots());
+            encode_order_display(&mut encoder, order.display());
+            encode_stp(&mut encoder, order.self_trade_prevention());
+            encode_optional_timestamp(&mut encoder, order.expires_at());
+            encoder.i64(order.trigger_price().raw());
+            encode_stop_activation(&mut encoder, order.activation());
+            encode_time_in_force(&mut encoder, order.time_in_force());
+            encoder.u64(order.priority_sequence());
+        }
         encoder.length("matching checkpoint command history", self.history().len())?;
         for entry in self.history() {
             encode_sized_bytes(
@@ -1730,6 +1891,27 @@ impl BinaryCodec for OrderBookCheckpoint {
                 )?,
             });
         }
+        let stop_count = decoder.count("matching checkpoint dormant stops", 54)?;
+        let mut dormant_stops =
+            reserve_decoded_vec("matching checkpoint dormant stops", stop_count)?;
+        for _ in 0..stop_count {
+            dormant_stops.push(DormantStopCheckpoint {
+                order_id: order(&mut decoder)?,
+                account_id: account(&mut decoder)?,
+                side: decode_side(&mut decoder)?,
+                leaves: quantity(&mut decoder)?,
+                display: decode_order_display(&mut decoder)?,
+                self_trade_prevention: decode_stp(&mut decoder)?,
+                expires_at: decode_optional_timestamp(
+                    &mut decoder,
+                    "absent dormant-stop expiration must have a zero value",
+                )?,
+                trigger_price: Price::from_raw(decoder.i64()?),
+                activation: decode_stop_activation(&mut decoder)?,
+                time_in_force: decode_time_in_force(&mut decoder)?,
+                priority_sequence: decoder.u64()?,
+            });
+        }
         let history_count = decoder.count("matching checkpoint command history", 8)?;
         let mut history =
             reserve_decoded_vec("matching checkpoint command history", history_count)?;
@@ -1746,6 +1928,7 @@ impl BinaryCodec for OrderBookCheckpoint {
             wal_sequence,
             definition,
             orders,
+            dormant_stops,
             history,
         )
         .map_err(Into::into)

@@ -959,6 +959,10 @@ impl InstrumentDefinition {
             Command::ExpirySweep(value) => {
                 self.validate_identity(value.instrument_id, value.instrument_version)
             }
+            Command::StopTriggerSweep(value) => {
+                self.validate_identity(value.instrument_id, value.instrument_version)?;
+                self.spec.price.validate(value.reference_price)
+            }
         }
     }
 
@@ -983,8 +987,18 @@ impl InstrumentDefinition {
         }
         self.spec.quantity.validate(order.quantity)?;
         self.validate_display(order.display, order.quantity)?;
-        if let OrderType::Limit(price) = order.order_type {
-            self.spec.price.validate(price)?;
+        match order.order_type {
+            OrderType::Market => {}
+            OrderType::Limit(price) => self.spec.price.validate(price)?,
+            OrderType::Stop {
+                trigger_price,
+                activation,
+            } => {
+                self.spec.price.validate(trigger_price)?;
+                if let crate::matching::StopActivation::Limit(price) = activation {
+                    self.spec.price.validate(price)?;
+                }
+            }
         }
         Ok(())
     }
