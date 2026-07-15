@@ -2,8 +2,9 @@
 //!
 //! Every matching event produces exactly one market-data update with the same
 //! sequence. Book-changing updates carry absolute aggregate level state, so a
-//! consumer never needs to infer an order-level delta. Full-depth snapshots
-//! establish a recovery boundary after a detected sequence gap.
+//! consumer never needs to infer an order-level delta. Constructor-bounded
+//! suffix replay repairs retained short gaps; full-depth snapshots establish
+//! the fallback recovery boundary.
 //!
 //! Publisher order/control mirrors, both ordered depth sides, affected-level
 //! validation scratch, replica active/standby depth, and replica batch scratch
@@ -26,6 +27,13 @@ use crate::matching::{
     CommandOutcome, Event, EventKind, ExecutionReport, LevelSnapshot, MassCancelScope, OrderBook,
     OrderBookLimits, OrderDisplay, OrderType, SelfTradePrevention, StopActivation, StopReference,
     TimeInForce, Trade, TradingStateControlAction, TradingStateSnapshot,
+};
+
+mod replay;
+
+pub use replay::{
+    MarketDataReplay, MarketDataReplayBuffer, MarketDataReplayConstructionError,
+    MarketDataReplayError, MarketDataReplayStatus,
 };
 
 /// One finite market-data state or preparation resource.

@@ -493,6 +493,16 @@ private dormant-stop map and two trigger arenas, and
 `O(P_max + E_max)` for one replica, with the replica reserving four per-side
 depth arenas in total (active and standby for bids and asks).
 
+For replay capacity `N`, one `MarketDataReplayBuffer` initializes `N` optional
+typed slots in `O(N)` time and retains `O(N)` state. An `E`-update admission
+preflights identity, contiguity, overlap, and collision in `O(E)` time, then
+writes only its new suffix with `O(1)` work per update and no allocation. Exact
+retained duplicates also cost `O(E)`. Exclusive-cursor range setup is `O(1)`;
+iterating `R` returned updates is `O(R)` time with `O(1)` borrowed iterator
+state, including physical wrap. Typed in-memory slot bytes and allocator/page
+rounding are target-dependent; version-3 encoded updates remain 33 B, 43 B,
+66 B, or 91 B by payload kind.
+
 ## Call-auction market data
 
 Call-auction public projection has the same constructor-owned storage

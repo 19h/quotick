@@ -1291,13 +1291,26 @@ market-data stream and its replicas.
     prices are absent. Locked or crossed snapshots are invalid.
 13. A replica rejects a missing, duplicated, or reordered sequence before
     mutating depth. A non-stale full-depth snapshot resets the recovery boundary.
+    A separate `MarketDataReplayBuffer` may retain one exact bounded suffix for
+    short-gap recovery before that snapshot path is used.
+    - The ring binds one instrument/version and one already-published initial
+      sequence, reserves every slot at construction, and never reallocates.
+    - Batch admission proves identity, internal contiguity, retained overlap,
+      and the exact next source sequence before overwriting a slot. Exact
+      retained duplicates are no-ops; conflicting content and overlap older
+      than retained evidence are typed nonmutating failures.
+    - Replay queries use an exclusive sequence cursor and positive page bound.
+      They return a zero-copy source-ordered iterator across physical wrap, or
+      report that the cursor is ahead or its required first sequence is gone.
 14. Trace or structural failures after incremental mutation poison publisher or
     replica state; a fresh authoritative bootstrap/snapshot is required.
     Batch-size, level-cardinality, and snapshot-cardinality failures are
     preflighted before authoritative mutation and do not poison the replica.
 15. The stable complete-value schema is
-    [Market-data payload format version 3](market-data-v3.md). Network framing,
-    fanout, entitlement, and retransmission sessions are outside this boundary.
+    [Market-data payload format version 3](market-data-v3.md). The process-local
+    replay ring retains those exact values and changes no payload bytes. Network
+    framing, fanout, entitlement, and authenticated retransmission sessions are
+    outside this boundary.
 16. One immutable validated `MarketDataLimits` envelope bounds publisher active
     orders including dormant stops, account controls, occupied prices per side,
     and updates per command.
@@ -1326,6 +1339,12 @@ market-data stream and its replicas.
     image as the next reusable standby allocation. `try_snapshot` and
     `try_depth` keep caller-owned output allocation failure typed; the wire
     payload contains no process-local limit or allocation metadata.
+21. For retained capacity `N`, replay construction initializes exactly `N`
+    optional typed slots. Admission and exact-overlap proof are `O(E)` for an
+    `E`-update batch, each new write and retained lookup is `O(1)`, range-query
+    setup is `O(1)`, and iterating `R` returned updates is `O(R)`. The ring is
+    neither durable nor a remote session: restart initializes it at a separately
+    proven publisher/snapshot boundary.
 
 ## Call-auction order-book and publication invariants
 
@@ -1720,6 +1739,11 @@ snapshot atomically; recover through the preallocated standby image; and run
 bucket, and scratch allocations remain fixed. Unit corruption tests deliberately
 discard active-arena and batch-scratch reservations and require the invariant
 auditor to reject both layouts.
+Replay tests reject zero/unrepresentable capacities, identity/version drift,
+gaps, collisions, evicted overlap, future/zero-limit queries, and oversized
+batches without mutation; prove exact retry, recovered boundaries, pagination,
+10,000 allocation-stable wraps, and `u64::MAX`; and reconstruct a skipped
+replica suffix before exercising snapshot fallback beyond retention.
 
 Call-auction market-data capacity tests apply the equivalent source-envelope,
 constructor-failure, full-replica, oversized-batch, and double-buffered snapshot
@@ -1807,6 +1831,13 @@ There is no additional claim that semantic checkpoint history is size bounded.
   [FIX Session Layer technical standard](https://www.fixtrading.org/standards/fix-session-layer-online/).
   Quotick uses analogous typed per-instrument stop-reference coordinates, not
   FIX transport or wire encoding.
+- CME MDP 3.0 TCP recovery requests an inclusive packet-sequence range for
+  historical replay, caps one request at 2,000 packets, and directs clients to
+  queue real-time data while recovering the missed range in the
+  [CME TCP recovery specification](https://cmegroupclientsite.atlassian.net/wiki/spaces/EPICSANDBOX/pages/457574209).
+  Quotick's replay ring instead retains per-instrument event updates and exposes
+  a process-local exclusive cursor; it does not claim CME packet, FIX session,
+  authentication, request-limit, or transport compatibility.
 - Writer leases use Rust's atomic, fail-if-present
   [`OpenOptions::create_new`](https://doc.rust-lang.org/stable/std/fs/struct.OpenOptions.html#method.create_new).
   WAL and directory barriers use [`File::sync_all`](https://doc.rust-lang.org/stable/std/fs/struct.File.html#method.sync_all);
@@ -1913,7 +1944,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Clearing lifecycle | novation/allocation, fees, settlement dates, fails, corrections, busts, and reconciliation |
 | High | Security boundary | authenticated principals, authorization policy, secret management, audit export, and abuse controls |
 | Medium | Gateways and schemas | versioned binary protocol, FIX adapter, backpressure, session recovery, and conformance fixtures |
-| Medium | Market-data distribution | authenticated transport framing, entitlement, fanout, retransmission sessions, bandwidth control, and conformance fixtures |
+| Medium | Market-data distribution | constructor-reserved per-instrument short-gap replay with typed gap/collision/eviction handling and snapshot fallback is implemented; remaining work is authenticated transport framing, entitlement, fanout, remote retransmission sessions, bandwidth control, and conformance fixtures |
 | Medium | Operations | metrics, traces, structured logs, health, capacity limits, alert rules, and runbooks |
 | Medium | Performance evidence | pinned-hardware benchmarks, allocation counts, tail latency, saturation, and regression thresholds |
 | Medium | Verification expansion | model-based/property tests, fuzzing, crash simulation, concurrency model checking, and long soak tests |

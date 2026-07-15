@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A105 are stable and are referenced from code comments and other
+identifiers A1-A107 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -3148,6 +3148,45 @@ publisher private state. Any accepted discontinuity/conflict, changed state on
 rejection, lost coordinate, replay divergence, or noncanonical optional bytes
 falsifies A106.
 
+## A107 — bounded continuous market-data replay
+
+**Assumption.** One `MarketDataReplayBuffer` retains an exact finite suffix of
+the public A70 update stream for one instrument/version. Construction binds an
+already-published sequence boundary and a non-zero retained-update maximum
+`N`; no update at or before an otherwise unretained boundary is inferred. A
+non-replayed command batch must contain `E <= N` contiguous updates. Exact
+overlap is accepted only while every duplicated sequence and value remains
+available; conflicting content, gaps, identity/version drift, and unprovable
+evicted overlap fail before mutation.
+
+`replay_after(s, L)` uses an exclusive source cursor and positive page limit
+`L`. It returns at most `L` exact updates in ascending sequence, including
+across physical ring wrap. A cursor above the latest boundary or a required
+first sequence older than the retained suffix is explicit. The ring is
+process-local volatile recovery state, not a transport, authenticated channel,
+durable archive, entitlement service, or remote retransmission session.
+
+**Dependent results.** [A12, A21, A23, A70, A107] Constructor work is `O(N)`
+time and typed slot space. Admission is `O(E)` time and performs no allocation;
+each retained lookup and new slot write is `O(1)`. Replay setup is `O(1)` and
+iteration is `O(R)` for `R <= min(L, N)` returned updates with `O(1)` iterator
+state. The existing `MarketDataReplica` remains the sole public-depth
+transition grammar; retained replay therefore introduces no second level/trade
+application implementation. Snapshot fallback remains authoritative when a
+cursor is unavailable or an incremental structural failure poisons a replica.
+
+**Falsification probe.** Reject zero and unrepresentable capacities; initialize
+at zero and non-zero recovered boundaries; append single updates and complete
+command batches; inject internal sequence gaps, foreign identity/version,
+content collision, exact duplicates, partial retained overlap, and overlap
+older than the ring. Wrap repeatedly at `N`, prove allocation capacity is
+unchanged, page every boundary, reject zero limits and future cursors, and
+exercise `u64::MAX`. Drop a retained suffix and require exact replica repair;
+drop an evicted prefix and require typed unavailability followed by atomic
+snapshot recovery. Any partial mutation on failure, stale value returned,
+sequence reordering, allocation growth, duplicated depth grammar, changed
+version-3 payload byte, or recovery divergence falsifies A107.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -3446,9 +3485,10 @@ capability, a remaining risk, or an opportunity.
 - **Medium impact:** formal state-machine/model-based tests are required for the
   combinatorial interaction of TIF, replacement, and self-trade policies.
 - **Medium impact:** local level-2 incrementals, full-depth images, stable
-  payloads, gap detection, and recovery are implemented; authenticated network
-  framing, entitlements, fanout, retransmission sessions, and bandwidth controls
-  remain outside the boundary.
+  payloads, gap detection, constructor-reserved per-instrument suffix replay,
+  typed eviction/collision handling, and snapshot fallback are implemented.
+  Authenticated network framing, entitlements, fanout, remote retransmission
+  sessions, and bandwidth controls remain outside the boundary.
 - **Medium impact risk:** public refresh updates necessarily reveal that hidden
   leaves survived the preceding displayed-slice depletion; the final partial
   slice can also bound prior hidden quantity. Quantifying this information

@@ -101,9 +101,20 @@ hidden leaves, trigger state, and stop reference are absent.
 
 ## Gap recovery and version boundary
 
-Consumers buffer incrementals, apply a same-shard snapshot, discard updates at
-or before its sequence, then require the exact contiguous suffix. A gap or
-structural failure requires another authoritative snapshot.
+`MarketDataReplayBuffer` can retain an exact constructor-bounded suffix of
+these unchanged update values for one instrument/version. It accepts complete
+publisher batches only after proving identity, internal contiguity, exact
+retained overlap, and the next sequence without mutation. A zero-copy query
+returns a bounded sequence page after an exclusive cursor, including across
+physical ring wrap. A conflicting duplicate, future cursor, or first required
+sequence older than retained evidence is explicit.
+
+Consumers can request a retained short gap and apply the returned updates
+through the ordinary replica grammar. If the first missing sequence has been
+evicted, they apply a same-shard snapshot, discard buffered updates at or
+before its sequence, then require the exact contiguous suffix. A structural
+incremental failure still requires another authoritative snapshot. Replay
+capacity, cursors, and ring metadata are process-local and add no payload bytes.
 
 Although version 3 retains version-2 bytes, its tag-`2` validation accepts the
 canonical absent maker level for fully hidden execution. Payloads have no
@@ -123,3 +134,9 @@ The displayed/hidden distinction for native reserve orders is documented by
 the [CME Market by Order FAQ](https://www.cmegroup.com/articles/faqs/market-by-order-mbo.html).
 Quotick's fully hidden queue class and payload bytes are internal contracts and
 do not claim compatibility with a CME market-data channel.
+
+CME MDP 3.0 specifies packet-sequence range recovery and a 2,000-packet request
+maximum for its authenticated TCP historical replay component in the
+[CME TCP recovery specification](https://cmegroupclientsite.atlassian.net/wiki/spaces/EPICSANDBOX/pages/457574209).
+Quotick's buffer is an internal per-instrument event-update ring; it defines no
+CME packet/channel mapping, FIX request, authentication, or network session.

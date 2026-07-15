@@ -336,8 +336,10 @@ Run any program with `cargo run --example <name>`.
   depth. Fully hidden executions publish an anonymized trade with a canonical
   absent maker level when no public level existed.
 - Full-depth snapshots in canonical market-priority order; replicas detect
-  missing, duplicated, and reordered updates and recover from gaps by
-  atomically swapping double-buffered, pre-reserved snapshot arenas.
+  missing, duplicated, and reordered updates. A constructor-reserved
+  per-instrument replay ring repairs retained short gaps without allocation;
+  older gaps recover by atomically swapping double-buffered, pre-reserved
+  snapshot arenas.
 - Continuous publishers mirror dormant stop identities, trigger indices, and
   the committed reference privately to validate canonical activation. Stop-only
   state changes publish `NoBookChange`; triggered execution publishes ordinary
@@ -419,7 +421,7 @@ caller-supplied finite row image plus one exact derived ID index. The defaults:
 | `OrderBookLimits` | 4,096 active orders, including dormant stops; 4,096 active accounts; 4,096 price levels per side; 65,536 accepted order IDs; 65,536 account controls; 65,536 retained commands (final 4,096 reserved for cancellation-capable commands); 65,536 events per report; 262,144 retained events (final 4,097 protected); 2 order-selection buffers |
 | Risk | 65,536 registered accounts (continuous and auction) |
 | Call auction | 4,096 active orders; 4,096 limit prices per side; 65,536 accepted order IDs; 2 prepared-uncross buffer sets; 65,536 retained commands (final 4,098 terminal); 73,730 retained events (final 8,194 terminal); 8,193 events per report; 65,536 orders per side in the allocation kernel |
-| Market data | 65,536 updates per continuous batch; 8,193 per auction batch; mirror envelopes default to the source components' limits |
+| Market data | 65,536 updates per continuous batch; 8,193 per auction batch; mirror envelopes default to the source components' limits; replay retention is an explicit non-zero caller bound |
 | Ledger | 65,536 non-zero balance keys; 65,536 transactions; 32,768 reversal links; 65,536 records; 256 postings per transaction; 1,024 transactions per record; 262,144 retained postings |
 | Storage | 16 MiB WAL frame payload; 1 GiB WAL segment; 1 GiB snapshot payload; `SyncAll` durability; strict recovery |
 
@@ -434,6 +436,8 @@ for single-instrument execution shards and a multi-asset ledger. It does not
 implement gateways, authentication, distributed sequencing, replication or
 consensus, portfolio collateral and margin, clearing lifecycle, network
 market-data transport, administrative interfaces, or reporting systems.
+Continuous market data includes a process-local bounded suffix replay ring,
+but no remote request/session, authentication, fanout, or entitlement layer.
 
 The matching model is a continuous price-time-priority book with sequenced
 instrument-wide trading-state controls, plus a separate bounded call-auction
@@ -462,7 +466,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 106 tagged assumptions (A1–A106), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 107 tagged assumptions (A1–A107), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -516,9 +520,10 @@ includes:
   tick-grid enumeration, allocation against literal order-priority walks,
   20,000 mixed book mutations and 10,000 uncross cases against independent
   models, and a 10,000-command engine phase-model run.
-- **Market data and accounting:** depth reconstruction, gap and snapshot
-  recovery, settlement, reversals, corrections, batches, period controls,
-  reconciliation, and signed `i128` boundaries.
+- **Market data and accounting:** depth reconstruction, replay-first gap repair,
+  snapshot fallback, allocation-stable ring wrap, settlement, reversals,
+  corrections, batches, period controls, reconciliation, and signed `i128`
+  boundaries.
 - **Storage, recovery, and checkpoints:** stable wire layouts, segment
   rotation, corruption and torn-tail handling, injected write/sync/cutover
   failures, concurrent-writer exclusion, replay-divergence detection,
