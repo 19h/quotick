@@ -314,7 +314,11 @@ recovery.
   balance, and ledger trial-audit vectors reserve exactly before use. Direct
   auction restoration borrows immutable checkpoints; coupled restoration does
   not clone embedded auction vectors. Returned constructor causes remain typed,
-  and only semantic capture contradictions poison durable shards.
+  and only semantic capture contradictions poison durable shards. Plain and
+  coupled call-auction capture now return opaque nonencodable candidates;
+  deterministic replay may run off-thread after a durable WAL barrier, with
+  standalone publication fenced by shard incarnation, profile metadata where
+  applicable, and the pre-cutover epoch.
 
 ### Accounting and settlement
 
@@ -802,6 +806,21 @@ checkpoint-bound original metadata and scans only the anchor and suffix, then
 executes matching/risk transitions only for the suffix. It does not bound the
 history-dependent structural/direct capture pause, worker replay memory,
 retained history, or generation lifetime.
+
+For `C` retained call-auction commands containing `E` events, `O` active
+orders, `I` accepted identities, and `A` coupled accounts, plain capture audits
+the live engine/book/event arena, exactly captures the three canonical row
+images, and projects phase/cycle, revision, order, identity, priority, trade,
+and event lineage without executing commands. Coupled capture additionally
+sorts `A` account rows in `O(A log A)`, reconstructs positions/reservations/
+exposures directly, and proves exact live equality. Complete plain or coupled
+replay occurs once in a consuming off-thread verifier; prior nested replay in
+the coupled path is eliminated. Durable capture synchronizes the represented
+WAL prefix and accepts standalone publication only through the same open shard
+and unchanged cutover epoch; ordinary suffix growth is valid. Candidate clones
+are `O(1)` and share accepted/order/history/account images. Writer projection
+and coupled direct reconstruction, worker memory, complete history retention,
+and synchronous physical cutover remain history-dependent.
 
 For `R` retained ledger records, `E` contained transaction entries, `L` posting
 legs, and `A` non-zero account balances, checkpoint capture/validation is linear

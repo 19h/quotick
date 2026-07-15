@@ -927,16 +927,27 @@ impl CallAuctionRiskCheckpoint {
         auction: CallAuctionCheckpoint,
         accounts: Vec<RiskAccountCheckpoint>,
     ) -> Result<Self, CallAuctionRiskCheckpointError> {
+        let checkpoint = Self::from_captured_parts(wal_first_sequence, auction, accounts)?;
+        let limits = checkpoint_validation_limits(&checkpoint)?;
+        checkpoint.verify_replay_with_limits(limits)?;
+        Ok(checkpoint)
+    }
+
+    fn from_captured_parts(
+        wal_first_sequence: u64,
+        auction: CallAuctionCheckpoint,
+        accounts: Vec<RiskAccountCheckpoint>,
+    ) -> Result<Self, CallAuctionRiskCheckpointError> {
         let checkpoint = Self {
             wal_first_sequence,
             auction,
             accounts: Arc::new(accounts),
         };
-        checkpoint.validate()?;
+        checkpoint.validate_structure()?;
         Ok(checkpoint)
     }
 
-    fn validate(&self) -> Result<(), CallAuctionRiskCheckpointError> {
+    fn validate_structure(&self) -> Result<(), CallAuctionRiskCheckpointError> {
         if self.wal_first_sequence == 0 {
             return Err(CallAuctionRiskCheckpointError::new(
                 "auction risk checkpoint WAL first sequence is zero",
@@ -967,8 +978,14 @@ impl CallAuctionRiskCheckpoint {
                 "auction risk checkpoint accounts are not strictly canonical",
             ));
         }
+        Ok(())
+    }
 
-        let limits = checkpoint_validation_limits(self)?;
+    fn verify_replay_with_limits(
+        &self,
+        limits: CallAuctionRiskLimits,
+    ) -> Result<(), CallAuctionRiskCheckpointError> {
+        self.validate_structure()?;
         let direct = self.restore_direct_with_limits(limits)?;
         let mut replay =
             CallAuctionRiskManagedEngine::try_with_limits(self.auction.definition(), limits)
@@ -990,12 +1007,17 @@ impl CallAuctionRiskCheckpoint {
         }
         let replayed_auction = replay
             .engine
-            .checkpoint(
+            .checkpoint_state(
                 self.auction.wal_metadata_sequence(),
                 self.auction.generation(),
             )
             .map_err(CallAuctionRiskCheckpointError::from)?;
+        let direct_auction = direct.engine.checkpoint_state(
+            self.auction.wal_metadata_sequence(),
+            self.auction.generation(),
+        )?;
         if replayed_auction != self.auction
+            || direct_auction != self.auction
             || checkpoint_accounts(&replay.risk)?.as_slice() != self.accounts.as_slice()
             || checkpoint_accounts(&direct.risk)?.as_slice() != self.accounts.as_slice()
         {
@@ -1081,6 +1103,106 @@ impl CallAuctionRiskCheckpoint {
                     current.account_id() == old.account_id() && current.profile() == old.profile()
                 })
             && self.auction.is_successor_of(&previous.auction)
+    }
+}
+
+/// An immutable but not yet coupled-replay-verified auction-risk capture.
+///
+/// Capture audits live auction/risk structure, profiles, positions, exposures,
+/// and reservations and proves direct reconstruction equality, but deliberately
+/// defers command execution. This type has no codec or snapshot implementation;
+/// clones share every immutable auction/account row image in `O(1)`.
+#[derive(Clone)]
+pub struct CallAuctionRiskCheckpointCapture {
+    checkpoint: CallAuctionRiskCheckpoint,
+    limits: CallAuctionRiskLimits,
+}
+
+impl CallAuctionRiskCheckpointCapture {
+    /// Returns the first physical WAL sequence occupied by the definition.
+    #[must_use]
+    pub const fn wal_first_sequence(&self) -> u64 {
+        self.checkpoint.wal_first_sequence()
+    }
+
+    /// Returns the final immutable definition/profile metadata sequence.
+    #[must_use]
+    pub const fn wal_metadata_sequence(&self) -> u64 {
+        self.checkpoint.auction().wal_metadata_sequence()
+    }
+
+    /// Returns the completed report boundary represented here.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.checkpoint.generation()
+    }
+
+    /// Returns the finite coupled resource policy used during verification.
+    #[must_use]
+    pub const fn limits(&self) -> CallAuctionRiskLimits {
+        self.limits
+    }
+
+    /// Returns the retained command/report cardinality.
+    #[must_use]
+    pub fn command_count(&self) -> usize {
+        self.checkpoint.auction().command_count()
+    }
+
+    /// Returns the active order/reservation cardinality.
+    #[must_use]
+    pub fn active_order_count(&self) -> usize {
+        self.checkpoint.auction().active_orders().len()
+    }
+
+    /// Returns the canonical immutable account/profile cardinality.
+    #[must_use]
+    pub fn account_count(&self) -> usize {
+        self.checkpoint.accounts().len()
+    }
+
+    /// Returns whether two captures share every immutable checkpoint row image.
+    #[must_use]
+    pub fn shares_checkpoint_storage_with(&self, other: &Self) -> bool {
+        self.checkpoint
+            .shares_account_storage_with(&other.checkpoint)
+            && self
+                .checkpoint
+                .auction()
+                .shares_accepted_order_storage_with(other.checkpoint.auction())
+            && self
+                .checkpoint
+                .auction()
+                .shares_active_order_storage_with(other.checkpoint.auction())
+            && self
+                .checkpoint
+                .auction()
+                .shares_history_storage_with(other.checkpoint.auction())
+    }
+
+    /// Consumes this capture and proves deterministic coupled auction/risk replay.
+    ///
+    /// Verification reconstructs direct state, registers the captured immutable
+    /// profiles in an isolated shard, requires exact command/report reproduction,
+    /// and compares canonical auction and account projections. It may run while
+    /// the source writer advances through later command/report pairs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed nested auction/resource/construction/profile failure or
+    /// `Invalid` for any replay, position, exposure, reservation, or projection
+    /// divergence.
+    pub fn verify(self) -> Result<CallAuctionRiskCheckpoint, CallAuctionRiskCheckpointError> {
+        let Self { checkpoint, limits } = self;
+        checkpoint.verify_replay_with_limits(limits)?;
+        Ok(checkpoint)
+    }
+}
+
+#[cfg(test)]
+impl CallAuctionRiskCheckpointCapture {
+    pub(crate) fn corrupt_wal_lineage_for_test(&mut self) {
+        self.checkpoint.wal_first_sequence = 0;
     }
 }
 
@@ -1380,26 +1502,52 @@ impl CallAuctionRiskManagedEngine {
         wal_metadata_sequence: u64,
         wal_sequence: u64,
     ) -> Result<CallAuctionRiskCheckpoint, CallAuctionRiskCheckpointError> {
+        self.capture_checkpoint_candidate(wal_first_sequence, wal_metadata_sequence, wal_sequence)?
+            .verify()
+    }
+
+    /// Captures immutable coupled state without executing retained history.
+    ///
+    /// The writer-side phase audits live auction/risk invariants, materializes
+    /// canonical auction and account images, reconstructs positions/exposures/
+    /// reservations directly under the current limits, and requires exact live
+    /// equality. The returned value is not encodable or persistable until its
+    /// consuming [`CallAuctionRiskCheckpointCapture::verify`] transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed nested capture/resource/construction failure or `Invalid`
+    /// for live, WAL, profile, position, exposure, reservation, or direct-state
+    /// contradiction.
+    pub fn capture_checkpoint_candidate(
+        &self,
+        wal_first_sequence: u64,
+        wal_metadata_sequence: u64,
+        wal_sequence: u64,
+    ) -> Result<CallAuctionRiskCheckpointCapture, CallAuctionRiskCheckpointError> {
         self.validate()
             .map_err(|error| CallAuctionRiskCheckpointError::new(error.detail()))?;
         let auction = self
             .engine
-            .checkpoint(wal_metadata_sequence, wal_sequence)?;
+            .checkpoint_state(wal_metadata_sequence, wal_sequence)?;
         let accounts = checkpoint_accounts(&self.risk)?;
         let checkpoint =
-            CallAuctionRiskCheckpoint::from_parts(wal_first_sequence, auction, accounts)?;
+            CallAuctionRiskCheckpoint::from_captured_parts(wal_first_sequence, auction, accounts)?;
         let restored = checkpoint.restore_direct_with_limits(self.limits)?;
         if checkpoint_accounts(&restored.risk)?.as_slice() != checkpoint.accounts.as_slice()
             || restored
                 .engine
-                .checkpoint(wal_metadata_sequence, wal_sequence)?
+                .checkpoint_state(wal_metadata_sequence, wal_sequence)?
                 != checkpoint.auction
         {
             return Err(CallAuctionRiskCheckpointError::new(
                 "auction risk checkpoint direct state differs from live coupled state",
             ));
         }
-        Ok(checkpoint)
+        Ok(CallAuctionRiskCheckpointCapture {
+            checkpoint,
+            limits: self.limits,
+        })
     }
 
     /// Restores directly indexed coupled state under default finite limits.

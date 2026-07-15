@@ -7,16 +7,19 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::auction_engine::{
-    CallAuctionCheckpoint, CallAuctionCheckpointError, CallAuctionCommand,
-    CallAuctionCommandPreparation, CallAuctionEngine, CallAuctionEngineConstructionError,
-    CallAuctionEngineError, CallAuctionEngineInvariantViolation, CallAuctionEngineLimits,
-    CallAuctionExecutionReport,
+    CallAuctionCheckpoint, CallAuctionCheckpointCapture, CallAuctionCheckpointError,
+    CallAuctionCommand, CallAuctionCommandPreparation, CallAuctionEngine,
+    CallAuctionEngineConstructionError, CallAuctionEngineError,
+    CallAuctionEngineInvariantViolation, CallAuctionEngineLimits, CallAuctionExecutionReport,
 };
 use crate::auction_risk::{
-    CallAuctionRiskCheckpoint, CallAuctionRiskCheckpointError, CallAuctionRiskConstructionError,
-    CallAuctionRiskInvariantViolation, CallAuctionRiskLimits, CallAuctionRiskManagedEngine,
+    CallAuctionRiskCheckpoint, CallAuctionRiskCheckpointCapture, CallAuctionRiskCheckpointError,
+    CallAuctionRiskConstructionError, CallAuctionRiskInvariantViolation, CallAuctionRiskLimits,
+    CallAuctionRiskManagedEngine,
 };
 use crate::domain::{InstrumentId, InstrumentVersion};
 use crate::durable_storage::{StorageError, StorageOptions, StorageReader, StorageWriter};
@@ -57,6 +60,258 @@ pub struct DurableCallAuctionRiskRecoveryReport {
     pub completed_profile_records: u64,
     /// Whether recovery completed one final command lacking its report.
     pub completed_dangling_command: bool,
+}
+
+/// A WAL-synchronized, not yet replay-verified durable call-auction capture.
+///
+/// The value is bound to one open [`DurableCallAuctionEngine`] incarnation and
+/// its current process-local physical-cutover epoch. It has no codec/snapshot
+/// implementation; clones share candidate rows and poison/origin state in
+/// `O(1)`.
+#[derive(Clone)]
+pub struct DurableCallAuctionCheckpointCapture {
+    capture: CallAuctionCheckpointCapture,
+    origin: Arc<AtomicBool>,
+    cutover_epoch: u64,
+}
+
+impl DurableCallAuctionCheckpointCapture {
+    /// Returns the immutable-definition WAL sequence before auction history.
+    #[must_use]
+    pub const fn wal_metadata_sequence(&self) -> u64 {
+        self.capture.wal_metadata_sequence()
+    }
+
+    /// Returns the completed durable report boundary represented here.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.capture.generation()
+    }
+
+    /// Returns the retained command/report cardinality.
+    #[must_use]
+    pub fn command_count(&self) -> usize {
+        self.capture.command_count()
+    }
+
+    /// Returns the canonical active-order cardinality.
+    #[must_use]
+    pub fn active_order_count(&self) -> usize {
+        self.capture.active_order_count()
+    }
+
+    /// Returns whether two captures share every immutable candidate row image.
+    #[must_use]
+    pub fn shares_checkpoint_storage_with(&self, other: &Self) -> bool {
+        self.capture.shares_checkpoint_storage_with(&other.capture)
+    }
+
+    /// Consumes this capture and verifies deterministic auction replay.
+    ///
+    /// Semantic failure atomically poisons the originating durable shard;
+    /// resource or temporary-engine construction failure remains retryable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying call-auction checkpoint verification failure.
+    pub fn verify(
+        self,
+    ) -> Result<VerifiedDurableCallAuctionCheckpoint, CallAuctionCheckpointError> {
+        let Self {
+            capture,
+            origin,
+            cutover_epoch,
+        } = self;
+        match capture.verify() {
+            Ok(checkpoint) => Ok(VerifiedDurableCallAuctionCheckpoint {
+                checkpoint,
+                origin,
+                cutover_epoch,
+            }),
+            Err(error) => {
+                record_checkpoint_verification_failure(&origin, &error);
+                Err(error)
+            }
+        }
+    }
+}
+
+/// A replay-verified auction checkpoint bound to one durable shard incarnation.
+#[derive(Clone)]
+pub struct VerifiedDurableCallAuctionCheckpoint {
+    checkpoint: CallAuctionCheckpoint,
+    origin: Arc<AtomicBool>,
+    cutover_epoch: u64,
+}
+
+impl VerifiedDurableCallAuctionCheckpoint {
+    /// Returns the immutable-definition WAL sequence before auction history.
+    #[must_use]
+    pub const fn wal_metadata_sequence(&self) -> u64 {
+        self.checkpoint.wal_metadata_sequence()
+    }
+
+    /// Returns the completed report boundary represented here.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.checkpoint.generation()
+    }
+
+    /// Returns the verified command/report cardinality.
+    #[must_use]
+    pub fn command_count(&self) -> usize {
+        self.checkpoint.command_count()
+    }
+
+    /// Returns whether two values share every immutable verified row image.
+    #[must_use]
+    pub fn shares_checkpoint_storage_with(&self, other: &Self) -> bool {
+        self.checkpoint
+            .shares_accepted_order_storage_with(&other.checkpoint)
+            && self
+                .checkpoint
+                .shares_active_order_storage_with(&other.checkpoint)
+            && self
+                .checkpoint
+                .shares_history_storage_with(&other.checkpoint)
+    }
+}
+
+/// A WAL-synchronized, not yet coupled-replay-verified auction-risk capture.
+///
+/// The value is bound to one open [`DurableCallAuctionRiskEngine`] incarnation
+/// and physical-cutover epoch and has no codec/snapshot implementation.
+#[derive(Clone)]
+pub struct DurableCallAuctionRiskCheckpointCapture {
+    capture: CallAuctionRiskCheckpointCapture,
+    origin: Arc<AtomicBool>,
+    cutover_epoch: u64,
+}
+
+impl DurableCallAuctionRiskCheckpointCapture {
+    /// Returns the first physical WAL sequence occupied by the definition.
+    #[must_use]
+    pub const fn wal_first_sequence(&self) -> u64 {
+        self.capture.wal_first_sequence()
+    }
+
+    /// Returns the final immutable definition/profile metadata sequence.
+    #[must_use]
+    pub const fn wal_metadata_sequence(&self) -> u64 {
+        self.capture.wal_metadata_sequence()
+    }
+
+    /// Returns the completed durable report boundary represented here.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.capture.generation()
+    }
+
+    /// Returns the retained command/report cardinality.
+    #[must_use]
+    pub fn command_count(&self) -> usize {
+        self.capture.command_count()
+    }
+
+    /// Returns the canonical account/profile cardinality.
+    #[must_use]
+    pub fn account_count(&self) -> usize {
+        self.capture.account_count()
+    }
+
+    /// Returns whether two captures share every immutable candidate row image.
+    #[must_use]
+    pub fn shares_checkpoint_storage_with(&self, other: &Self) -> bool {
+        self.capture.shares_checkpoint_storage_with(&other.capture)
+    }
+
+    /// Consumes this capture and verifies deterministic coupled auction/risk replay.
+    ///
+    /// Semantic failure atomically poisons the originating durable shard;
+    /// nested resource or temporary-construction failure remains retryable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying coupled auction-risk verification failure.
+    pub fn verify(
+        self,
+    ) -> Result<VerifiedDurableCallAuctionRiskCheckpoint, CallAuctionRiskCheckpointError> {
+        let Self {
+            capture,
+            origin,
+            cutover_epoch,
+        } = self;
+        match capture.verify() {
+            Ok(checkpoint) => Ok(VerifiedDurableCallAuctionRiskCheckpoint {
+                checkpoint,
+                origin,
+                cutover_epoch,
+            }),
+            Err(error) => {
+                record_risk_checkpoint_verification_failure(&origin, &error);
+                Err(error)
+            }
+        }
+    }
+}
+
+/// A coupled-replay-verified auction-risk checkpoint bound to one durable shard.
+#[derive(Clone)]
+pub struct VerifiedDurableCallAuctionRiskCheckpoint {
+    checkpoint: CallAuctionRiskCheckpoint,
+    origin: Arc<AtomicBool>,
+    cutover_epoch: u64,
+}
+
+impl VerifiedDurableCallAuctionRiskCheckpoint {
+    /// Returns the first physical WAL sequence occupied by the definition.
+    #[must_use]
+    pub const fn wal_first_sequence(&self) -> u64 {
+        self.checkpoint.wal_first_sequence()
+    }
+
+    /// Returns the final immutable definition/profile metadata sequence.
+    #[must_use]
+    pub const fn wal_metadata_sequence(&self) -> u64 {
+        self.checkpoint.auction().wal_metadata_sequence()
+    }
+
+    /// Returns the completed report boundary represented here.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.checkpoint.generation()
+    }
+
+    /// Returns the verified command/report cardinality.
+    #[must_use]
+    pub fn command_count(&self) -> usize {
+        self.checkpoint.auction().command_count()
+    }
+
+    /// Returns the verified account/profile cardinality.
+    #[must_use]
+    pub fn account_count(&self) -> usize {
+        self.checkpoint.accounts().len()
+    }
+
+    /// Returns whether two values share every immutable verified row image.
+    #[must_use]
+    pub fn shares_checkpoint_storage_with(&self, other: &Self) -> bool {
+        self.checkpoint
+            .shares_account_storage_with(&other.checkpoint)
+            && self
+                .checkpoint
+                .auction()
+                .shares_accepted_order_storage_with(other.checkpoint.auction())
+            && self
+                .checkpoint
+                .auction()
+                .shares_active_order_storage_with(other.checkpoint.auction())
+            && self
+                .checkpoint
+                .auction()
+                .shares_history_storage_with(other.checkpoint.auction())
+    }
 }
 
 /// Durable call-auction orchestration or replay failure.
@@ -113,7 +368,7 @@ pub enum DurableCallAuctionError {
     },
     /// A checkpoint definition differs from the requested/WAL definition.
     CheckpointDefinitionMismatch,
-    /// A checkpoint's profile-metadata boundary differs from the WAL prefix.
+    /// A checkpoint's metadata boundary differs from the WAL prefix.
     CheckpointMetadataBoundaryMismatch {
         /// Boundary retained by the checkpoint.
         checkpoint_metadata_sequence: u64,
@@ -165,6 +420,17 @@ pub enum DurableCallAuctionError {
         /// Conflicting canonical path.
         path: PathBuf,
     },
+    /// A verified checkpoint belongs to another or previously reopened shard.
+    CheckpointCaptureOriginMismatch,
+    /// Physical WAL-prefix retirement occurred after checkpoint capture.
+    CheckpointCaptureStale {
+        /// Process-local cutover epoch retained by the capture.
+        captured_epoch: u64,
+        /// Current process-local cutover epoch of the source shard.
+        current_epoch: u64,
+    },
+    /// Process-local checkpoint cutover fencing cannot advance.
+    CheckpointCutoverEpochExhausted,
     /// A frame violated the auction-journal grammar.
     UnexpectedRecord {
         /// Journal frame sequence.
@@ -255,7 +521,7 @@ impl fmt::Display for DurableCallAuctionError {
                 wal_metadata_sequence,
             } => write!(
                 formatter,
-                "auction risk checkpoint metadata boundary {checkpoint_metadata_sequence} differs from WAL boundary {wal_metadata_sequence}"
+                "auction checkpoint metadata boundary {checkpoint_metadata_sequence} differs from WAL boundary {wal_metadata_sequence}"
             ),
             Self::CheckpointRiskProfileSetMismatch => formatter
                 .write_str("auction risk checkpoint profile set differs from requested metadata"),
@@ -297,6 +563,19 @@ impl fmt::Display for DurableCallAuctionError {
                 "auction checkpoint path {} conflicts with WAL storage",
                 path.display()
             ),
+            Self::CheckpointCaptureOriginMismatch => formatter.write_str(
+                "verified auction checkpoint belongs to another durable shard incarnation",
+            ),
+            Self::CheckpointCaptureStale {
+                captured_epoch,
+                current_epoch,
+            } => write!(
+                formatter,
+                "verified auction checkpoint was captured at WAL cutover epoch {captured_epoch}, but the shard is at epoch {current_epoch}"
+            ),
+            Self::CheckpointCutoverEpochExhausted => {
+                formatter.write_str("durable auction checkpoint cutover epoch is exhausted")
+            }
             Self::UnexpectedRecord { sequence, kind } => write!(
                 formatter,
                 "unexpected {kind:?} record at call-auction journal sequence {sequence}"
@@ -432,6 +711,8 @@ pub struct DurableCallAuctionEngine {
     journal: StorageWriter,
     wal_metadata_sequence: u64,
     checkpoint_slot: Option<CheckpointSlot>,
+    checkpoint_verification_origin: Arc<AtomicBool>,
+    cutover_epoch: u64,
     recovery: DurableCallAuctionRecoveryReport,
     poisoned: bool,
 }
@@ -649,6 +930,8 @@ impl DurableCallAuctionEngine {
             journal,
             wal_metadata_sequence: opened.wal_metadata_sequence,
             checkpoint_slot: opened.checkpoint_slot,
+            checkpoint_verification_origin: Arc::new(AtomicBool::new(false)),
+            cutover_epoch: 0,
             recovery: DurableCallAuctionRecoveryReport {
                 journal: opened.recovery,
                 checkpointed_commands,
@@ -671,6 +954,13 @@ impl DurableCallAuctionEngine {
         &self.engine
     }
 
+    /// Returns whether local failure or asynchronous checkpoint verification
+    /// has made this shard unusable until reopen/recovery.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned || self.checkpoint_verification_origin.load(Ordering::Acquire)
+    }
+
     /// Durably sequences one command and records its deterministic report.
     ///
     /// Exact retries return shared cached history without adding WAL frames.
@@ -685,13 +975,21 @@ impl DurableCallAuctionEngine {
         &mut self,
         command: CallAuctionCommand,
     ) -> Result<CallAuctionExecutionReport, DurableCallAuctionError> {
-        if self.poisoned {
+        if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
         let prepared = match self.engine.prepare(command)? {
-            CallAuctionCommandPreparation::Replay(report) => return Ok(report),
+            CallAuctionCommandPreparation::Replay(report) => {
+                if self.is_poisoned() {
+                    return Err(DurableCallAuctionError::Poisoned);
+                }
+                return Ok(report);
+            }
             CallAuctionCommandPreparation::Ready(prepared) => prepared,
         };
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
         if let Err(error) = self.journal.append(&prepared.command()) {
             self.poisoned = self.journal.is_poisoned();
             return Err(error.into());
@@ -710,6 +1008,49 @@ impl DurableCallAuctionEngine {
         Ok(report)
     }
 
+    /// Synchronizes the auction WAL and captures immutable canonical state
+    /// without deterministic command replay.
+    ///
+    /// Ordinary command/report suffix growth is permitted while verification
+    /// runs; reopen and physical-prefix cutover invalidate publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, WAL barrier failure, or
+    /// typed live capture/lineage failure. Operational capture failure leaves
+    /// the shard usable; semantic contradiction poisons it.
+    pub fn capture_checkpoint_candidate(
+        &mut self,
+    ) -> Result<DurableCallAuctionCheckpointCapture, DurableCallAuctionError> {
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        self.sync_all()?;
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        let wal_sequence = self
+            .journal
+            .next_sequence()
+            .checked_sub(1)
+            .ok_or(CallAuctionEngineError::SequenceExhausted)?;
+        let capture = match self
+            .engine
+            .capture_checkpoint_candidate(self.wal_metadata_sequence, wal_sequence)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                self.poisoned = checkpoint_failure_requires_poison(&error);
+                return Err(DurableCallAuctionError::Checkpoint(error));
+            }
+        };
+        Ok(DurableCallAuctionCheckpointCapture {
+            capture,
+            origin: Arc::clone(&self.checkpoint_verification_origin),
+            cutover_epoch: self.cutover_epoch,
+        })
+    }
+
     /// Writes a synchronized semantic checkpoint without changing WAL layout.
     ///
     /// # Errors
@@ -721,7 +1062,7 @@ impl DurableCallAuctionEngine {
         path: impl AsRef<Path>,
         options: SnapshotOptions,
     ) -> Result<SnapshotReceipt, DurableCallAuctionError> {
-        if self.poisoned {
+        if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
         validate_auction_checkpoint_path(
@@ -729,23 +1070,74 @@ impl DurableCallAuctionEngine {
             self.journal.layout(),
             path.as_ref(),
         )?;
-        self.sync_all()?;
-        let wal_sequence = self
-            .journal
-            .next_sequence()
-            .checked_sub(1)
-            .ok_or(CallAuctionEngineError::SequenceExhausted)?;
-        let checkpoint = match self
-            .engine
-            .checkpoint(self.wal_metadata_sequence, wal_sequence)
-        {
+        let capture = self.capture_checkpoint_candidate()?;
+        let verified = match capture.verify() {
             Ok(value) => value,
             Err(error) => {
                 self.poisoned = checkpoint_failure_requires_poison(&error);
                 return Err(DurableCallAuctionError::Checkpoint(error));
             }
         };
-        SnapshotFile::write(path, &checkpoint, options).map_err(Into::into)
+        self.write_verified_checkpoint(path, &verified, options)
+    }
+
+    /// Publishes a replay-verified standalone checkpoint through its source shard.
+    ///
+    /// Ordinary suffix growth is accepted. Another shard, reopen, physical
+    /// prefix cutover, metadata drift, or a checkpoint ahead of the current WAL
+    /// head is rejected. This method cannot retire a WAL prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, origin/epoch mismatch,
+    /// path conflict, metadata/head contradiction, snapshot ownership, codec,
+    /// or I/O failure.
+    pub fn write_verified_checkpoint(
+        &mut self,
+        path: impl AsRef<Path>,
+        verified: &VerifiedDurableCallAuctionCheckpoint,
+        options: SnapshotOptions,
+    ) -> Result<SnapshotReceipt, DurableCallAuctionError> {
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        if !Arc::ptr_eq(&self.checkpoint_verification_origin, &verified.origin) {
+            return Err(DurableCallAuctionError::CheckpointCaptureOriginMismatch);
+        }
+        if verified.cutover_epoch != self.cutover_epoch {
+            return Err(DurableCallAuctionError::CheckpointCaptureStale {
+                captured_epoch: verified.cutover_epoch,
+                current_epoch: self.cutover_epoch,
+            });
+        }
+        validate_auction_checkpoint_path(
+            self.journal.path(),
+            self.journal.layout(),
+            path.as_ref(),
+        )?;
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        let wal_sequence = self
+            .journal
+            .next_sequence()
+            .checked_sub(1)
+            .ok_or(CallAuctionEngineError::SequenceExhausted)?;
+        if verified.checkpoint.wal_metadata_sequence() != self.wal_metadata_sequence {
+            return Err(
+                DurableCallAuctionError::CheckpointMetadataBoundaryMismatch {
+                    checkpoint_metadata_sequence: verified.checkpoint.wal_metadata_sequence(),
+                    wal_metadata_sequence: self.wal_metadata_sequence,
+                },
+            );
+        }
+        if verified.checkpoint.generation() > wal_sequence {
+            return Err(DurableCallAuctionError::CheckpointAheadOfWal {
+                checkpoint_sequence: verified.checkpoint.generation(),
+                wal_last_sequence: Some(wal_sequence),
+            });
+        }
+        SnapshotFile::write(path, &verified.checkpoint, options).map_err(Into::into)
     }
 
     /// Publishes an inactive A/B auction checkpoint and atomically retires the
@@ -760,9 +1152,13 @@ impl DurableCallAuctionEngine {
         checkpoint_base: impl AsRef<Path>,
         options: SnapshotOptions,
     ) -> Result<CheckpointCutoverReceipt, DurableCallAuctionError> {
-        if self.poisoned {
+        if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
+        let next_cutover_epoch = self
+            .cutover_epoch
+            .checked_add(1)
+            .ok_or(DurableCallAuctionError::CheckpointCutoverEpochExhausted)?;
         validate_auction_checkpoint_path(
             self.journal.path(),
             self.journal.layout(),
@@ -801,6 +1197,7 @@ impl DurableCallAuctionEngine {
             return Err(error.into());
         }
         self.checkpoint_slot = Some(slot);
+        self.cutover_epoch = next_cutover_epoch;
         Ok(CheckpointCutoverReceipt::new(snapshot, slot, wal_sequence))
     }
 
@@ -811,7 +1208,7 @@ impl DurableCallAuctionEngine {
     /// Returns [`DurableCallAuctionError`] and poisons the shard when the
     /// synchronization outcome is ambiguous.
     pub fn sync_all(&mut self) -> Result<(), DurableCallAuctionError> {
-        if self.poisoned {
+        if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
         if let Err(error) = self.journal.sync_all() {
@@ -828,7 +1225,7 @@ impl DurableCallAuctionEngine {
     /// Returns [`DurableCallAuctionError`] for poison, synchronization, or
     /// lease-release failure.
     pub fn close(self) -> Result<(), DurableCallAuctionError> {
-        if self.poisoned {
+        if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
         self.journal.close().map_err(Into::into)
@@ -843,6 +1240,8 @@ pub struct DurableCallAuctionRiskEngine {
     wal_first_sequence: u64,
     wal_metadata_sequence: u64,
     checkpoint_slot: Option<CheckpointSlot>,
+    checkpoint_verification_origin: Arc<AtomicBool>,
+    cutover_epoch: u64,
     recovery: DurableCallAuctionRiskRecoveryReport,
     poisoned: bool,
 }
@@ -1088,6 +1487,8 @@ impl DurableCallAuctionRiskEngine {
             wal_first_sequence: opened.wal_first_sequence,
             wal_metadata_sequence: opened.wal_metadata_sequence,
             checkpoint_slot: opened.checkpoint_slot,
+            checkpoint_verification_origin: Arc::new(AtomicBool::new(false)),
+            cutover_epoch: 0,
             recovery: DurableCallAuctionRiskRecoveryReport {
                 journal: opened.recovery,
                 checkpointed_commands: replay.checkpointed_commands,
@@ -1111,6 +1512,13 @@ impl DurableCallAuctionRiskEngine {
         &self.managed
     }
 
+    /// Returns whether local failure or asynchronous checkpoint verification
+    /// has made this coupled shard unusable until reopen/recovery.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned || self.checkpoint_verification_origin.load(Ordering::Acquire)
+    }
+
     /// Persists a command before applying its coupled auction/risk transition.
     ///
     /// Exact retries return retained history without adding WAL frames.
@@ -1123,13 +1531,21 @@ impl DurableCallAuctionRiskEngine {
         &mut self,
         command: CallAuctionCommand,
     ) -> Result<CallAuctionExecutionReport, DurableCallAuctionError> {
-        if self.poisoned {
+        if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
         let prepared = match self.managed.prepare(command)? {
-            CallAuctionCommandPreparation::Replay(report) => return Ok(report),
+            CallAuctionCommandPreparation::Replay(report) => {
+                if self.is_poisoned() {
+                    return Err(DurableCallAuctionError::Poisoned);
+                }
+                return Ok(report);
+            }
             CallAuctionCommandPreparation::Ready(prepared) => prepared,
         };
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
         if let Err(error) = self.journal.append(&prepared.command()) {
             self.poisoned = self.journal.is_poisoned();
             return Err(error.into());
@@ -1148,6 +1564,50 @@ impl DurableCallAuctionRiskEngine {
         Ok(report)
     }
 
+    /// Synchronizes the coupled auction-risk WAL and captures immutable direct
+    /// state without deterministic command replay.
+    ///
+    /// Ordinary command/report suffix growth is permitted while verification
+    /// runs; reopen and physical-prefix cutover invalidate publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, WAL barrier failure, or
+    /// typed live coupled capture failure. Operational capture failure leaves
+    /// the shard usable; semantic contradiction poisons it.
+    pub fn capture_checkpoint_candidate(
+        &mut self,
+    ) -> Result<DurableCallAuctionRiskCheckpointCapture, DurableCallAuctionError> {
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        self.sync_all()?;
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        let wal_sequence = self
+            .journal
+            .next_sequence()
+            .checked_sub(1)
+            .ok_or(CallAuctionEngineError::SequenceExhausted)?;
+        let capture = match self.managed.capture_checkpoint_candidate(
+            self.wal_first_sequence,
+            self.wal_metadata_sequence,
+            wal_sequence,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.poisoned = risk_checkpoint_failure_requires_poison(&error);
+                return Err(DurableCallAuctionError::RiskCheckpoint(error));
+            }
+        };
+        Ok(DurableCallAuctionRiskCheckpointCapture {
+            capture,
+            origin: Arc::clone(&self.checkpoint_verification_origin),
+            cutover_epoch: self.cutover_epoch,
+        })
+    }
+
     /// Synchronizes the WAL, audits coupled state, and writes a checkpoint.
     ///
     /// # Errors
@@ -1159,7 +1619,7 @@ impl DurableCallAuctionRiskEngine {
         path: impl AsRef<Path>,
         options: SnapshotOptions,
     ) -> Result<SnapshotReceipt, DurableCallAuctionError> {
-        if self.poisoned {
+        if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
         validate_auction_checkpoint_path(
@@ -1167,24 +1627,83 @@ impl DurableCallAuctionRiskEngine {
             self.journal.layout(),
             path.as_ref(),
         )?;
-        self.sync_all()?;
-        let wal_sequence = self
-            .journal
-            .next_sequence()
-            .checked_sub(1)
-            .ok_or(CallAuctionEngineError::SequenceExhausted)?;
-        let checkpoint = match self.managed.checkpoint(
-            self.wal_first_sequence,
-            self.wal_metadata_sequence,
-            wal_sequence,
-        ) {
+        let capture = self.capture_checkpoint_candidate()?;
+        let verified = match capture.verify() {
             Ok(value) => value,
             Err(error) => {
                 self.poisoned = risk_checkpoint_failure_requires_poison(&error);
                 return Err(DurableCallAuctionError::RiskCheckpoint(error));
             }
         };
-        SnapshotFile::write(path, &checkpoint, options).map_err(Into::into)
+        self.write_verified_checkpoint(path, &verified, options)
+    }
+
+    /// Publishes a coupled-replay-verified checkpoint through its source shard.
+    ///
+    /// Ordinary suffix growth is accepted. Another shard, reopen, physical
+    /// prefix cutover, profile-metadata drift, or a value ahead of the current
+    /// WAL head is rejected. This method cannot retire a WAL prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, origin/epoch or lineage
+    /// mismatch, path conflict, checkpoint-ahead contradiction, snapshot
+    /// ownership, codec, or I/O failure.
+    pub fn write_verified_checkpoint(
+        &mut self,
+        path: impl AsRef<Path>,
+        verified: &VerifiedDurableCallAuctionRiskCheckpoint,
+        options: SnapshotOptions,
+    ) -> Result<SnapshotReceipt, DurableCallAuctionError> {
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        if !Arc::ptr_eq(&self.checkpoint_verification_origin, &verified.origin) {
+            return Err(DurableCallAuctionError::CheckpointCaptureOriginMismatch);
+        }
+        if verified.cutover_epoch != self.cutover_epoch {
+            return Err(DurableCallAuctionError::CheckpointCaptureStale {
+                captured_epoch: verified.cutover_epoch,
+                current_epoch: self.cutover_epoch,
+            });
+        }
+        validate_auction_checkpoint_path(
+            self.journal.path(),
+            self.journal.layout(),
+            path.as_ref(),
+        )?;
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        if verified.checkpoint.wal_first_sequence() != self.wal_first_sequence {
+            return Err(DurableCallAuctionError::CheckpointWalLineageMismatch {
+                checkpoint_first_sequence: verified.checkpoint.wal_first_sequence(),
+                wal_first_sequence: self.wal_first_sequence,
+            });
+        }
+        if verified.checkpoint.auction().wal_metadata_sequence() != self.wal_metadata_sequence {
+            return Err(
+                DurableCallAuctionError::CheckpointMetadataBoundaryMismatch {
+                    checkpoint_metadata_sequence: verified
+                        .checkpoint
+                        .auction()
+                        .wal_metadata_sequence(),
+                    wal_metadata_sequence: self.wal_metadata_sequence,
+                },
+            );
+        }
+        let wal_sequence = self
+            .journal
+            .next_sequence()
+            .checked_sub(1)
+            .ok_or(CallAuctionEngineError::SequenceExhausted)?;
+        if verified.checkpoint.generation() > wal_sequence {
+            return Err(DurableCallAuctionError::CheckpointAheadOfWal {
+                checkpoint_sequence: verified.checkpoint.generation(),
+                wal_last_sequence: Some(wal_sequence),
+            });
+        }
+        SnapshotFile::write(path, &verified.checkpoint, options).map_err(Into::into)
     }
 
     /// Publishes an inactive A/B checkpoint and retires the selected WAL prefix.
@@ -1198,9 +1717,13 @@ impl DurableCallAuctionRiskEngine {
         checkpoint_base: impl AsRef<Path>,
         options: SnapshotOptions,
     ) -> Result<CheckpointCutoverReceipt, DurableCallAuctionError> {
-        if self.poisoned {
+        if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
+        let next_cutover_epoch = self
+            .cutover_epoch
+            .checked_add(1)
+            .ok_or(DurableCallAuctionError::CheckpointCutoverEpochExhausted)?;
         validate_auction_checkpoint_path(
             self.journal.path(),
             self.journal.layout(),
@@ -1240,6 +1763,7 @@ impl DurableCallAuctionRiskEngine {
             return Err(error.into());
         }
         self.checkpoint_slot = Some(slot);
+        self.cutover_epoch = next_cutover_epoch;
         Ok(CheckpointCutoverReceipt::new(snapshot, slot, wal_sequence))
     }
 
@@ -1250,7 +1774,7 @@ impl DurableCallAuctionRiskEngine {
     /// Returns [`DurableCallAuctionError`] and poisons the shard when the
     /// synchronization outcome is ambiguous.
     pub fn sync_all(&mut self) -> Result<(), DurableCallAuctionError> {
-        if self.poisoned {
+        if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
         if let Err(error) = self.journal.sync_all() {
@@ -1267,7 +1791,7 @@ impl DurableCallAuctionRiskEngine {
     /// Returns [`DurableCallAuctionError`] for poison, synchronization, or
     /// lease-release failure.
     pub fn close(self) -> Result<(), DurableCallAuctionError> {
-        if self.poisoned {
+        if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
         self.journal.close().map_err(Into::into)
@@ -1280,6 +1804,21 @@ const fn checkpoint_failure_requires_poison(error: &CallAuctionCheckpointError) 
 
 const fn risk_checkpoint_failure_requires_poison(error: &CallAuctionRiskCheckpointError) -> bool {
     !error.is_operational_failure()
+}
+
+fn record_checkpoint_verification_failure(poison: &AtomicBool, error: &CallAuctionCheckpointError) {
+    if checkpoint_failure_requires_poison(error) {
+        poison.store(true, Ordering::Release);
+    }
+}
+
+fn record_risk_checkpoint_verification_failure(
+    poison: &AtomicBool,
+    error: &CallAuctionRiskCheckpointError,
+) {
+    if risk_checkpoint_failure_requires_poison(error) {
+        poison.store(true, Ordering::Release);
+    }
 }
 
 struct OpenedAuctionJournal {
@@ -2066,15 +2605,47 @@ fn validate_auction_risk_checkpoint_prefix_frame(
 
 #[cfg(test)]
 mod checkpoint_failure_tests {
-    use super::{checkpoint_failure_requires_poison, risk_checkpoint_failure_requires_poison};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use crate::auction_engine::{
-        CallAuctionCheckpointError, CallAuctionCheckpointResource,
+        CallAuctionCheckpointError, CallAuctionCheckpointResource, CallAuctionEngine,
         CallAuctionEngineConstructionError,
     };
     use crate::auction_risk::{
         CallAuctionRiskCheckpointError, CallAuctionRiskCheckpointResource,
-        CallAuctionRiskConstructionError,
+        CallAuctionRiskConstructionError, CallAuctionRiskManagedEngine,
     };
+    use crate::domain::{AssetId, InstrumentId, InstrumentVersion, Price, TimestampNs};
+    use crate::instrument::{
+        InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
+        QuantityRules, ReserveOrderRules, TradingState,
+    };
+
+    use super::{
+        DurableCallAuctionCheckpointCapture, DurableCallAuctionRiskCheckpointCapture,
+        checkpoint_failure_requires_poison, record_checkpoint_verification_failure,
+        record_risk_checkpoint_verification_failure, risk_checkpoint_failure_requires_poison,
+    };
+
+    fn definition() -> InstrumentDefinition {
+        InstrumentDefinition::new(InstrumentSpec {
+            instrument_id: InstrumentId::new(1).unwrap(),
+            version: InstrumentVersion::new(1).unwrap(),
+            effective_from: TimestampNs::from_unix_nanos(0),
+            symbol: InstrumentSymbol::new("DUR-AUCTION-STAGED").unwrap(),
+            kind: InstrumentKind::Future,
+            base_asset_id: AssetId::new(1).unwrap(),
+            quote_asset_id: AssetId::new(2).unwrap(),
+            price: PriceRules::new(0, 1, Price::from_raw(1), Price::from_raw(1_000)).unwrap(),
+            quantity: QuantityRules::new(1, 1, 1_000).unwrap(),
+            reserve: ReserveOrderRules::new(100).unwrap(),
+            base_units_per_lot: 1,
+            quote_units_per_price_unit: 1,
+            trading_state: TradingState::Open,
+        })
+        .unwrap()
+    }
 
     #[test]
     fn resource_pressure_is_retryable_but_semantic_failure_requires_poison() {
@@ -2105,5 +2676,70 @@ mod checkpoint_failure_tests {
         assert!(risk_checkpoint_failure_requires_poison(
             &CallAuctionRiskCheckpointError::Invalid("semantic contradiction".into())
         ));
+    }
+
+    #[test]
+    fn asynchronous_verification_latches_record_only_semantic_failure() {
+        let plain = AtomicBool::new(false);
+        let plain_operational = CallAuctionCheckpointError::ResourceReservationFailed {
+            resource: CallAuctionCheckpointResource::CaptureHistory,
+            maximum: 1,
+        };
+        record_checkpoint_verification_failure(&plain, &plain_operational);
+        assert!(!plain.load(Ordering::Acquire));
+        record_checkpoint_verification_failure(
+            &plain,
+            &CallAuctionCheckpointError::Invalid("replay divergence".into()),
+        );
+        assert!(plain.load(Ordering::Acquire));
+
+        let risk = AtomicBool::new(false);
+        let risk_operational = CallAuctionRiskCheckpointError::ResourceReservationFailed {
+            resource: CallAuctionRiskCheckpointResource::CaptureAccounts,
+            maximum: 1,
+        };
+        record_risk_checkpoint_verification_failure(&risk, &risk_operational);
+        assert!(!risk.load(Ordering::Acquire));
+        record_risk_checkpoint_verification_failure(
+            &risk,
+            &CallAuctionRiskCheckpointError::Invalid("coupled divergence".into()),
+        );
+        assert!(risk.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn durable_plain_capture_semantic_failure_trips_its_origin_latch() {
+        let engine = CallAuctionEngine::try_new(definition()).unwrap();
+        let mut capture = engine.capture_checkpoint_candidate(1, 1).unwrap();
+        capture.corrupt_generation_for_test();
+        let origin = Arc::new(AtomicBool::new(false));
+        let durable = DurableCallAuctionCheckpointCapture {
+            capture,
+            origin: Arc::clone(&origin),
+            cutover_epoch: 0,
+        };
+        assert!(matches!(
+            durable.verify(),
+            Err(CallAuctionCheckpointError::Invalid(_))
+        ));
+        assert!(origin.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn durable_risk_capture_semantic_failure_trips_its_origin_latch() {
+        let managed = CallAuctionRiskManagedEngine::try_new(definition()).unwrap();
+        let mut capture = managed.capture_checkpoint_candidate(1, 1, 1).unwrap();
+        capture.corrupt_wal_lineage_for_test();
+        let origin = Arc::new(AtomicBool::new(false));
+        let durable = DurableCallAuctionRiskCheckpointCapture {
+            capture,
+            origin: Arc::clone(&origin),
+            cutover_epoch: 0,
+        };
+        assert!(matches!(
+            durable.verify(),
+            Err(CallAuctionRiskCheckpointError::Invalid(_))
+        ));
+        assert!(origin.load(Ordering::Acquire));
     }
 }

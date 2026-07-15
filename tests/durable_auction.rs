@@ -10,12 +10,15 @@ use quotick::auction_book::{
     CallAuctionSelfTradePolicy, CallAuctionUncrossPolicy,
 };
 use quotick::auction_engine::{
-    CallAuctionCheckpoint, CallAuctionCommand, CallAuctionEngine, CallAuctionEngineError,
-    CallAuctionEngineLimits, CallAuctionEngineLimitsSpec, CallAuctionPhase,
+    CallAuctionCheckpoint, CallAuctionCheckpointCapture, CallAuctionCommand, CallAuctionEngine,
+    CallAuctionEngineError, CallAuctionEngineLimits, CallAuctionEngineLimitsSpec, CallAuctionPhase,
     CallAuctionPhaseControl, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use quotick::codec::{BinaryCodec, CodecError};
-use quotick::durable_auction::{DurableCallAuctionEngine, DurableCallAuctionError};
+use quotick::durable_auction::{
+    DurableCallAuctionCheckpointCapture, DurableCallAuctionEngine, DurableCallAuctionError,
+    VerifiedDurableCallAuctionCheckpoint,
+};
 use quotick::instrument::{
     InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
     QuantityRules, ReserveOrderRules, TradingState,
@@ -213,6 +216,184 @@ fn frame_wire_tags(path: &Path) -> Vec<u16> {
             u16::from_le_bytes(bytes[offset + 6..offset + 8].try_into().unwrap())
         })
         .collect()
+}
+
+#[test]
+fn staged_auction_capture_is_shared_and_survives_source_suffix_growth() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<CallAuctionCheckpointCapture>();
+    let mut engine = CallAuctionEngine::try_new(definition()).unwrap();
+    engine
+        .submit(phase(1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    engine.submit(submit(2, order(1, 1, Side::Buy, 5))).unwrap();
+    let capture = engine.capture_checkpoint_candidate(1, 5).unwrap();
+    let shared = capture.clone();
+    assert!(capture.shares_checkpoint_storage_with(&shared));
+    assert_eq!(capture.command_count(), 2);
+    assert_eq!(capture.active_order_count(), 1);
+    assert_eq!(capture.accepted_order_count(), 1);
+    let synchronous = engine.checkpoint(1, 5).unwrap();
+    let worker = std::thread::spawn(move || capture.verify().unwrap());
+    engine
+        .submit(submit(3, order(2, 2, Side::Sell, 5)))
+        .unwrap();
+    let verified = worker.join().unwrap();
+
+    assert_eq!(verified, synchronous);
+    assert_eq!(verified.generation(), 5);
+    assert_eq!(verified.active_orders().len(), 1);
+    assert_eq!(engine.book().active_order_count(), 2);
+    let restored = CallAuctionEngine::from_checkpoint(&verified).unwrap();
+    assert_eq!(restored.phase_snapshot(), verified.phase());
+    assert_eq!(restored.book().active_order_count(), 1);
+}
+
+#[test]
+fn durable_staged_auction_checkpoint_replays_only_post_capture_suffix() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<DurableCallAuctionCheckpointCapture>();
+    assert_send_sync::<VerifiedDurableCallAuctionCheckpoint>();
+    let area = TestPath::directory("staged-checkpoint");
+    fs::create_dir_all(area.path()).unwrap();
+    let wal = area.join("auction.wal");
+    let snapshot = area.join("auction.qsnp");
+    let mut durable = DurableCallAuctionEngine::open(&wal, definition(), options()).unwrap();
+    durable
+        .submit(phase(1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    durable
+        .submit(submit(2, order(1, 1, Side::Buy, 5)))
+        .unwrap();
+    let capture = durable.capture_checkpoint_candidate().unwrap();
+    let shared = capture.clone();
+    assert!(capture.shares_checkpoint_storage_with(&shared));
+    assert_eq!(capture.generation(), 5);
+    let worker = std::thread::spawn(move || capture.verify().unwrap());
+    durable
+        .submit(submit(3, order(2, 2, Side::Sell, 5)))
+        .unwrap();
+    let verified = worker.join().unwrap();
+    durable
+        .write_verified_checkpoint(&snapshot, &verified, SnapshotOptions::default())
+        .unwrap();
+    durable.close().unwrap();
+
+    let recovered = DurableCallAuctionEngine::open_with_checkpoint(
+        &wal,
+        &snapshot,
+        definition(),
+        options(),
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().checkpointed_commands, 2);
+    assert_eq!(recovered.recovery().replayed_commands, 1);
+    assert_eq!(recovered.engine().book().active_order_count(), 2);
+    recovered.engine().validate().unwrap();
+}
+
+#[test]
+fn verified_auction_checkpoint_rejects_other_reopen_and_cutover_epoch() {
+    let area = TestPath::directory("staged-fences");
+    fs::create_dir_all(area.path()).unwrap();
+    let source_wal = area.join("source.wal");
+    let other_wal = area.join("other.wal");
+    let other_output = area.join("other.qsnp");
+    let reopen_output = area.join("reopen.qsnp");
+    let stale_output = area.join("stale.qsnp");
+    let cutover_base = area.join("cutover.qsnp");
+    let mut source = DurableCallAuctionEngine::open(&source_wal, definition(), options()).unwrap();
+    source
+        .submit(phase(1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    let verified = source
+        .capture_checkpoint_candidate()
+        .unwrap()
+        .verify()
+        .unwrap();
+
+    let mut other = DurableCallAuctionEngine::open(&other_wal, definition(), options()).unwrap();
+    assert!(matches!(
+        other.write_verified_checkpoint(&other_output, &verified, SnapshotOptions::default()),
+        Err(DurableCallAuctionError::CheckpointCaptureOriginMismatch)
+    ));
+    assert!(!other_output.exists());
+    assert!(!other.is_poisoned());
+    other.close().unwrap();
+
+    source.close().unwrap();
+    let mut reopened =
+        DurableCallAuctionEngine::open(&source_wal, definition(), options()).unwrap();
+    assert!(matches!(
+        reopened.write_verified_checkpoint(&reopen_output, &verified, SnapshotOptions::default()),
+        Err(DurableCallAuctionError::CheckpointCaptureOriginMismatch)
+    ));
+    assert!(!reopen_output.exists());
+    let stale = reopened
+        .capture_checkpoint_candidate()
+        .unwrap()
+        .verify()
+        .unwrap();
+    reopened
+        .compact_to_checkpoint(&cutover_base, SnapshotOptions::default())
+        .unwrap();
+    assert!(matches!(
+        reopened.write_verified_checkpoint(&stale_output, &stale, SnapshotOptions::default()),
+        Err(DurableCallAuctionError::CheckpointCaptureStale {
+            captured_epoch: 0,
+            current_epoch: 1
+        })
+    ));
+    assert!(!stale_output.exists());
+    assert!(!reopened.is_poisoned());
+    reopened.close().unwrap();
+}
+
+#[test]
+fn segmented_staged_auction_checkpoint_recovers_across_rotated_suffix() {
+    let area = TestPath::directory("segmented-staged");
+    fs::create_dir_all(area.path()).unwrap();
+    let segments = area.join("segments");
+    let snapshot = area.join("auction.qsnp");
+    let segmented_options = SegmentedJournalOptions {
+        maximum_segment_bytes: 512,
+        journal: options(),
+    };
+    let mut durable =
+        DurableCallAuctionEngine::open_segmented(&segments, definition(), segmented_options)
+            .unwrap();
+    durable
+        .submit(phase(1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    durable
+        .submit(submit(2, order(1, 1, Side::Buy, 5)))
+        .unwrap();
+    let capture = durable.capture_checkpoint_candidate().unwrap();
+    let worker = std::thread::spawn(move || capture.verify().unwrap());
+    durable
+        .submit(submit(3, order(2, 2, Side::Sell, 5)))
+        .unwrap();
+    let verified = worker.join().unwrap();
+    durable
+        .write_verified_checkpoint(&snapshot, &verified, SnapshotOptions::default())
+        .unwrap();
+    durable.close().unwrap();
+
+    let recovered = DurableCallAuctionEngine::open_segmented_with_checkpoint(
+        &segments,
+        &snapshot,
+        definition(),
+        segmented_options,
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().checkpointed_commands, 2);
+    assert_eq!(recovered.recovery().replayed_commands, 1);
+    assert!(recovered.recovery().journal.segment_count >= 2);
+    assert_eq!(recovered.engine().book().active_order_count(), 2);
 }
 
 #[test]

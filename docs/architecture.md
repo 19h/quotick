@@ -642,7 +642,8 @@ per-command capacity.
 6. A call-auction checkpoint retains the immutable definition and WAL origin,
    completed report boundary, phase/cycle, book revision, next priority/trade
    counters, canonical accepted IDs and active orders, and complete
-   command/report history. Capture independently replays that history and
+   command/report history. Capture audits and projects that history without
+   executing commands; the consuming verifier independently replays it and
    requires exact checkpoint equality. Decode projects every event, including
    per-cycle pre-uncross remainder quantities, before direct reconstruction.
 7. Uncut checkpoint recovery proves every physical frame through the checkpoint
@@ -1208,21 +1209,24 @@ collateral from ledger balances.
     publication by shard incarnation, profile boundary, and cutover epoch;
     suffix growth is accepted. Recovery applies transitions only after the
     checkpoint generation.
-12. Call-auction capture binds the WAL origin and definition and retains phase,
-    cycle, collection revision, accepted IDs, active orders, priority/trade
-    counters, and exact retry history. Independent replay must reproduce the
-    direct image. Restore rebuilds AVL/FIFO state and cached reports directly,
-    then applies only suffix commands. Capture reserves its history, active-order,
-    and accepted-identifier vectors exactly; restoration borrows the checkpoint.
-13. Coupled call-auction/risk capture additionally binds the canonical immutable
-    profile prefix and redundant account positions/exposures. Restore rebuilds
-    reservations from active auction orders; independent replay must reproduce
-    every accepted and risk-rejected report. Kind-`5` uncut recovery proves the
-    definition, all profile frames, and every command/report prefix frame;
-    anchored recovery binds the exact A/B slot before applying only the suffix.
-    Account capture reserves exactly before sorting, coupled restoration borrows
-    the embedded auction checkpoint, and operational capture failure is retryable
-    without durable poison or namespace mutation.
+12. Call-auction candidate capture binds the WAL origin and definition and
+    retains phase, cycle, collection revision, accepted IDs, active orders,
+    priority/trade counters, and exact retry history. It projects complete
+    lineage without executing commands; consuming verification independently
+    replays once before releasing the snapshot-capable type. Durable capture
+    synchronizes the prefix and fences publication by shard incarnation and
+    cutover epoch while accepting suffix growth. Restore rebuilds AVL/FIFO state
+    and cached reports directly, then applies only suffix commands. Capture
+    reserves its history, active-order, and accepted-identifier vectors exactly.
+13. Coupled call-auction/risk candidate capture additionally binds the canonical
+    immutable profile prefix and redundant account positions/exposures. It
+    reconstructs reservations and proves direct/live equality without command
+    execution; consuming verification performs one coupled replay and compares
+    auction/account projections. Kind-`5` durable publication uses the same
+    barrier, origin, profile-boundary, and cutover-epoch fence. Uncut recovery
+    proves every prefix frame; anchored recovery binds the exact A/B slot before
+    applying only the suffix. Operational capture/verification failure is
+    retryable without durable poison or namespace mutation.
 
 The authoritative persisted framing and payload schemas are
 [WAL format version 4](wal-v4.md) and
@@ -1461,7 +1465,7 @@ additional claim that semantic checkpoint history is size bounded.
 |---|---|---|
 | High | Durable storage completion | externally coordinated retired-generation archival/handoff; kernel inode locking or qualified alias exclusion; forced-power-loss filesystem/device evidence |
 | High | Ledger lifecycle completion | controller authorization; versioned calendar ingestion; durable external-statement evidence; externally anchored cutoff proofs; allocation/fee/settlement workflow adapters over atomic batches |
-| High | Snapshots and compaction | single-file and segmented matching/risk/ledger/call-auction WAL cutover plus off-thread direct and WAL-synchronized continuous matching/coupled-risk replay verification and standalone publication are implemented; remaining evidence is bounded checkpoint memory/writer audit-copy/direct-reconstruction pause, asynchronous suffix-preserving durable cutover, coupled call-auction/risk staging, semantic generation rollover, and externally retained audit/idempotency proofs |
+| High | Snapshots and compaction | single-file and segmented matching/risk/ledger/call-auction WAL cutover plus off-thread direct and WAL-synchronized plain/coupled continuous-matching and call-auction replay verification/standalone publication are implemented; remaining evidence is bounded checkpoint memory/writer audit-copy/projection/direct-reconstruction pause, asynchronous suffix-preserving durable cutover, semantic generation rollover, and externally retained audit/idempotency proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
 | High | Matching lifecycle expansion | basic revisioned instrument state changes, bounded crossed call-auction collection, aggregate depth queries, banded discovery with market interest, pure order-level price-time allocation, deterministic pairing/atomic uncross, sequenced auction phase/idempotency, live and durable risk reservations/positions, stable auction/private-public wire schemas, gap-repair snapshots, semantic engine checkpoints, and plain/coupled-risk full-WAL plus single/segmented cutover recovery are implemented; remaining work is reference and dynamic-band derivation, reserve/display and venue priority/allocation policies, preventive self-trade policies, ledger integration, calendar/session scheduling, volatility triggers and interruption auctions, stop, pegged, discretionary, day/GTD, venue-specific amendment/uncross/publication semantics, and authenticated market-data transport; cross-instrument/multi-leg execution with atomic ownership and replay proofs |

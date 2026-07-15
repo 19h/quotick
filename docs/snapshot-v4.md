@@ -55,6 +55,18 @@ and independently replays complete retained history through the core-first risk
 gate. A historically risk-rejected submit must reproduce from the retained
 profile set.
 
+Live plain and coupled auction capture are staged independently of these stable
+payloads. `CallAuctionCheckpointCapture` and
+`CallAuctionRiskCheckpointCapture` expose no codec or snapshot implementation.
+They perform structural/lineage projection (and coupled direct reconstruction)
+without command execution; consuming verification releases the respective
+stable checkpoint only after exact replay and canonical projection equality.
+Durable capture first synchronizes the represented WAL prefix and binds a
+verified standalone publication to the same open shard incarnation and
+pre-cutover epoch. Append-only suffix growth is permitted; reopen and physical
+prefix retirement reject the handle. A/B cutover remains a synchronous
+current-head operation.
+
 ## Lineage and WAL Cutover
 
 Kind-`5` lineage requires equal WAL origin, immutable definition, canonical
@@ -98,4 +110,3 @@ fields or silently reinterpret an expired envelope.
 The `QSNP` kind registry, financial payloads, lineage rules, and recovery
 grammars are Quotick internal contracts verified by repository tests rather
 than attributed to an external financial standard.
-

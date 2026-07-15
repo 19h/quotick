@@ -1209,6 +1209,145 @@ impl CallAuctionCheckpoint {
     }
 }
 
+/// An immutable but not yet deterministic-replay-verified auction capture.
+///
+/// Capture audits live engine/book structure and projects the complete retained
+/// command/event lineage into canonical direct state, but deliberately defers
+/// command execution. This type has no codec or snapshot implementation. Its
+/// clones share all accepted-identity, active-order, history, and event storage
+/// and are therefore `O(1)`.
+#[derive(Clone)]
+pub struct CallAuctionCheckpointCapture {
+    checkpoint: CallAuctionCheckpoint,
+    limits: CallAuctionEngineLimits,
+}
+
+impl CallAuctionCheckpointCapture {
+    /// Returns the immutable-definition WAL sequence before auction history.
+    #[must_use]
+    pub const fn wal_metadata_sequence(&self) -> u64 {
+        self.checkpoint.wal_metadata_sequence()
+    }
+
+    /// Returns the completed execution-report boundary represented here.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.checkpoint.generation()
+    }
+
+    /// Returns the captured finite engine policy used during verification.
+    #[must_use]
+    pub const fn limits(&self) -> CallAuctionEngineLimits {
+        self.limits
+    }
+
+    /// Returns the captured phase/cycle state without exposing candidate rows.
+    #[must_use]
+    pub const fn phase(&self) -> CallAuctionPhaseSnapshot {
+        self.checkpoint.phase()
+    }
+
+    /// Returns the retained command/report cardinality.
+    #[must_use]
+    pub fn command_count(&self) -> usize {
+        self.checkpoint.command_count()
+    }
+
+    /// Returns the canonical active-order cardinality.
+    #[must_use]
+    pub fn active_order_count(&self) -> usize {
+        self.checkpoint.active_orders().len()
+    }
+
+    /// Returns the never-reusable accepted-identity cardinality.
+    #[must_use]
+    pub fn accepted_order_count(&self) -> usize {
+        self.checkpoint.accepted_order_ids().len()
+    }
+
+    /// Returns whether two captures share every immutable candidate row image.
+    #[must_use]
+    pub fn shares_checkpoint_storage_with(&self, other: &Self) -> bool {
+        self.checkpoint
+            .shares_accepted_order_storage_with(&other.checkpoint)
+            && self
+                .checkpoint
+                .shares_active_order_storage_with(&other.checkpoint)
+            && self
+                .checkpoint
+                .shares_history_storage_with(&other.checkpoint)
+    }
+
+    /// Consumes this capture and proves deterministic call-auction replay.
+    ///
+    /// Verification constructs an isolated engine under the captured finite
+    /// policy, requires exact command/report reproduction (including externally
+    /// gated risk rejections), and compares a fresh canonical replay projection
+    /// with the captured candidate. It may run while the source writer advances.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed resource/construction failure or `Invalid` for command,
+    /// report, phase, allocation, order, identity, counter, or projection drift.
+    pub fn verify(self) -> Result<CallAuctionCheckpoint, CallAuctionCheckpointError> {
+        let Self { checkpoint, limits } = self;
+        checkpoint.validate()?;
+        let mut replay = CallAuctionEngine::try_with_limits(checkpoint.definition(), limits)
+            .map_err(CallAuctionCheckpointError::Construction)?;
+        for entry in checkpoint.history() {
+            let preparation = replay.prepare(entry.command()).map_err(|error| {
+                CallAuctionCheckpointError::new(format!(
+                    "auction checkpoint history cannot be prepared: {error}"
+                ))
+            })?;
+            let reproduced = match preparation {
+                CallAuctionCommandPreparation::Replay(_) => {
+                    return Err(CallAuctionCheckpointError::new(
+                        "auction checkpoint history unexpectedly replays a command",
+                    ));
+                }
+                CallAuctionCommandPreparation::Ready(prepared) => {
+                    let external_rejection = match entry.report().outcome {
+                        CallAuctionCommandOutcome::Rejected(reason)
+                            if is_external_risk_rejection(reason) =>
+                        {
+                            Some(reason)
+                        }
+                        _ => None,
+                    };
+                    replay
+                        .commit_with_gate(prepared, external_rejection)
+                        .map_err(|error| {
+                            CallAuctionCheckpointError::new(format!(
+                                "auction checkpoint history cannot be committed: {error}"
+                            ))
+                        })?
+                }
+            };
+            if reproduced != *entry.report() {
+                return Err(CallAuctionCheckpointError::new(
+                    "auction checkpoint history diverges under deterministic replay",
+                ));
+            }
+        }
+        let replayed =
+            replay.checkpoint_state(checkpoint.wal_metadata_sequence(), checkpoint.generation())?;
+        if replayed != checkpoint {
+            return Err(CallAuctionCheckpointError::new(
+                "auction checkpoint direct state differs from deterministic history replay",
+            ));
+        }
+        Ok(checkpoint)
+    }
+}
+
+#[cfg(test)]
+impl CallAuctionCheckpointCapture {
+    pub(crate) fn corrupt_generation_for_test(&mut self) {
+        self.checkpoint.wal_sequence = self.checkpoint.wal_sequence.saturating_add(1);
+    }
+}
+
 /// One fallibly reserved call-auction-checkpoint capture or validation resource.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CallAuctionCheckpointResource {
@@ -2353,10 +2492,11 @@ impl CallAuctionEngine {
         }
     }
 
-    /// Captures canonical direct state at one completed WAL report boundary.
+    /// Captures and synchronously verifies canonical state at one completed WAL
+    /// report boundary.
     ///
-    /// Capture independently replays complete retained history and requires the
-    /// reproduced direct state to equal the live engine before returning.
+    /// This convenience path composes [`Self::capture_checkpoint_candidate`]
+    /// and [`CallAuctionCheckpointCapture::verify`].
     ///
     /// # Errors
     ///
@@ -2368,55 +2508,35 @@ impl CallAuctionEngine {
         wal_metadata_sequence: u64,
         wal_sequence: u64,
     ) -> Result<CallAuctionCheckpoint, CallAuctionCheckpointError> {
-        let checkpoint = self.checkpoint_state(wal_metadata_sequence, wal_sequence)?;
-        let mut replay = Self::try_with_limits(self.book.definition(), self.limits)
-            .map_err(CallAuctionCheckpointError::Construction)?;
-        for entry in checkpoint.history() {
-            let preparation = replay.prepare(entry.command()).map_err(|error| {
-                CallAuctionCheckpointError::new(format!(
-                    "auction checkpoint history cannot be prepared: {error}"
-                ))
-            })?;
-            let reproduced = match preparation {
-                CallAuctionCommandPreparation::Replay(_) => {
-                    return Err(CallAuctionCheckpointError::new(
-                        "auction checkpoint history unexpectedly replays a command",
-                    ));
-                }
-                CallAuctionCommandPreparation::Ready(prepared) => {
-                    let external_rejection = match entry.report().outcome {
-                        CallAuctionCommandOutcome::Rejected(reason)
-                            if is_external_risk_rejection(reason) =>
-                        {
-                            Some(reason)
-                        }
-                        _ => None,
-                    };
-                    replay
-                        .commit_with_gate(prepared, external_rejection)
-                        .map_err(|error| {
-                            CallAuctionCheckpointError::new(format!(
-                                "auction checkpoint history cannot be committed: {error}"
-                            ))
-                        })?
-                }
-            };
-            if reproduced != *entry.report() {
-                return Err(CallAuctionCheckpointError::new(
-                    "auction checkpoint history diverges under deterministic replay",
-                ));
-            }
-        }
-        let replayed = replay.checkpoint_state(wal_metadata_sequence, wal_sequence)?;
-        if replayed != checkpoint {
-            return Err(CallAuctionCheckpointError::new(
-                "auction checkpoint direct state differs from deterministic history replay",
-            ));
-        }
-        Ok(checkpoint)
+        self.capture_checkpoint_candidate(wal_metadata_sequence, wal_sequence)?
+            .verify()
     }
 
-    fn checkpoint_state(
+    /// Captures immutable canonical state without executing retained history.
+    ///
+    /// The writer-side phase audits the live engine/book and event arena,
+    /// materializes canonical accepted identities, active orders, and retained
+    /// command/report handles, and projects their phase/order/counter lineage.
+    /// The returned value is not encodable or persistable until consumed by
+    /// [`CallAuctionCheckpointCapture::verify`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed capture/validation resource failure or `Invalid` for a
+    /// live structure, WAL boundary, trace grammar, phase, identity, order, or
+    /// counter contradiction.
+    pub fn capture_checkpoint_candidate(
+        &self,
+        wal_metadata_sequence: u64,
+        wal_sequence: u64,
+    ) -> Result<CallAuctionCheckpointCapture, CallAuctionCheckpointError> {
+        Ok(CallAuctionCheckpointCapture {
+            checkpoint: self.checkpoint_state(wal_metadata_sequence, wal_sequence)?,
+            limits: self.limits,
+        })
+    }
+
+    pub(crate) fn checkpoint_state(
         &self,
         wal_metadata_sequence: u64,
         wal_sequence: u64,

@@ -13,10 +13,12 @@ use quotick::auction_engine::{
     CallAuctionUncrossCommand,
 };
 use quotick::auction_risk::{
-    CallAuctionRiskLimits, CallAuctionRiskLimitsSpec, CallAuctionRiskManagedEngine,
+    CallAuctionRiskCheckpointCapture, CallAuctionRiskLimits, CallAuctionRiskLimitsSpec,
+    CallAuctionRiskManagedEngine,
 };
 use quotick::durable_auction::{
-    DurableCallAuctionEngine, DurableCallAuctionError, DurableCallAuctionRiskEngine,
+    DurableCallAuctionEngine, DurableCallAuctionError, DurableCallAuctionRiskCheckpointCapture,
+    DurableCallAuctionRiskEngine, VerifiedDurableCallAuctionRiskCheckpoint,
 };
 use quotick::instrument::{
     InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -201,6 +203,74 @@ fn frame_count(path: &Path) -> usize {
 }
 
 #[test]
+fn staged_coupled_capture_verifies_old_phase_risk_state_after_uncross_suffix() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<CallAuctionRiskCheckpointCapture>();
+    let mut managed = CallAuctionRiskManagedEngine::try_new(definition()).unwrap();
+    for value in profiles() {
+        managed
+            .register_account(value.account_id(), value.profile())
+            .unwrap();
+    }
+    let commands = [
+        phase(1, 0, CallAuctionPhase::Collecting),
+        submit(2, order(1, 1, Side::Buy, AuctionOrderConstraint::Market, 6)),
+        submit(
+            3,
+            order(
+                2,
+                2,
+                Side::Sell,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                5,
+            ),
+        ),
+        submit(
+            4,
+            order(3, 99, Side::Buy, AuctionOrderConstraint::Market, 1),
+        ),
+        phase(5, 1, CallAuctionPhase::Frozen),
+    ];
+    for command in commands {
+        managed.submit(command).unwrap();
+    }
+    let capture = managed.capture_checkpoint_candidate(1, 3, 13).unwrap();
+    let shared = capture.clone();
+    assert!(capture.shares_checkpoint_storage_with(&shared));
+    assert_eq!(capture.account_count(), 2);
+    assert_eq!(capture.command_count(), 5);
+    assert_eq!(capture.active_order_count(), 2);
+    let synchronous = managed.checkpoint(1, 3, 13).unwrap();
+    let worker = std::thread::spawn(move || capture.verify().unwrap());
+    managed
+        .submit(uncross(6, CallAuctionRemainderPolicy::RetainAll))
+        .unwrap();
+    let verified = worker.join().unwrap();
+
+    assert_eq!(verified, synchronous);
+    let restored = CallAuctionRiskManagedEngine::from_checkpoint(&verified).unwrap();
+    assert_eq!(restored.risk().reservation_count(), 2);
+    assert_eq!(
+        restored
+            .risk()
+            .snapshot(account(1))
+            .unwrap()
+            .position_lots(),
+        0
+    );
+    assert_eq!(
+        managed.risk().snapshot(account(1)).unwrap().position_lots(),
+        5
+    );
+    assert_eq!(
+        managed.risk().snapshot(account(2)).unwrap().position_lots(),
+        -5
+    );
+    assert_eq!(managed.risk().reservation_count(), 1);
+}
+
+#[test]
 fn single_file_recovery_reproduces_risk_rejections_positions_and_reservations() {
     let area = TestArea::new("round-trip");
     let wal = area.join("auction-risk.wal");
@@ -283,6 +353,10 @@ fn single_file_recovery_reproduces_risk_rejections_positions_and_reservations() 
 
 #[test]
 fn checkpoint_is_snapshot_kind_five_and_replays_only_the_suffix() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<DurableCallAuctionRiskCheckpointCapture>();
+    assert_send_sync::<VerifiedDurableCallAuctionRiskCheckpoint>();
     let area = TestArea::new("checkpoint");
     let wal = area.join("auction-risk.wal");
     let snapshot = area.join("auction-risk.qsnp");
@@ -298,16 +372,24 @@ fn checkpoint_is_snapshot_kind_five_and_replays_only_the_suffix() {
             order(1, 1, Side::Buy, AuctionOrderConstraint::Market, 2),
         ))
         .unwrap();
-    let receipt = durable
-        .write_checkpoint(&snapshot, SnapshotOptions::default())
-        .unwrap();
-    assert_eq!(receipt.generation(), 7);
+    let capture = durable.capture_checkpoint_candidate().unwrap();
+    let shared = capture.clone();
+    assert!(capture.shares_checkpoint_storage_with(&shared));
+    assert_eq!(capture.wal_first_sequence(), 1);
+    assert_eq!(capture.wal_metadata_sequence(), 3);
+    assert_eq!(capture.generation(), 7);
+    let worker = std::thread::spawn(move || capture.verify().unwrap());
     durable
         .submit(submit(
             3,
             order(2, 2, Side::Sell, AuctionOrderConstraint::Market, 2),
         ))
         .unwrap();
+    let verified = worker.join().unwrap();
+    let receipt = durable
+        .write_verified_checkpoint(&snapshot, &verified, SnapshotOptions::default())
+        .unwrap();
+    assert_eq!(receipt.generation(), 7);
     durable.close().unwrap();
 
     let bytes = fs::read(&snapshot).unwrap();
@@ -352,6 +434,124 @@ fn checkpoint_is_snapshot_kind_five_and_replays_only_the_suffix() {
         Err(DurableCallAuctionError::RiskProfileSetMismatch { .. }
             | DurableCallAuctionError::CheckpointRiskProfileSetMismatch)
     ));
+}
+
+#[test]
+fn verified_coupled_auction_checkpoint_rejects_other_reopen_and_cutover_epoch() {
+    let area = TestArea::new("staged-fences");
+    let source_wal = area.join("source.wal");
+    let other_wal = area.join("other.wal");
+    let other_output = area.join("other.qsnp");
+    let reopen_output = area.join("reopen.qsnp");
+    let stale_output = area.join("stale.qsnp");
+    let cutover_base = area.join("cutover.qsnp");
+    let profile_values = profiles();
+    let mut source =
+        DurableCallAuctionRiskEngine::open(&source_wal, definition(), &profile_values, options())
+            .unwrap();
+    source
+        .submit(phase(1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    let verified = source
+        .capture_checkpoint_candidate()
+        .unwrap()
+        .verify()
+        .unwrap();
+
+    let mut other =
+        DurableCallAuctionRiskEngine::open(&other_wal, definition(), &profile_values, options())
+            .unwrap();
+    assert!(matches!(
+        other.write_verified_checkpoint(&other_output, &verified, SnapshotOptions::default()),
+        Err(DurableCallAuctionError::CheckpointCaptureOriginMismatch)
+    ));
+    assert!(!other_output.exists());
+    assert!(!other.is_poisoned());
+    other.close().unwrap();
+
+    source.close().unwrap();
+    let mut reopened =
+        DurableCallAuctionRiskEngine::open(&source_wal, definition(), &profile_values, options())
+            .unwrap();
+    assert!(matches!(
+        reopened.write_verified_checkpoint(&reopen_output, &verified, SnapshotOptions::default()),
+        Err(DurableCallAuctionError::CheckpointCaptureOriginMismatch)
+    ));
+    assert!(!reopen_output.exists());
+    let stale = reopened
+        .capture_checkpoint_candidate()
+        .unwrap()
+        .verify()
+        .unwrap();
+    reopened
+        .compact_to_checkpoint(&cutover_base, SnapshotOptions::default())
+        .unwrap();
+    assert!(matches!(
+        reopened.write_verified_checkpoint(&stale_output, &stale, SnapshotOptions::default()),
+        Err(DurableCallAuctionError::CheckpointCaptureStale {
+            captured_epoch: 0,
+            current_epoch: 1
+        })
+    ));
+    assert!(!stale_output.exists());
+    assert!(!reopened.is_poisoned());
+    reopened.close().unwrap();
+}
+
+#[test]
+fn segmented_staged_coupled_checkpoint_replays_only_rotated_suffix() {
+    let area = TestArea::new("segmented-staged");
+    let segments = area.join("segments");
+    let snapshot = area.join("auction-risk.qsnp");
+    let profile_values = profiles();
+    let segmented_options = SegmentedJournalOptions {
+        maximum_segment_bytes: 256,
+        journal: options(),
+    };
+    let mut durable = DurableCallAuctionRiskEngine::open_segmented(
+        &segments,
+        definition(),
+        &profile_values,
+        segmented_options,
+    )
+    .unwrap();
+    durable
+        .submit(phase(1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    durable
+        .submit(submit(
+            2,
+            order(1, 1, Side::Buy, AuctionOrderConstraint::Market, 2),
+        ))
+        .unwrap();
+    let capture = durable.capture_checkpoint_candidate().unwrap();
+    let worker = std::thread::spawn(move || capture.verify().unwrap());
+    durable
+        .submit(submit(
+            3,
+            order(2, 2, Side::Sell, AuctionOrderConstraint::Market, 2),
+        ))
+        .unwrap();
+    let verified = worker.join().unwrap();
+    durable
+        .write_verified_checkpoint(&snapshot, &verified, SnapshotOptions::default())
+        .unwrap();
+    durable.close().unwrap();
+
+    let recovered = DurableCallAuctionRiskEngine::open_segmented_with_checkpoint(
+        &segments,
+        &snapshot,
+        definition(),
+        &profile_values,
+        segmented_options,
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().checkpointed_commands, 2);
+    assert_eq!(recovered.recovery().replayed_commands, 1);
+    assert!(recovered.recovery().journal.segment_count >= 2);
+    assert_eq!(recovered.managed().risk().reservation_count(), 2);
+    recovered.managed().validate().unwrap();
 }
 
 #[test]

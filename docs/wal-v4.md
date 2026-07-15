@@ -244,6 +244,15 @@ requested canonical profile set. Every command/report frame through generation
 `G` must equal the nested checkpoint history before direct restoration; only
 the suffix after `G` executes.
 
+Plain and coupled durable auction runtimes may synchronize through a completed
+report boundary `G`, capture a nonencodable canonical candidate without command
+execution, and verify that exact prefix off-thread while later command/report
+pairs append. Standalone publication accepts only the verified typestate through
+the same open shard and unchanged process-local cutover epoch; coupled
+publication also rechecks `F` and `M`. Another shard, reopen, metadata drift, a
+checkpoint ahead of the WAL head, or successful prefix cutover is rejected
+before snapshot creation. A staged handle cannot drive kind-`8` cutover.
+
 A compacted coupled shard begins at `G` with a kind-`8` anchor naming
 `CallAuctionRiskCheckpoint` kind `5`. The selected A/B snapshot must match the
 anchor kind, slot, generation, payload length, checksum, definition, WAL
