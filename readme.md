@@ -78,9 +78,8 @@ verify deterministic replay during recovery.
 
 ## Quick start
 
-Quotick is a library crate; it ships no binaries or examples. The following
-program defines an instrument, matches two orders under default limits, and
-reads the sequenced trade events:
+Quotick is a library crate. The following program defines an instrument,
+matches two orders under default limits, and reads the sequenced trade events:
 
 ```rust
 use quotick::instrument::{
@@ -181,6 +180,30 @@ satisfied; production code uses `OrderBook::try_with_limits` and the other
 To persist the same command stream, wrap the book in
 `durable::DurableOrderBook`, which appends each command to a WAL before the
 book applies it.
+
+## Executable examples
+
+The [`examples/`](examples/readme.md) directory contains complete deterministic
+programs built only from Quotick's public API. Each stateful program uses an
+explicit finite resource envelope and checks its resulting invariants before
+printing a summary.
+
+| Example | End-to-end workflow |
+| --- | --- |
+| [`venue_session`](examples/venue_session.rs) | Calendar-relative admission through pre-trade risk, matching, level-2 publication, DVP settlement, and expiry |
+| [`versioned_universe`](examples/versioned_universe.rs) | Effective-time instrument selection and version-bound shard routing |
+| [`order_lifecycle`](examples/order_lifecycle.rs) | Reserve priority, hidden liquidity, stop activation, GTD expiry, account fences, and instrument controls |
+| [`indicative_cross`](examples/indicative_cross.rs) | Risk-managed call-auction collection, public depth, deterministic uncross, and retained remainders |
+| [`auction_restart`](examples/auction_restart.rs) | Durable auction checkpoint cutover, phase-transition suffix replay, and exact retry |
+| [`signed_price_discovery`](examples/signed_price_discovery.rs) | Banded negative-price discovery, pressure policy, and exact order allocation |
+| [`feed_repair`](examples/feed_repair.rs) | Sequence-gap detection, nonmutating rejection, full-depth repair, and incremental continuation |
+| [`clearing_ledger`](examples/clearing_ledger.rs) | Atomic funding, trade settlement, correction, period controls, trial balance, and reconciliation |
+| [`durable_accounting`](examples/durable_accounting.rs) | Atomic batch and correction recovery across ledger checkpoint cutover and suffix replay |
+| [`wal_recovery`](examples/wal_recovery.rs) | Durable coupled matching/risk recovery from an off-thread checkpoint and WAL suffix |
+| [`segmented_cutover`](examples/segmented_cutover.rs) | Automatic WAL rotation, A/B checkpoint cutover, retained suffix recovery, and exact retry |
+| [`state_handoff`](examples/state_handoff.rs) | Off-thread checkpoint verification, stable encoding, direct restore, and deterministic continuation |
+
+Run any program with `cargo run --example <name>`.
 
 ## Capabilities
 
