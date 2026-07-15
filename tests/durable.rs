@@ -12,11 +12,12 @@ use quotick::journal::{
 };
 use quotick::matching::{
     CancelReason, Command, EventKind, ExpirySweep, MatchingError, NewOrder, OrderBook, OrderType,
-    SelfTradePrevention, StopActivation, StopTriggerSweep, TimeInForce,
+    SelfTradePrevention, StopActivation, StopReference, StopReferenceCursor, StopTriggerSweep,
+    TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
-    TimestampNs,
+    StopReferenceSequence, StopReferenceSourceId, StopReferenceSourceVersion, TimestampNs,
 };
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
@@ -118,12 +119,19 @@ fn expiry_sweep(command_id: u64, through: u64, received_at: u64) -> Command {
     })
 }
 
-fn stop_trigger(command_id: u64, reference_price: i64) -> Command {
+fn stop_trigger(command_id: u64, source_sequence: u64, reference_price: i64) -> Command {
     Command::StopTriggerSweep(StopTriggerSweep {
         command_id: CommandId::new(command_id).unwrap(),
         instrument_id: instrument(),
         instrument_version: version(),
-        reference_price: Price::from_raw(reference_price),
+        reference: StopReference::new(
+            StopReferenceCursor::new(
+                StopReferenceSourceId::new(1).unwrap(),
+                StopReferenceSourceVersion::new(1).unwrap(),
+                StopReferenceSequence::new(source_sequence).unwrap(),
+            ),
+            Price::from_raw(reference_price),
+        ),
         maximum_orders: 4,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
@@ -227,7 +235,10 @@ fn durable_gtd_expiry_restores_the_watermark_and_exact_retry() {
 #[test]
 fn durable_recovery_restores_dormant_stop_reference_and_activation() {
     let file = TestFile::new("stop-recovery");
-    let reference = stop_trigger(1, 100);
+    let reference = stop_trigger(1, 1, 100);
+    let Command::StopTriggerSweep(reference_sweep) = reference else {
+        unreachable!();
+    };
     let stop = stop_limit(2, 1);
     let mut durable = DurableOrderBook::open(file.path(), definition(), options()).unwrap();
     durable.submit(reference).unwrap();
@@ -237,13 +248,17 @@ fn durable_recovery_restores_dormant_stop_reference_and_activation() {
 
     let mut reopened = DurableOrderBook::open(file.path(), definition(), options()).unwrap();
     assert_eq!(
-        reopened.book().stop_reference_price(),
-        Some(Price::from_raw(100))
+        reopened.book().stop_reference(),
+        Some(reference_sweep.reference)
     );
     assert_eq!(reopened.book().dormant_stop_count(), 1);
     assert!(reopened.submit(stop).unwrap().replayed);
     assert_eq!(reopened.submit(stop).unwrap().events, armed.events);
-    reopened.submit(stop_trigger(3, 110)).unwrap();
+    let activation = stop_trigger(3, 2, 110);
+    let Command::StopTriggerSweep(activation_sweep) = activation else {
+        unreachable!();
+    };
+    reopened.submit(activation).unwrap();
     assert!(
         reopened
             .book()
@@ -263,8 +278,8 @@ fn durable_recovery_restores_dormant_stop_reference_and_activation() {
 
     let recovered = DurableOrderBook::open(file.path(), definition(), options()).unwrap();
     assert_eq!(
-        recovered.book().stop_reference_price(),
-        Some(Price::from_raw(110))
+        recovered.book().stop_reference(),
+        Some(activation_sweep.reference)
     );
     assert_eq!(recovered.book().dormant_stop_count(), 0);
     assert_eq!(

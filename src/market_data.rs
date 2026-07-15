@@ -24,8 +24,8 @@ use crate::instrument::TradingState;
 use crate::matching::{
     AccountAdmissionState, AccountControlAction, AccountControlSnapshot, CancelReason, Command,
     CommandOutcome, Event, EventKind, ExecutionReport, LevelSnapshot, MassCancelScope, OrderBook,
-    OrderBookLimits, OrderDisplay, OrderType, SelfTradePrevention, StopActivation, TimeInForce,
-    Trade, TradingStateControlAction, TradingStateSnapshot,
+    OrderBookLimits, OrderDisplay, OrderType, SelfTradePrevention, StopActivation, StopReference,
+    TimeInForce, Trade, TradingStateControlAction, TradingStateSnapshot,
 };
 
 /// One finite market-data state or preparation resource.
@@ -841,7 +841,7 @@ pub struct MarketDataPublisher {
     affected_levels: BoundedHashMap<(Side, Price), ()>,
     trading_state: TradingStateSnapshot,
     expiry_watermark: Option<TimestampNs>,
-    stop_reference_price: Option<Price>,
+    stop_reference: Option<StopReference>,
     last_sequence: u64,
     last_trade_id: Option<TradeId>,
     poisoned: bool,
@@ -915,7 +915,7 @@ impl MarketDataPublisher {
             )?,
             trading_state: book.trading_state(),
             expiry_watermark: book.expiry_watermark(),
-            stop_reference_price: book.stop_reference_price(),
+            stop_reference: book.stop_reference(),
             last_sequence: book.last_event_sequence(),
             last_trade_id: book.last_trade_id(),
             poisoned: false,
@@ -1248,7 +1248,7 @@ impl MarketDataPublisher {
             || self.last_trade_id != book.last_trade_id()
             || self.trading_state != book.trading_state()
             || self.expiry_watermark != book.expiry_watermark()
-            || self.stop_reference_price != book.stop_reference_price()
+            || self.stop_reference != book.stop_reference()
         {
             return Err(MarketDataError::SourceDivergence(
                 "publisher source sequences differ from the matching book",
@@ -1553,25 +1553,25 @@ impl MarketDataPublisher {
             EventKind::StopOrderTriggered {
                 order_id,
                 trigger_price,
-                reference_price,
+                reference,
                 priority_sequence,
             } => self.handle_stop_triggered(
                 command,
                 order_id,
                 trigger_price,
-                reference_price,
+                reference,
                 priority_sequence,
                 stop_trigger_progress,
             ),
             EventKind::StopTriggerSweepCompleted {
-                previous_reference_price,
-                current_reference_price,
+                previous_reference,
+                current_reference,
                 triggered_order_count,
                 remaining_eligible_order_count,
             } => self.handle_stop_trigger_sweep_completed(
                 command,
-                previous_reference_price,
-                current_reference_price,
+                previous_reference,
+                current_reference,
                 triggered_order_count,
                 remaining_eligible_order_count,
                 stop_trigger_progress,
@@ -2231,7 +2231,7 @@ impl MarketDataPublisher {
         command: Command,
         order_id: OrderId,
         trigger_price: Price,
-        reference_price: Price,
+        reference: StopReference,
         priority_sequence: u64,
         progress: &mut StopTriggerProgress,
     ) -> Result<MarketDataKind, MarketDataError> {
@@ -2242,8 +2242,8 @@ impl MarketDataPublisher {
         };
         if progress.completed
             || progress.active.is_some()
-            || sweep.reference_price != reference_price
-            || self.first_eligible_stop(reference_price)? != Some(order_id)
+            || sweep.reference != reference
+            || self.first_eligible_stop(reference.price())? != Some(order_id)
         {
             return Err(MarketDataError::TraceMismatch(
                 "StopOrderTriggered is absent, ineligible, or not canonical",
@@ -2273,8 +2273,8 @@ impl MarketDataPublisher {
     fn handle_stop_trigger_sweep_completed(
         &mut self,
         command: Command,
-        previous_reference_price: Option<Price>,
-        current_reference_price: Price,
+        previous_reference: Option<StopReference>,
+        current_reference: StopReference,
         triggered_order_count: u64,
         remaining_eligible_order_count: u64,
         progress: &mut StopTriggerProgress,
@@ -2284,15 +2284,15 @@ impl MarketDataPublisher {
                 "non-trigger command emitted StopTriggerSweepCompleted",
             ));
         };
-        let remaining = self.eligible_stop_count(current_reference_price)?;
+        let remaining = self.eligible_stop_count(current_reference.price())?;
         let total = progress
             .triggered_count
             .checked_add(remaining)
             .ok_or(MarketDataError::ArithmeticOverflow)?;
         if progress.completed
             || progress.active.is_some()
-            || previous_reference_price != self.stop_reference_price
-            || current_reference_price != sweep.reference_price
+            || previous_reference != self.stop_reference
+            || current_reference != sweep.reference
             || progress.triggered_count != triggered_order_count
             || remaining != remaining_eligible_order_count
             || triggered_order_count != total.min(u64::from(sweep.maximum_orders))
@@ -2301,7 +2301,7 @@ impl MarketDataPublisher {
                 "StopTriggerSweepCompleted contradicts its command or activation trace",
             ));
         }
-        self.stop_reference_price = Some(current_reference_price);
+        self.stop_reference = Some(current_reference);
         progress.completed = true;
         Ok(MarketDataKind::NoBookChange)
     }
@@ -3002,7 +3002,7 @@ impl MarketDataPublisher {
             || book.resting_order_count() != self.orders.len()
             || book.dormant_stop_count() != self.stops.len()
             || book.trading_state() != self.trading_state
-            || book.stop_reference_price() != self.stop_reference_price
+            || book.stop_reference() != self.stop_reference
         {
             return Err(MarketDataError::SourceDivergence(
                 "published sequence, trade, or order count differs from the matching book",

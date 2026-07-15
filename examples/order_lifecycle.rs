@@ -10,7 +10,7 @@ use quotick::matching::{
 };
 use quotick::{CommandId, OrderId, Price, Quantity, Side};
 
-use support::{LimitOrder, account, definition, matching_limits, timestamp};
+use support::{LimitOrder, account, definition, matching_limits, stop_reference, timestamp};
 
 fn stop_market(
     definition: quotick::instrument::InstrumentDefinition,
@@ -42,13 +42,14 @@ fn stop_market(
 fn trigger(
     definition: quotick::instrument::InstrumentDefinition,
     command_id: u64,
+    source_sequence: u64,
     reference_price: i64,
 ) -> Command {
     Command::StopTriggerSweep(StopTriggerSweep {
         command_id: CommandId::new(command_id).unwrap(),
         instrument_id: definition.instrument_id(),
         instrument_version: definition.version(),
-        reference_price: Price::from_raw(reference_price),
+        reference: stop_reference(source_sequence, reference_price),
         maximum_orders: 8,
         received_at: timestamp(command_id),
     })
@@ -89,7 +90,7 @@ fn main() {
             .any(|event| matches!(event.kind, EventKind::OrderRefreshed { .. }))
     );
 
-    book.submit(trigger(definition, 4, 9_500)).unwrap();
+    book.submit(trigger(definition, 4, 1, 9_500)).unwrap();
     book.submit(stop_market(definition, 5, 4, 14, 3, 10_500))
         .unwrap();
     assert_eq!(book.dormant_stop_count(), 1);
@@ -101,7 +102,7 @@ fn main() {
 
     book.submit(LimitOrder::resting(7, 6, 16, Side::Sell, 3, 10_200).command(definition))
         .unwrap();
-    let triggered = book.submit(trigger(definition, 8, 10_500)).unwrap();
+    let triggered = book.submit(trigger(definition, 8, 2, 10_500)).unwrap();
     assert!(triggered.events.iter().any(|event| matches!(
         event.kind,
         EventKind::StopOrderTriggered { order_id, .. } if order_id == OrderId::new(4).unwrap()
@@ -113,6 +114,10 @@ fn main() {
             .any(|event| matches!(event.kind, EventKind::Trade(_)))
     );
     assert_eq!(book.dormant_stop_count(), 0);
+    let committed_reference = book.stop_reference().unwrap();
+    assert_eq!(committed_reference.cursor().source_id().get(), 1);
+    assert_eq!(committed_reference.cursor().source_version().get(), 1);
+    assert_eq!(committed_reference.cursor().source_sequence().get(), 2);
 
     let mut expiring = LimitOrder::resting(9, 7, 17, Side::Buy, 2, 8_000);
     expiring.time_in_force = TimeInForce::GoodTilTimestamp {
@@ -180,9 +185,10 @@ fn main() {
     book.validate().unwrap();
 
     println!(
-        "priority_trades={} stop_events={} halt_events={} final_sequence={}",
+        "priority_trades={} stop_events={} stop_source_sequence={} halt_events={} final_sequence={}",
         makers.len(),
         triggered.events.len(),
+        committed_reference.cursor().source_sequence(),
         halted.events.len(),
         book.last_event_sequence()
     );

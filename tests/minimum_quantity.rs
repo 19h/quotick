@@ -13,12 +13,23 @@ use quotick::market_data::{MarketDataKind, MarketDataPublisher};
 use quotick::matching::{
     CancelReason, Command, CommandOutcome, EventKind, NewOrder, OrderBook, OrderBookCheckpoint,
     OrderDisplay, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, StopActivation,
-    StopTriggerSweep, TimeInForce,
+    StopReference, StopReferenceCursor, StopTriggerSweep, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
-    TimestampNs,
+    StopReferenceSequence, StopReferenceSourceId, StopReferenceSourceVersion, TimestampNs,
 };
+
+fn stop_reference(source_sequence: u64, price: i64) -> StopReference {
+    StopReference::new(
+        StopReferenceCursor::new(
+            StopReferenceSourceId::new(1).unwrap(),
+            StopReferenceSourceVersion::new(1).unwrap(),
+            StopReferenceSequence::new(source_sequence).unwrap(),
+        ),
+        Price::from_raw(price),
+    )
+}
 
 static NEXT_WAL: AtomicU64 = AtomicU64::new(1);
 
@@ -345,7 +356,7 @@ fn dormant_stop_minimum_survives_checkpoint_and_is_checked_at_activation() {
         command_id: CommandId::new(1).unwrap(),
         instrument_id: InstrumentId::new(1).unwrap(),
         instrument_version: InstrumentVersion::new(1).unwrap(),
-        reference_price: Price::from_raw(90),
+        reference: stop_reference(1, 90),
         maximum_orders: 10,
         received_at: TimestampNs::from_unix_nanos(1),
     }))
@@ -408,7 +419,7 @@ fn dormant_stop_minimum_survives_checkpoint_and_is_checked_at_activation() {
             command_id: CommandId::new(5).unwrap(),
             instrument_id: InstrumentId::new(1).unwrap(),
             instrument_version: InstrumentVersion::new(1).unwrap(),
-            reference_price: Price::from_raw(110),
+            reference: stop_reference(2, 110),
             maximum_orders: 10,
             received_at: TimestampNs::from_unix_nanos(5),
         }))

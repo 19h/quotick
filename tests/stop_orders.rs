@@ -7,11 +7,11 @@ use quotick::matching::{
     CancelOrder, CancelReason, Command, CommandOutcome, CommandPreparation, EventKind, ExpirySweep,
     MatchingCapacity, MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsSpec,
     OrderDisplay, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, StopActivation,
-    StopTriggerSweep, TimeInForce,
+    StopReference, StopReferenceCursor, StopTriggerSweep, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
-    TimestampNs,
+    StopReferenceSequence, StopReferenceSourceId, StopReferenceSourceVersion, TimestampNs,
 };
 
 fn definition() -> InstrumentDefinition {
@@ -73,15 +73,100 @@ fn stop_limit(trigger_price: i64, limit_price: i64) -> OrderType {
     }
 }
 
-fn trigger(command_id: u64, reference_price: i64, maximum_orders: u32) -> Command {
+fn trigger(
+    command_id: u64,
+    source_sequence: u64,
+    reference_price: i64,
+    maximum_orders: u32,
+) -> Command {
+    sourced_trigger(
+        command_id,
+        1,
+        1,
+        source_sequence,
+        reference_price,
+        maximum_orders,
+    )
+}
+
+fn sourced_trigger(
+    command_id: u64,
+    source_id: u64,
+    source_version: u64,
+    source_sequence: u64,
+    reference_price: i64,
+    maximum_orders: u32,
+) -> Command {
     Command::StopTriggerSweep(StopTriggerSweep {
         command_id: CommandId::new(command_id).unwrap(),
         instrument_id: InstrumentId::new(1).unwrap(),
         instrument_version: InstrumentVersion::new(1).unwrap(),
-        reference_price: Price::from_raw(reference_price),
+        reference: StopReference::new(
+            StopReferenceCursor::new(
+                StopReferenceSourceId::new(source_id).unwrap(),
+                StopReferenceSourceVersion::new(source_version).unwrap(),
+                StopReferenceSequence::new(source_sequence).unwrap(),
+            ),
+            Price::from_raw(reference_price),
+        ),
         maximum_orders,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
+}
+
+#[test]
+fn stop_reference_stream_rejects_gaps_conflicts_and_unannounced_source_changes() {
+    let mut book = OrderBook::new(definition());
+    let initial = sourced_trigger(1, 9, 4, 41, 100, 1);
+    assert_eq!(
+        book.submit(initial).unwrap().outcome,
+        CommandOutcome::Accepted
+    );
+
+    assert_eq!(
+        book.submit(sourced_trigger(2, 9, 4, 43, 101, 1))
+            .unwrap()
+            .outcome,
+        CommandOutcome::Rejected(RejectReason::StopReferenceSequenceDiscontinuity)
+    );
+    assert_eq!(
+        book.submit(sourced_trigger(3, 8, 4, 42, 101, 1))
+            .unwrap()
+            .outcome,
+        CommandOutcome::Rejected(RejectReason::StopReferenceSourceMismatch)
+    );
+    assert_eq!(
+        book.submit(sourced_trigger(4, 9, 6, 1, 101, 1))
+            .unwrap()
+            .outcome,
+        CommandOutcome::Rejected(RejectReason::StopReferenceVersionDiscontinuity)
+    );
+
+    let next = sourced_trigger(5, 9, 4, 42, 101, 1);
+    assert_eq!(book.submit(next).unwrap().outcome, CommandOutcome::Accepted);
+    assert_eq!(
+        book.submit(sourced_trigger(6, 9, 4, 42, 102, 1))
+            .unwrap()
+            .outcome,
+        CommandOutcome::Rejected(RejectReason::StopReferenceCursorCollision)
+    );
+    assert_eq!(
+        book.submit(sourced_trigger(7, 9, 5, 2, 102, 1))
+            .unwrap()
+            .outcome,
+        CommandOutcome::Rejected(RejectReason::StopReferenceSequenceDiscontinuity)
+    );
+
+    let rolled = sourced_trigger(8, 9, 5, 1, 102, 1);
+    assert_eq!(
+        book.submit(rolled).unwrap().outcome,
+        CommandOutcome::Accepted
+    );
+    let Command::StopTriggerSweep(rolled) = rolled else {
+        unreachable!();
+    };
+    assert_eq!(book.stop_reference(), Some(rolled.reference));
+    book.validate().unwrap();
 }
 
 fn expiry(command_id: u64, through: u64) -> Command {
@@ -141,15 +226,15 @@ fn stop_requires_a_reference_and_arms_without_public_depth() {
         CommandOutcome::Rejected(RejectReason::StopReferenceUnavailable)
     );
 
-    let reference = book.submit(trigger(2, 100, 1)).unwrap();
+    let reference = book.submit(trigger(2, 1, 100, 1)).unwrap();
     assert!(matches!(
         reference.events.last().unwrap().kind,
         EventKind::StopTriggerSweepCompleted {
-            previous_reference_price: None,
-            current_reference_price,
+            previous_reference: None,
+            current_reference,
             triggered_order_count: 0,
             remaining_eligible_order_count: 0,
-        } if current_reference_price == Price::from_raw(100)
+        } if current_reference.price() == Price::from_raw(100)
     ));
 
     let armed = book
@@ -185,7 +270,7 @@ fn stop_requires_a_reference_and_arms_without_public_depth() {
 #[test]
 fn bounded_buy_activation_is_canonical_and_fences_reference_movement() {
     let mut book = OrderBook::new(definition());
-    book.submit(trigger(1, 100, 1)).unwrap();
+    book.submit(trigger(1, 1, 100, 1)).unwrap();
     for (command_id, order_id, trigger_price) in [(2, 30, 110), (3, 20, 105), (4, 10, 105)] {
         book.submit(order(
             command_id,
@@ -199,7 +284,7 @@ fn bounded_buy_activation_is_canonical_and_fences_reference_movement() {
         .unwrap();
     }
 
-    let first = book.submit(trigger(5, 110, 2)).unwrap();
+    let first = book.submit(trigger(5, 2, 110, 2)).unwrap();
     let triggered: Vec<_> = first
         .events
         .iter()
@@ -221,25 +306,28 @@ fn bounded_buy_activation_is_canonical_and_fences_reference_movement() {
         }
     ));
     assert_eq!(
-        book.submit(trigger(6, 111, 1)).unwrap().outcome,
+        book.submit(trigger(6, 3, 111, 1)).unwrap().outcome,
         CommandOutcome::Rejected(RejectReason::StopTriggerBacklog)
     );
 
-    let second = book.submit(trigger(7, 110, 1)).unwrap();
+    let second = book.submit(trigger(7, 2, 110, 1)).unwrap();
     assert!(second.events.iter().any(|event| matches!(
         event.kind,
         EventKind::StopOrderTriggered { order_id, .. }
             if order_id == OrderId::new(30).unwrap()
     )));
     assert_eq!(book.dormant_stop_count(), 0);
-    assert_eq!(book.stop_reference_price(), Some(Price::from_raw(110)));
+    assert_eq!(
+        book.stop_reference().map(StopReference::price),
+        Some(Price::from_raw(110))
+    );
     book.validate().unwrap();
 }
 
 #[test]
 fn triggered_market_and_limit_orders_use_normal_matching_semantics() {
     let mut book = OrderBook::new(definition());
-    book.submit(trigger(1, 100, 1)).unwrap();
+    book.submit(trigger(1, 1, 100, 1)).unwrap();
     book.submit(order(
         2,
         1,
@@ -261,7 +349,7 @@ fn triggered_market_and_limit_orders_use_normal_matching_semantics() {
     ))
     .unwrap();
 
-    let market = book.submit(trigger(4, 110, 1)).unwrap();
+    let market = book.submit(trigger(4, 2, 110, 1)).unwrap();
     assert!(market.events.iter().any(|event| matches!(
         event.kind,
         EventKind::Trade(trade)
@@ -288,7 +376,7 @@ fn triggered_market_and_limit_orders_use_normal_matching_semantics() {
         TimeInForce::GoodTilCancelled,
     ))
     .unwrap();
-    book.submit(trigger(6, 120, 1)).unwrap();
+    book.submit(trigger(6, 3, 120, 1)).unwrap();
     let residual = book.order(OrderId::new(3).unwrap()).unwrap();
     assert_eq!(residual.price, Price::from_raw(101));
     assert_eq!(residual.leaves_quantity.lots(), 4);
@@ -299,7 +387,7 @@ fn triggered_market_and_limit_orders_use_normal_matching_semantics() {
 #[test]
 fn dormant_stops_participate_in_cancel_expiry_and_exact_retry() {
     let mut book = OrderBook::new(definition());
-    book.submit(trigger(1, 100, 1)).unwrap();
+    book.submit(trigger(1, 1, 100, 1)).unwrap();
     let armed = order(
         2,
         1,
@@ -362,10 +450,10 @@ fn dormant_stops_participate_in_cancel_expiry_and_exact_retry() {
 fn satisfied_and_invalid_trigger_commands_are_nonmutating_rejections() {
     let mut book = OrderBook::new(definition());
     assert_eq!(
-        book.submit(trigger(1, 100, 0)).unwrap().outcome,
+        book.submit(trigger(1, 1, 100, 0)).unwrap().outcome,
         CommandOutcome::Rejected(RejectReason::StopTriggerBatchEmpty)
     );
-    book.submit(trigger(2, 100, 1)).unwrap();
+    book.submit(trigger(2, 1, 100, 1)).unwrap();
     assert_eq!(
         book.submit(order(
             3,
@@ -381,9 +469,12 @@ fn satisfied_and_invalid_trigger_commands_are_nonmutating_rejections() {
         CommandOutcome::Rejected(RejectReason::StopAlreadyTriggered)
     );
     assert_eq!(book.active_order_count(), 0);
-    assert_eq!(book.stop_reference_price(), Some(Price::from_raw(100)));
     assert_eq!(
-        book.submit(trigger(4, 100, u32::MAX)).unwrap().outcome,
+        book.stop_reference().map(StopReference::price),
+        Some(Price::from_raw(100))
+    );
+    assert_eq!(
+        book.submit(trigger(4, 1, 100, u32::MAX)).unwrap().outcome,
         CommandOutcome::Rejected(RejectReason::StopTriggerBatchExceedsActiveOrderCapacity)
     );
     book.validate().unwrap();
@@ -392,7 +483,7 @@ fn satisfied_and_invalid_trigger_commands_are_nonmutating_rejections() {
 #[test]
 fn bounded_sell_activation_uses_descending_trigger_then_acceptance_priority() {
     let mut book = OrderBook::new(definition());
-    book.submit(trigger(1, 100, 1)).unwrap();
+    book.submit(trigger(1, 1, 100, 1)).unwrap();
     for (command_id, order_id, trigger_price) in [(2, 30, 90), (3, 20, 95), (4, 10, 95)] {
         book.submit(order(
             command_id,
@@ -406,7 +497,7 @@ fn bounded_sell_activation_uses_descending_trigger_then_acceptance_priority() {
         .unwrap();
     }
 
-    let first = book.submit(trigger(5, 90, 2)).unwrap();
+    let first = book.submit(trigger(5, 2, 90, 2)).unwrap();
     let triggered: Vec<_> = first
         .events
         .iter()
@@ -420,16 +511,19 @@ fn bounded_sell_activation_uses_descending_trigger_then_acceptance_priority() {
         [OrderId::new(20).unwrap(), OrderId::new(10).unwrap()]
     );
     assert_eq!(book.dormant_stop_count(), 1);
-    book.submit(trigger(6, 90, 1)).unwrap();
+    book.submit(trigger(6, 2, 90, 1)).unwrap();
     assert_eq!(book.dormant_stop_count(), 0);
-    assert_eq!(book.stop_reference_price(), Some(Price::from_raw(90)));
+    assert_eq!(
+        book.stop_reference().map(StopReference::price),
+        Some(Price::from_raw(90))
+    );
     book.validate().unwrap();
 }
 
 #[test]
 fn triggered_fok_and_post_only_fail_atomically_with_typed_reasons() {
     let mut book = OrderBook::new(definition());
-    book.submit(trigger(1, 100, 1)).unwrap();
+    book.submit(trigger(1, 1, 100, 1)).unwrap();
     book.submit(order(
         2,
         1,
@@ -450,7 +544,7 @@ fn triggered_fok_and_post_only_fail_atomically_with_typed_reasons() {
         TimeInForce::FillOrKill,
     ))
     .unwrap();
-    let fok = book.submit(trigger(4, 110, 1)).unwrap();
+    let fok = book.submit(trigger(4, 2, 110, 1)).unwrap();
     assert!(
         !fok.events
             .iter()
@@ -482,7 +576,7 @@ fn triggered_fok_and_post_only_fail_atomically_with_typed_reasons() {
         TimeInForce::PostOnly,
     ))
     .unwrap();
-    let post_only = book.submit(trigger(6, 120, 1)).unwrap();
+    let post_only = book.submit(trigger(6, 3, 120, 1)).unwrap();
     assert!(post_only.events.iter().any(|event| matches!(
         event.kind,
         EventKind::OrderCancelled {
@@ -510,7 +604,7 @@ fn triggered_fok_and_post_only_fail_atomically_with_typed_reasons() {
 #[test]
 fn dormant_stop_limit_replacement_preserves_or_reprioritizes_trigger_priority() {
     let mut book = OrderBook::new(definition());
-    book.submit(trigger(1, 100, 1)).unwrap();
+    book.submit(trigger(1, 1, 100, 1)).unwrap();
     book.submit(order(
         2,
         1,
@@ -554,7 +648,7 @@ fn dormant_stop_limit_replacement_preserves_or_reprioritizes_trigger_priority() 
         StopActivation::Limit(Price::from_raw(102))
     );
 
-    book.submit(trigger(5, 110, 1)).unwrap();
+    book.submit(trigger(5, 2, 110, 1)).unwrap();
     assert_eq!(
         book.order(OrderId::new(1).unwrap()).unwrap().price,
         Price::from_raw(102)
@@ -581,7 +675,7 @@ fn dormant_stop_limit_replacement_preserves_or_reprioritizes_trigger_priority() 
 fn dormant_stops_consume_active_capacity_and_capacity_failed_activation_cancels() {
     let selected = limits(2, 1);
     let mut book = OrderBook::with_limits(definition(), selected);
-    book.submit(trigger(1, 100, 1)).unwrap();
+    book.submit(trigger(1, 1, 100, 1)).unwrap();
     book.submit(order(
         2,
         1,
@@ -618,7 +712,7 @@ fn dormant_stops_consume_active_capacity_and_capacity_failed_activation_cancels(
         ))
     );
 
-    let activated = book.submit(trigger(5, 110, 1)).unwrap();
+    let activated = book.submit(trigger(5, 2, 110, 1)).unwrap();
     assert!(activated.events.iter().any(|event| matches!(
         event.kind,
         EventKind::OrderCancelled {
@@ -648,7 +742,7 @@ fn nonempty_trigger_preparation_uses_and_releases_the_bounded_selection_pool() {
     })
     .unwrap();
     let mut book = OrderBook::with_limits(definition(), selected);
-    book.submit(trigger(1, 100, 1)).unwrap();
+    book.submit(trigger(1, 1, 100, 1)).unwrap();
     book.submit(order(
         2,
         1,
@@ -660,19 +754,22 @@ fn nonempty_trigger_preparation_uses_and_releases_the_bounded_selection_pool() {
     ))
     .unwrap();
 
-    let held = match book.prepare(trigger(3, 110, 1)).unwrap() {
+    let held = match book.prepare(trigger(3, 2, 110, 1)).unwrap() {
         CommandPreparation::Ready(prepared) => prepared,
         CommandPreparation::Replay(_) => panic!("new trigger command cannot be a replay"),
     };
     assert!(matches!(
-        book.prepare(trigger(4, 110, 1)),
+        book.prepare(trigger(4, 2, 110, 1)),
         Err(MatchingError::PreparationCapacityExhausted { maximum: 1 })
     ));
-    assert_eq!(book.stop_reference_price(), Some(Price::from_raw(100)));
+    assert_eq!(
+        book.stop_reference().map(StopReference::price),
+        Some(Price::from_raw(100))
+    );
     assert_eq!(book.dormant_stop_count(), 1);
 
     drop(held);
-    let ready = match book.prepare(trigger(4, 110, 1)).unwrap() {
+    let ready = match book.prepare(trigger(4, 2, 110, 1)).unwrap() {
         CommandPreparation::Ready(prepared) => prepared,
         CommandPreparation::Replay(_) => panic!("uncommitted trigger command cannot be a replay"),
     };
@@ -684,7 +781,10 @@ fn nonempty_trigger_preparation_uses_and_releases_the_bounded_selection_pool() {
 #[test]
 fn dormant_stop_checkpoint_codec_restores_reference_priority_and_exact_retries() {
     let mut book = OrderBook::new(definition());
-    let reference = trigger(1, 100, 2);
+    let reference = trigger(1, 1, 100, 2);
+    let Command::StopTriggerSweep(reference_sweep) = reference else {
+        unreachable!();
+    };
     let buy = order(
         2,
         1,
@@ -722,18 +822,47 @@ fn dormant_stop_checkpoint_codec_restores_reference_priority_and_exact_retries()
     ));
 
     let mut restored = OrderBook::from_checkpoint(&decoded).unwrap();
-    assert_eq!(restored.stop_reference_price(), Some(Price::from_raw(100)));
+    assert_eq!(restored.stop_reference(), Some(reference_sweep.reference));
     assert_eq!(restored.dormant_stop_count(), 2);
     assert_eq!(
         restored.dormant_stop(OrderId::new(1).unwrap()),
         book.dormant_stop(OrderId::new(1).unwrap())
     );
     assert!(restored.submit(buy).unwrap().replayed);
-    let triggered = restored.submit(trigger(4, 110, 2)).unwrap();
+    let triggered = restored.submit(trigger(4, 2, 110, 2)).unwrap();
     assert!(triggered.events.iter().any(|event| matches!(
         event.kind,
         EventKind::StopOrderTriggered { order_id, .. }
             if order_id == OrderId::new(1).unwrap()
     )));
     restored.validate().unwrap();
+}
+
+#[test]
+fn checkpoint_decoder_rejects_discontinuous_stop_reference_lineage() {
+    let mut book = OrderBook::new(definition());
+    book.submit(trigger(1, 1, 100, 1)).unwrap();
+    book.submit(trigger(2, 2, 101, 1)).unwrap();
+
+    let checkpoint = book.checkpoint(1, 5).unwrap();
+    let mut encoded = checkpoint.encode().unwrap();
+    let mut second_reference = Vec::new();
+    second_reference.extend_from_slice(&1_u64.to_le_bytes());
+    second_reference.extend_from_slice(&1_u64.to_le_bytes());
+    second_reference.extend_from_slice(&2_u64.to_le_bytes());
+    second_reference.extend_from_slice(&101_i64.to_le_bytes());
+    let offsets = encoded
+        .windows(second_reference.len())
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == second_reference).then_some(offset))
+        .collect::<Vec<_>>();
+    assert_eq!(offsets.len(), 2, "command and completion reference");
+    for offset in offsets {
+        encoded[offset + 16..offset + 24].copy_from_slice(&4_u64.to_le_bytes());
+    }
+
+    assert!(matches!(
+        quotick::matching::OrderBookCheckpoint::decode(&encoded),
+        Err(quotick::codec::CodecError::InvalidMatchingCheckpoint(_))
+    ));
 }

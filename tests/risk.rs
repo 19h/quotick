@@ -6,8 +6,8 @@ use quotick::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
     Command, CommandOutcome, CommandPreparation, EventKind, ExpirySweep, MatchingHashIndex,
     NewOrder, OrderBookLimits, OrderBookLimitsSpec, OrderType, RejectReason, ReplaceOrder,
-    SelfTradePrevention, StopActivation, StopTriggerSweep, TimeInForce, TradingStateControl,
-    TradingStateControlAction,
+    SelfTradePrevention, StopActivation, StopReference, StopReferenceCursor, StopTriggerSweep,
+    TimeInForce, TradingStateControl, TradingStateControlAction,
 };
 use quotick::risk::{
     AccountRiskState, RiskError, RiskHashIndex, RiskLimitSpec, RiskLimits, RiskManagedLimits,
@@ -16,7 +16,7 @@ use quotick::risk::{
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
-    TimestampNs,
+    StopReferenceSequence, StopReferenceSourceId, StopReferenceSourceVersion, TimestampNs,
 };
 
 fn account(value: u64) -> AccountId {
@@ -188,12 +188,19 @@ fn expiry_sweep(command_id: u64, through: u64, received_at: u64) -> Command {
     })
 }
 
-fn stop_trigger(command_id: u64, reference_price: i64) -> Command {
+fn stop_trigger(command_id: u64, source_sequence: u64, reference_price: i64) -> Command {
     Command::StopTriggerSweep(StopTriggerSweep {
         command_id: CommandId::new(command_id).unwrap(),
         instrument_id: instrument(),
         instrument_version: version(),
-        reference_price: Price::from_raw(reference_price),
+        reference: StopReference::new(
+            StopReferenceCursor::new(
+                StopReferenceSourceId::new(1).unwrap(),
+                StopReferenceSourceVersion::new(1).unwrap(),
+                StopReferenceSequence::new(source_sequence).unwrap(),
+            ),
+            Price::from_raw(reference_price),
+        ),
         maximum_orders: 4,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
@@ -805,7 +812,7 @@ fn dormant_stop_risk_reservations_persist_then_activate_or_release() {
     let mut book = RiskManagedOrderBook::new(definition());
     book.register_account(account(11), profile(AccountRiskState::Active, 0))
         .unwrap();
-    book.submit(stop_trigger(1, 100)).unwrap();
+    book.submit(stop_trigger(1, 1, 100)).unwrap();
 
     book.submit(order(
         2,
@@ -829,7 +836,7 @@ fn dormant_stop_risk_reservations_persist_then_activate_or_release() {
     );
     assert_eq!(book.risk().snapshot(account(11)).unwrap().open_orders(), 1);
 
-    book.submit(stop_trigger(3, 110)).unwrap();
+    book.submit(stop_trigger(3, 2, 110)).unwrap();
     let active = book.risk().reservation(OrderId::new(1).unwrap()).unwrap();
     assert!(!active.is_dormant_stop());
     assert_eq!(active.constraint(), dormant.constraint());
@@ -855,7 +862,7 @@ fn dormant_stop_risk_reservations_persist_then_activate_or_release() {
     let market = book.risk().reservation(OrderId::new(2).unwrap()).unwrap();
     assert!(market.is_dormant_stop());
     assert_eq!(market.constraint(), RiskPriceConstraint::Market);
-    book.submit(stop_trigger(5, 100)).unwrap();
+    book.submit(stop_trigger(5, 3, 100)).unwrap();
     assert!(book.risk().reservation(OrderId::new(2).unwrap()).is_none());
     assert_eq!(book.risk().snapshot(account(11)).unwrap().open_orders(), 1);
     book.validate().unwrap();

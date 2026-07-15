@@ -12,17 +12,29 @@ use quotick::journal::{Durability, JournalOptions};
 use quotick::market_data::{MarketDataKind, MarketDataPublisher, MarketDataReplica};
 use quotick::matching::{
     Command, CommandOutcome, EventKind, ExpirySweep, NewOrder, OrderBook, OrderDisplay, OrderType,
-    RejectReason, ReplaceOrder, SelfTradePrevention, StopActivation, StopTriggerSweep, TimeInForce,
+    RejectReason, ReplaceOrder, SelfTradePrevention, StopActivation, StopReference,
+    StopReferenceCursor, StopTriggerSweep, TimeInForce,
 };
 use quotick::risk::{
     AccountRiskState, RiskLimitSpec, RiskLimits, RiskManagedOrderBook, RiskProfile,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
-    TimestampNs,
+    StopReferenceSequence, StopReferenceSourceId, StopReferenceSourceVersion, TimestampNs,
 };
 
 static NEXT_WAL: AtomicU64 = AtomicU64::new(1);
+
+fn stop_reference(source_sequence: u64, price: i64) -> StopReference {
+    StopReference::new(
+        StopReferenceCursor::new(
+            StopReferenceSourceId::new(1).unwrap(),
+            StopReferenceSourceVersion::new(1).unwrap(),
+            StopReferenceSequence::new(source_sequence).unwrap(),
+        ),
+        Price::from_raw(price),
+    )
+}
 
 fn definition(hidden_orders_supported: bool) -> InstrumentDefinition {
     InstrumentDefinition::new(InstrumentSpec {
@@ -634,7 +646,7 @@ fn hidden_gtd_and_stop_limit_state_remains_private_through_controls() {
         command_id: CommandId::new(1).unwrap(),
         instrument_id: InstrumentId::new(1).unwrap(),
         instrument_version: InstrumentVersion::new(1).unwrap(),
-        reference_price: Price::from_raw(100),
+        reference: stop_reference(1, 100),
         maximum_orders: 1,
         received_at: TimestampNs::from_unix_nanos(1),
     }))
@@ -665,7 +677,7 @@ fn hidden_gtd_and_stop_limit_state_remains_private_through_controls() {
             command_id: CommandId::new(3).unwrap(),
             instrument_id: InstrumentId::new(1).unwrap(),
             instrument_version: InstrumentVersion::new(1).unwrap(),
-            reference_price: Price::from_raw(110),
+            reference: stop_reference(2, 110),
             maximum_orders: 1,
             received_at: TimestampNs::from_unix_nanos(3),
         }))

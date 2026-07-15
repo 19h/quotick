@@ -14,15 +14,16 @@ use quotick::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
     Command, CommandOutcome, Event, EventKind, ExecutionReport, ExpirySweep, MassCancel,
     MassCancelScope, NewOrder, OrderBook, OrderDisplay, OrderType, RejectReason, ReplaceOrder,
-    SelfTradePrevention, StopActivation, StopTriggerSweep, TimeInForce, Trade, TradingStateControl,
-    TradingStateControlAction,
+    SelfTradePrevention, StopActivation, StopReference, StopReferenceCursor, StopTriggerSweep,
+    TimeInForce, Trade, TradingStateControl, TradingStateControlAction,
 };
 use quotick::risk::{
     AccountRiskDefinition, AccountRiskState, RiskError, RiskLimitSpec, RiskLimits, RiskProfile,
 };
 use quotick::{
     AccountId, AccountingDate, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price,
-    Quantity, Side, TimestampNs, TradeId, TransactionId,
+    Quantity, Side, StopReferenceSequence, StopReferenceSourceId, StopReferenceSourceVersion,
+    TimestampNs, TradeId, TransactionId,
 };
 
 fn id<T>(result: Result<T, quotick::domain::DomainError>) -> T {
@@ -31,6 +32,22 @@ fn id<T>(result: Result<T, quotick::domain::DomainError>) -> T {
 
 fn version() -> InstrumentVersion {
     id(InstrumentVersion::new(1))
+}
+
+fn stop_reference(
+    source_id: u64,
+    source_version: u64,
+    source_sequence: u64,
+    price: i64,
+) -> StopReference {
+    StopReference::new(
+        StopReferenceCursor::new(
+            id(StopReferenceSourceId::new(source_id)),
+            id(StopReferenceSourceVersion::new(source_version)),
+            id(StopReferenceSequence::new(source_sequence)),
+        ),
+        Price::from_raw(price),
+    )
 }
 
 fn definition() -> InstrumentDefinition {
@@ -97,6 +114,53 @@ fn command_codec_has_a_stable_little_endian_layout() {
 }
 
 #[test]
+fn stop_reference_codec_rejects_zero_identities_and_noncanonical_absence() {
+    let command = Command::StopTriggerSweep(StopTriggerSweep {
+        command_id: id(CommandId::new(1)),
+        instrument_id: id(InstrumentId::new(4)),
+        instrument_version: version(),
+        reference: stop_reference(1, 1, 1, 10),
+        maximum_orders: 1,
+        received_at: TimestampNs::from_unix_nanos(1),
+    });
+    let mut zero_source = command.encode().unwrap();
+    zero_source[25..33].copy_from_slice(&0_u64.to_le_bytes());
+    assert_eq!(
+        Command::decode(&zero_source),
+        Err(CodecError::InvalidDomain(
+            quotick::domain::DomainError::ZeroIdentifier("stop-reference source identifier")
+        ))
+    );
+
+    let command_id = id(CommandId::new(2));
+    let report = ExecutionReport {
+        command_id,
+        outcome: CommandOutcome::Accepted,
+        events: vec![Event {
+            sequence: 1,
+            command_id,
+            occurred_at: TimestampNs::from_unix_nanos(2),
+            kind: EventKind::StopTriggerSweepCompleted {
+                previous_reference: None,
+                current_reference: stop_reference(1, 1, 1, 10),
+                triggered_order_count: 0,
+                remaining_eligible_order_count: 0,
+            },
+        }]
+        .into(),
+        replayed: false,
+    };
+    let mut noncanonical_absence = report.encode().unwrap();
+    noncanonical_absence[40] = 1;
+    assert_eq!(
+        ExecutionReport::decode(&noncanonical_absence),
+        Err(CodecError::InvalidValue(
+            "absent stop reference must have zero-valued fields"
+        ))
+    );
+}
+
+#[test]
 fn hidden_order_display_has_a_stable_command_tag() {
     let mut value = command(1, 2, Side::Buy);
     let Command::New(order) = &mut value else {
@@ -154,7 +218,7 @@ fn stop_command_codecs_have_stable_little_endian_layouts() {
         command_id: id(CommandId::new(10)),
         instrument_id: id(InstrumentId::new(4)),
         instrument_version: version(),
-        reference_price: Price::from_raw(-11),
+        reference: stop_reference(5, 6, 7, -11),
         maximum_orders: 12,
         received_at: TimestampNs::from_unix_nanos(13),
     });
@@ -162,6 +226,9 @@ fn stop_command_codecs_have_stable_little_endian_layouts() {
     expected.extend_from_slice(&10_u64.to_le_bytes());
     expected.extend_from_slice(&4_u64.to_le_bytes());
     expected.extend_from_slice(&1_u64.to_le_bytes());
+    expected.extend_from_slice(&5_u64.to_le_bytes());
+    expected.extend_from_slice(&6_u64.to_le_bytes());
+    expected.extend_from_slice(&7_u64.to_le_bytes());
     expected.extend_from_slice(&(-11_i64).to_le_bytes());
     expected.extend_from_slice(&12_u32.to_le_bytes());
     expected.extend_from_slice(&13_u64.to_le_bytes());
@@ -738,7 +805,7 @@ fn every_command_variant_round_trips() {
             command_id: id(CommandId::new(8)),
             instrument_id: id(InstrumentId::new(4)),
             instrument_version: version(),
-            reference_price: Price::from_raw(-10),
+            reference: stop_reference(1, 1, 1, -10),
             maximum_orders: 11,
             received_at: TimestampNs::from_unix_nanos(12),
         }),
@@ -945,6 +1012,10 @@ fn every_rejection_reason_has_a_stable_round_trip() {
         RejectReason::HiddenOrderCannotBeImmediate,
         RejectReason::InvalidMinimumQuantity,
         RejectReason::UnsupportedMinimumQuantitySelfTradePolicy,
+        RejectReason::StopReferenceCursorCollision,
+        RejectReason::StopReferenceSourceMismatch,
+        RejectReason::StopReferenceVersionDiscontinuity,
+        RejectReason::StopReferenceSequenceDiscontinuity,
     ];
     for (index, reason) in reasons.into_iter().enumerate() {
         let command_id = id(CommandId::new(
@@ -1071,12 +1142,12 @@ fn every_event_variant_round_trips() {
         EventKind::StopOrderTriggered {
             order_id,
             trigger_price: Price::from_raw(19),
-            reference_price: Price::from_raw(22),
+            reference: stop_reference(1, 1, 2, 22),
             priority_sequence: 21,
         },
         EventKind::StopTriggerSweepCompleted {
-            previous_reference_price: Some(Price::from_raw(18)),
-            current_reference_price: Price::from_raw(22),
+            previous_reference: Some(stop_reference(1, 1, 1, 18)),
+            current_reference: stop_reference(1, 1, 2, 22),
             triggered_order_count: 1,
             remaining_eligible_order_count: 0,
         },

@@ -18,7 +18,7 @@ use quotick::journal::{Durability, JournalOptions};
 use quotick::ledger::{Ledger, LedgerLimitsSpec};
 use quotick::matching::{
     Command, EventKind, NewOrder, OrderBookLimits, OrderBookLimitsSpec, OrderDisplay, OrderType,
-    SelfTradePrevention, TimeInForce, Trade,
+    SelfTradePrevention, StopReference, StopReferenceCursor, TimeInForce, Trade,
 };
 use quotick::risk::{
     AccountRiskDefinition, AccountRiskState, RiskLimitSpec, RiskLimits, RiskManagedLimits,
@@ -26,7 +26,7 @@ use quotick::risk::{
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
-    TimestampNs,
+    StopReferenceSequence, StopReferenceSourceId, StopReferenceSourceVersion, TimestampNs,
 };
 
 pub const INSTRUMENT: u64 = 7001;
@@ -51,6 +51,19 @@ pub fn version(value: u64) -> InstrumentVersion {
 
 pub fn timestamp(value: u64) -> TimestampNs {
     TimestampNs::from_unix_nanos(value)
+}
+
+pub fn stop_reference(source_sequence: u64, price: i64) -> StopReference {
+    StopReference::new(
+        StopReferenceCursor::new(
+            StopReferenceSourceId::new(1).expect("example stop-reference source is non-zero"),
+            StopReferenceSourceVersion::new(1)
+                .expect("example stop-reference source version is non-zero"),
+            StopReferenceSequence::new(source_sequence)
+                .expect("example stop-reference sequence is non-zero"),
+        ),
+        Price::from_raw(price),
+    )
 }
 
 pub fn definition(symbol: &str) -> InstrumentDefinition {

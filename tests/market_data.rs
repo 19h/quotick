@@ -14,11 +14,12 @@ use quotick::market_data::{
 use quotick::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
     Command, EventKind, ExecutionReport, ExpirySweep, NewOrder, OrderBook, OrderType, ReplaceOrder,
-    SelfTradePrevention, StopActivation, StopTriggerSweep, TimeInForce,
+    SelfTradePrevention, StopActivation, StopReference, StopReferenceCursor, StopTriggerSweep,
+    TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
-    TimestampNs,
+    StopReferenceSequence, StopReferenceSourceId, StopReferenceSourceVersion, TimestampNs,
 };
 
 static NEXT_WAL: AtomicU64 = AtomicU64::new(1);
@@ -167,12 +168,24 @@ fn stop_order(
     Command::New(value)
 }
 
-fn stop_trigger(command_id: u64, reference_price: i64, maximum_orders: u32) -> Command {
+fn stop_trigger(
+    command_id: u64,
+    source_sequence: u64,
+    reference_price: i64,
+    maximum_orders: u32,
+) -> Command {
     Command::StopTriggerSweep(StopTriggerSweep {
         command_id: CommandId::new(command_id).unwrap(),
         instrument_id: instrument(),
         instrument_version: version(),
-        reference_price: Price::from_raw(reference_price),
+        reference: StopReference::new(
+            StopReferenceCursor::new(
+                StopReferenceSourceId::new(1).unwrap(),
+                StopReferenceSourceVersion::new(1).unwrap(),
+                StopReferenceSequence::new(source_sequence).unwrap(),
+            ),
+            Price::from_raw(reference_price),
+        ),
         maximum_orders,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
@@ -278,7 +291,7 @@ fn dormant_stop_publication_is_depth_neutral_and_triggered_trades_are_mirrored()
     replica.apply_snapshot(&publisher.snapshot()).unwrap();
 
     for command in [
-        stop_trigger(1, 100, 1),
+        stop_trigger(1, 1, 100, 1),
         order(
             2,
             1,
@@ -319,7 +332,7 @@ fn dormant_stop_publication_is_depth_neutral_and_triggered_trades_are_mirrored()
         .validate_against(&book)
         .unwrap();
 
-    let triggered = publish(&mut book, &mut publisher, stop_trigger(4, 110, 1));
+    let triggered = publish(&mut book, &mut publisher, stop_trigger(4, 2, 110, 1));
     assert!(
         triggered
             .updates()
@@ -335,7 +348,7 @@ fn dormant_stop_publication_is_depth_neutral_and_triggered_trades_are_mirrored()
 #[test]
 fn publisher_rejects_noncanonical_stop_activation_and_handles_triggered_stp() {
     let mut book = OrderBook::new(definition());
-    book.submit(stop_trigger(1, 100, 1)).unwrap();
+    book.submit(stop_trigger(1, 1, 100, 1)).unwrap();
     for command in [
         stop_order(
             2,
@@ -362,7 +375,7 @@ fn publisher_rejects_noncanonical_stop_activation_and_handles_triggered_stp() {
     }
     let pre_trigger = OrderBook::from_checkpoint(&book.checkpoint(1, 7).unwrap()).unwrap();
     let mut rejecting = MarketDataPublisher::from_book(&pre_trigger).unwrap();
-    let sweep = stop_trigger(4, 110, 2);
+    let sweep = stop_trigger(4, 2, 110, 2);
     let report = book.submit(sweep).unwrap();
     let mut corrupted = report.clone();
     let first_trigger = corrupted
@@ -384,7 +397,7 @@ fn publisher_rejects_noncanonical_stop_activation_and_handles_triggered_stp() {
 
     let mut book = OrderBook::new(definition());
     let mut publisher = MarketDataPublisher::from_book(&book).unwrap();
-    publish(&mut book, &mut publisher, stop_trigger(10, 100, 1));
+    publish(&mut book, &mut publisher, stop_trigger(10, 1, 100, 1));
     publish(
         &mut book,
         &mut publisher,
@@ -413,7 +426,7 @@ fn publisher_rejects_noncanonical_stop_activation_and_handles_triggered_stp() {
             SelfTradePrevention::CancelResting,
         ),
     );
-    let batch = publish(&mut book, &mut publisher, stop_trigger(13, 110, 1));
+    let batch = publish(&mut book, &mut publisher, stop_trigger(13, 2, 110, 1));
     assert!(batch.updates().iter().any(|update| matches!(
         update.kind(),
         MarketDataKind::Level(level) if level.price == Price::from_raw(105) && level.quantity == 0

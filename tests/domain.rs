@@ -1,4 +1,7 @@
-use quotick::domain::{AccountId, AuctionId, DomainError, Price, Quantity, Side};
+use quotick::domain::{
+    AccountId, AuctionId, DomainError, Price, Quantity, Side, StopReferenceSequence,
+    StopReferenceSourceId, StopReferenceSourceVersion,
+};
 
 #[test]
 fn identifiers_reserve_zero_and_preserve_nonzero_values() {
@@ -10,6 +13,20 @@ fn identifiers_reserve_zero_and_preserve_nonzero_values() {
     assert_eq!(
         AuctionId::new(0),
         Err(DomainError::ZeroIdentifier("auction identifier"))
+    );
+    assert_eq!(
+        StopReferenceSourceId::new(0),
+        Err(DomainError::ZeroIdentifier(
+            "stop-reference source identifier"
+        ))
+    );
+    assert_eq!(
+        StopReferenceSourceVersion::new(0),
+        Err(DomainError::ZeroIdentifier("stop-reference source version"))
+    );
+    assert_eq!(
+        StopReferenceSequence::new(0),
+        Err(DomainError::ZeroIdentifier("stop-reference sequence"))
     );
 }
 

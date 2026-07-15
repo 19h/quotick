@@ -971,7 +971,7 @@ impl InstrumentDefinition {
             }
             Command::StopTriggerSweep(value) => {
                 self.validate_identity(value.instrument_id, value.instrument_version)?;
-                self.spec.price.validate(value.reference_price)
+                self.spec.price.validate(value.reference.price())
             }
         }
     }

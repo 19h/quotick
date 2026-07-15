@@ -38,6 +38,7 @@ mod trace_arena;
 
 pub use domain::{
     AccountId, AccountingDate, AssetId, AuctionId, CalendarId, CalendarVersion, CommandId,
-    InstrumentId, InstrumentVersion, OrderId, Price, Quantity, ReconciliationId, Side, TimestampNs,
-    TradeId, TradingSessionId, TransactionId,
+    InstrumentId, InstrumentVersion, OrderId, Price, Quantity, ReconciliationId, Side,
+    StopReferenceSequence, StopReferenceSourceId, StopReferenceSourceVersion, TimestampNs, TradeId,
+    TradingSessionId, TransactionId,
 };

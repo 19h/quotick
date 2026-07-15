@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::bounded_hash::{BoundedHashMap, BoundedHashSet};
 use crate::domain::{
     AccountId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
-    TimestampNs, TradeId,
+    StopReferenceSequence, StopReferenceSourceId, StopReferenceSourceVersion, TimestampNs, TradeId,
 };
 use crate::indexed_avl::{IndexedAvlHandle, IndexedAvlMap};
 use crate::instrument::{AdmissionError, InstrumentDefinition, TradingState};
@@ -460,6 +460,75 @@ pub struct ExpirySweep {
     pub received_at: TimestampNs,
 }
 
+/// Stable upstream position of one authoritative stop reference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StopReferenceCursor {
+    id: StopReferenceSourceId,
+    version: StopReferenceSourceVersion,
+    sequence: StopReferenceSequence,
+}
+
+impl StopReferenceCursor {
+    /// Constructs a cursor from its validated source coordinates.
+    #[must_use]
+    pub const fn new(
+        source_id: StopReferenceSourceId,
+        source_version: StopReferenceSourceVersion,
+        source_sequence: StopReferenceSequence,
+    ) -> Self {
+        Self {
+            id: source_id,
+            version: source_version,
+            sequence: source_sequence,
+        }
+    }
+
+    /// Returns the logical authoritative source identity.
+    #[must_use]
+    pub const fn source_id(self) -> StopReferenceSourceId {
+        self.id
+    }
+
+    /// Returns the source generation/version containing the sequence.
+    #[must_use]
+    pub const fn source_version(self) -> StopReferenceSourceVersion {
+        self.version
+    }
+
+    /// Returns the source-assigned sequence within the version.
+    #[must_use]
+    pub const fn source_sequence(self) -> StopReferenceSequence {
+        self.sequence
+    }
+}
+
+/// One authoritative last-trade price and its durable upstream position.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StopReference {
+    cursor: StopReferenceCursor,
+    price: Price,
+}
+
+impl StopReference {
+    /// Binds a validated source cursor to its authoritative price.
+    #[must_use]
+    pub const fn new(cursor: StopReferenceCursor, price: Price) -> Self {
+        Self { cursor, price }
+    }
+
+    /// Returns the source position of this reference.
+    #[must_use]
+    pub const fn cursor(self) -> StopReferenceCursor {
+        self.cursor
+    }
+
+    /// Returns the last-trade price carried at the source position.
+    #[must_use]
+    pub const fn price(self) -> Price {
+        self.price
+    }
+}
+
 /// Advances the deterministic last-trade stop reference and activates a
 /// bounded canonical prefix of newly eligible dormant stops.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -470,8 +539,8 @@ pub struct StopTriggerSweep {
     pub instrument_id: InstrumentId,
     /// Immutable instrument-definition version expected by the controller.
     pub instrument_version: InstrumentVersion,
-    /// New authoritative last-trade reference price.
-    pub reference_price: Price,
+    /// New authoritative last-trade reference and upstream source position.
+    pub reference: StopReference,
     /// Maximum dormant orders this command may activate.
     pub maximum_orders: u32,
     /// Gateway/controller receive time.
@@ -680,6 +749,14 @@ pub enum RejectReason {
     StopTriggerBatchExceedsActiveOrderCapacity,
     /// Eligible stops at the current reference must be drained before it moves.
     StopTriggerBacklog,
+    /// A cursor reused for different reference content is contradictory.
+    StopReferenceCursorCollision,
+    /// The logical reference source changed within one instrument shard.
+    StopReferenceSourceMismatch,
+    /// The source version was neither current nor its immediate successor.
+    StopReferenceVersionDiscontinuity,
+    /// The source sequence was not the exact next position for its version.
+    StopReferenceSequenceDiscontinuity,
     /// A dormant stop-market order cannot use post-only behavior.
     StopMarketCannotPost,
     /// The replacement schema cannot amend a dormant stop-market constraint.
@@ -873,17 +950,17 @@ pub enum EventKind {
         order_id: OrderId,
         /// Original trigger threshold.
         trigger_price: Price,
-        /// Reference price that satisfied the trigger.
-        reference_price: Price,
+        /// Reference and source position that satisfied the trigger.
+        reference: StopReference,
         /// Retained same-price trigger priority.
         priority_sequence: u64,
     },
     /// A bounded stop-reference advance completed atomically.
     StopTriggerSweepCompleted {
         /// Previously committed reference, absent before initialization.
-        previous_reference_price: Option<Price>,
+        previous_reference: Option<StopReference>,
         /// Newly committed authoritative reference.
-        current_reference_price: Price,
+        current_reference: StopReference,
         /// Number of stops activated by this command.
         triggered_order_count: u64,
         /// Eligible stops retained for a same-reference continuation.
@@ -1797,7 +1874,7 @@ struct OrderBookCheckpointLineage {
     account_controls: BoundedHashMap<AccountId, AccountControlSnapshot>,
     trading_state: TradingStateSnapshot,
     expiry_watermark: Option<TimestampNs>,
-    stop_reference_price: Option<Price>,
+    stop_reference: Option<StopReference>,
     retained_event_count: usize,
     next_sequence: u64,
     next_trade_id: u64,
@@ -1962,7 +2039,7 @@ impl OrderBookCheckpoint {
         let mut trading_state =
             TradingStateSnapshot::from_parts(self.definition.trading_state(), 0);
         let mut expiry_watermark = None;
-        let mut stop_reference_price = None;
+        let mut stop_reference: Option<StopReference> = None;
         let mut retained_event_count = 0_usize;
         let mut expected_event_sequence = 1_u64;
         let mut expected_trade_id = 1_u64;
@@ -2026,14 +2103,14 @@ impl OrderBookCheckpoint {
                     ));
                 }
                 if let Some((trigger_price, activation)) = order.order_type.stop() {
-                    let reference = stop_reference_price.ok_or_else(|| {
+                    let reference = stop_reference.ok_or_else(|| {
                         OrderBookCheckpointError::new(
                             "checkpoint accepts a stop before reference initialization",
                         )
                     })?;
                     let trigger_is_satisfied = match order.side {
-                        Side::Buy => reference >= trigger_price,
-                        Side::Sell => reference <= trigger_price,
+                        Side::Buy => reference.price() >= trigger_price,
+                        Side::Sell => reference.price() <= trigger_price,
                     };
                     let (Some(accepted), Some(armed)) =
                         (entry.report.events.get(0), entry.report.events.get(1))
@@ -2378,16 +2455,24 @@ impl OrderBookCheckpoint {
                         "checkpoint accepts an empty stop-trigger batch",
                     ));
                 }
-                if let Some(current) = stop_reference_price
-                    && current != sweep.reference_price
-                    && eligible_checkpoint_stop_count(&dormant_lineage, current)? != 0
-                {
-                    return Err(OrderBookCheckpointError::new(
-                        "checkpoint advances a stop reference with an eligible backlog",
-                    ));
-                }
+                let current_has_backlog = match stop_reference {
+                    Some(current) => {
+                        eligible_checkpoint_stop_count(&dormant_lineage, current.price())? != 0
+                    }
+                    None => false,
+                };
+                validate_stop_reference_transition(
+                    stop_reference,
+                    current_has_backlog,
+                    sweep.reference,
+                )
+                .map_err(|reason| {
+                    OrderBookCheckpointError::new(format!(
+                        "checkpoint stop-reference transition is invalid: {reason:?}"
+                    ))
+                })?;
                 let initial_eligible =
-                    eligible_checkpoint_stop_count(&dormant_lineage, sweep.reference_price)?;
+                    eligible_checkpoint_stop_count(&dormant_lineage, sweep.reference.price())?;
                 let mut triggered = 0_u64;
                 for event in entry
                     .report
@@ -2398,14 +2483,14 @@ impl OrderBookCheckpoint {
                     let EventKind::StopOrderTriggered {
                         order_id,
                         trigger_price,
-                        reference_price,
+                        reference,
                         priority_sequence,
                     } = event.kind
                     else {
                         continue;
                     };
                     let expected =
-                        first_eligible_checkpoint_stop(&dormant_lineage, sweep.reference_price)?
+                        first_eligible_checkpoint_stop(&dormant_lineage, sweep.reference.price())?
                             .ok_or_else(|| {
                                 OrderBookCheckpointError::new(
                                     "checkpoint triggers an absent or ineligible stop",
@@ -2414,7 +2499,7 @@ impl OrderBookCheckpoint {
                     if expected.order_id != order_id
                         || expected.trigger_price != trigger_price
                         || expected.priority_sequence != priority_sequence
-                        || reference_price != sweep.reference_price
+                        || reference != sweep.reference
                     {
                         return Err(OrderBookCheckpointError::new(
                             "checkpoint stop activation order is not canonical",
@@ -2426,17 +2511,17 @@ impl OrderBookCheckpoint {
                     })?;
                 }
                 let remaining =
-                    eligible_checkpoint_stop_count(&dormant_lineage, sweep.reference_price)?;
+                    eligible_checkpoint_stop_count(&dormant_lineage, sweep.reference.price())?;
                 if triggered != initial_eligible.min(u64::from(sweep.maximum_orders))
                     || !matches!(
                         entry.report.events.last().map(|event| event.kind),
                         Some(EventKind::StopTriggerSweepCompleted {
-                            previous_reference_price,
-                            current_reference_price,
+                            previous_reference,
+                            current_reference,
                             triggered_order_count,
                             remaining_eligible_order_count,
-                        }) if previous_reference_price == stop_reference_price
-                            && current_reference_price == sweep.reference_price
+                        }) if previous_reference == stop_reference
+                            && current_reference == sweep.reference
                             && triggered_order_count == triggered
                             && remaining_eligible_order_count == remaining
                     )
@@ -2445,7 +2530,7 @@ impl OrderBookCheckpoint {
                         "checkpoint stop-reference lineage is invalid",
                     ));
                 }
-                stop_reference_price = Some(sweep.reference_price);
+                stop_reference = Some(sweep.reference);
             }
             for event in &entry.report.events {
                 let EventKind::OrderCancelled {
@@ -2559,7 +2644,7 @@ impl OrderBookCheckpoint {
                 "checkpoint omits dormant-stop state reconstructed from history",
             ));
         }
-        if !self.dormant_stops.is_empty() && stop_reference_price.is_none() {
+        if !self.dormant_stops.is_empty() && stop_reference.is_none() {
             return Err(OrderBookCheckpointError::new(
                 "checkpoint retains dormant stops without a reference price",
             ));
@@ -2569,7 +2654,7 @@ impl OrderBookCheckpoint {
             account_controls,
             trading_state,
             expiry_watermark,
-            stop_reference_price,
+            stop_reference,
             retained_event_count,
             next_sequence: expected_event_sequence,
             next_trade_id: expected_trade_id,
@@ -3122,6 +3207,48 @@ fn dormant_checkpoint_sort_key(order: DormantStopCheckpoint) -> (u8, i128, u64, 
         order.priority_sequence,
         order.order_id,
     )
+}
+
+fn validate_stop_reference_transition(
+    current: Option<StopReference>,
+    current_has_backlog: bool,
+    next: StopReference,
+) -> Result<(), RejectReason> {
+    let Some(current) = current else {
+        return Ok(());
+    };
+    if next.cursor() == current.cursor() {
+        if next.price() != current.price() {
+            return Err(RejectReason::StopReferenceCursorCollision);
+        }
+        return if current_has_backlog {
+            Ok(())
+        } else {
+            Err(RejectReason::StopReferenceSequenceDiscontinuity)
+        };
+    }
+    if current_has_backlog {
+        return Err(RejectReason::StopTriggerBacklog);
+    }
+    if next.cursor().source_id() != current.cursor().source_id() {
+        return Err(RejectReason::StopReferenceSourceMismatch);
+    }
+    if next.cursor().source_version() == current.cursor().source_version() {
+        let expected = current.cursor().source_sequence().get().checked_add(1);
+        return if expected == Some(next.cursor().source_sequence().get()) {
+            Ok(())
+        } else {
+            Err(RejectReason::StopReferenceSequenceDiscontinuity)
+        };
+    }
+    let expected_version = current.cursor().source_version().get().checked_add(1);
+    if expected_version != Some(next.cursor().source_version().get()) {
+        return Err(RejectReason::StopReferenceVersionDiscontinuity);
+    }
+    if next.cursor().source_sequence().get() != 1 {
+        return Err(RejectReason::StopReferenceSequenceDiscontinuity);
+    }
+    Ok(())
 }
 
 fn first_eligible_checkpoint_stop(
@@ -4470,7 +4597,7 @@ pub struct OrderBook {
     expiry_watermark: Option<TimestampNs>,
     buy_stops: IndexedAvlMap<BuyStopKey, OrderId>,
     sell_stops: IndexedAvlMap<SellStopKey, OrderId>,
-    stop_reference_price: Option<Price>,
+    stop_reference: Option<StopReference>,
     account_orders: BoundedHashMap<AccountId, AccountOrderIndex>,
     seen_order_ids: BoundedHashSet<OrderId>,
     account_controls: BoundedHashMap<AccountId, AccountControlSnapshot>,
@@ -4494,7 +4621,7 @@ impl PartialEq for OrderBook {
             && self.expiry_watermark == other.expiry_watermark
             && self.buy_stops == other.buy_stops
             && self.sell_stops == other.sell_stops
-            && self.stop_reference_price == other.stop_reference_price
+            && self.stop_reference == other.stop_reference
             && self.account_orders == other.account_orders
             && self.seen_order_ids == other.seen_order_ids
             && self.account_controls == other.account_controls
@@ -4538,7 +4665,7 @@ impl Clone for OrderBook {
             expiry_watermark: self.expiry_watermark,
             buy_stops: self.buy_stops.clone(),
             sell_stops: self.sell_stops.clone(),
-            stop_reference_price: self.stop_reference_price,
+            stop_reference: self.stop_reference,
             account_orders: self.account_orders.clone(),
             seen_order_ids: self.seen_order_ids.clone(),
             account_controls: self.account_controls.clone(),
@@ -4645,7 +4772,7 @@ impl OrderBook {
             expiry_watermark: None,
             buy_stops,
             sell_stops,
-            stop_reference_price: None,
+            stop_reference: None,
             account_orders,
             seen_order_ids,
             account_controls,
@@ -4818,7 +4945,7 @@ impl OrderBook {
                 "live expiry watermark differs from command history",
             ));
         }
-        if lineage.stop_reference_price != self.stop_reference_price {
+        if lineage.stop_reference != self.stop_reference {
             return Err(OrderBookCheckpointError::new(
                 "live stop reference differs from command history",
             ));
@@ -4917,7 +5044,7 @@ impl OrderBook {
             if let (Command::StopTriggerSweep(sweep), CommandOutcome::Accepted) =
                 (entry.command, entry.report.outcome)
             {
-                book.stop_reference_price = Some(sweep.reference_price);
+                book.stop_reference = Some(sweep.reference);
             }
             for event in &entry.report.events {
                 book.next_sequence = event.sequence.checked_add(1).ok_or_else(|| {
@@ -5034,8 +5161,8 @@ impl OrderBook {
 
     /// Returns the committed authoritative last-trade stop reference, if initialized.
     #[must_use]
-    pub const fn stop_reference_price(&self) -> Option<Price> {
-        self.stop_reference_price
+    pub const fn stop_reference(&self) -> Option<StopReference> {
+        self.stop_reference
     }
 
     /// Applies a command exactly once and returns its complete trace.
@@ -5107,11 +5234,11 @@ impl OrderBook {
                 }
                 if let Some((trigger_price, activation)) = command.order_type.stop() {
                     let reference = self
-                        .stop_reference_price
+                        .stop_reference
                         .ok_or(RejectReason::StopReferenceUnavailable)?;
                     let satisfied = match command.side {
-                        Side::Buy => reference >= trigger_price,
-                        Side::Sell => reference <= trigger_price,
+                        Side::Buy => reference.price() >= trigger_price,
+                        Side::Sell => reference.price() <= trigger_price,
                     };
                     if satisfied {
                         return Err(RejectReason::StopAlreadyTriggered);
@@ -5275,13 +5402,16 @@ impl OrderBook {
                 {
                     return Err(RejectReason::StopTriggerBatchExceedsActiveOrderCapacity);
                 }
-                if self.stop_reference_price.is_some_and(|current| {
-                    current != command.reference_price && self.eligible_stop_count(current) != 0
-                }) {
-                    return Err(RejectReason::StopTriggerBacklog);
-                }
+                let current_has_backlog = self
+                    .stop_reference
+                    .is_some_and(|current| self.eligible_stop_count(current.price()) != 0);
+                validate_stop_reference_transition(
+                    self.stop_reference,
+                    current_has_backlog,
+                    command.reference,
+                )?;
                 if self.trading_state.state != TradingState::Open
-                    && self.eligible_stop_count(command.reference_price) != 0
+                    && self.eligible_stop_count(command.reference.price()) != 0
                 {
                     return Err(RejectReason::InstrumentNotOpen);
                 }
@@ -5387,7 +5517,7 @@ impl OrderBook {
             }
             (None, Command::StopTriggerSweep(command)) => Some(
                 self.acquire_order_selection(
-                    self.eligible_stop_count(command.reference_price).min(
+                    self.eligible_stop_count(command.reference.price()).min(
                         usize::try_from(command.maximum_orders)
                             .map_err(|_| MatchingError::InternalInvariantViolation)?,
                     ),
@@ -5576,13 +5706,13 @@ impl OrderBook {
         &self,
         command: StopTriggerSweep,
     ) -> Result<(usize, u64), MatchingError> {
-        let limit = self.eligible_stop_count(command.reference_price).min(
+        let limit = self.eligible_stop_count(command.reference.price()).min(
             usize::try_from(command.maximum_orders)
                 .map_err(|_| MatchingError::InternalInvariantViolation)?,
         );
         let mut events = 1_u128;
         let mut trades = 0_u64;
-        self.for_each_eligible_stop(command.reference_price, limit, |order_id| {
+        self.for_each_eligible_stop(command.reference.price(), limit, |order_id| {
             let order = self
                 .orders
                 .get(&order_id)
@@ -6607,21 +6737,21 @@ impl OrderBook {
                 "dormant stop cardinality differs from trigger-index coverage",
             ));
         }
-        if indexed != 0 && self.stop_reference_price.is_none() {
+        if indexed != 0 && self.stop_reference.is_none() {
             return Err(InvariantViolation::new(
                 "dormant stops exist before stop-reference initialization",
             ));
         }
-        let eligible_buys = self.stop_reference_price.map_or(0, |reference| {
+        let eligible_buys = self.stop_reference.map_or(0, |reference| {
             self.buy_stops
                 .iter()
-                .take_while(|(key, _)| key.trigger_price <= reference)
+                .take_while(|(key, _)| key.trigger_price <= reference.price())
                 .count()
         });
-        let eligible_sells = self.stop_reference_price.map_or(0, |reference| {
+        let eligible_sells = self.stop_reference.map_or(0, |reference| {
             self.sell_stops
                 .iter()
-                .take_while(|(key, _)| key.trigger_price.0 >= reference)
+                .take_while(|(key, _)| key.trigger_price.0 >= reference.price())
                 .count()
         });
         if eligible_buys != 0 && eligible_sells != 0 {
@@ -7456,8 +7586,9 @@ impl OrderBook {
         mut events: EventTraceBuilder,
         mut selected: PooledOrderSelection,
     ) -> Result<ExecutionReport, MatchingError> {
-        let previous_reference_price = self.stop_reference_price;
-        let selected_count = self.eligible_stop_count(command.reference_price).min(
+        let previous_reference = self.stop_reference;
+        let reference_price = command.reference.price();
+        let selected_count = self.eligible_stop_count(reference_price).min(
             usize::try_from(command.maximum_orders)
                 .map_err(|_| MatchingError::InternalInvariantViolation)?,
         );
@@ -7466,7 +7597,7 @@ impl OrderBook {
         }
         let selected_values = selected.values_mut();
         let selected_buffer = selected_values.as_ptr();
-        self.for_each_eligible_stop(command.reference_price, selected_count, |order_id| {
+        self.for_each_eligible_stop(reference_price, selected_count, |order_id| {
             selected_values.push(order_id);
             Ok::<(), MatchingError>(())
         })?;
@@ -7485,7 +7616,7 @@ impl OrderBook {
                 EventKind::StopOrderTriggered {
                     order_id,
                     trigger_price: stop.trigger_price,
-                    reference_price: command.reference_price,
+                    reference: command.reference,
                     priority_sequence: stop.priority_sequence,
                 },
             )?;
@@ -7568,15 +7699,15 @@ impl OrderBook {
             )?;
         }
 
-        self.stop_reference_price = Some(command.reference_price);
-        let remaining = self.eligible_stop_count(command.reference_price);
+        self.stop_reference = Some(command.reference);
+        let remaining = self.eligible_stop_count(reference_price);
         self.push_event(
             &mut events,
             command.command_id,
             command.received_at,
             EventKind::StopTriggerSweepCompleted {
-                previous_reference_price,
-                current_reference_price: command.reference_price,
+                previous_reference,
+                current_reference: command.reference,
                 triggered_order_count: u64::try_from(selected_count)
                     .map_err(|_| MatchingError::SequenceExhausted)?,
                 remaining_eligible_order_count: u64::try_from(remaining)

@@ -122,7 +122,10 @@ activation can add its ordinary crossed-order inspection. Counting retained
 eligible backlog is
 `O(R + 1)` for `R` stops remaining at the committed reference. A sweep with no
 eligible stop is `O(1)` and still records the reference; a partial sweep
-requires same-reference continuation before advancement.
+requires exact-reference continuation before cursor advancement. Source-ID,
+source-version, and source-sequence transition validation is `O(1)` time and
+space. Each command/event reference occupies 32 B in retained history; live
+book and publisher state retain one optional reference independent of `O`.
 
 Active matching state uses `O(O + P + C + T)` memory for `O` resting or
 dormant orders, `C` retained idempotency reports, and `T` never-evicted

@@ -17,8 +17,9 @@ use crate::auction_risk::{CallAuctionRiskCheckpoint, CallAuctionRiskCheckpointEr
 use crate::calendar::{TradingCalendar, TradingCalendarError, TradingSession};
 use crate::domain::{
     AccountId, AccountingDate, AssetId, CalendarId, CalendarVersion, CommandId, DomainError,
-    InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side, TimestampNs, TradeId,
-    TradingSessionId, TransactionId,
+    InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side, StopReferenceSequence,
+    StopReferenceSourceId, StopReferenceSourceVersion, TimestampNs, TradeId, TradingSessionId,
+    TransactionId,
 };
 use crate::instrument::{
     InstrumentDefinition, InstrumentError, InstrumentKind, InstrumentSpec, InstrumentSymbol,
@@ -37,8 +38,9 @@ use crate::matching::{
     Command, CommandOutcome, CommandReportCheckpoint, DormantStopCheckpoint, Event, EventKind,
     ExecutionReport, ExpirySweep, MassCancel, MassCancelScope, NewOrder, OrderBookCheckpoint,
     OrderBookCheckpointError, OrderDisplay, OrderType, RejectReason, ReplaceOrder,
-    RestingOrderCheckpoint, SelfTradePrevention, StopActivation, StopTriggerSweep, TimeInForce,
-    Trade, TradingStateControl, TradingStateControlAction, TradingStateSnapshot,
+    RestingOrderCheckpoint, SelfTradePrevention, StopActivation, StopReference,
+    StopReferenceCursor, StopTriggerSweep, TimeInForce, Trade, TradingStateControl,
+    TradingStateControlAction, TradingStateSnapshot,
 };
 use crate::risk::{
     AccountRiskDefinition, AccountRiskState, RiskAccountCheckpoint, RiskError, RiskLimitSpec,
@@ -915,6 +917,10 @@ fn encode_reject_reason(encoder: &mut Encoder, value: RejectReason) {
         RejectReason::HiddenOrderCannotBeImmediate => 49,
         RejectReason::InvalidMinimumQuantity => 50,
         RejectReason::UnsupportedMinimumQuantitySelfTradePolicy => 51,
+        RejectReason::StopReferenceCursorCollision => 52,
+        RejectReason::StopReferenceSourceMismatch => 53,
+        RejectReason::StopReferenceVersionDiscontinuity => 54,
+        RejectReason::StopReferenceSequenceDiscontinuity => 55,
     });
 }
 
@@ -972,6 +978,10 @@ fn decode_reject_reason(decoder: &mut Decoder<'_>) -> Result<RejectReason, Codec
         49 => Ok(RejectReason::HiddenOrderCannotBeImmediate),
         50 => Ok(RejectReason::InvalidMinimumQuantity),
         51 => Ok(RejectReason::UnsupportedMinimumQuantitySelfTradePolicy),
+        52 => Ok(RejectReason::StopReferenceCursorCollision),
+        53 => Ok(RejectReason::StopReferenceSourceMismatch),
+        54 => Ok(RejectReason::StopReferenceVersionDiscontinuity),
+        55 => Ok(RejectReason::StopReferenceSequenceDiscontinuity),
         tag => Err(CodecError::InvalidTag {
             type_name: "RejectReason",
             tag,
@@ -1053,6 +1063,62 @@ fn transaction(decoder: &mut Decoder<'_>) -> Result<TransactionId, CodecError> {
     Ok(TransactionId::new(decoder.u64()?)?)
 }
 
+fn encode_stop_reference(encoder: &mut Encoder, value: StopReference) {
+    encoder.u64(value.cursor().source_id().get());
+    encoder.u64(value.cursor().source_version().get());
+    encoder.u64(value.cursor().source_sequence().get());
+    encoder.i64(value.price().raw());
+}
+
+fn decode_stop_reference(decoder: &mut Decoder<'_>) -> Result<StopReference, CodecError> {
+    Ok(StopReference::new(
+        StopReferenceCursor::new(
+            StopReferenceSourceId::new(decoder.u64()?)?,
+            StopReferenceSourceVersion::new(decoder.u64()?)?,
+            StopReferenceSequence::new(decoder.u64()?)?,
+        ),
+        Price::from_raw(decoder.i64()?),
+    ))
+}
+
+fn encode_optional_stop_reference(encoder: &mut Encoder, value: Option<StopReference>) {
+    encoder.bool(value.is_some());
+    if let Some(reference) = value {
+        encode_stop_reference(encoder, reference);
+    } else {
+        encoder.u64(0);
+        encoder.u64(0);
+        encoder.u64(0);
+        encoder.i64(0);
+    }
+}
+
+fn decode_optional_stop_reference(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<StopReference>, CodecError> {
+    let present = decoder.bool()?;
+    let source_id = decoder.u64()?;
+    let source_version = decoder.u64()?;
+    let source_sequence = decoder.u64()?;
+    let price = decoder.i64()?;
+    if !present {
+        if source_id != 0 || source_version != 0 || source_sequence != 0 || price != 0 {
+            return Err(CodecError::InvalidValue(
+                "absent stop reference must have zero-valued fields",
+            ));
+        }
+        return Ok(None);
+    }
+    Ok(Some(StopReference::new(
+        StopReferenceCursor::new(
+            StopReferenceSourceId::new(source_id)?,
+            StopReferenceSourceVersion::new(source_version)?,
+            StopReferenceSequence::new(source_sequence)?,
+        ),
+        Price::from_raw(price),
+    )))
+}
+
 fn encode_optional_timestamp(encoder: &mut Encoder, value: Option<TimestampNs>) {
     encoder.bool(value.is_some());
     encoder.u64(value.map_or(0, TimestampNs::as_unix_nanos));
@@ -1068,23 +1134,6 @@ fn decode_optional_timestamp(
         return Err(CodecError::InvalidValue(field));
     }
     Ok(present.then(|| TimestampNs::from_unix_nanos(value)))
-}
-
-fn encode_optional_price(encoder: &mut Encoder, value: Option<Price>) {
-    encoder.bool(value.is_some());
-    encoder.i64(value.map_or(0, Price::raw));
-}
-
-fn decode_optional_price(
-    decoder: &mut Decoder<'_>,
-    field: &'static str,
-) -> Result<Option<Price>, CodecError> {
-    let present = decoder.bool()?;
-    let value = decoder.i64()?;
-    if !present && value != 0 {
-        return Err(CodecError::InvalidValue(field));
-    }
-    Ok(present.then(|| Price::from_raw(value)))
 }
 
 fn encode_command(encoder: &mut Encoder, command: Command) {
@@ -1167,7 +1216,7 @@ fn encode_command(encoder: &mut Encoder, command: Command) {
             encoder.u64(value.command_id.get());
             encoder.u64(value.instrument_id.get());
             encoder.u64(value.instrument_version.get());
-            encoder.i64(value.reference_price.raw());
+            encode_stop_reference(encoder, value.reference);
             encoder.u32(value.maximum_orders);
             encoder.u64(value.received_at.as_unix_nanos());
         }
@@ -1246,7 +1295,7 @@ fn decode_command(decoder: &mut Decoder<'_>) -> Result<Command, CodecError> {
             command_id: command_id(decoder)?,
             instrument_id: instrument(decoder)?,
             instrument_version: instrument_version(decoder)?,
-            reference_price: Price::from_raw(decoder.i64()?),
+            reference: decode_stop_reference(decoder)?,
             maximum_orders: decoder.u32()?,
             received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
         })),
@@ -1688,24 +1737,24 @@ fn encode_event_kind(encoder: &mut Encoder, kind: EventKind) {
         EventKind::StopOrderTriggered {
             order_id,
             trigger_price,
-            reference_price,
+            reference,
             priority_sequence,
         } => {
             encoder.u8(13);
             encoder.u64(order_id.get());
             encoder.i64(trigger_price.raw());
-            encoder.i64(reference_price.raw());
+            encode_stop_reference(encoder, reference);
             encoder.u64(priority_sequence);
         }
         EventKind::StopTriggerSweepCompleted {
-            previous_reference_price,
-            current_reference_price,
+            previous_reference,
+            current_reference,
             triggered_order_count,
             remaining_eligible_order_count,
         } => {
             encoder.u8(14);
-            encode_optional_price(encoder, previous_reference_price);
-            encoder.i64(current_reference_price.raw());
+            encode_optional_stop_reference(encoder, previous_reference);
+            encode_stop_reference(encoder, current_reference);
             encoder.u64(triggered_order_count);
             encoder.u64(remaining_eligible_order_count);
         }
@@ -1793,15 +1842,12 @@ fn decode_event_kind(decoder: &mut Decoder<'_>) -> Result<EventKind, CodecError>
         13 => Ok(EventKind::StopOrderTriggered {
             order_id: order(decoder)?,
             trigger_price: Price::from_raw(decoder.i64()?),
-            reference_price: Price::from_raw(decoder.i64()?),
+            reference: decode_stop_reference(decoder)?,
             priority_sequence: decoder.u64()?,
         }),
         14 => Ok(EventKind::StopTriggerSweepCompleted {
-            previous_reference_price: decode_optional_price(
-                decoder,
-                "absent stop reference must have a zero value",
-            )?,
-            current_reference_price: Price::from_raw(decoder.i64()?),
+            previous_reference: decode_optional_stop_reference(decoder)?,
+            current_reference: decode_stop_reference(decoder)?,
             triggered_order_count: decoder.u64()?,
             remaining_eligible_order_count: decoder.u64()?,
         }),

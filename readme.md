@@ -192,7 +192,7 @@ printing a summary.
 | --- | --- |
 | [`venue_session`](examples/venue_session.rs) | Calendar-relative admission through pre-trade risk, matching, level-2 publication, DVP settlement, and expiry |
 | [`versioned_universe`](examples/versioned_universe.rs) | Effective-time instrument selection and version-bound shard routing |
-| [`order_lifecycle`](examples/order_lifecycle.rs) | Reserve priority, hidden liquidity, stop activation, GTD expiry, account fences, and instrument controls |
+| [`order_lifecycle`](examples/order_lifecycle.rs) | Reserve priority, hidden liquidity, sourced stop activation, GTD expiry, account fences, and instrument controls |
 | [`indicative_cross`](examples/indicative_cross.rs) | Risk-managed call-auction collection, public depth, deterministic uncross, and retained remainders |
 | [`auction_restart`](examples/auction_restart.rs) | Durable auction checkpoint cutover, phase-transition suffix replay, and exact retry |
 | [`signed_price_discovery`](examples/signed_price_discovery.rs) | Banded negative-price discovery, pressure policy, and exact order allocation |
@@ -254,8 +254,11 @@ Run any program with `cargo run --example <name>`.
   `(deadline, OrderId)` order; no wall clock is read by the matching engine.
 - Stop-market and stop-limit orders remain dormant and absent from public
   depth until an explicit sequenced last-trade reference reaches their trigger.
+  Each reference carries durable source identity, source version, and source
+  sequence; gaps, regressions, cursor conflicts, and unannounced source changes
+  are nonmutating typed rejections.
   Bounded sweeps activate a canonical `(trigger, priority, OrderId)` prefix;
-  eligible backlog must drain at the same reference before it can advance.
+  eligible backlog must drain at the exact reference before its cursor advances.
 - Cancel and replace with ownership checks and explicit priority-retention
   rules; account-scoped mass cancellation emitted in ascending `OrderId`
   order with exact final counts and cancelled-lot totals.
@@ -364,7 +367,7 @@ Run any program with `cargo run --example <name>`.
 
 ### Durability and recovery
 
-- Versioned CRC-32C WAL frames (format 6) with bounded payloads and
+- Versioned CRC-32C WAL frames (format 9) with bounded payloads and
   contiguous sequences, as a single-file `Journal` or a size-bounded
   `SegmentedJournal` rotating whole frames and batches under one global
   sequence.
@@ -374,7 +377,7 @@ Run any program with `cargo run --example <name>`.
   writer leases with explicit abandoned-writer recovery.
 - Strict corruption detection: only a physically incomplete final frame may be
   repaired, and closed segments are always scanned strictly.
-- Versioned, bounded `QSNP` semantic snapshots (format 6) with monotonic
+- Versioned, bounded `QSNP` semantic snapshots (format 9) with monotonic
   exact-prefix lineage and synchronized atomic replacement.
 - Durable runtimes for matching, coupled risk/matching, call auctions, and
   coupled auction/risk record every command before committing the in-memory
@@ -437,7 +440,9 @@ instrument-wide trading-state controls, plus a separate bounded call-auction
 path with banded aggregate discovery, price-time allocation, and a
 process-local atomic uncross. Continuous stop orders require an authoritative
 external source to submit each sequenced reference; matching never infers one
-from local trades or wall time. The platform does not implement pegged orders,
+from local trades or wall time. Source coordinates are validated and retained,
+but source authentication, transport recovery, and raw-feed normalization are
+external. The platform does not implement pegged orders,
 discretionary ranges, cross-instrument or multi-leg execution, volatility-
 interruption trigger logic, or venue-specific priority rule sets. Immutable
 calendar images and day/session-to-GTD normalization are implemented, but
@@ -457,12 +462,12 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 105 tagged assumptions (A1–A105), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 106 tagged assumptions (A1–A106), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
-| [WAL format v8](docs/wal-v8.md) | Current write-ahead-log frame and record schema |
-| [Snapshot format v8](docs/snapshot-v8.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
+| [WAL format v9](docs/wal-v9.md) | Current write-ahead-log frame and record schema |
+| [Snapshot format v9](docs/snapshot-v9.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
 | [Market-data payload v3](docs/market-data-v3.md) | Current continuous market-data update/snapshot payloads |
 | [Auction market-data payload v1](docs/auction-market-data-v1.md) | Current call-auction market-data payloads |
 | [Auction-risk checkpoint payload v1](docs/auction-risk-checkpoint-v1.md) | Current coupled call-auction risk checkpoint payload |
@@ -473,12 +478,14 @@ byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/wal-v5.md](docs/wal-v5.md),
 [docs/wal-v6.md](docs/wal-v6.md),
 [docs/wal-v7.md](docs/wal-v7.md),
+[docs/wal-v8.md](docs/wal-v8.md),
 [docs/snapshot-v2.md](docs/snapshot-v2.md), and
 [docs/snapshot-v3.md](docs/snapshot-v3.md), and
 [docs/snapshot-v4.md](docs/snapshot-v4.md), and
 [docs/snapshot-v5.md](docs/snapshot-v5.md), and
 [docs/snapshot-v6.md](docs/snapshot-v6.md), and
-[docs/snapshot-v7.md](docs/snapshot-v7.md), plus continuous
+[docs/snapshot-v7.md](docs/snapshot-v7.md), and
+[docs/snapshot-v8.md](docs/snapshot-v8.md), plus continuous
 [market-data v2](docs/market-data-v2.md).
 
 ## Build and verify
