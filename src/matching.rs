@@ -129,6 +129,9 @@ pub enum OrderDisplay {
         /// Maximum displayed lots in each replenished slice.
         peak: Quantity,
     },
+    /// Expose no resting quantity while remaining executable at the limit
+    /// price behind every displayed-priority order at that price.
+    Hidden,
 }
 
 impl OrderDisplay {
@@ -138,18 +141,24 @@ impl OrderDisplay {
         matches!(self, Self::Reserve { .. })
     }
 
+    /// Returns true for a fully hidden resting order.
+    #[must_use]
+    pub const fn is_hidden(self) -> bool {
+        matches!(self, Self::Hidden)
+    }
+
     /// Returns the configured reserve peak, if any.
     #[must_use]
     pub const fn peak(self) -> Option<Quantity> {
         match self {
-            Self::FullyDisplayed => None,
+            Self::FullyDisplayed | Self::Hidden => None,
             Self::Reserve { peak } => Some(peak),
         }
     }
 
-    const fn displayed_lots(self, total_leaves: u64) -> u64 {
+    const fn working_lots(self, total_leaves: u64) -> u64 {
         match self {
-            Self::FullyDisplayed => total_leaves,
+            Self::FullyDisplayed | Self::Hidden => total_leaves,
             Self::Reserve { peak } => {
                 if peak.lots() < total_leaves {
                     peak.lots()
@@ -158,6 +167,22 @@ impl OrderDisplay {
                 }
             }
         }
+    }
+
+    const fn visible_lots(self, working_lots: u64) -> u64 {
+        match self {
+            Self::FullyDisplayed | Self::Reserve { .. } => working_lots,
+            Self::Hidden => 0,
+        }
+    }
+
+    const fn same_mode(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::FullyDisplayed, Self::FullyDisplayed)
+                | (Self::Reserve { .. }, Self::Reserve { .. })
+                | (Self::Hidden, Self::Hidden)
+        )
     }
 }
 
@@ -315,7 +340,8 @@ pub struct ReplaceOrder {
     pub new_quantity: Quantity,
     /// New limit price.
     pub new_price: Price,
-    /// New display policy. Changing between displayed and reserve is rejected.
+    /// New display policy. Changing among fully displayed, reserve, and fully
+    /// hidden modes is rejected.
     pub new_display: OrderDisplay,
     /// Gateway receive time.
     pub received_at: TimestampNs,
@@ -586,6 +612,8 @@ pub enum RejectReason {
     RiskArithmeticOverflow,
     /// The immutable instrument version disables reserve orders.
     ReserveOrderNotSupported,
+    /// The immutable instrument version disables fully hidden orders.
+    HiddenOrderNotSupported,
     /// A reserve display peak was not aligned to the lot increment.
     DisplayQuantityOffGrid,
     /// A reserve display peak was not smaller than total leaves.
@@ -594,6 +622,8 @@ pub enum RejectReason {
     ReserveReplenishmentLimit,
     /// A reserve qualifier was attached to a non-resting order.
     ReserveOrderCannotBeImmediate,
+    /// A hidden qualifier was attached to a non-resting order.
+    HiddenOrderCannotBeImmediate,
     /// Replacement attempted to convert between displayed and reserve modes.
     OrderDisplayModeChangeNotAllowed,
     /// A shard-local administrative fence blocks new orders and replacements.
@@ -643,6 +673,7 @@ impl From<AdmissionError> for RejectReason {
             AdmissionError::QuantityOffGrid => Self::QuantityOffGrid,
             AdmissionError::QuantityOutsideLimits => Self::QuantityOutsideLimits,
             AdmissionError::ReserveOrderNotSupported => Self::ReserveOrderNotSupported,
+            AdmissionError::HiddenOrderNotSupported => Self::HiddenOrderNotSupported,
             AdmissionError::DisplayQuantityOffGrid => Self::DisplayQuantityOffGrid,
             AdmissionError::DisplayQuantityNotLessThanOrder => {
                 Self::DisplayQuantityNotLessThanOrder
@@ -735,10 +766,10 @@ pub enum EventKind {
         price: Price,
         /// Leaves quantity.
         leaves_quantity: Quantity,
-        /// Quantity currently visible at the level.
-        displayed_quantity: Quantity,
+        /// Quantity currently executable before a reserve refresh is required.
+        working_quantity: Quantity,
     },
-    /// A depleted reserve peak replenished and moved to the FIFO tail.
+    /// A depleted reserve peak replenished at the displayed-class tail.
     OrderRefreshed {
         /// Persistent private order identifier.
         order_id: OrderId,
@@ -1463,7 +1494,7 @@ pub struct HashIndexStatus {
     pub occupied_entries: usize,
 }
 
-/// A visible resting order.
+/// Private state of one resting order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OrderSnapshot {
     /// Order identifier.
@@ -1476,12 +1507,28 @@ pub struct OrderSnapshot {
     pub price: Price,
     /// Leaves quantity.
     pub leaves_quantity: Quantity,
-    /// Quantity currently represented in public depth.
-    pub displayed_quantity: Quantity,
+    /// Quantity currently executable before a reserve refresh is required.
+    pub working_quantity: Quantity,
     /// Persistent display policy.
     pub display: OrderDisplay,
     /// Absolute expiry for GTD orders; absent for GTC and post-only orders.
     pub expires_at: Option<TimestampNs>,
+}
+
+impl OrderSnapshot {
+    /// Returns the quantity currently represented in public depth.
+    ///
+    /// Fully hidden orders return `None`; displayed and reserve orders return
+    /// their current positive working quantity.
+    #[must_use]
+    pub const fn visible_quantity(self) -> Option<Quantity> {
+        match self.display {
+            OrderDisplay::FullyDisplayed | OrderDisplay::Reserve { .. } => {
+                Some(self.working_quantity)
+            }
+            OrderDisplay::Hidden => None,
+        }
+    }
 }
 
 /// Private state of one accepted stop order that has not yet triggered.
@@ -1523,7 +1570,7 @@ pub struct RestingOrderCheckpoint {
     pub(crate) side: Side,
     pub(crate) price: Price,
     pub(crate) leaves: Quantity,
-    pub(crate) displayed: Quantity,
+    pub(crate) working: Quantity,
     pub(crate) display: OrderDisplay,
     pub(crate) self_trade_prevention: SelfTradePrevention,
     pub(crate) expires_at: Option<TimestampNs>,
@@ -1554,16 +1601,25 @@ impl RestingOrderCheckpoint {
         self.price
     }
 
-    /// Returns total leaves, including hidden reserve quantity.
+    /// Returns total leaves, including any non-public quantity.
     #[must_use]
     pub const fn leaves(self) -> Quantity {
         self.leaves
     }
 
-    /// Returns the currently displayed slice.
+    /// Returns the currently executable working slice.
     #[must_use]
-    pub const fn displayed(self) -> Quantity {
-        self.displayed
+    pub const fn working(self) -> Quantity {
+        self.working
+    }
+
+    /// Returns the current public quantity, absent for fully hidden orders.
+    #[must_use]
+    pub const fn visible_quantity(self) -> Option<Quantity> {
+        match self.display {
+            OrderDisplay::FullyDisplayed | OrderDisplay::Reserve { .. } => Some(self.working),
+            OrderDisplay::Hidden => None,
+        }
     }
 
     /// Returns the persistent display policy.
@@ -2406,7 +2462,11 @@ impl OrderBookCheckpoint {
                     "checkpoint active-order identity is duplicated or absent from accepted history",
                 ));
             }
-            let key = (side_wire_order(order.side), order.price);
+            let key = (
+                side_wire_order(order.side),
+                order.price,
+                order.display.is_hidden(),
+            );
             if previous_key.is_some_and(|previous| previous > key) {
                 return Err(OrderBookCheckpointError::new(
                     "checkpoint active orders are not in canonical side/price/FIFO order",
@@ -2921,6 +2981,7 @@ mod staged_checkpoint_capture_tests {
             price: PriceRules::new(0, 1, Price::from_raw(1), Price::from_raw(1_000)).unwrap(),
             quantity: QuantityRules::new(1, 1, 1_000).unwrap(),
             reserve: ReserveOrderRules::new(100).unwrap(),
+            hidden_orders_supported: false,
             base_units_per_lot: 1,
             quote_units_per_price_unit: 1,
             trading_state: TradingState::Open,
@@ -2961,7 +3022,7 @@ mod staged_checkpoint_capture_tests {
             side: Side::Buy,
             price: Price::from_raw(100),
             leaves: Quantity::new(1).unwrap(),
-            displayed: Quantity::new(1).unwrap(),
+            working: Quantity::new(1).unwrap(),
             display: OrderDisplay::FullyDisplayed,
             self_trade_prevention: SelfTradePrevention::CancelAggressor,
             expires_at: None,
@@ -2995,22 +3056,29 @@ fn validate_checkpoint_order(
         .quantity_rules()
         .validate_leaves(order.leaves)
         .map_err(|_| OrderBookCheckpointError::new("checkpoint order leaves violate definition"))?;
-    if order.displayed.lots() > order.leaves.lots() {
+    if order.working.lots() > order.leaves.lots() {
         return Err(OrderBookCheckpointError::new(
-            "checkpoint displayed quantity exceeds total leaves",
+            "checkpoint working quantity exceeds total leaves",
         ));
     }
     match order.display {
-        OrderDisplay::FullyDisplayed if order.displayed != order.leaves => Err(
+        OrderDisplay::FullyDisplayed if order.working != order.leaves => Err(
             OrderBookCheckpointError::new("checkpoint fully displayed order hides quantity"),
         ),
         OrderDisplay::Reserve { peak }
             if !definition.reserve_order_rules().enabled()
                 || peak.lots() % definition.quantity_rules().increment_lots() != 0
-                || order.displayed.lots() > peak.lots() =>
+                || order.working.lots() > peak.lots() =>
         {
             Err(OrderBookCheckpointError::new(
                 "checkpoint reserve display violates definition or peak",
+            ))
+        }
+        OrderDisplay::Hidden
+            if !definition.hidden_orders_supported() || order.working != order.leaves =>
+        {
+            Err(OrderBookCheckpointError::new(
+                "checkpoint hidden order violates definition or has partial working quantity",
             ))
         }
         _ => Ok(()),
@@ -3127,6 +3195,13 @@ fn validate_checkpoint_stop(
     {
         return Err(OrderBookCheckpointError::new(
             "checkpoint dormant stop has an invalid reserve qualifier",
+        ));
+    }
+    if order.display.is_hidden()
+        && !(matches!(order.activation, StopActivation::Limit(_)) && order.time_in_force.may_rest())
+    {
+        return Err(OrderBookCheckpointError::new(
+            "checkpoint dormant stop has an invalid hidden qualifier",
         ));
     }
     Ok(())
@@ -3804,7 +3879,7 @@ impl RestingOrder {
             return 0;
         }
         let slices = match self.display {
-            OrderDisplay::FullyDisplayed => 1,
+            OrderDisplay::FullyDisplayed | OrderDisplay::Hidden => 1,
             OrderDisplay::Reserve { peak } => {
                 let hidden = u128::from(self.leaves - self.displayed);
                 let peak = u128::from(peak.lots());
@@ -3844,8 +3919,10 @@ impl RestingOrder {
 struct PriceLevel {
     head: OrderId,
     tail: OrderId,
+    displayed_tail: Option<OrderId>,
     total_quantity: u128,
     order_count: u64,
+    visible_order_count: u64,
     event_units: u128,
 }
 
@@ -3855,22 +3932,24 @@ struct PriceLevelHandle {
     slot: IndexedAvlHandle,
 }
 
-/// Bounded occupied prices for one side with a mutation-maintained market
-/// extremum and its key-checked stable-slot handle.
+/// Bounded execution and public prices for one side with mutation-maintained
+/// market extrema and a key-checked execution-level stable-slot handle.
 ///
-/// The preallocated indexed AVL map remains the authoritative ordered
-/// enumeration/index structure. The cached best price is redundant derived
-/// state, updated by every applicable mutation and independently checked by
-/// `validate_extremum`. Read-only best-price discovery and handle-addressed
-/// maker-level mutation therefore do not traverse the tree, and level mutation
-/// performs no allocation.
+/// The execution-price AVL is the authoritative level enumeration and the
+/// public-price AVL indexes its non-zero visible subset. Both cached extrema
+/// are redundant derived state, updated by every applicable mutation and
+/// independently checked by `validate_extremum`. Read-only best-price
+/// discovery and handle-addressed maker-level mutation therefore do not
+/// traverse either tree, and level mutation performs no allocation.
 #[cfg_attr(test, derive(Clone))]
 #[derive(Debug)]
 struct PriceLevels {
     side: Side,
     by_price: IndexedAvlMap<Price, PriceLevel>,
+    visible_by_price: IndexedAvlMap<Price, ()>,
     best: Option<(Price, PriceLevel)>,
     best_handle: Option<PriceLevelHandle>,
+    best_visible: Option<(Price, PriceLevel)>,
     event_units: u128,
 }
 
@@ -3878,7 +3957,9 @@ impl PartialEq for PriceLevels {
     fn eq(&self, other: &Self) -> bool {
         self.side == other.side
             && self.by_price == other.by_price
+            && self.visible_by_price == other.visible_by_price
             && self.best == other.best
+            && self.best_visible == other.best_visible
             && self.event_units == other.event_units
     }
 }
@@ -3893,8 +3974,10 @@ impl PriceLevels {
         Ok(Self {
             side,
             by_price: IndexedAvlMap::try_with_capacity(maximum_levels)?,
+            visible_by_price: IndexedAvlMap::try_with_capacity(maximum_levels)?,
             best: None,
             best_handle: None,
+            best_visible: None,
             event_units: 0,
         })
     }
@@ -3931,8 +4014,13 @@ impl PriceLevels {
         self.best.map(|(price, _)| price)
     }
 
+    #[cfg(test)]
     fn best_level(&self) -> Option<(Price, PriceLevel)> {
         self.best
+    }
+
+    fn best_visible_level(&self) -> Option<(Price, PriceLevel)> {
+        self.best_visible
     }
 
     fn best_level_with_handle(&self) -> Option<(PriceLevelHandle, PriceLevel)> {
@@ -3966,6 +4054,7 @@ impl PriceLevels {
             self.best = Some((price, level));
             self.best_handle = Some(PriceLevelHandle { price, slot });
         }
+        self.sync_visible_level(price, replaced, Some(level));
         replaced
     }
 
@@ -3979,22 +4068,23 @@ impl PriceLevels {
         handle: PriceLevelHandle,
         update: impl FnOnce(&mut PriceLevel) -> R,
     ) -> Option<R> {
-        let (result, snapshot, previous_event_units) = {
+        let (result, snapshot, previous) = {
             let level = self
                 .by_price
                 .get_mut_by_handle(handle.slot, &handle.price)?;
-            let previous_event_units = level.event_units;
+            let previous = *level;
             let result = update(level);
-            (result, *level, previous_event_units)
+            (result, *level, previous)
         };
         self.event_units = self
             .event_units
-            .checked_sub(previous_event_units)
+            .checked_sub(previous.event_units)
             .and_then(|value| value.checked_add(snapshot.event_units))
             .expect("active-order event work must fit u128");
         if self.best_handle == Some(handle) {
             self.best = Some((handle.price, snapshot));
         }
+        self.sync_visible_level(handle.price, Some(previous), Some(snapshot));
         Some(result)
     }
 
@@ -4017,6 +4107,9 @@ impl PriceLevels {
             self.best = extremum.map(|(_, price, level)| (price, level));
             self.best_handle = extremum.map(|(handle, _, _)| handle);
         }
+        if let Some(level) = removed {
+            self.sync_visible_level(handle.price, Some(level), None);
+        }
         removed
     }
 
@@ -4028,8 +4121,19 @@ impl PriceLevels {
     }
 
     fn validate_extremum(&self) -> Result<(), InvariantViolation> {
+        if self.visible_by_price.maximum() != self.by_price.maximum()
+            || self.visible_by_price.allocation_capacity() < self.by_price.maximum()
+        {
+            return Err(InvariantViolation::new(format!(
+                "{:?} public-price index reservation differs from its price-level arena",
+                self.side
+            )));
+        }
         self.by_price.validate().map_err(|detail| {
             InvariantViolation::new(format!("{:?} price index: {detail}", self.side))
+        })?;
+        self.visible_by_price.validate().map_err(|detail| {
+            InvariantViolation::new(format!("{:?} public-price index: {detail}", self.side))
         })?;
         let actual = self.map_extremum();
         let actual_best = actual.map(|(_, price, level)| (price, level));
@@ -4038,6 +4142,35 @@ impl PriceLevels {
             return Err(InvariantViolation::new(format!(
                 "{:?} cached best level {:?}/{:?} differs from indexed-AVL extremum {:?}/{:?}",
                 self.side, self.best, self.best_handle, actual_best, actual_handle
+            )));
+        }
+        let actual_visible_best = self.visible_extremum().and_then(|price| {
+            self.by_price
+                .get(&price)
+                .copied()
+                .map(|level| (price, level))
+        });
+        if self.best_visible != actual_visible_best {
+            return Err(InvariantViolation::new(format!(
+                "{:?} cached public best level {:?} differs from public-price extremum {:?}",
+                self.side, self.best_visible, actual_visible_best
+            )));
+        }
+        if self.visible_by_price.len()
+            != self
+                .by_price
+                .iter()
+                .filter(|(_, level)| level.total_quantity != 0)
+                .count()
+            || self.visible_by_price.iter().any(|(price, ())| {
+                self.by_price
+                    .get(price)
+                    .is_none_or(|level| level.total_quantity == 0)
+            })
+        {
+            return Err(InvariantViolation::new(format!(
+                "{:?} public-price membership differs from visible aggregates",
+                self.side
             )));
         }
         let actual_event_units = self
@@ -4067,6 +4200,52 @@ impl PriceLevels {
             Side::Sell => self.by_price.first_key_value_with_handle(),
         }?;
         Some((PriceLevelHandle { price, slot }, price, level))
+    }
+
+    fn sync_visible_level(
+        &mut self,
+        price: Price,
+        previous: Option<PriceLevel>,
+        current: Option<PriceLevel>,
+    ) {
+        let was_visible = previous.is_some_and(|level| level.total_quantity != 0);
+        let is_visible = current.is_some_and(|level| level.total_quantity != 0);
+        match (was_visible, is_visible) {
+            (false, true) => {
+                assert!(self.visible_by_price.insert(price, ()).is_none());
+            }
+            (true, false) => {
+                assert_eq!(self.visible_by_price.remove(&price), Some(()));
+            }
+            (false, false) | (true, true) => {}
+        }
+        if is_visible
+            && self
+                .best_visible
+                .is_none_or(|(best, _)| best == price || self.is_better(price, best))
+        {
+            self.best_visible = current.map(|level| (price, level));
+        } else if self
+            .best_visible
+            .is_some_and(|(best, _)| best == price && !is_visible)
+        {
+            self.best_visible = self
+                .visible_extremum()
+                .and_then(|best| self.by_price.get(&best).copied().map(|level| (best, level)));
+        }
+    }
+
+    fn visible_extremum(&self) -> Option<Price> {
+        match self.side {
+            Side::Buy => self
+                .visible_by_price
+                .last_key_value()
+                .map(|(&price, ())| price),
+            Side::Sell => self
+                .visible_by_price
+                .first_key_value()
+                .map(|(&price, ())| price),
+        }
     }
 }
 
@@ -4556,9 +4735,9 @@ impl OrderBook {
                                 "live order has zero leaves during checkpoint",
                             )
                         })?,
-                        displayed: Quantity::new(order.displayed).map_err(|_| {
+                        working: Quantity::new(order.displayed).map_err(|_| {
                             OrderBookCheckpointError::new(
-                                "live order has zero displayed quantity during checkpoint",
+                                "live order has zero working quantity during checkpoint",
                             )
                         })?,
                         display: order.display,
@@ -4757,7 +4936,7 @@ impl OrderBook {
                 side: state.side,
                 price: state.price,
                 leaves: state.leaves.lots(),
-                displayed: state.displayed.lots(),
+                displayed: state.working.lots(),
                 display: state.display,
                 self_trade_prevention: state.self_trade_prevention,
                 expires_at: state.expires_at,
@@ -4769,7 +4948,7 @@ impl OrderBook {
             });
         }
         for &state in checkpoint.dormant_stops.iter() {
-            let displayed = state.display.displayed_lots(state.leaves.lots());
+            let displayed = state.display.working_lots(state.leaves.lots());
             book.append_dormant_stop(RestingOrder {
                 order_id: state.order_id,
                 account_id: state.account_id,
@@ -4912,6 +5091,12 @@ impl OrderBook {
                 {
                     return Err(RejectReason::ReserveOrderCannotBeImmediate);
                 }
+                if command.display.is_hidden()
+                    && !(matches!(active_order_type, OrderType::Limit(_))
+                        && command.time_in_force.may_rest())
+                {
+                    return Err(RejectReason::HiddenOrderCannotBeImmediate);
+                }
                 if command.order_type.stop().is_some() {
                     if command.time_in_force == TimeInForce::FillOrKill
                         && command.self_trade_prevention == SelfTradePrevention::DecrementAndCancel
@@ -4973,7 +5158,7 @@ impl OrderBook {
                 {
                     return Err(RejectReason::AccountAdmissionBlocked);
                 }
-                if order.display.is_reserve() != command.new_display.is_reserve() {
+                if !order.display.same_mode(command.new_display) {
                     return Err(RejectReason::OrderDisplayModeChangeNotAllowed);
                 }
                 if order
@@ -5788,7 +5973,7 @@ impl OrderBook {
     #[must_use]
     pub fn best_bid(&self) -> Option<LevelSnapshot> {
         self.bids
-            .best_level()
+            .best_visible_level()
             .map(|(price, level)| Self::level_snapshot(price, &level))
     }
 
@@ -5796,16 +5981,18 @@ impl OrderBook {
     #[must_use]
     pub fn best_ask(&self) -> Option<LevelSnapshot> {
         self.asks
-            .best_level()
+            .best_visible_level()
             .map(|(price, level)| Self::level_snapshot(price, &level))
     }
 
-    /// Returns process-local allocation telemetry for one price-level arena.
+    /// Returns process-local allocation telemetry for one execution-price
+    /// arena.
     ///
     /// The allocated capacity is at least the configured maximum but can be
     /// larger because allocator rounding is permitted. Initialized slots are a
     /// high-water mark; removal moves a slot to the reusable count instead of
-    /// deallocating it.
+    /// deallocating it. The paired public-price arena has the same configured
+    /// reservation and is independently checked by [`Self::validate`].
     #[must_use]
     pub fn price_level_arena_status(&self, side: Side) -> PriceLevelArenaStatus {
         let levels = self.levels(side);
@@ -5888,17 +6075,20 @@ impl OrderBook {
     pub(crate) fn depth_levels(
         &self,
         side: Side,
-    ) -> impl DoubleEndedIterator<Item = LevelSnapshot> + ExactSizeIterator + '_ {
+    ) -> impl DoubleEndedIterator<Item = LevelSnapshot> + '_ {
         self.levels(side)
             .iter()
+            .filter(|(_, level)| level.total_quantity != 0)
             .map(|(&price, level)| Self::level_snapshot(price, level))
     }
 
-    /// Returns one aggregate level, or `None` when the price is unoccupied.
+    /// Returns one public aggregate level, or `None` when the price has no
+    /// displayed liquidity.
     #[must_use]
     pub fn level(&self, side: Side, price: Price) -> Option<LevelSnapshot> {
         self.levels(side)
             .get(price)
+            .filter(|level| level.total_quantity != 0)
             .map(|level| Self::level_snapshot(price, level))
     }
 
@@ -5914,13 +6104,13 @@ impl OrderBook {
                 .and_then(|leaves_quantity| {
                     Quantity::new(order.displayed)
                         .ok()
-                        .map(|displayed_quantity| OrderSnapshot {
+                        .map(|working_quantity| OrderSnapshot {
                             order_id,
                             account_id: order.account_id,
                             side: order.side,
                             price: order.price,
                             leaves_quantity,
-                            displayed_quantity,
+                            working_quantity,
                             display: order.display,
                             expires_at: order.expires_at,
                         })
@@ -5928,7 +6118,7 @@ impl OrderBook {
         })
     }
 
-    /// Returns every visible resting order in ascending identifier order.
+    /// Returns every active resting order in ascending identifier order.
     ///
     /// This allocates and sorts in `O(O log O)` time. It is intended for
     /// snapshots, recovered-state bootstrap, and diagnostics rather than the
@@ -5961,9 +6151,9 @@ impl OrderBook {
                         order.order_id
                     ))
                 })?;
-                let displayed_quantity = Quantity::new(order.displayed).map_err(|_| {
+                let working_quantity = Quantity::new(order.displayed).map_err(|_| {
                     InvariantViolation::new(format!(
-                        "active order {} has zero displayed quantity",
+                        "active order {} has zero working quantity",
                         order.order_id
                     ))
                 })?;
@@ -5973,7 +6163,7 @@ impl OrderBook {
                     side: order.side,
                     price: order.price,
                     leaves_quantity,
-                    displayed_quantity,
+                    working_quantity,
                     display: order.display,
                     expires_at: order.expires_at,
                 })
@@ -6627,14 +6817,18 @@ impl OrderBook {
         LevelSnapshot {
             price,
             quantity: level.total_quantity,
-            order_count: level.order_count,
+            order_count: level.visible_order_count,
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one allocation-free pass audits links, display classes, and aggregates"
+    )]
     fn validate_side(&self, side: Side) -> Result<usize, InvariantViolation> {
         let mut indexed_orders = 0_usize;
         for (&price, level) in self.levels(side).iter() {
-            if level.order_count == 0 || level.total_quantity == 0 {
+            if level.order_count == 0 {
                 return Err(InvariantViolation::new(format!(
                     "empty {side:?} level at price {}",
                     price.raw()
@@ -6643,8 +6837,11 @@ impl OrderBook {
             let mut current = Some(level.head);
             let mut previous = None;
             let mut count = 0_u64;
+            let mut visible_count = 0_u64;
             let mut total = 0_u128;
             let mut event_units = 0_u128;
+            let mut displayed_tail = None;
+            let mut hidden_class_started = false;
             while let Some(order_id) = current {
                 if indexed_orders >= self.orders.len() {
                     return Err(InvariantViolation::new(format!(
@@ -6671,7 +6868,7 @@ impl OrderBook {
                 }
                 if order.displayed == 0 || order.displayed > order.leaves {
                     return Err(InvariantViolation::new(format!(
-                        "order {order_id} has invalid displayed/total leaves"
+                        "order {order_id} has invalid working/total leaves"
                     )));
                 }
                 match order.display {
@@ -6685,13 +6882,29 @@ impl OrderBook {
                             "reserve order {order_id} exceeds its display peak"
                         )));
                     }
+                    OrderDisplay::Hidden if order.displayed != order.leaves => {
+                        return Err(InvariantViolation::new(format!(
+                            "hidden order {order_id} has a partial working quantity"
+                        )));
+                    }
                     _ => {}
+                }
+                if order.display.is_hidden() {
+                    hidden_class_started = true;
+                } else {
+                    if hidden_class_started {
+                        return Err(InvariantViolation::new(format!(
+                            "displayed-priority order {order_id} follows hidden liquidity"
+                        )));
+                    }
+                    displayed_tail = Some(order_id);
+                    visible_count += 1;
+                    total += u128::from(order.displayed);
                 }
                 count += 1;
                 indexed_orders = indexed_orders.checked_add(1).ok_or_else(|| {
                     InvariantViolation::new("price-index total order count is exhausted")
                 })?;
-                total += u128::from(order.displayed);
                 event_units = event_units
                     .checked_add(order.remaining_event_units())
                     .expect("active level event work must fit u128");
@@ -6704,7 +6917,14 @@ impl OrderBook {
                     price.raw()
                 )));
             }
+            if displayed_tail != level.displayed_tail {
+                return Err(InvariantViolation::new(format!(
+                    "{side:?} level at {} has an incorrect displayed-class tail",
+                    price.raw()
+                )));
+            }
             if count != level.order_count
+                || visible_count != level.visible_order_count
                 || total != level.total_quantity
                 || event_units != level.event_units
             {
@@ -6747,7 +6967,7 @@ impl OrderBook {
             activation,
         } = command.order_type
         {
-            let displayed = command.display.displayed_lots(command.quantity.lots());
+            let displayed = command.display.working_lots(command.quantity.lots());
             self.append_dormant_stop(RestingOrder {
                 order_id: command.order_id,
                 account_id: command.account_id,
@@ -7349,6 +7569,7 @@ impl OrderBook {
         if priority_retained {
             let new_displayed = old.displayed.min(new_quantity);
             let displayed_reduction = old.displayed - new_displayed;
+            let visible_reduction = old.display.visible_lots(displayed_reduction);
             let new = RestingOrder {
                 leaves: new_quantity,
                 displayed: new_displayed,
@@ -7358,7 +7579,7 @@ impl OrderBook {
             let new_event_units = new.remaining_event_units();
             self.levels_mut(old.side)
                 .update(old.price, |level| {
-                    level.total_quantity -= u128::from(displayed_reduction);
+                    level.total_quantity -= u128::from(visible_reduction);
                     level.event_units = level
                         .event_units
                         .checked_sub(old_event_units)
@@ -7441,7 +7662,7 @@ impl OrderBook {
         let mut updated = old;
         updated.price = command.new_price;
         updated.leaves = new_quantity;
-        updated.displayed = command.new_display.displayed_lots(new_quantity);
+        updated.displayed = command.new_display.working_lots(new_quantity);
         updated.display = command.new_display;
         let updated_priority = if priority_retained {
             old_stop.priority_sequence
@@ -7615,7 +7836,7 @@ impl OrderBook {
                 | TimeInForce::GoodTilTimestamp { .. }
                 | TimeInForce::PostOnly,
             ) => {
-                let displayed = incoming.display.displayed_lots(incoming.leaves);
+                let displayed = incoming.display.working_lots(incoming.leaves);
                 self.append_order(RestingOrder {
                     order_id: incoming.order_id,
                     account_id: incoming.account_id,
@@ -7641,8 +7862,8 @@ impl OrderBook {
                         price,
                         leaves_quantity: Quantity::new(incoming.leaves)
                             .expect("resting quantity must be non-zero"),
-                        displayed_quantity: Quantity::new(displayed)
-                            .expect("displayed resting quantity must be non-zero"),
+                        working_quantity: Quantity::new(displayed)
+                            .expect("working resting quantity must be non-zero"),
                     },
                 )?;
             }
@@ -8033,9 +8254,10 @@ impl OrderBook {
     /// With no self order, every external order's total leaves are reachable
     /// before matching advances to a worse price. Cancel-resting removes self
     /// orders, so the same total-leaves rule applies to the remaining queue.
-    /// Under an aggressor-blocking policy, the first self order is a FIFO
-    /// barrier: only current displayed slices ahead of it are reachable, because
-    /// a replenished reserve slice rejoins behind that barrier.
+    /// Under an aggressor-blocking policy, a self order in the displayed class
+    /// blocks reserve slices that requeue behind it. If the first self order is
+    /// hidden, every displayed order's total leaves remain reachable because
+    /// reserve refreshes stay ahead of the hidden class.
     fn fok_level_liquidity(
         &self,
         incoming: &NewOrder,
@@ -8093,6 +8315,9 @@ impl OrderBook {
                 .expect("price-level order must exist");
             current = order.next;
             if order.account_id == account_id {
+                if order.display.is_hidden() && total_path_remaining == 0 {
+                    return LevelLiquidity::Filled;
+                }
                 return LevelLiquidity::BlockedBySelfTrade;
             }
             total_path_remaining = total_path_remaining.saturating_sub(order.leaves);
@@ -8322,37 +8547,75 @@ impl OrderBook {
     fn append_order_preserving_account_index(&mut self, mut order: RestingOrder) {
         assert!(order.stop.is_none(), "price-level member cannot be dormant");
         let event_units = order.remaining_event_units();
+        let visible = order.display.visible_lots(order.displayed);
         let existing_level = self.levels(order.side).handle(order.price).map(|handle| {
-            let tail = self
+            let level = *self
                 .levels(order.side)
                 .get_by_handle(handle)
-                .expect("fresh price-level handle must resolve")
-                .tail;
-            (handle, tail)
+                .expect("fresh price-level handle must resolve");
+            (handle, level)
         });
-        order.previous = existing_level.map(|(_, tail)| tail);
 
-        if let Some((handle, tail)) = existing_level {
-            self.orders
-                .get_mut(&tail)
-                .expect("price-level tail must exist")
-                .next = Some(order.order_id);
+        if let Some((handle, level)) = existing_level {
+            if order.display.is_hidden() {
+                order.previous = Some(level.tail);
+                self.orders
+                    .get_mut(&level.tail)
+                    .expect("price-level tail must exist")
+                    .next = Some(order.order_id);
+            } else {
+                order.previous = level.displayed_tail;
+                order.next = level
+                    .displayed_tail
+                    .and_then(|tail| {
+                        self.orders
+                            .get(&tail)
+                            .expect("displayed-class tail must exist")
+                            .next
+                    })
+                    .or_else(|| level.displayed_tail.is_none().then_some(level.head));
+                if let Some(previous) = order.previous {
+                    self.orders
+                        .get_mut(&previous)
+                        .expect("displayed-class tail must exist")
+                        .next = Some(order.order_id);
+                }
+                if let Some(next) = order.next {
+                    self.orders
+                        .get_mut(&next)
+                        .expect("hidden-class head must exist")
+                        .previous = Some(order.order_id);
+                }
+            }
             self.levels_mut(order.side)
                 .update_by_handle(handle, |level| {
-                    level.tail = order.order_id;
-                    level.total_quantity += u128::from(order.displayed);
+                    if order.display.is_hidden() {
+                        level.tail = order.order_id;
+                    } else {
+                        if order.previous.is_none() {
+                            level.head = order.order_id;
+                        }
+                        if order.next.is_none() {
+                            level.tail = order.order_id;
+                        }
+                        level.displayed_tail = Some(order.order_id);
+                    }
+                    level.total_quantity += u128::from(visible);
                     level.order_count += 1;
+                    level.visible_order_count += u64::from(!order.display.is_hidden());
                     level.event_units += event_units;
                 })
-                .expect("tail implies existing price level");
+                .expect("existing order level must remain addressable");
         } else {
             self.levels_mut(order.side).insert(
                 order.price,
                 PriceLevel {
                     head: order.order_id,
                     tail: order.order_id,
-                    total_quantity: u128::from(order.displayed),
+                    displayed_tail: (!order.display.is_hidden()).then_some(order.order_id),
+                    total_quantity: u128::from(visible),
                     order_count: 1,
+                    visible_order_count: u64::from(!order.display.is_hidden()),
                     event_units,
                 },
             );
@@ -8403,9 +8666,10 @@ impl OrderBook {
                 .expect("decremented order must exist");
             updated.leaves -= quantity;
             updated.displayed -= quantity;
+            let visible_reduction = order.display.visible_lots(quantity);
             self.levels_mut(order.side)
                 .update_by_handle(level_handle, |level| {
-                    level.total_quantity -= u128::from(quantity);
+                    level.total_quantity -= u128::from(visible_reduction);
                 })
                 .expect("resting order must reference a level");
             None
@@ -8428,10 +8692,18 @@ impl OrderBook {
             leaves: order.leaves - quantity,
             ..order
         };
-        refreshed.displayed = refreshed.display.displayed_lots(refreshed.leaves);
+        refreshed.displayed = refreshed.display.working_lots(refreshed.leaves);
         let new_event_units = refreshed.remaining_event_units();
 
-        if let Some(next) = order.next {
+        let level = *self
+            .levels(order.side)
+            .get_by_handle(level_handle)
+            .expect("resting order handle must reference its level");
+        let move_to_displayed_tail = level.displayed_tail != Some(order.order_id);
+        if move_to_displayed_tail {
+            let next = order
+                .next
+                .expect("non-tail displayed order must have a FIFO successor");
             if let Some(previous) = order.previous {
                 self.orders
                     .get_mut(&previous)
@@ -8442,37 +8714,56 @@ impl OrderBook {
                 .get_mut(&next)
                 .expect("next FIFO link must exist")
                 .previous = order.previous;
-            let tail = self
-                .levels(order.side)
-                .get_by_handle(level_handle)
-                .expect("resting order handle must reference its level")
-                .tail;
-            debug_assert_ne!(tail, order.order_id);
+            let displayed_tail = level
+                .displayed_tail
+                .expect("reserve order implies a displayed-class tail");
+            debug_assert_ne!(displayed_tail, order.order_id);
+            let insertion_next = self
+                .orders
+                .get(&displayed_tail)
+                .expect("displayed-class tail must exist")
+                .next;
             self.orders
-                .get_mut(&tail)
-                .expect("price-level tail must exist")
+                .get_mut(&displayed_tail)
+                .expect("displayed-class tail must exist")
                 .next = Some(order.order_id);
-            refreshed.previous = Some(tail);
-            refreshed.next = None;
+            if let Some(insertion_next) = insertion_next {
+                self.orders
+                    .get_mut(&insertion_next)
+                    .expect("hidden-class head must exist")
+                    .previous = Some(order.order_id);
+            }
+            refreshed.previous = Some(displayed_tail);
+            refreshed.next = insertion_next;
         }
 
         self.levels_mut(order.side)
             .update_by_handle(level_handle, |level| {
                 level.total_quantity = level
                     .total_quantity
-                    .checked_sub(u128::from(order.displayed))
-                    .and_then(|total| total.checked_add(u128::from(refreshed.displayed)))
+                    .checked_sub(u128::from(order.display.visible_lots(order.displayed)))
+                    .and_then(|total| {
+                        total.checked_add(u128::from(
+                            refreshed.display.visible_lots(refreshed.displayed),
+                        ))
+                    })
                     .expect("reserve refresh quantity must fit level aggregate");
                 level.event_units = level
                     .event_units
                     .checked_sub(old_event_units)
                     .and_then(|total| total.checked_add(new_event_units))
                     .expect("reserve refresh work must fit level aggregate");
-                if let Some(next) = order.next {
+                if move_to_displayed_tail {
+                    let next = order
+                        .next
+                        .expect("moved displayed order must have had a successor");
                     if order.previous.is_none() {
                         level.head = next;
                     }
-                    level.tail = order.order_id;
+                    if refreshed.next.is_none() {
+                        level.tail = order.order_id;
+                    }
+                    level.displayed_tail = Some(order.order_id);
                 }
             })
             .expect("resting order handle must reference its level");
@@ -8600,8 +8891,9 @@ impl OrderBook {
         let level_is_empty = self
             .levels_mut(order.side)
             .update_by_handle(level_handle, |level| {
-                level.total_quantity -= u128::from(order.displayed);
+                level.total_quantity -= u128::from(order.display.visible_lots(order.displayed));
                 level.order_count -= 1;
+                level.visible_order_count -= u64::from(!order.display.is_hidden());
                 level.event_units -= order.remaining_event_units();
                 if order.previous.is_none() {
                     if let Some(next) = order.next {
@@ -8612,6 +8904,9 @@ impl OrderBook {
                     if let Some(previous) = order.previous {
                         level.tail = previous;
                     }
+                }
+                if level.displayed_tail == Some(order.order_id) {
+                    level.displayed_tail = order.previous;
                 }
                 level.order_count == 0
             })
@@ -8710,6 +9005,7 @@ mod price_level_index_tests {
             price: PriceRules::new(0, 1, Price::from_raw(-1_000), Price::from_raw(1_000)).unwrap(),
             quantity: QuantityRules::new(1, 1, u64::MAX).unwrap(),
             reserve: ReserveOrderRules::new(64).unwrap(),
+            hidden_orders_supported: true,
             base_units_per_lot: 1,
             quote_units_per_price_unit: 1,
             trading_state: TradingState::Open,
@@ -8820,7 +9116,7 @@ mod price_level_index_tests {
                 }
                 order.leaves -= executed;
                 if order.leaves > 0 {
-                    order.displayed = order.display.displayed_lots(order.leaves);
+                    order.displayed = order.display.working_lots(order.leaves);
                     order.previous = None;
                     order.next = None;
                     queue.push_back(order);
@@ -9019,8 +9315,10 @@ mod price_level_index_tests {
         PriceLevel {
             head: order_id,
             tail: order_id,
+            displayed_tail: Some(order_id),
             total_quantity: u128::from(order_id.get()),
             order_count: 1,
+            visible_order_count: 1,
             event_units: u128::from(order_id.get()),
         }
     }
@@ -9662,6 +9960,13 @@ mod price_level_index_tests {
         assert!(error.detail().contains("GTD expiry-index reservation"));
 
         let mut book = OrderBook::new(reserve_definition());
+        book.bids.visible_by_price.shrink_to_fit();
+        let error = book
+            .validate()
+            .expect_err("lost public-price headroom is invalid");
+        assert!(error.detail().contains("public-price index reservation"));
+
+        let mut book = OrderBook::new(reserve_definition());
         Arc::get_mut(&mut book.order_selection_pool)
             .expect("unleased pool has one owner")
             .order_capacity = 0;
@@ -9669,6 +9974,42 @@ mod price_level_index_tests {
             .validate()
             .expect_err("lost order-selection headroom is invalid");
         assert!(error.detail().contains("order-selection pool reservation"));
+    }
+
+    #[test]
+    fn checkpoint_rejects_hidden_before_displayed_at_one_price() {
+        let mut book = OrderBook::new(reserve_definition());
+        for (command_id, order_id, account_id, display) in [
+            (1, 1, 1, OrderDisplay::Hidden),
+            (2, 2, 2, OrderDisplay::FullyDisplayed),
+        ] {
+            book.submit(Command::New(NewOrder {
+                command_id: CommandId::new(command_id).unwrap(),
+                order_id: OrderId::new(order_id).unwrap(),
+                account_id: AccountId::new(account_id).unwrap(),
+                instrument_id: InstrumentId::new(1).unwrap(),
+                instrument_version: InstrumentVersion::new(1).unwrap(),
+                side: Side::Buy,
+                quantity: Quantity::new(1).unwrap(),
+                display,
+                order_type: OrderType::Limit(Price::from_raw(100)),
+                time_in_force: TimeInForce::GoodTilCancelled,
+                self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                received_at: TimestampNs::from_unix_nanos(command_id),
+            }))
+            .unwrap();
+        }
+        let mut checkpoint = book.checkpoint_state(1, 5).unwrap();
+        Arc::make_mut(&mut checkpoint.orders).swap(0, 1);
+
+        let error = checkpoint
+            .validate()
+            .expect_err("hidden-before-displayed checkpoint rows are noncanonical");
+        assert!(
+            error
+                .to_string()
+                .contains("canonical side/price/FIFO order")
+        );
     }
 
     #[test]

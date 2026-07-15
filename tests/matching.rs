@@ -38,6 +38,7 @@ fn definition() -> InstrumentDefinition {
             .expect("price rules"),
         quantity: QuantityRules::new(1, 1, u64::MAX).expect("quantity rules"),
         reserve: quotick::instrument::ReserveOrderRules::disabled(),
+        hidden_orders_supported: false,
         base_units_per_lot: 1,
         quote_units_per_price_unit: 1,
         trading_state: TradingState::Open,

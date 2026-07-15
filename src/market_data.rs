@@ -354,11 +354,12 @@ pub enum MarketDataKind {
     NoBookChange,
     /// One aggregate level changed.
     Level(MarketDataLevel),
-    /// A trade printed and its maker level changed atomically.
+    /// A trade printed with its absolute public maker-level state.
     Trade {
         /// Anonymized execution.
         print: TradePrint,
-        /// Absolute maker-level state after the execution.
+        /// Absolute maker-level state after execution; zero/zero also denotes
+        /// execution against an absent, fully hidden public level.
         maker_level: MarketDataLevel,
     },
     /// The effective instrument-wide trading state changed.
@@ -951,7 +952,7 @@ impl MarketDataPublisher {
                     side: order.side,
                     price: order.price,
                     leaves: order.leaves_quantity.lots(),
-                    displayed: order.displayed_quantity.lots(),
+                    displayed: order.working_quantity.lots(),
                     display: order.display,
                     expires_at: order.expires_at,
                 },
@@ -1281,7 +1282,7 @@ impl MarketDataPublisher {
                 side: order.side,
                 price: order.price,
                 leaves: order.leaves_quantity.lots(),
-                displayed: order.displayed_quantity.lots(),
+                displayed: order.working_quantity.lots(),
                 display: order.display,
                 expires_at: order.expires_at,
             };
@@ -1421,12 +1422,12 @@ impl MarketDataPublisher {
                 order_id,
                 price,
                 leaves_quantity,
-                displayed_quantity,
+                working_quantity,
             } => self.handle_order_rested(
                 command,
                 order_id,
                 price,
-                (leaves_quantity, displayed_quantity),
+                (leaves_quantity, working_quantity),
                 replacement_state,
                 stop_trigger_progress,
             ),
@@ -1610,7 +1611,7 @@ impl MarketDataPublisher {
         replacement_state: &mut Option<(Side, Option<TimestampNs>)>,
         stop_trigger_progress: &mut StopTriggerProgress,
     ) -> Result<MarketDataKind, MarketDataError> {
-        let (leaves_quantity, displayed_quantity) = quantities;
+        let (leaves_quantity, working_quantity) = quantities;
         let (account_id, side, display, expires_at) =
             match command {
                 Command::New(new_order) if new_order.order_id == order_id => {
@@ -1674,9 +1675,9 @@ impl MarketDataPublisher {
                 "OrderRested duplicated an active order",
             ));
         }
-        if displayed_quantity.lots() != displayed_lots(display, leaves_quantity.lots()) {
+        if working_quantity.lots() != displayed_lots(display, leaves_quantity.lots()) {
             return Err(MarketDataError::TraceMismatch(
-                "rested display differs from the order display policy",
+                "rested working quantity differs from the order display policy",
             ));
         }
         self.orders
@@ -1687,7 +1688,7 @@ impl MarketDataPublisher {
                     side,
                     price,
                     leaves: leaves_quantity.lots(),
-                    displayed: displayed_quantity.lots(),
+                    displayed: working_quantity.lots(),
                     display,
                     expires_at,
                 },
@@ -1697,8 +1698,12 @@ impl MarketDataPublisher {
                 maximum: self.limits.max_active_orders(),
                 attempted: self.orders.len().saturating_add(1),
             })?;
-        self.add_level(side, price, displayed_quantity.lots())
-            .map(MarketDataKind::Level)
+        if display.is_hidden() {
+            Ok(MarketDataKind::NoBookChange)
+        } else {
+            self.add_level(side, price, working_quantity.lots())
+                .map(MarketDataKind::Level)
+        }
     }
 
     fn handle_order_refreshed(
@@ -1784,7 +1789,19 @@ impl MarketDataPublisher {
             ));
         }
         self.advance_trade_id(trade.trade_id)?;
-        let level = self.decrement_order(trade.maker_order_id, trade.quantity.lots())?;
+        let level = self
+            .decrement_order(trade.maker_order_id, trade.quantity.lots())?
+            .map_or_else(
+                || {
+                    if self.levels(maker.side).get(&maker.price).is_some() {
+                        return Err(MarketDataError::TraceMismatch(
+                            "hidden maker executed before visible same-price liquidity",
+                        ));
+                    }
+                    MarketDataLevel::new(maker.side, maker.price, 0, 0)
+                },
+                Ok,
+            )?;
         if let Some(mut active) = triggered {
             active.stop.leaves = active
                 .stop
@@ -1984,7 +2001,7 @@ impl MarketDataPublisher {
                 }
             }
             self.remove_tracked_order(order_id, quantity.lots())
-                .map(MarketDataKind::Level)
+                .map(|level| level.map_or(MarketDataKind::NoBookChange, MarketDataKind::Level))
         } else {
             let incoming_reason = matches!(
                 reason,
@@ -2535,12 +2552,16 @@ impl MarketDataPublisher {
                 ))?;
             tracked.leaves = new_quantity.lots();
             tracked.displayed = new_displayed;
-            self.reduce_level_quantity(old.side, old.price, displayed_reduction)?
+            if old.display.is_hidden() {
+                None
+            } else {
+                Some(self.reduce_level_quantity(old.side, old.price, displayed_reduction)?)
+            }
         } else {
             *replacement_state = Some((old.side, old.expires_at));
             self.remove_tracked_order(order_id, old.leaves)?
         };
-        Ok(MarketDataKind::Level(level))
+        Ok(level.map_or(MarketDataKind::NoBookChange, MarketDataKind::Level))
     }
 
     #[allow(
@@ -2640,7 +2661,7 @@ impl MarketDataPublisher {
                 )?;
                 stop_trigger_progress.active = (active.stop.leaves != 0).then_some(active);
             }
-            Ok(MarketDataKind::Level(level))
+            Ok(level.map_or(MarketDataKind::NoBookChange, MarketDataKind::Level))
         } else {
             Ok(MarketDataKind::NoBookChange)
         }
@@ -2828,7 +2849,7 @@ impl MarketDataPublisher {
         &mut self,
         order_id: OrderId,
         quantity: u64,
-    ) -> Result<MarketDataLevel, MarketDataError> {
+    ) -> Result<Option<MarketDataLevel>, MarketDataError> {
         let order = self
             .orders
             .get(&order_id)
@@ -2853,6 +2874,9 @@ impl MarketDataPublisher {
             tracked.leaves -= quantity;
             tracked.displayed -= quantity;
         }
+        if order.display.is_hidden() {
+            return Ok(None);
+        }
         let level = self.levels_mut(order.side).get_mut(&order.price).ok_or(
             MarketDataError::TraceMismatch("resting order references an absent public level"),
         )?;
@@ -2875,14 +2899,14 @@ impl MarketDataPublisher {
         if result.quantity == 0 {
             self.levels_mut(order.side).remove(&order.price);
         }
-        Ok(result)
+        Ok(Some(result))
     }
 
     fn remove_tracked_order(
         &mut self,
         order_id: OrderId,
         total_quantity: u64,
-    ) -> Result<MarketDataLevel, MarketDataError> {
+    ) -> Result<Option<MarketDataLevel>, MarketDataError> {
         let order = self
             .orders
             .remove(&order_id)
@@ -2894,6 +2918,9 @@ impl MarketDataPublisher {
             return Err(MarketDataError::TraceMismatch(
                 "removed quantity differs from total resting leaves",
             ));
+        }
+        if order.display.is_hidden() {
+            return Ok(None);
         }
         let level = self.levels_mut(order.side).get_mut(&order.price).ok_or(
             MarketDataError::TraceMismatch("resting order references an absent public level"),
@@ -2916,7 +2943,7 @@ impl MarketDataPublisher {
         if result.quantity == 0 {
             self.levels_mut(order.side).remove(&order.price);
         }
-        Ok(result)
+        Ok(Some(result))
     }
 
     fn reduce_level_quantity(
@@ -3504,34 +3531,43 @@ impl MarketDataReplica {
                         "trade print contradicts its identifier or maker-level update",
                     ));
                 }
-                let previous = self
+                match self
                     .levels(maker_level.side)
                     .get(&maker_level.price)
                     .copied()
-                    .ok_or(MarketDataError::InvalidUpdate(
-                        "trade update references an absent maker level",
-                    ))?;
-                let expected_quantity = previous
-                    .quantity
-                    .checked_sub(u128::from(print.quantity.lots()))
-                    .ok_or(MarketDataError::InvalidUpdate(
-                        "trade quantity exceeds the maker level",
-                    ))?;
-                let retained_count = maker_level.order_count == previous.order_count;
-                let removed_one = previous
-                    .order_count
-                    .checked_sub(1)
-                    .is_some_and(|count| maker_level.order_count == count);
-                if maker_level.quantity != expected_quantity
-                    || (!retained_count && !removed_one)
-                    || (maker_level.quantity == 0 && maker_level.order_count != 0)
                 {
-                    return Err(MarketDataError::InvalidUpdate(
-                        "trade print does not reconcile to its maker-level transition",
-                    ));
+                    None => {
+                        if maker_level.quantity != 0 || maker_level.order_count != 0 {
+                            return Err(MarketDataError::InvalidUpdate(
+                                "trade from absent public liquidity retained a maker level",
+                            ));
+                        }
+                        self.last_trade_id = Some(print.trade_id);
+                    }
+                    Some(previous) => {
+                        let expected_quantity = previous
+                            .quantity
+                            .checked_sub(u128::from(print.quantity.lots()))
+                            .ok_or(MarketDataError::InvalidUpdate(
+                                "trade quantity exceeds the maker level",
+                            ))?;
+                        let retained_count = maker_level.order_count == previous.order_count;
+                        let removed_one = previous
+                            .order_count
+                            .checked_sub(1)
+                            .is_some_and(|count| maker_level.order_count == count);
+                        if maker_level.quantity != expected_quantity
+                            || (!retained_count && !removed_one)
+                            || (maker_level.quantity == 0 && maker_level.order_count != 0)
+                        {
+                            return Err(MarketDataError::InvalidUpdate(
+                                "trade print does not reconcile to its maker-level transition",
+                            ));
+                        }
+                        self.last_trade_id = Some(print.trade_id);
+                        self.set_level(maker_level)?;
+                    }
                 }
-                self.last_trade_id = Some(print.trade_id);
-                self.set_level(maker_level)?;
             }
             MarketDataKind::TradingState {
                 previous_state,
@@ -3783,16 +3819,16 @@ fn preflight_replica_level_capacity(
     Ok(())
 }
 
-fn depth_matches(mirror: &DepthMap, source: impl ExactSizeIterator<Item = LevelSnapshot>) -> bool {
-    mirror.len() == source.len()
-        && mirror
-            .iter()
-            .zip(source)
-            .all(|((&price, aggregate), level)| {
-                price == level.price
-                    && aggregate.quantity == level.quantity
-                    && aggregate.order_count == level.order_count
-            })
+fn depth_matches(mirror: &DepthMap, source: impl Iterator<Item = LevelSnapshot>) -> bool {
+    let mut source = source;
+    mirror.iter().all(|(&price, aggregate)| {
+        let Some(level) = source.next() else {
+            return false;
+        };
+        price == level.price
+            && aggregate.quantity == level.quantity
+            && aggregate.order_count == level.order_count
+    }) && source.next().is_none()
 }
 
 fn arena_status(levels: &DepthMap) -> MarketDataArenaStatus {
@@ -3819,7 +3855,7 @@ where
 
 const fn displayed_lots(display: OrderDisplay, leaves: u64) -> u64 {
     match display {
-        OrderDisplay::FullyDisplayed => leaves,
+        OrderDisplay::FullyDisplayed | OrderDisplay::Hidden => leaves,
         OrderDisplay::Reserve { peak } => {
             if peak.lots() < leaves {
                 peak.lots()

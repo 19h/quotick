@@ -1,4 +1,4 @@
-# Market-data payload format version 2
+# Expired Market-data Payload Format Version 2
 
 This document defines the complete-value binary payloads implemented by
 `BinaryCodec` for `MarketDataUpdate` and `MarketDataSnapshot`. It does not

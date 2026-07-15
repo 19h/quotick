@@ -46,6 +46,7 @@ fn definition() -> InstrumentDefinition {
             .expect("price rules"),
         quantity: QuantityRules::new(1, 1, u64::MAX).expect("quantity rules"),
         reserve: quotick::instrument::ReserveOrderRules::disabled(),
+        hidden_orders_supported: false,
         base_units_per_lot: 1,
         quote_units_per_price_unit: 1,
         trading_state: TradingState::Open,
@@ -92,6 +93,22 @@ fn command_codec_has_a_stable_little_endian_layout() {
     assert_eq!(
         Command::decode(&encoded).expect("valid command"),
         command(1, 2, Side::Buy)
+    );
+}
+
+#[test]
+fn hidden_order_display_has_a_stable_command_tag() {
+    let mut value = command(1, 2, Side::Buy);
+    let Command::New(order) = &mut value else {
+        unreachable!("command fixture is a new order");
+    };
+    order.display = OrderDisplay::Hidden;
+
+    let encoded = value.encode().expect("hidden command encodes");
+    assert_eq!(encoded[50], 2);
+    assert_eq!(
+        Command::decode(&encoded).expect("hidden command decodes"),
+        value
     );
 }
 
@@ -558,10 +575,26 @@ fn codec_rejects_truncation_invalid_tags_and_trailing_bytes() {
 fn instrument_definition_codec_round_trips_and_revalidates_rules() {
     let value = definition();
     let encoded = value.encode().expect("definition encodes");
-    assert_eq!(encoded.len(), 116);
+    assert_eq!(encoded.len(), 117);
+    assert_eq!(encoded[99], 0);
     assert_eq!(
         InstrumentDefinition::decode(&encoded).expect("definition decodes"),
         value
+    );
+
+    let mut hidden_enabled = encoded.clone();
+    hidden_enabled[99] = 1;
+    assert!(
+        InstrumentDefinition::decode(&hidden_enabled)
+            .unwrap()
+            .hidden_orders_supported()
+    );
+
+    let mut invalid_hidden_flag = encoded.clone();
+    invalid_hidden_flag[99] = 2;
+    assert_eq!(
+        InstrumentDefinition::decode(&invalid_hidden_flag),
+        Err(CodecError::InvalidBoolean(2))
     );
 
     let mut empty_symbol = encoded.clone();
@@ -866,6 +899,8 @@ fn every_rejection_reason_has_a_stable_round_trip() {
         RejectReason::StopTriggerBacklog,
         RejectReason::StopMarketCannotPost,
         RejectReason::StopMarketCannotBeReplaced,
+        RejectReason::HiddenOrderNotSupported,
+        RejectReason::HiddenOrderCannotBeImmediate,
     ];
     for (index, reason) in reasons.into_iter().enumerate() {
         let command_id = id(CommandId::new(
@@ -884,6 +919,7 @@ fn every_rejection_reason_has_a_stable_round_trip() {
             replayed: false,
         };
         let bytes = report.encode().expect("rejection report encodes");
+        assert_eq!(bytes[9], u8::try_from(index).unwrap());
         assert_eq!(ExecutionReport::decode(&bytes).unwrap(), report);
     }
 }
@@ -911,7 +947,7 @@ fn every_event_variant_round_trips() {
             order_id,
             price: Price::from_raw(-14),
             leaves_quantity: quantity,
-            displayed_quantity: quantity,
+            working_quantity: quantity,
         },
         EventKind::Trade(Trade {
             trade_id: id(TradeId::new(15)),

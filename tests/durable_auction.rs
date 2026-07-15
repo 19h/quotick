@@ -90,6 +90,7 @@ fn definition_with_symbol(symbol: &str) -> InstrumentDefinition {
         price: PriceRules::new(0, 1, Price::from_raw(0), Price::from_raw(1_000)).unwrap(),
         quantity: QuantityRules::new(1, 1, 1_000).unwrap(),
         reserve: ReserveOrderRules::disabled(),
+        hidden_orders_supported: false,
         base_units_per_lot: 1,
         quote_units_per_price_unit: 1,
         trading_state: TradingState::Closed,
@@ -761,7 +762,7 @@ fn auction_checkpoint_has_stable_kind_codec_and_direct_restore() {
     SnapshotFile::write(&snapshot, &shared, SnapshotOptions::default()).unwrap();
     let bytes = fs::read(snapshot).unwrap();
     assert_eq!(&bytes[0..4], b"QSNP");
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 6);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 7);
     assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 4);
 }
 

@@ -1,4 +1,4 @@
-# Semantic Snapshot Format Version 6
+# Expired Semantic Snapshot Format Version 6
 
 `SnapshotFile` stores one complete typed semantic value in a bounded,
 versioned CRC-32C envelope. Version 6 preserves the version-5 kind registry.

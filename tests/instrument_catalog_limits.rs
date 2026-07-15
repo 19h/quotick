@@ -35,6 +35,7 @@ fn definition(instrument: u64, version_value: u64, effective_from: u64) -> Instr
         price: PriceRules::new(2, 1, Price::from_raw(-1_000), Price::from_raw(1_000)).unwrap(),
         quantity: QuantityRules::new(1, 1, 1_000).unwrap(),
         reserve: ReserveOrderRules::disabled(),
+        hidden_orders_supported: false,
         base_units_per_lot: 100_000_000,
         quote_units_per_price_unit: 1,
         trading_state: if version_value % 2 == 0 {

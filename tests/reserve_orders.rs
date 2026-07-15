@@ -38,6 +38,7 @@ fn definition(reserve: ReserveOrderRules) -> InstrumentDefinition {
         price: PriceRules::new(0, 1, Price::from_raw(1), Price::from_raw(1_000)).unwrap(),
         quantity: QuantityRules::new(5, 5, 10_000).unwrap(),
         reserve,
+        hidden_orders_supported: false,
         base_units_per_lot: 1,
         quote_units_per_price_unit: 1,
         trading_state: TradingState::Open,
@@ -250,7 +251,7 @@ fn exhausted_peak_refreshes_at_the_fifo_tail_under_the_same_order_id() {
 
     let order = book.order(OrderId::new(1).unwrap()).unwrap();
     assert_eq!(order.leaves_quantity.lots(), 15);
-    assert_eq!(order.displayed_quantity.lots(), 5);
+    assert_eq!(order.working_quantity.lots(), 5);
     assert_eq!(order.display, reserve(10));
     let level = book.level(Side::Sell, Price::from_raw(100)).unwrap();
     assert_eq!(level.quantity, 5);
@@ -289,7 +290,7 @@ fn marketable_reserve_uses_total_incoming_quantity_and_peaks_only_the_residual()
     assert_eq!(maker_trades(&report), vec![(1, 15)]);
     let residual = book.order(OrderId::new(2).unwrap()).unwrap();
     assert_eq!(residual.leaves_quantity.lots(), 15);
-    assert_eq!(residual.displayed_quantity.lots(), 10);
+    assert_eq!(residual.working_quantity.lots(), 10);
     assert_eq!(book.best_bid().unwrap().quantity, 10);
     book.validate().unwrap();
 }
@@ -328,7 +329,7 @@ fn hidden_leaves_are_fok_eligible_but_public_depth_remains_displayed_only() {
     assert_eq!(maker_trades(&report), vec![(1, 10), (1, 10), (1, 5)]);
     let order = book.order(OrderId::new(1).unwrap()).unwrap();
     assert_eq!(order.leaves_quantity.lots(), 5);
-    assert_eq!(order.displayed_quantity.lots(), 5);
+    assert_eq!(order.working_quantity.lots(), 5);
     assert_eq!(book.best_ask().unwrap().quantity, 5);
     book.validate().unwrap();
 }
@@ -394,7 +395,7 @@ fn fok_preflight_simulates_reserve_requeue_before_self_trade_barriers() {
     assert!(maker_trades(&rejected).is_empty());
     let reserve_order = book.order(OrderId::new(1).unwrap()).unwrap();
     assert_eq!(reserve_order.leaves_quantity.lots(), 30);
-    assert_eq!(reserve_order.displayed_quantity.lots(), 10);
+    assert_eq!(reserve_order.working_quantity.lots(), 10);
     assert_eq!(book.best_ask().unwrap().quantity, 25);
 
     let accepted = book
@@ -716,7 +717,7 @@ fn decrement_and_cancel_stp_consumes_displayed_slices_and_refreshes_deterministi
     assert_eq!(maker_trades(&report), Vec::<(u64, u64)>::new());
     let order = book.order(OrderId::new(1).unwrap()).unwrap();
     assert_eq!(order.leaves_quantity.lots(), 15);
-    assert_eq!(order.displayed_quantity.lots(), 5);
+    assert_eq!(order.working_quantity.lots(), 5);
     assert_eq!(book.best_ask().unwrap().quantity, 5);
     book.validate().unwrap();
 }
@@ -777,7 +778,7 @@ fn public_incrementals_expose_only_each_active_peak_across_refresh() {
 
     let private = book.order(OrderId::new(1).unwrap()).unwrap();
     assert_eq!(private.leaves_quantity.lots(), 15);
-    assert_eq!(private.displayed_quantity.lots(), 5);
+    assert_eq!(private.working_quantity.lots(), 5);
     assert_eq!(replica.depth(Side::Sell, 1)[0].quantity, 5);
     assert_eq!(replica.depth(Side::Sell, 1), book.depth(Side::Sell, 1));
     publisher.validate_against(&book).unwrap();
@@ -930,7 +931,7 @@ fn reserve_definition_commands_and_post_refresh_state_survive_wal_recovery() {
     assert_eq!(recovered.book().last_trade_id(), live_trade_id);
     let private = recovered.book().order(OrderId::new(1).unwrap()).unwrap();
     assert_eq!(private.leaves_quantity.lots(), 15);
-    assert_eq!(private.displayed_quantity.lots(), 5);
+    assert_eq!(private.working_quantity.lots(), 5);
     assert_eq!(recovered.book().best_ask().unwrap().quantity, 5);
     assert!(
         live_report

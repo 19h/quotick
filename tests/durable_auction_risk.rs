@@ -92,6 +92,7 @@ fn definition() -> InstrumentDefinition {
         price: PriceRules::new(0, 5, Price::from_raw(-100), Price::from_raw(200)).unwrap(),
         quantity: QuantityRules::new(1, 1, 1_000).unwrap(),
         reserve: ReserveOrderRules::disabled(),
+        hidden_orders_supported: false,
         base_units_per_lot: 1,
         quote_units_per_price_unit: 1,
         trading_state: TradingState::Halted,
@@ -393,7 +394,7 @@ fn checkpoint_is_snapshot_kind_five_and_replays_only_the_suffix() {
     durable.close().unwrap();
 
     let bytes = fs::read(&snapshot).unwrap();
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 6);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 7);
     assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 5);
     let mut recovered = DurableCallAuctionRiskEngine::open_with_checkpoint(
         &wal,

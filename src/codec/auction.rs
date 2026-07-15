@@ -226,6 +226,7 @@ fn encode_admission_error(encoder: &mut Encoder, error: AdmissionError) {
         AdmissionError::DisplayQuantityOffGrid => 8,
         AdmissionError::DisplayQuantityNotLessThanOrder => 9,
         AdmissionError::ReserveReplenishmentLimit => 10,
+        AdmissionError::HiddenOrderNotSupported => 11,
     });
 }
 
@@ -242,6 +243,7 @@ fn decode_admission_error(decoder: &mut Decoder<'_>) -> Result<AdmissionError, C
         8 => Ok(AdmissionError::DisplayQuantityOffGrid),
         9 => Ok(AdmissionError::DisplayQuantityNotLessThanOrder),
         10 => Ok(AdmissionError::ReserveReplenishmentLimit),
+        11 => Ok(AdmissionError::HiddenOrderNotSupported),
         tag => Err(CodecError::InvalidTag {
             type_name: "AdmissionError",
             tag,
@@ -856,5 +858,24 @@ fn decode_optional_auction_id(decoder: &mut Decoder<'_>) -> Result<Option<Auctio
         Ok(Some(auction_id(decoder)?))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AdmissionError, Decoder, Encoder, decode_admission_error, encode_admission_error};
+
+    #[test]
+    fn hidden_admission_error_has_stable_tag_eleven() {
+        let mut encoder = Encoder::default();
+        encode_admission_error(&mut encoder, AdmissionError::HiddenOrderNotSupported);
+        assert_eq!(encoder.finish().unwrap(), [11]);
+
+        let mut decoder = Decoder::new(&[11]);
+        assert_eq!(
+            decode_admission_error(&mut decoder).unwrap(),
+            AdmissionError::HiddenOrderNotSupported
+        );
+        decoder.finish().unwrap();
     }
 }

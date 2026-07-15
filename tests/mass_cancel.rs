@@ -38,6 +38,7 @@ fn definition(state: TradingState) -> InstrumentDefinition {
         price: PriceRules::new(0, 1, Price::from_raw(1), Price::from_raw(1_000)).unwrap(),
         quantity: QuantityRules::new(1, 1, 10_000).unwrap(),
         reserve: ReserveOrderRules::new(32).unwrap(),
+        hidden_orders_supported: false,
         base_units_per_lot: 1,
         quote_units_per_price_unit: 1,
         trading_state: state,

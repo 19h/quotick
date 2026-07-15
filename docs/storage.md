@@ -233,7 +233,7 @@ semantic generation plus exact history lineage. It decides as follows:
   size exceeds the caller's configured limit is preserved.
 
 The complete wire and decision contract is
-[Semantic snapshot format version 6](snapshot-v6.md).
+[Semantic snapshot format version 7](snapshot-v7.md).
 
 Direct users must dedicate the target and its two sidecars to snapshots.
 `DurableOrderBook`, `DurableRiskOrderBook`, `DurableLedger`, and
@@ -426,7 +426,8 @@ and how reopen interprets the resulting bytes.
 - **Snapshot/checkpoint tests** exercise stable framing, payload bounds,
   corrupt and incomplete pending files, current/pending generation forks,
   exact matching-command/report and ledger-record lineage, matching
-  FIFO/reserve/STP/GTD-expiry/dormant-stop restoration, correction and generalized
+  displayed/hidden FIFO, reserve/STP/GTD-expiry/dormant-stop restoration,
+  correction and generalized
   ledger-batch grouping, batch torn-tail repair and whole-frame segment rotation,
   managed-directory rejection, WAL-path alias rejection, single/segmented
   WAL-prefix proof, suffix replay, coupled risk

@@ -108,6 +108,7 @@ fn main() {
         price: PriceRules::new(0, 1, Price::from_raw(1), Price::from_raw(1_000_000)).unwrap(),
         quantity: QuantityRules::new(1, 1, 1_000_000).unwrap(),
         reserve: ReserveOrderRules::disabled(),
+        hidden_orders_supported: false,
         base_units_per_lot: 1,
         quote_units_per_price_unit: 1,
         trading_state: TradingState::Open,
@@ -204,7 +205,9 @@ book applies it.
 - Market and limit orders with GTC, GTD, IOC, FOK, and post-only behavior
   (market orders can neither rest nor post); native reserve (iceberg) orders with
   fixed displayed peaks, hidden total leaves, bounded replenishment, and
-  FIFO-tail priority on refresh.
+  displayed-class-tail priority on refresh; and instrument-gated fully hidden
+  resting limit orders with zero public depth and deterministic priority behind
+  every displayed or reserve order at the same price.
 - GTD orders use absolute UTC nanosecond deadlines and expire only through an
   explicit sequenced inclusive watermark advance. Expiry order is canonical
   `(deadline, OrderId)` order; no wall clock is read by the matching engine.
@@ -285,7 +288,9 @@ book applies it.
   event at the identical source sequence; no account, order, or command
   identifiers are ever published.
 - Absolute displayed level-2 quantity and order-count updates plus trade
-  prints; hidden reserve leaves are never published as depth.
+  prints; reserve hidden leaves and fully hidden orders are never published as
+  depth. Fully hidden executions publish an anonymized trade with a canonical
+  absent maker level when no public level existed.
 - Full-depth snapshots in canonical market-priority order; replicas detect
   missing, duplicated, and reordered updates and recover from gaps by
   atomically swapping double-buffered, pre-reserved snapshot arenas.
@@ -407,12 +412,12 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 102 tagged assumptions (A1–A102), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 103 tagged assumptions (A1–A103), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
-| [WAL format v6](docs/wal-v6.md) | Current write-ahead-log frame and record schema |
-| [Snapshot format v6](docs/snapshot-v6.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
-| [Market-data payload v2](docs/market-data-v2.md) | Current continuous market-data update/snapshot payloads |
+| [WAL format v7](docs/wal-v7.md) | Current write-ahead-log frame and record schema |
+| [Snapshot format v7](docs/snapshot-v7.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
+| [Market-data payload v3](docs/market-data-v3.md) | Current continuous market-data update/snapshot payloads |
 | [Auction market-data payload v1](docs/auction-market-data-v1.md) | Current call-auction market-data payloads |
 | [Auction-risk checkpoint payload v1](docs/auction-risk-checkpoint-v1.md) | Current coupled call-auction risk checkpoint payload |
 
@@ -420,10 +425,13 @@ Historical formats whose envelopes the runtime rejects are retained as
 byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/wal-v4.md](docs/wal-v4.md),
 [docs/wal-v5.md](docs/wal-v5.md),
+[docs/wal-v6.md](docs/wal-v6.md),
 [docs/snapshot-v2.md](docs/snapshot-v2.md), and
 [docs/snapshot-v3.md](docs/snapshot-v3.md), and
 [docs/snapshot-v4.md](docs/snapshot-v4.md), and
-[docs/snapshot-v5.md](docs/snapshot-v5.md).
+[docs/snapshot-v5.md](docs/snapshot-v5.md), and
+[docs/snapshot-v6.md](docs/snapshot-v6.md), plus continuous
+[market-data v2](docs/market-data-v2.md).
 
 ## Build and verify
 
@@ -439,12 +447,12 @@ differential tests drive tens of thousands of generated operations from
 fixed-seed PRNGs against independent in-test reference models. Coverage
 includes:
 
-- **Matching and risk:** priority and FIFO boundaries, reserve admission and
-  replenishment, GTD intake and canonical expiry sweeps, dormant stop intake,
-  canonical bounded trigger sweeps, activation-time failures, mass
-  cancellation, account and trading-state controls, every self-trade policy,
-  risk rejection and reservation release, and capacity behavior at every
-  configured bound.
+- **Matching and risk:** displayed/hidden queue classes, hidden and reserve
+  admission and replenishment, GTD intake and canonical expiry sweeps, dormant
+  stop intake, canonical bounded trigger sweeps, activation-time failures,
+  mass cancellation, account and trading-state controls, every self-trade
+  policy, risk rejection and reservation release, and capacity behavior at
+  every configured bound.
 - **Call auctions:** discovery differentially checked against exhaustive
   tick-grid enumeration, allocation against literal order-priority walks,
   20,000 mixed book mutations and 10,000 uncross cases against independent

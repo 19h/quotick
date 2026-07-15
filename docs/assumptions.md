@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A101 are stable and are referenced from code comments and other
+identifiers A1-A103 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -262,27 +262,31 @@ integrity; concern about the second requires authenticated records.
 
 ## A15 — format version immutability
 
-**Assumption.** WAL format version 6 and snapshot format version 6 are
-immutable. WAL and snapshot versions `1` through `5` are expired and rejected
-explicitly rather than inferred or migrated. WAL v6 preserves v5 record-kind
-tags and payload bytes for kinds `3` through `10`; kinds `1`/`2` add continuous
-stop order, reference-sweep, activation, rejection, and cancellation tags.
-Snapshot v6 preserves v5 payload bytes for kinds `1`, `4`, and `5`; kinds
-`2`/`3` add canonical dormant-stop rows and derive reference/trigger lineage
-from retained history. No runtime interprets an expired envelope as current.
-Any future incompatible evolution uses a new explicit version and provenance-
-preserving migration when authoritative predecessors exist.
+**Assumption.** WAL format version 7, snapshot format version 7, and continuous
+market-data payload version 3 are immutable. WAL and snapshot versions `1`
+through `6` are expired and rejected explicitly rather than inferred or
+migrated. WAL v7 preserves the v6 frame and record-kind registry, adds one
+instrument-definition boolean, fully hidden display tag `2`, continuous
+rejection tags `48`/`49`, and call-auction admission-error tag `11`.
+Snapshot v7 preserves ledger kind `1`, embeds the changed definition in kinds
+`2` through `5`, and permits canonical fully hidden continuous rows in kinds
+`2`/`3`. Market-data v3 preserves v2 bytes but adds the absent-public-maker
+trade interpretation required for fully hidden execution. No runtime
+interprets an expired envelope as current. Any future incompatible evolution
+uses a new explicit version and provenance-preserving migration when
+authoritative predecessors exist.
 
 **Dependent results.** Deterministic decoding, historical replay, checkpoint
 recovery, anchor interpretation, stable auction records/images, and fail-closed
 format boundaries.
 
-**Falsification probe.** Byte-compare golden WAL-v6 and snapshot-v6 fixtures
-through every supported release; mutate valid WAL frames and images to versions
-`1`/`2`/`3`/`4`/`5`; verify continuous expiry/stop tags, raw auction record
-tags `9`/`10`, and snapshot kinds `1` through `5`. Any changed supported
-bytes/interpretation or acceptance across an expired envelope boundary
-falsifies A15.
+**Falsification probe.** Byte-compare golden WAL-v7, snapshot-v7, and market-
+data-v3 fixtures through every supported release; mutate valid WAL frames and
+images to versions `1` through `6`; verify definition booleans, every display
+and hidden rejection tag, continuous expiry/stop tags, raw auction record tags
+`9`/`10`, snapshot kinds `1` through `5`, and hidden-maker trade application.
+Any changed supported bytes/interpretation or acceptance across an expired
+envelope boundary falsifies A15.
 
 ## A16 — at most one dangling command
 
@@ -390,10 +394,11 @@ audit, falsifies A21.
 
 **Assumption.** The configured native reserve policy is the authoritative
 policy for this shard: one stable private order ID, a fixed maximum displayed
-peak, total hidden leaves eligible for matching/FOK/risk, and FIFO-tail requeue
-after full displayed-slice exhaustion. Public depth contains only active
+peak, total hidden leaves eligible for matching/FOK/risk, and displayed-class-
+tail requeue after full slice exhaustion. The displayed/reserve class remains
+ahead of the fully hidden class at one price. Public depth contains only active
 displayed slices. Discretionary, pegged, synthetic/implied, randomized-peak,
-and venue-managed hidden priority are outside this policy.
+and other venue-managed hidden priority are outside this policy.
 
 **Dependent results.** Reserve admission, maker priority, replenishment events,
 public depth, FOK, risk, and replay.
@@ -505,7 +510,7 @@ A28.
 
 **Assumption.** A ledger checkpoint and its recovery WAL represent one
 immutable ledger-record history; numeric generation is never treated as lineage
-without exact prefix equality or an exact version-6 checkpoint anchor. An
+without exact prefix equality or an exact version-7 checkpoint anchor. An
 anchored WAL separately binds semantic record count and physical retired-prefix
 sequence. Capture/audit resource or replay-constructor failure under A89 occurs
 before snapshot/cutover mutation and leaves the durable ledger unpoisoned; live
@@ -611,12 +616,12 @@ environment.
 **Assumption.** The dated 47 B fixed ledger-entry payload, ledger-correction
 WAL kind `6`, ledger-batch WAL kind `7`, and tagged record-based checkpoint
 schema first defined under version 3 are retained byte-for-byte by the
-deployable version-6 WAL/version-6 snapshot accounting formats; no earlier
+deployable version-7 WAL/version-7 snapshot accounting formats; no earlier
 undated or flat-entry expired `QWAL`/`QSNP` ledger artifact requires
 compatibility. Older development envelopes fail before payload interpretation
 rather than receiving inferred dates, times, or grouping.
 
-**Dependent results.** A version-6 WAL/version-6 snapshot dated atomic
+**Dependent results.** A version-7 WAL/version-7 snapshot dated atomic
 grouped-event accounting schema with an explicit rejection boundary for expired
 artifacts.
 
@@ -645,23 +650,25 @@ effect, accepted partial state, or incorrect final balance falsifies A36.
 
 ## A37 — retained matching payload formats
 
-**Assumption.** The reserve-, mass-cancel-, account-control-, and GTD-enabled
-instrument, command, and execution-report variants defined through version 5
-remain byte-for-byte variants inside deployable WAL version 6. Version 6 adds
-explicit continuous stop order, reference-sweep, activation, cancellation,
-rejection, and completion tags; it does not infer them from WAL version 5. No
-earlier matching WAL requires runtime compatibility. Expired envelopes fail
-before payload interpretation rather than receiving inferred display, mass-
-cancel, control, expiry, stop, reference, trigger-priority, or anchor semantics.
+**Assumption.** The reserve-, mass-cancel-, account-control-, GTD-, and stop-
+enabled command/report variants defined through version 6 remain explicit
+variants inside deployable WAL version 7. Version 7 adds the instrument hidden-
+support boolean, fully hidden display tag, working-rest quantity semantics, and
+typed hidden rejections; it does not infer them from WAL version 6. No earlier
+matching WAL requires runtime compatibility. Expired envelopes fail before
+payload interpretation rather than receiving inferred display, mass-cancel,
+control, expiry, stop, reference, trigger-priority, hidden, or anchor semantics.
 
-**Dependent results.** Explicit fully-displayed/reserve/GTD/stop state, refresh,
-expiry, and trigger events, canonical mass cancellation, revisioned account
-fencing, and anchored cutover under WAL envelope version `6`.
+**Dependent results.** Explicit fully displayed/reserve/fully hidden/GTD/stop
+state, refresh, expiry, and trigger events, canonical mass cancellation,
+revisioned account fencing, and anchored cutover under WAL envelope version
+`7`.
 
 **Falsification probe.** Inventory every persisted matching WAL and decode
-golden version-6 fixtures before deployment. Reject version-5 artifacts with
-and without re-labelled headers, and mutate every expiry/stop tag, deadline,
-watermark, reference, trigger, activation, aggregate, and ordering relation.
+golden version-7 fixtures before deployment. Reject version-6 artifacts with
+and without re-labelled headers, and mutate every hidden/expiry/stop tag,
+definition flag, deadline, watermark, reference, trigger, activation,
+aggregate, and ordering relation.
 Discovery of an authoritative
 predecessor that must remain readable falsifies A37 and requires a
 provenance-preserving migration; silently inferring absent fields is not
@@ -805,14 +812,16 @@ fixed-width wrap, or audit failure on valid committed state falsifies A43.
 
 ## A44 — cached best-level state
 
-**Assumption.** Each side's bounded indexed AVL map is authoritative and its
-cached best `(price, key-checked slot handle, head, tail, displayed quantity,
-order count)` is redundant derived state updated through the sole level insert,
-handle-update, and remove boundary. No caller obtains unrestricted mutable
-level access.
+**Assumption.** Each side's bounded execution-price AVL map is authoritative
+for matching and its cached best `(price, key-checked slot handle, head, tail,
+public quantity, public order count)` is redundant derived state. A second
+bounded AVL contains exactly prices with non-zero public quantity and supplies
+an independently cached public best. Both indexes and caches update through the
+sole level insert, handle-update, and remove boundary. No caller obtains
+unrestricted mutable level access.
 
-**Dependent results.** Allocation-free `O(1)` best-price, best-order, and
-best-level snapshot discovery plus A83 direct maker-level mutation; no
+**Dependent results.** Allocation-free `O(1)` execution-best price/order and
+public-best level discovery plus A83 direct maker-level mutation; no
 ordered-tree traversal per maker-slice selection or non-empty aggregate update;
 deterministic checkpoint reconstruction derives fresh process-local handles.
 
@@ -821,18 +830,21 @@ better/worse/equal-price insertion, best/non-best deletion, partial/full fill,
 retained/lost-priority replace, all STP modes, sole/multi-order reserve
 refresh, mass cancel, and checkpoint/WAL reconstruction in both side
 directions. Deliberately corrupt the cached price, handle, or any cached level
-field and run the independent AVL/cache audit. Any undetected divergence, stale
-handle, or best lookup inconsistent with the AVL map falsifies A44.
+field or public-price membership and run the independent AVL/cache audit. Any
+undetected divergence, stale handle, or best lookup inconsistent with its AVL
+map falsifies A44.
 
 ## A45 — FOK eligibility under reserve replenishment
 
 **Assumption.** For FOK eligibility, reserve replenishment changes execution
 order but not total fillable external leaves at a price unless a
-cancel-aggressor/cancel-both self order is encountered. The first such self
-order is a FIFO barrier: reserve replenishments from earlier orders rejoin
-behind it, so only their current displayed slices are executable before the
-barrier. Cancel-resting removes self orders and leaves every external total
-leaf eligible. Decrement-and-cancel remains inadmissible for FOK.
+cancel-aggressor/cancel-both self order is encountered. A self order in the
+displayed class is a barrier after only the current slices preceding it because
+refresh rejoins at that class's tail. A self order in the hidden class is a
+barrier after all total leaves in the preceding displayed class, plus earlier
+hidden leaves, because refresh never crosses into the hidden class. Cancel-
+resting removes self orders and leaves every external total leaf eligible.
+Decrement-and-cancel remains inadmissible for FOK.
 
 **Dependent results.** Allocation-free FOK preflight with `O(1)` auxiliary
 space and one visit per active order in crossed levels; exact hidden-liquidity
@@ -840,8 +852,9 @@ and STP behavior without materialized slice queues.
 
 **Falsification probe.** Differentially compare against an independent literal
 slice/requeue simulation across generated levels, FIFO ownership patterns,
-partial reserve slices, quantities, prices, and every supported FOK STP mode;
-retain explicit same-price barrier, better-price hidden exhaustion,
+partial reserve slices, fully hidden FIFO, quantities, prices, and every
+supported FOK STP mode; retain explicit displayed- and hidden-class same-price
+barriers, better-price hidden exhaustion,
 cancel-resting, insufficient-liquidity, and execution-trace fixtures. Any
 eligibility or trace disagreement falsifies A45.
 
@@ -859,7 +872,7 @@ max_active_orders + 1`, and the derived event reserve is `max_active_orders +
 max_active_orders`.
 
 Stop-trigger sweeps use ordinary history/event capacity and independently
-prove their full activation/matching report bound. Both price-level arenas, the
+prove their full activation/matching report bound. All four price arenas, the
 GTD-expiry arena, both stop-trigger arenas, the retained-event arena, and all
 matching/profile/reservation dense hashes are fallibly constructed through
 configured maxima before the shard exists. Limits are not financial
@@ -986,10 +999,11 @@ cycle, or non-thread-safe trace falsifies A49.
 
 ## A50 — per-command event and trade bounds
 
-**Assumption.** For a resting fully displayed order, one future maker/STP
-interaction event remains. For a reserve order with total leaves `L`, displayed
-leaves `D`, and peak `p`, `s = 1 + ceil((L - D) / p)` future displayed slices
-remain and `e = 2s - 1` interaction/refresh event units are sufficient.
+**Assumption.** For a resting fully displayed or fully hidden order, one future
+maker/STP interaction event remains. For a reserve order with total leaves
+`L`, displayed leaves `D`, and peak `p`, `s = 1 + ceil((L - D) / p)` future
+displayed slices remain and `e = 2s - 1` interaction/refresh event units are
+sufficient.
 Per-level, per-side, and per-account/per-side sums of `e` are redundant
 mutation-maintained state. All admitted quantities and display peaks are
 positive multiples of the instrument lot increment.
@@ -1013,11 +1027,12 @@ Conservative aggregates can reject early at a boundary, but only actual
 committed events advance the arena cursor.
 
 **Falsification probe.** Differentially execute at least 20,000 generated books
-across both sides, multiple prices, full/reserve orders, partial displayed
-slices, all five TIF modes, and all four STP modes; assert actual event/trade
-counts never exceed preparation, retained-event count equals exact cached
-coverage, and complete invariant validation passes. Independently generate at
-least 20,000 non-priority replacements. Exercise final sequence/event slots,
+across both sides, multiple prices, full/reserve/fully hidden orders, partial
+displayed slices, all five TIF modes, and all four STP modes; assert actual
+event/trade counts never exceed preparation, retained-event count equals exact
+cached coverage, and complete invariant validation passes. Independently
+generate at least 20,000 non-priority replacements. Exercise final
+sequence/event slots,
 reserve refresh, partial/full fill, replacement, cancellation, STP, stop-
 market/limit activation, multi-stop batches, WAL/checkpoint recovery, and
 deliberate aggregate/range corruption. Any bound
@@ -1146,8 +1161,8 @@ post-construction buffer growth, or noncanonical output falsifies A54.
 
 ## A55 — indexed AVL matching arenas
 
-**Assumption.** The ordered-price, GTD-expiry, and buy/sell stop-trigger
-implementations follow the
+**Assumption.** The execution-price, public-price, GTD-expiry, and buy/sell
+stop-trigger implementations follow the
 height-balanced search-tree invariant introduced by Adel'son-Vel'skii and
 Landis ([primary paper,
 1962](https://www.mathnet.ru/php/archive.phtml?jrnid=dan&option_lang=eng&paperid=26964&wshow=paper)):
@@ -1169,9 +1184,11 @@ every child reference once, requires exactly `P - 1` tree edges, resolves every
 occupied key to its exact stable slot, and then validates reachability,
 ordering, balance, cached height, and free-list coverage in `O(P log(P + 1))`
 time and `O(1)` auxiliary space without allocating. Price-arena memory
-reservation is `2 × P_max × size_of::<Slot<Price, PriceLevel>>()` bytes plus
-two vector headers; the expiry arena adds `O_max × S_expiry`, where `S_expiry`
-is the target ABI size of one `(deadline, OrderId)` index slot. The two stop
+reservation is `2 P_max S_level + 2 P_max S_public` bytes plus four vector
+headers, where `S_level` is one execution-price/`PriceLevel` slot and
+`S_public` one public-price/unit slot. The expiry arena adds
+`O_max × S_expiry`, where `S_expiry` is the target ABI size of one
+`(deadline, OrderId)` index slot. The two stop
 arenas add at most `2 × O_max × S_stop`, where `S_stop` is the target ABI slot
 size; all byte bounds remain subject to allocator rounding.
 Double-ended traversal uses a fixed `256 ×
@@ -1243,8 +1260,8 @@ risk profiles remain immutable under A18. Authentication and authorization of
 the controller are external inputs; coupled risk requires the target profile to
 exist.
 
-**Dependent results.** Deterministic, idempotent, version-6
-WAL/version-6-checkpoint-recoverable local admission control; no active order
+**Dependent results.** Deterministic, idempotent, version-7
+WAL/version-7-checkpoint-recoverable local admission control; no active order
 survives an accepted block; blocked new/replacement admission fails while
 cancellation remains available. For `K` selected orders, block is `O(K(log K +
 log P))` time and `O(K)` constructor-leased scratch under A87; enable is
@@ -1312,7 +1329,7 @@ session identifiers, controller authentication, and venue transition graphs are
 external and currently unrepresented.
 
 **Dependent results.** Deterministic entry gating with cancel/control
-availability in every state; exact retry; version-6 WAL and version-6
+availability in every state; exact retry; version-7 WAL and version-7
 checkpoint reconstruction; account-independent risk bypass with
 cancellation-derived reservation release; public market-data state/revision
 recovery. For `O` active orders, transition-and-cancel is `O(O log O + O log
@@ -1532,7 +1549,7 @@ A65/A66.
 ## A65 — durable auction WAL grammar
 
 **Assumption.** One `DurableCallAuctionEngine` owns the only writer lease for
-one WAL-version-6 single-file or marker-selected segmented auction shard. Its
+one WAL-version-7 single-file or marker-selected segmented auction shard. Its
 uncut grammar is one immutable definition followed by command/report pairs and
 at most one final dangling command. Submission prepares before command append,
 commits the same token, then appends the exact report; acknowledgement strength
@@ -1559,13 +1576,13 @@ only a torn active tail; replay exact state/trade IDs/cache identity; retry
 before/after reopen and prove zero frame growth. Inject definition drift,
 unexpected records, consecutive/dangling duplicates, persisted `replayed =
 true`, report mutation, segment corruption, insufficient limits, and frame
-versions `1`/`2`/`3`/`4`/`5`. Any accepted divergent/noncanonical history, duplicate
-transition, retry frame, cross-layout semantic difference, or unaudited
-dangling completion falsifies A65.
+versions `1`/`2`/`3`/`4`/`5`/`6`. Any accepted divergent/noncanonical history,
+duplicate transition, retry frame, cross-layout semantic difference, or
+unaudited dangling completion falsifies A65.
 
 ## A66 — auction checkpoint lineage
 
-**Assumption.** A snapshot-version-6 call-auction checkpoint and its recovery
+**Assumption.** A snapshot-version-7 call-auction checkpoint and its recovery
 WAL represent one immutable A65 command/report lineage. The image retains the
 definition/WAL origin, completed report boundary, phase/cycle, book revision,
 next priority/trade counters, canonical accepted identities and active orders,
@@ -1573,7 +1590,7 @@ and complete exact-retry history. A completed checkpoint is released only after
 independent replay requires exact direct-state equality; A97/A98 separate
 non-replaying capture from that proof. Numeric generation is never accepted
 without exact uncut prefix equality or a kind/checksum/generation/slot-bound
-version-6 anchor. Capture/validation resource or temporary-constructor failure
+version-7 anchor. Capture/validation resource or temporary-constructor failure
 under A78 occurs before snapshot/cutover mutation and leaves the durable shard
 unpoisoned; semantic contradiction poisons it.
 
@@ -1684,7 +1701,7 @@ A66-style auction image, reconstructs reservations from active orders, and is
 released only after full history replay through the coupled gate; A99/A100
 stage that proof.
 
-Snapshot-v6 kind `5` and `DurableCallAuctionRiskEngine` bind a canonical
+Snapshot-v7 kind `5` and `DurableCallAuctionRiskEngine` bind a canonical
 definition/profile prefix, risk-aware command/report replay, one
 dangling-command completion, exact uncut prefix proof, and
 single-file/segmented A/B cutover. Dynamic profile/control mutation,
@@ -1761,6 +1778,9 @@ matching shard's configured active-order (including dormant-stop), per-side pric
 account-control, and per-report event maxima—not merely its current
 cardinality. One replica independently selects a finite envelope and consumes
 only same-instrument/version snapshots and contiguous updates under A21/A23.
+The publisher retains fully hidden orders in private state but excludes them
+from public quantity/count. A trade from an absent public maker price is valid
+only with the canonical zero/zero maker level defined by payload version 3.
 
 **Dependent results.** [A70] Publisher bid/ask and buy/sell stop-trigger AVL
 arenas, resting-order/dormant-stop/control dense hashes, and affected-level
@@ -1788,9 +1808,10 @@ valid image while proving active/standby allocation stability. Run at least
 1,000 distinct order/price cycles with periodic publisher cross-audit, snapshot
 swaps, and replica structural validation; assert every AVL, dense, bucket, and
 scratch allocation remains fixed and scratch is empty between calls.
-Exercise stop arm/replace/cancel/expiry/trigger traces at full identity capacity,
-corrupt canonical trigger order/reference/backlog, and require publisher
-rejection without public-depth divergence.
+Exercise fully hidden rest/replace/cancel/trade traces, hidden-only execution
+prices, and stop arm/replace/cancel/expiry/trigger traces at full identity
+capacity, corrupt canonical trigger order/reference/backlog, and require
+publisher rejection without public-depth divergence.
 
 Deliberately discard active-arena and scratch reservations and require
 invariant rejection. Any accepted undersized publisher, post-construction state
@@ -1852,14 +1873,15 @@ resolve to an order with the same side and price, and every account-list entry
 to the same owner and side. Because each price and account/side list is unique,
 any repeated identity or cycle within a list necessarily attempts more than the
 authoritative active-order cardinality. Each dormant identity instead resolves
-to exactly one side-derived stop key. A55 independently proves each price,
-expiry, and stop arena's tree and free-list topology without scratch.
+to exactly one side-derived stop key. A55 independently proves each execution-
+price, public-price, expiry, and stop arena's tree and free-list topology
+without scratch.
 
 **Dependent results.** [A72] Successful complete live-book audit is allocation-
 free `O(O + P log(P + 1) + X log(X + 1) + S log(S + 1))` time and `O(1)`
-auxiliary space for `O` active orders, at most `P` initialized AVL slots per
-price side, `X <= O` initialized expiry slots, and `S <= O` initialized stop
-slots. Exact price/account/expiry/trigger coverage,
+auxiliary space for `O` active orders, at most `P` initialized slots per
+execution/public price arena, `X <= O` initialized expiry slots, and `S <= O`
+initialized stop slots. Exact price/account/expiry/trigger coverage,
 forward/backward links, aggregates, accepted identity, account controls,
 watermark exclusion, spread, hash layouts, arena reservations, order-selection
 pool configuration/capacity, cached extrema/handles, and AVL topology remain
@@ -1867,7 +1889,8 @@ checked. Human-readable formatting after an invariant failure can allocate
 under A12.
 
 **Falsification probe.** Build empty, single-level, multi-level, two-sided,
-multi-account, reserve, GTD, dormant-stop, triggered-stop, control, and churned
+multi-account, reserve, fully hidden, GTD, dormant-stop, triggered-stop,
+control, and churned
 books and audit after every transition. Inject price-FIFO and account-list self/
 multi-node cycles,
 duplicate membership, wrong side/price/owner, missing order, broken
@@ -2219,10 +2242,11 @@ WALs, or checkpoints.
 makes best-level lookup and mutation by handle `O(1)` without an ordered key
 search. Partial maker fills, removal from a level that remains occupied, and
 reserve replenishment are `O(1)` price-index work. Replenishment splices the
-order to the FIFO tail in place and updates level/account work aggregates
-without deleting/reinserting the price. Empty-level AVL removal and residual
-level insertion remain `O(log(P + 1))`. A command consuming `E` displayed maker
-slices and exhausting `L <= E` price levels is `O(E + (L + 1) log(P + 1))`
+order to the displayed-class tail in place and updates level/account work
+aggregates without deleting/reinserting the price. Empty-level AVL removal and
+residual level insertion remain `O(log(P + 1))`. A command consuming `E`
+displayed maker slices and exhausting `L <= E` price levels is
+`O(E + (L + 1) log(P + 1))`
 expected time outside bounded hash-collision costs, with `O(1)` matching
 auxiliary space after preparation.
 
@@ -2399,9 +2423,10 @@ residency, and cache locality require target-specific measurement.
 chronological `CommandReportCheckpoint` rows, `R` canonical
 `RestingOrderCheckpoint` rows, and `S` canonical `DormantStopCheckpoint` rows
 for the live retained-command and active-order cardinalities, where
-`R + S = O`. Each resting or dormant row retains its optional GTD deadline, while the
-inclusive expiry watermark, stop reference, and trigger lineage are
-reconstructed from chronological history.
+`R + S = O`. Resting rows retain executable working quantity and canonical
+displayed-class-before-hidden FIFO order. Each resting or dormant row retains
+its optional GTD deadline, while the inclusive expiry watermark, stop
+reference, and trigger lineage are reconstructed from chronological history.
 Coupled risk capture additionally owns exactly `A`
 account/profile/exposure rows. Each vector is empty and completes
 `try_reserve_exact` for its immutable source cardinality before its first push;
@@ -2948,6 +2973,39 @@ persisted sweep, noncanonical equal-threshold order, accepted reference advance
 over backlog, second retry effect, or inability to identify a missing upstream
 reference falsifies A102 and requires a different versioned trigger authority.
 
+## A103 — fully hidden continuous queue policy
+
+**Assumption.** One immutable instrument-definition flag is authoritative for
+fully hidden continuous-order admission. A fully hidden qualifier is valid only
+for a limit order whose time in force may rest. At one price, fully displayed
+and native-reserve orders form the first execution class and fully hidden
+orders the second; FIFO applies within each class, and reserve refresh rejoins
+the first class's tail. Every hidden leaf is executable for matching, FOK, STP,
+risk, checkpoint, and replay, while public quantity and public order count are
+zero. Venue-specific alternative hidden classes, midpoint/non-displayed types,
+minimum-quantity constraints, and discretionary interaction are not inferred.
+
+**Dependent results.** [A1, A15, A20, A21, A22, A44, A45, A47, A50, A55,
+A70, A72, A83, A88, A103] Deterministic displayed-before-hidden execution,
+hidden FIFO, reserve refresh priority, hidden-aware FOK/STP barriers, total-
+leaves risk, version-7 WAL/snapshot recovery, and version-3 public projection.
+A hidden-only price can be the private execution best while being absent from
+public best/depth. A hidden-maker trade prints at its execution price with a
+canonical absent public maker level when no visible same-price level exists.
+
+**Falsification probe.** Import venue-certified fixtures and execute an older
+hidden order, later fully displayed and reserve orders at the same price,
+multiple reserve refreshes, multiple hidden orders, every FOK/STP policy,
+same-price self barriers in both classes, retained/lost-priority replacement,
+GTD/stop-limit activation, checkpoint/WAL recovery, risk reconstruction, and
+publisher/replica gap repair. Independently compare private queue order, public
+depth/count, trade sequence, and restored state. Any hidden order executing
+ahead of displayed-class liquidity, reserve refresh crossing behind hidden,
+hidden FIFO inversion, hidden public depth, lost executable leaves, replica
+sequence gap, replay divergence, or required venue rule outside the represented
+class model falsifies A103 for that integration and requires a new versioned
+policy.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -3008,9 +3066,10 @@ capability, a remaining risk, or an opportunity.
   authorization, versioned calendar ingestion, durable external evidence,
   clearing workflow adapters, external retired-generation archival, and
   checkpoint-memory-bounded restart remain.
-- **High impact:** immutable versioned tick, lot, asset, trading-state, and
-  settlement and bounded native reserve rules are implemented; authoritative
-  source ingestion, venue-certified reserve adapters, calendars, corporate
+- **High impact:** immutable versioned tick, lot, asset, trading-state,
+  settlement, bounded native reserve, and fully hidden admission rules are
+  implemented; authoritative source ingestion, venue-certified display/queue
+  adapters, calendars, corporate
   actions, derivative lifecycle rules, and signed configuration distribution
   remain outside the boundary.
 - **High impact:** the dated ledger codec is deployment-safe only under A35.
@@ -3033,7 +3092,8 @@ capability, a remaining risk, or an opportunity.
   lifecycle boundary.
 - **High impact:** matching includes one continuous single-instrument
   price-time-priority book with market/limit, GTC/GTD/IOC/FOK/post-only, native
-  reserve, stop-market/stop-limit, replace/cancel, canonical explicit expiry and
+  reserve, fully hidden displayed-priority queue classes,
+  stop-market/stop-limit, replace/cancel, canonical explicit expiry and
   stop-reference sweeps, mass cancellation, four STP policies, and revisioned
   open/cancel-only/halted/closed controls. A
   separate bounded call-auction book
@@ -3047,7 +3107,7 @@ capability, a remaining risk, or an opportunity.
   single/segmented recovery, aggregate-depth queries, and anonymized
   phase/trade/final-clearing publication with gap-repair snapshots are
   implemented. Reference/dynamic-band construction, indicative publication,
-  reserve/display and pro-rata/size/venue allocation policies, preventive
+  auction display and pro-rata/size/venue allocation policies, preventive
   self-trade policies, auction-ledger integration, settlement, authenticated
   public/private transport, market-on-auction and imbalance-only order types,
   authoritative external continuous stop-reference ingestion, pegged triggers,
@@ -3122,12 +3182,13 @@ capability, a remaining risk, or an opportunity.
   then performs `K` price/expiry AVL removals, emitting `K + 1` events. The
   asymptotic bound is deterministic; pinned-hardware p50/p99.9 latency, burst
   cadence, and cache-residency effects at `K = O_max` remain unknown.
-- **Medium impact:** complete best-level caches and A83 key-checked stable-slot
-  handles make best price/FIFO discovery, partial maker mutation, non-empty-
-  level removal, and reserve FIFO-tail refresh allocation-free `O(1)` without
-  an ordered price search. They add two fixed `PriceLevel` copies and handles
-  per book; all authoritative-map mutations refresh the affected cache and the
-  invariant audit independently recomputes both extrema and handles. Empty-
+- **Medium impact:** execution and public best-level caches plus A83 key-checked
+  stable-slot handles make execution-price/FIFO discovery, public-best lookup,
+  partial maker mutation, non-empty-level removal, and reserve displayed-class-
+  tail refresh allocation-free `O(1)` without an ordered price search. They add
+  two execution-price handles/copies and two public-best copies per book; all
+  authoritative-map mutations synchronize public membership and both cache
+  classes. Empty-
   level deletion, residual insertion, and next-worse traversal remain
   `O(log(P + 1))`. Pinned-hardware branch/cache-miss and p50/p99.9 latency
   deltas are unknown.
@@ -3147,15 +3208,16 @@ capability, a remaining risk, or an opportunity.
   differential test matches the prior literal slice/requeue model. Maximum-book
   scan latency and interaction with CPU cache residency remain unknown until
   measured on declared production capacities and hardware.
-- **Medium impact:** both price-level indexed AVL arenas, the GTD-expiry AVL,
-  and both stop-trigger AVL arenas are always fallibly reserved during book
-  construction. Price
-  reservation is `2 × P_max × S_price` and expiry reservation is
+- **Medium impact:** all four execution/public price AVL arenas, the GTD-expiry
+  AVL, and both stop-trigger AVL arenas are always fallibly reserved during
+  book construction. Price reservation is
+  `2 P_max S_level + 2 P_max S_public` and expiry reservation is
   `O_max × S_expiry` bytes; stop reservation is
   `2 × O_max × S_stop` bytes before allocator rounding, where `S_price`,
-  `S_expiry`, and `S_stop` are the target ABI slot sizes; exact ABI-dependent
-  slot sizes and resident-page behavior require target measurement. All five matching
-  fixed-capacity hashes and the coupled-risk profile/reservation maps also reserve their
+  `S_level`, `S_public`, `S_expiry`, and `S_stop` are the target ABI slot sizes;
+  exact ABI-dependent slot sizes and resident-page behavior require target
+  measurement. All five matching fixed-capacity hashes and the coupled-risk
+  profile/reservation maps also reserve their
   complete dense maxima and initialize lookup arrays at load at most 0.5 during
   construction. Exact ABI byte footprint, seed-dependent probe distribution,
   and page residency remain target-dependent and require measurement. Matching and risk
@@ -3235,6 +3297,11 @@ capability, a remaining risk, or an opportunity.
   slice can also bound prior hidden quantity. Quantifying this information
   leakage and any venue-specific feed obfuscation is outside the current local
   publisher contract.
+- **Medium impact risk:** a fully hidden-maker trade reveals executable
+  liquidity at its price even though the preceding public depth was empty.
+  Quantifying information leakage or applying venue-specific delayed,
+  conflated, or suppressed publication requires a different versioned feed
+  policy.
 - **High impact risk:** call-auction risk profiles are immutable within one
   durable lineage. Profile revision, external position synchronization,
   clearing transfers, busts/corrections, and administrative controls require a

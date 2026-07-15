@@ -51,17 +51,19 @@ favors exhaustive overlap detection over control-plane audit latency.
 For `P` occupied price levels, `E` maker-slice interactions, and `L <= E`
 levels exhausted by one command:
 
-- Cached best-price, best-order, and best-level-snapshot discovery is `O(1)`.
+- Cached private execution-best price/order and public-best level discovery is
+  `O(1)`; the two prices can differ when the execution best is hidden-only.
 - The cache carries a key-checked stable AVL slot handle into maker mutation,
   so partial fills, removal from a still-occupied level, and reserve
-  FIFO-tail refresh are `O(1)` and perform no ordered price search.
+  displayed-class-tail refresh are `O(1)` and perform no ordered price search.
 - Ordered level insertion, empty-level deletion, and next-worse traversal are
   `O(log(P + 1))`; execution is `O(E + (L + 1) log(P + 1))`.
 - AVL rotations and two-child deletion relink nodes without moving surviving
   key/value pairs.
-- A reserve order can contribute more than one interaction through
-  replenishment, but refresh splices it to the FIFO tail in place without
-  deleting and reinserting its level.
+- At equal price, fully displayed/reserve orders precede fully hidden orders;
+  FIFO applies within each class. A reserve order can contribute more than one
+  interaction through replenishment, but refresh splices it to the displayed-
+  class tail in place without deleting and reinserting its level.
 - FIFO append and removal also maintain intrusive per-account/per-side
   links, so account membership changes add `O(1)` work and no
   membership-node allocation to the `O(log P)` price-level operation.
@@ -99,11 +101,12 @@ controlled accounts; the fixed GTD index and two stop-trigger indexes each
 contribute at most one AVL entry per active order, and account indexing adds
 two links per active order plus fixed
 head/tail/count/aggregate state per active account, within the same `O(O)`
-bound. The two complete best-level caches add `O(1)` space.
+bound. The secondary public-price indexes add `O(P)` fixed space; execution and
+public best-level caches add `O(1)` space.
 
 Successful full-book validation traverses all price FIFO, dormant stop, and
-account lists in `O(O)`, audits both initialized price AVL arenas in
-`O(P log(P + 1))`, audits `X_i` initialized expiry-arena slots in
+account lists in `O(O)`, audits all four initialized execution/public price
+AVL arenas in `O(P log(P + 1))`, audits `X_i` initialized expiry-arena slots in
 `O(X_i log(X_i + 1))`, and audits `S_i` initialized slots across the two stop
 arenas in `O(S_i log(S_i + 1))`, using `O(1)` auxiliary space and no heap
 allocation. Human-readable failure-detail formatting may allocate after
@@ -214,7 +217,9 @@ semantic validation time.
 FOK preflight over `O_c` active orders in `P_c` crossed levels is
 `O(O_c + P_c log P)` time and `O(1)` auxiliary space. Each inspected order is
 visited at most once; complexity is independent of the number of reserve
-slices that subsequent execution emits.
+slices that subsequent execution emits. A displayed-class self barrier admits
+only preceding working slices; a hidden-class self barrier admits the total
+leaves of the preceding displayed class and earlier hidden leaves.
 
 ## Default matching limits and memory
 
@@ -324,9 +329,10 @@ On the current `aarch64-apple-darwin` build:
 
 ### Constructor reservations
 
-Every constructor fallibly reserves five stable-slot indexed AVL arenas (two
-price indexes, one GTD-expiry index, and two stop-trigger indexes), one
-262,144-slot default continuous retained-event arena, one 73,730-slot default
+Every constructor fallibly reserves seven stable-slot indexed AVL arenas
+(four execution/public price indexes, one GTD-expiry index, and two
+stop-trigger indexes), one 262,144-slot default continuous retained-event
+arena, one 73,730-slot default
 call-auction retained-event arena, all five fixed-capacity matching hash
 indexes, and the coupled-risk profile and reservation indexes to their
 complete applicable bounds, plus every configured continuous order-selection
@@ -431,7 +437,10 @@ account exposure.
 ## Market data
 
 Market-data trace and replica application are `O(log P)` for level-changing
-events. Ordinary no-change events are `O(1)`; stop arm, removal, replacement,
+events. Fully hidden lifecycle events are private expected `O(1)` hash
+transitions and project to `NoBookChange`; a fully hidden-maker trade advances
+identifiers without public tree mutation when its price is absent. Ordinary
+no-change events are `O(1)`; stop arm, removal, replacement,
 and trigger validation are `O(log(O + 1))` in the private stop arenas. For `E`
 updates and `U <= E` affected prices, publication reserves `O(E)` output before
 mutation and validates unique affected prices in expected
@@ -510,7 +519,7 @@ the later suffix behind `anchor(G)`.
 Uncut checkpoint open scans every WAL byte and decodes the exact
 command/report prefix. Anchored open in either physical layout instead
 validates the selected A/B checkpoint and scans only current anchor and
-suffix bytes, then reconstructs price/stop indices in
+suffix bytes, then reconstructs execution-price/public-price/stop indices in
 `O(O(log(P + 1) + log(O + 1)))` and executes matching
 transitions only for the suffix. Cutover bounds physical WAL-prefix storage
 and scan work per cutover; retained history and writer-side capture

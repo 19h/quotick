@@ -645,6 +645,7 @@ fn encode_order_display(encoder: &mut Encoder, display: OrderDisplay) {
             encoder.u8(1);
             encoder.u64(peak.lots());
         }
+        OrderDisplay::Hidden => encoder.u8(2),
     }
 }
 
@@ -654,6 +655,7 @@ fn decode_order_display(decoder: &mut Decoder<'_>) -> Result<OrderDisplay, Codec
         1 => Ok(OrderDisplay::Reserve {
             peak: quantity(decoder)?,
         }),
+        2 => Ok(OrderDisplay::Hidden),
         tag => Err(CodecError::InvalidTag {
             type_name: "OrderDisplay",
             tag,
@@ -843,6 +845,8 @@ fn encode_reject_reason(encoder: &mut Encoder, value: RejectReason) {
         RejectReason::StopTriggerBacklog => 45,
         RejectReason::StopMarketCannotPost => 46,
         RejectReason::StopMarketCannotBeReplaced => 47,
+        RejectReason::HiddenOrderNotSupported => 48,
+        RejectReason::HiddenOrderCannotBeImmediate => 49,
     });
 }
 
@@ -896,6 +900,8 @@ fn decode_reject_reason(decoder: &mut Decoder<'_>) -> Result<RejectReason, Codec
         45 => Ok(RejectReason::StopTriggerBacklog),
         46 => Ok(RejectReason::StopMarketCannotPost),
         47 => Ok(RejectReason::StopMarketCannotBeReplaced),
+        48 => Ok(RejectReason::HiddenOrderNotSupported),
+        49 => Ok(RejectReason::HiddenOrderCannotBeImmediate),
         tag => Err(CodecError::InvalidTag {
             type_name: "RejectReason",
             tag,
@@ -1274,6 +1280,7 @@ impl BinaryCodec for InstrumentDefinition {
         encoder.u64(quantity.minimum_lots());
         encoder.u64(quantity.maximum_lots());
         encoder.u32(self.reserve_order_rules().maximum_replenishments());
+        encoder.bool(self.hidden_orders_supported());
         let settlement = self.settlement_convention();
         encoder.u64(settlement.base_units_per_lot);
         encoder.u64(settlement.quote_units_per_price_unit);
@@ -1306,6 +1313,7 @@ impl BinaryCodec for InstrumentDefinition {
         } else {
             ReserveOrderRules::new(maximum_replenishments)?
         };
+        let hidden_orders_supported = decoder.bool()?;
         let base_units_per_lot = decoder.u64()?;
         let quote_units_per_price_unit = decoder.u64()?;
         let trading_state = decode_trading_state(&mut decoder)?;
@@ -1321,6 +1329,7 @@ impl BinaryCodec for InstrumentDefinition {
             price,
             quantity,
             reserve,
+            hidden_orders_supported,
             base_units_per_lot,
             quote_units_per_price_unit,
             trading_state,
@@ -1468,13 +1477,13 @@ fn encode_event_kind(encoder: &mut Encoder, kind: EventKind) {
             order_id,
             price,
             leaves_quantity,
-            displayed_quantity,
+            working_quantity,
         } => {
             encoder.u8(1);
             encoder.u64(order_id.get());
             encoder.i64(price.raw());
             encoder.u64(leaves_quantity.lots());
-            encoder.u64(displayed_quantity.lots());
+            encoder.u64(working_quantity.lots());
         }
         EventKind::Trade(trade) => {
             encoder.u8(2);
@@ -1642,7 +1651,7 @@ fn decode_event_kind(decoder: &mut Decoder<'_>) -> Result<EventKind, CodecError>
             order_id: order(decoder)?,
             price: Price::from_raw(decoder.i64()?),
             leaves_quantity: quantity(decoder)?,
-            displayed_quantity: quantity(decoder)?,
+            working_quantity: quantity(decoder)?,
         }),
         2 => Ok(EventKind::Trade(decode_trade(decoder)?)),
         3 => Ok(EventKind::OrderCancelled {
@@ -1828,7 +1837,7 @@ impl BinaryCodec for OrderBookCheckpoint {
             encode_side(&mut encoder, order.side());
             encoder.i64(order.price().raw());
             encoder.u64(order.leaves().lots());
-            encoder.u64(order.displayed().lots());
+            encoder.u64(order.working().lots());
             encode_order_display(&mut encoder, order.display());
             encode_stp(&mut encoder, order.self_trade_prevention());
             encode_optional_timestamp(&mut encoder, order.expires_at());
@@ -1882,7 +1891,7 @@ impl BinaryCodec for OrderBookCheckpoint {
                 side: decode_side(&mut decoder)?,
                 price: Price::from_raw(decoder.i64()?),
                 leaves: quantity(&mut decoder)?,
-                displayed: quantity(&mut decoder)?,
+                working: quantity(&mut decoder)?,
                 display: decode_order_display(&mut decoder)?,
                 self_trade_prevention: decode_stp(&mut decoder)?,
                 expires_at: decode_optional_timestamp(

@@ -1,4 +1,4 @@
-# WAL Format Version 6
+# Expired WAL Format Version 6
 
 This document is the authoritative byte-level schema for Quotick WAL version
 6. All multibyte integers are little-endian. Rust enum layout, padding,

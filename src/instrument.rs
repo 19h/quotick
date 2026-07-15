@@ -386,6 +386,8 @@ pub enum AdmissionError {
     QuantityOutsideLimits,
     /// This instrument version does not admit reserve orders.
     ReserveOrderNotSupported,
+    /// This instrument version does not admit fully hidden orders.
+    HiddenOrderNotSupported,
     /// Display quantity was not aligned to the lot increment.
     DisplayQuantityOffGrid,
     /// Display quantity was not smaller than total order quantity.
@@ -809,6 +811,8 @@ pub struct InstrumentSpec {
     pub quantity: QuantityRules,
     /// Native reserve-order admission and per-state refresh bound.
     pub reserve: ReserveOrderRules,
+    /// Whether fully hidden resting limit orders are admitted.
+    pub hidden_orders_supported: bool,
     /// Base ledger units delivered by one lot.
     pub base_units_per_lot: u64,
     /// Quote ledger units per raw price unit times one lot.
@@ -898,6 +902,12 @@ impl InstrumentDefinition {
     #[must_use]
     pub const fn reserve_order_rules(self) -> ReserveOrderRules {
         self.spec.reserve
+    }
+
+    /// Returns whether fully hidden resting limit orders are admitted.
+    #[must_use]
+    pub const fn hidden_orders_supported(self) -> bool {
+        self.spec.hidden_orders_supported
     }
 
     /// Returns the trading state.
@@ -1022,6 +1032,13 @@ impl InstrumentDefinition {
         display: OrderDisplay,
         total: Quantity,
     ) -> Result<(), AdmissionError> {
+        if display == OrderDisplay::Hidden {
+            return if self.spec.hidden_orders_supported {
+                Ok(())
+            } else {
+                Err(AdmissionError::HiddenOrderNotSupported)
+            };
+        }
         let OrderDisplay::Reserve { peak } = display else {
             return Ok(());
         };
