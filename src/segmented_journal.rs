@@ -339,6 +339,38 @@ struct CutoverPlan {
     next_marker: Marker,
 }
 
+#[derive(Debug)]
+struct StagedCutoverGeneration {
+    segments: Vec<SegmentDescriptor>,
+    last_sequence: u64,
+    valid_bytes: u128,
+}
+
+struct CutoverSegmentState {
+    segments: Vec<SegmentDescriptor>,
+    current: Option<Journal>,
+    current_start: u64,
+    current_path: PathBuf,
+    current_is_staging: bool,
+    last_sequence: u64,
+    valid_bytes: u128,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SegmentedJournalCutoverBoundary {
+    active_generation: u64,
+    active_first_sequence: u64,
+    segment_start_sequence: u64,
+    suffix_offset: u64,
+    wal_sequence: u64,
+}
+
+impl SegmentedJournalCutoverBoundary {
+    pub(crate) const fn wal_sequence(self) -> u64 {
+        self.wal_sequence
+    }
+}
+
 /// One exclusive writer over an automatically rotating segment directory.
 #[derive(Debug)]
 pub struct SegmentedJournal {
@@ -632,14 +664,13 @@ impl SegmentedJournal {
         Ok(segmented_receipts)
     }
 
-    /// Replaces the complete selected segment generation with one checkpoint
-    /// anchor segment and advances the marker-selected physical generation.
+    /// Replaces the selected prefix with a checkpoint anchor, preserves any
+    /// later suffix frames, and advances the marker-selected generation.
     ///
-    /// The current generation remains authoritative until the new one-frame
+    /// The current generation remains authoritative until every replacement
     /// segment is synchronized and the replacement marker is atomically
     /// published. Files from non-selected generations are removed only after
-    /// that marker barrier and are ignored by readers during an interrupted
-    /// cleanup.
+    /// that marker barrier and are ignored by readers during interrupted cleanup.
     ///
     /// # Errors
     ///
@@ -649,30 +680,49 @@ impl SegmentedJournal {
         &mut self,
         anchor: CheckpointAnchor,
     ) -> Result<(), SegmentedJournalError> {
+        let boundary = self.cutover_boundary()?;
+        self.replace_with_checkpoint_anchor_at(anchor, boundary)
+    }
+
+    pub(crate) fn replace_with_checkpoint_anchor_at(
+        &mut self,
+        anchor: CheckpointAnchor,
+        boundary: SegmentedJournalCutoverBoundary,
+    ) -> Result<(), SegmentedJournalError> {
         self.ensure_healthy()?;
-        let plan = self.prepare_cutover(anchor)?;
-        self.stage_cutover_segment(anchor, &plan)?;
+        let plan = self.prepare_cutover(anchor, boundary)?;
+        let staged = self.stage_cutover_generation(anchor, boundary, &plan)?;
         self.publish_cutover_marker(plan.next_marker)?;
-        self.install_cutover_generation(anchor, plan)
+        self.install_cutover_generation(&plan, staged)
     }
 
     fn prepare_cutover(
         &self,
         anchor: CheckpointAnchor,
+        boundary: SegmentedJournalCutoverBoundary,
     ) -> Result<CutoverPlan, SegmentedJournalError> {
         let current_boundary = self.next_sequence().checked_sub(1);
-        if current_boundary != Some(anchor.wal_sequence()) {
+        let next_generation = self
+            .marker
+            .active_generation
+            .checked_add(1)
+            .ok_or(SegmentedJournalError::GenerationExhausted)?;
+        let retained_segment = self.segments.iter().find(|segment| {
+            segment.generation == boundary.active_generation
+                && segment.start_sequence == boundary.segment_start_sequence
+        });
+        if anchor.wal_sequence() != boundary.wal_sequence
+            || boundary.active_generation != self.marker.active_generation
+            || boundary.active_first_sequence != self.marker.active_first_sequence
+            || retained_segment.is_none_or(|segment| boundary.suffix_offset > segment.valid_bytes)
+            || current_boundary.is_none_or(|value| anchor.wal_sequence() > value)
+        {
             return Err(JournalError::CheckpointAnchorSequenceMismatch {
                 current: current_boundary,
                 proposed: anchor.wal_sequence(),
             }
             .into());
         }
-        let next_generation = self
-            .marker
-            .active_generation
-            .checked_add(1)
-            .ok_or(SegmentedJournalError::GenerationExhausted)?;
         let payload = anchor.encode().map_err(JournalError::Codec)?;
         let payload_length =
             u32::try_from(payload.len()).map_err(|_| JournalError::PayloadTooLarge {
@@ -721,34 +771,242 @@ impl SegmentedJournal {
         })
     }
 
-    fn stage_cutover_segment(
+    fn stage_cutover_generation(
         &mut self,
         anchor: CheckpointAnchor,
+        boundary: SegmentedJournalCutoverBoundary,
         plan: &CutoverPlan,
-    ) -> Result<(), SegmentedJournalError> {
+    ) -> Result<StagedCutoverGeneration, SegmentedJournalError> {
+        let (reader, mut state) = self.prepare_staged_generation(anchor, boundary, plan)?;
+        for result in reader {
+            let frame = match result {
+                Ok(value) => value,
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+            };
+            self.append_staged_suffix_frame(&mut state, &frame, plan)?;
+        }
+        if self.next_sequence().checked_sub(1) != Some(state.last_sequence) {
+            self.poisoned = true;
+            return Err(JournalError::CheckpointAnchorSequenceMismatch {
+                current: self.next_sequence().checked_sub(1),
+                proposed: anchor.wal_sequence(),
+            }
+            .into());
+        }
+        self.finish_staged_generation(state, plan)
+    }
+
+    fn prepare_staged_generation(
+        &mut self,
+        anchor: CheckpointAnchor,
+        boundary: SegmentedJournalCutoverBoundary,
+        plan: &CutoverPlan,
+    ) -> Result<(SegmentedJournalReader, CutoverSegmentState), SegmentedJournalError> {
         self.sync_all()?;
-        let mut staged = match Journal::open_managed(
-            &plan.staging_path,
-            segment_options(self.options, anchor.wal_sequence()),
-        ) {
+        let Some(suffix_start_index) = self
+            .segments
+            .iter()
+            .position(|segment| segment.start_sequence == boundary.segment_start_sequence)
+        else {
+            self.poisoned = true;
+            return Err(JournalError::CheckpointAnchorSequenceMismatch {
+                current: self.next_sequence().checked_sub(1),
+                proposed: boundary.wal_sequence,
+            }
+            .into());
+        };
+        let maximum_segments = self
+            .segments
+            .len()
+            .checked_sub(suffix_start_index)
+            .ok_or(JournalError::FrameLengthOverflow)?
+            .checked_add(1)
+            .ok_or(JournalError::FrameLengthOverflow)?;
+        let segments = reserve_journal_vec(JournalResource::SegmentInventory, maximum_segments)
+            .map_err(SegmentedJournalError::Storage)?;
+        let source_segments = std::mem::take(&mut self.segments);
+        let reader =
+            match SegmentedJournalReader::open_suffix(source_segments, self.options, boundary) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+            };
+        let staged_options = buffered_segment_options(self.options, anchor.wal_sequence());
+        let mut current = match Journal::open_managed(&plan.staging_path, staged_options) {
             Ok(value) => value,
             Err(error) => {
                 self.poisoned = true;
                 return Err(segment_error(plan.staging_path.clone(), error));
             }
         };
-        if let Err(error) = staged.append(&anchor).and_then(|_| staged.sync_all()) {
+        if let Err(error) = current.append(&anchor) {
             self.poisoned = true;
             return Err(segment_error(plan.staging_path.clone(), error));
         }
-        drop(staged);
-        if let Err(error) = fs::rename(&plan.staging_path, &plan.next_path)
-            .and_then(|()| sync_parent(&plan.next_path))
+        Ok((
+            reader,
+            CutoverSegmentState {
+                segments,
+                current: Some(current),
+                current_start: anchor.wal_sequence(),
+                current_path: plan.staging_path.clone(),
+                current_is_staging: true,
+                last_sequence: anchor.wal_sequence(),
+                valid_bytes: 0,
+            },
+        ))
+    }
+
+    fn append_staged_suffix_frame(
+        &mut self,
+        state: &mut CutoverSegmentState,
+        frame: &JournalFrame,
+        plan: &CutoverPlan,
+    ) -> Result<(), SegmentedJournalError> {
+        let frame_length =
+            u64::try_from(frame.frame_length()).map_err(|_| JournalError::FrameLengthOverflow)?;
+        if frame_length > self.options.maximum_segment_bytes {
+            self.poisoned = true;
+            return Err(SegmentedJournalError::SegmentCapacityExceeded {
+                required: frame_length,
+                maximum: self.options.maximum_segment_bytes,
+            });
+        }
+        let fits = state
+            .current
+            .as_ref()
+            .ok_or(SegmentedJournalError::Poisoned)?
+            .current_offset()
+            .checked_add(frame_length)
+            .is_some_and(|length| length <= self.options.maximum_segment_bytes);
+        if !fits {
+            self.rotate_staged_segment(state, frame.sequence(), plan)?;
+        }
+        if let Err(error) = state
+            .current
+            .as_mut()
+            .ok_or(SegmentedJournalError::Poisoned)?
+            .append_raw(frame.kind(), frame.payload())
         {
             self.poisoned = true;
-            return Err(JournalError::Io(error).into());
+            return Err(segment_error(state.current_path.clone(), error));
         }
+        state.last_sequence = frame.sequence();
         Ok(())
+    }
+
+    fn rotate_staged_segment(
+        &mut self,
+        state: &mut CutoverSegmentState,
+        next_start: u64,
+        plan: &CutoverPlan,
+    ) -> Result<(), SegmentedJournalError> {
+        let current = state
+            .current
+            .take()
+            .ok_or(SegmentedJournalError::Poisoned)?;
+        let completed_bytes = current.current_offset();
+        if let Err(error) = current.close() {
+            self.poisoned = true;
+            return Err(segment_error(state.current_path.clone(), error));
+        }
+        let completed_path = if state.current_is_staging {
+            if let Err(error) = fs::rename(&plan.staging_path, &plan.next_path)
+                .and_then(|()| sync_parent(&plan.next_path))
+            {
+                self.poisoned = true;
+                return Err(JournalError::Io(error).into());
+            }
+            state.current_is_staging = false;
+            plan.next_path.clone()
+        } else {
+            std::mem::take(&mut state.current_path)
+        };
+        state.valid_bytes = state
+            .valid_bytes
+            .checked_add(u128::from(completed_bytes))
+            .ok_or(JournalError::FrameLengthOverflow)?;
+        let completed = SegmentDescriptor {
+            generation: plan.next_generation,
+            start_sequence: state.current_start,
+            path: completed_path,
+            valid_bytes: completed_bytes,
+        };
+        if let Err(error) = push_reserved_segment(&mut state.segments, completed) {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+
+        state.current_start = next_start;
+        state.current_path = segment_path(&self.directory, plan.next_generation, next_start);
+        if state.current_path.exists() {
+            self.poisoned = true;
+            return Err(SegmentedJournalError::CutoverPendingExists(
+                state.current_path.clone(),
+            ));
+        }
+        state.current = match Journal::open_managed(
+            &state.current_path,
+            buffered_segment_options(self.options, next_start),
+        ) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                self.poisoned = true;
+                return Err(segment_error(state.current_path.clone(), error));
+            }
+        };
+        Ok(())
+    }
+
+    fn finish_staged_generation(
+        &mut self,
+        mut state: CutoverSegmentState,
+        plan: &CutoverPlan,
+    ) -> Result<StagedCutoverGeneration, SegmentedJournalError> {
+        let current = state
+            .current
+            .take()
+            .ok_or(SegmentedJournalError::Poisoned)?;
+        let completed_bytes = current.current_offset();
+        if let Err(error) = current.close() {
+            self.poisoned = true;
+            return Err(segment_error(state.current_path, error));
+        }
+        let completed_path = if state.current_is_staging {
+            if let Err(error) = fs::rename(&plan.staging_path, &plan.next_path)
+                .and_then(|()| sync_parent(&plan.next_path))
+            {
+                self.poisoned = true;
+                return Err(JournalError::Io(error).into());
+            }
+            plan.next_path.clone()
+        } else {
+            state.current_path
+        };
+        state.valid_bytes = state
+            .valid_bytes
+            .checked_add(u128::from(completed_bytes))
+            .ok_or(JournalError::FrameLengthOverflow)?;
+        let completed = SegmentDescriptor {
+            generation: plan.next_generation,
+            start_sequence: state.current_start,
+            path: completed_path,
+            valid_bytes: completed_bytes,
+        };
+        if let Err(error) = push_reserved_segment(&mut state.segments, completed) {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        Ok(StagedCutoverGeneration {
+            segments: state.segments,
+            last_sequence: state.last_sequence,
+            valid_bytes: state.valid_bytes,
+        })
     }
 
     fn publish_cutover_marker(&mut self, next_marker: Marker) -> Result<(), SegmentedJournalError> {
@@ -777,38 +1035,38 @@ impl SegmentedJournal {
 
     fn install_cutover_generation(
         &mut self,
-        anchor: CheckpointAnchor,
-        plan: CutoverPlan,
+        plan: &CutoverPlan,
+        staged: StagedCutoverGeneration,
     ) -> Result<(), SegmentedJournalError> {
         self.marker = plan.next_marker;
         drop(self.current.take());
+        let active = staged
+            .segments
+            .last()
+            .ok_or(SegmentedJournalError::NoSegments)?;
         let next = match Journal::open_managed(
-            &plan.next_path,
-            segment_options(self.options, anchor.wal_sequence()),
+            &active.path,
+            segment_options(self.options, active.start_sequence),
         ) {
             Ok(value) => value,
             Err(error) => {
                 self.poisoned = true;
-                return Err(segment_error(plan.next_path, error));
+                return Err(segment_error(active.path.clone(), error));
             }
         };
-        let valid_bytes = next.current_offset();
-        let canonical_path = next.path().to_path_buf();
         self.current = Some(next);
-        self.segments = vec![SegmentDescriptor {
-            generation: plan.next_generation,
-            start_sequence: anchor.wal_sequence(),
-            path: canonical_path,
-            valid_bytes,
-        }];
+        let segment_count =
+            u64::try_from(staged.segments.len()).map_err(|_| JournalError::FrameLengthOverflow)?;
+        let active_segment_start = active.start_sequence;
+        self.segments = staged.segments;
         self.recovery = SegmentedRecoveryReport {
             active_generation: plan.next_generation,
-            segment_count: 1,
-            first_sequence: anchor.wal_sequence(),
-            last_sequence: Some(anchor.wal_sequence()),
-            valid_bytes: u128::from(valid_bytes),
+            segment_count,
+            first_sequence: plan.next_marker.active_first_sequence,
+            last_sequence: Some(staged.last_sequence),
+            valid_bytes: staged.valid_bytes,
             truncated_bytes: 0,
-            active_segment_start: anchor.wal_sequence(),
+            active_segment_start,
         };
         let inventory = discover_segments(&self.directory, plan.next_generation)?;
         if let Err(error) = cleanup_inactive_inventory(&self.directory, &inventory.inactive) {
@@ -834,6 +1092,34 @@ impl SegmentedJournal {
                 self.poisoned = true;
                 segment_error(path, error)
             })
+    }
+
+    pub(crate) fn cutover_boundary(
+        &self,
+    ) -> Result<SegmentedJournalCutoverBoundary, SegmentedJournalError> {
+        self.ensure_healthy()?;
+        let wal_sequence = self.next_sequence().checked_sub(1).ok_or(
+            JournalError::CheckpointAnchorSequenceMismatch {
+                current: None,
+                proposed: self.marker.active_first_sequence,
+            },
+        )?;
+        let segment = self
+            .segments
+            .iter()
+            .rev()
+            .find(|segment| segment.valid_bytes != 0)
+            .ok_or(JournalError::CheckpointAnchorSequenceMismatch {
+                current: None,
+                proposed: self.marker.active_first_sequence,
+            })?;
+        Ok(SegmentedJournalCutoverBoundary {
+            active_generation: self.marker.active_generation,
+            active_first_sequence: self.marker.active_first_sequence,
+            segment_start_sequence: segment.start_sequence,
+            suffix_offset: segment.valid_bytes,
+            wal_sequence,
+        })
     }
 
     /// Synchronizes the active segment and durably releases manager ownership.
@@ -1021,6 +1307,8 @@ pub struct SegmentedJournalReader {
     index: usize,
     current: Option<JournalReader>,
     current_had_frame: bool,
+    current_may_be_empty: bool,
+    first_suffix_offset: Option<u64>,
     expected_sequence: u64,
     finished: bool,
 }
@@ -1053,7 +1341,60 @@ impl SegmentedJournalReader {
             index: 0,
             current: None,
             current_had_frame: false,
+            current_may_be_empty: false,
+            first_suffix_offset: None,
             expected_sequence: marker.active_first_sequence,
+            finished: false,
+        })
+    }
+
+    fn open_suffix(
+        segments: Vec<SegmentDescriptor>,
+        options: SegmentedJournalOptions,
+        boundary: SegmentedJournalCutoverBoundary,
+    ) -> Result<Self, SegmentedJournalError> {
+        validate_options(options)?;
+        if segments.is_empty() {
+            return Err(SegmentedJournalError::NoSegments);
+        }
+        if segments[0].start_sequence != boundary.active_first_sequence
+            || segments
+                .iter()
+                .any(|segment| segment.generation != boundary.active_generation)
+        {
+            return Err(JournalError::CheckpointAnchorSequenceMismatch {
+                current: None,
+                proposed: boundary.wal_sequence,
+            }
+            .into());
+        }
+        let start_index = segments
+            .iter()
+            .position(|segment| segment.start_sequence == boundary.segment_start_sequence)
+            .ok_or(JournalError::CheckpointAnchorSequenceMismatch {
+                current: None,
+                proposed: boundary.wal_sequence,
+            })?;
+        if boundary.suffix_offset > segments[start_index].valid_bytes {
+            return Err(JournalError::CheckpointAnchorSequenceMismatch {
+                current: None,
+                proposed: boundary.wal_sequence,
+            }
+            .into());
+        }
+        let expected_sequence = boundary
+            .wal_sequence
+            .checked_add(1)
+            .ok_or(JournalError::SequenceExhausted)?;
+        Ok(Self {
+            segments,
+            options,
+            index: start_index,
+            current: None,
+            current_had_frame: false,
+            current_may_be_empty: true,
+            first_suffix_offset: Some(boundary.suffix_offset),
+            expected_sequence,
             finished: false,
         })
     }
@@ -1072,15 +1413,28 @@ impl Iterator for SegmentedJournalReader {
                     self.finished = true;
                     return None;
                 };
-                if segment.start_sequence != self.expected_sequence {
+                let suffix_offset = self.first_suffix_offset.take();
+                if suffix_offset.is_none() && segment.start_sequence != self.expected_sequence {
                     self.finished = true;
                     return Some(Err(SegmentedJournalError::SegmentDiscontinuity {
                         expected: self.expected_sequence,
                         actual: segment.start_sequence,
                     }));
                 }
-                let options = segment_options(self.options, segment.start_sequence);
-                match JournalReader::open(&segment.path, options) {
+                let reader = if let Some(offset) = suffix_offset {
+                    JournalReader::open_suffix(
+                        &segment.path,
+                        offset,
+                        self.expected_sequence,
+                        self.options.journal.max_payload_length,
+                    )
+                } else {
+                    JournalReader::open(
+                        &segment.path,
+                        segment_options(self.options, segment.start_sequence),
+                    )
+                };
+                match reader {
                     Ok(reader) => self.current = Some(reader),
                     Err(error) => {
                         self.finished = true;
@@ -1114,12 +1468,13 @@ impl Iterator for SegmentedJournalReader {
                 }
                 None => {
                     let is_final = self.index + 1 == self.segments.len();
-                    if !self.current_had_frame && !is_final {
+                    if !self.current_had_frame && !is_final && !self.current_may_be_empty {
                         self.finished = true;
                         return Some(Err(SegmentedJournalError::EmptyNonFinalSegment(
                             segment.path.clone(),
                         )));
                     }
+                    self.current_may_be_empty = false;
                     self.current = None;
                     self.index += 1;
                 }
@@ -1424,6 +1779,33 @@ fn segment_options(options: SegmentedJournalOptions, initial_sequence: u64) -> J
     }
 }
 
+fn buffered_segment_options(
+    options: SegmentedJournalOptions,
+    initial_sequence: u64,
+) -> JournalOptions {
+    JournalOptions {
+        durability: crate::journal::Durability::Buffered,
+        ..segment_options(options, initial_sequence)
+    }
+}
+
+fn push_reserved_segment(
+    segments: &mut Vec<SegmentDescriptor>,
+    segment: SegmentDescriptor,
+) -> Result<(), JournalError> {
+    if segments.len() == segments.capacity() {
+        return Err(JournalError::CapacityReservationFailed {
+            resource: JournalResource::SegmentInventory,
+            maximum: segments
+                .len()
+                .checked_add(1)
+                .ok_or(JournalError::FrameLengthOverflow)?,
+        });
+    }
+    segments.push(segment);
+    Ok(())
+}
+
 fn verify_first_segment(
     segments: &[SegmentDescriptor],
     expected: u64,
@@ -1544,6 +1926,118 @@ mod tests {
             99,
             0x1234_5678,
         )
+    }
+
+    #[test]
+    fn cutover_repacks_and_preserves_a_multisegment_suffix() {
+        let directory = test_directory("cutover-suffix");
+        let _ = fs::remove_dir_all(&directory);
+        let options = SegmentedJournalOptions {
+            maximum_segment_bytes: 128,
+            ..options()
+        };
+        let mut journal = SegmentedJournal::open(&directory, options).unwrap();
+        for value in 1_u8..=2 {
+            journal
+                .append_raw(RecordKind::Command, &[value; 80])
+                .unwrap();
+        }
+        let boundary = journal.cutover_boundary().unwrap();
+        for value in 3_u8..=5 {
+            journal
+                .append_raw(RecordKind::Command, &[value; 80])
+                .unwrap();
+        }
+        assert_eq!(journal.segments().len(), 5);
+        let anchor = CheckpointAnchor::from_parts(
+            SnapshotKind::MatchingCheckpoint,
+            CheckpointSlot::A,
+            2,
+            2,
+            99,
+            0x1234_5678,
+        );
+
+        journal
+            .replace_with_checkpoint_anchor_at(anchor, boundary)
+            .unwrap();
+
+        assert_eq!(journal.recovery().active_generation, 2);
+        assert_eq!(journal.recovery().first_sequence, 2);
+        assert_eq!(journal.recovery().last_sequence, Some(5));
+        assert_eq!(journal.segments().len(), 4);
+        assert!(
+            journal
+                .segments()
+                .iter()
+                .all(|segment| segment.generation() == 2)
+        );
+        assert_eq!(journal.next_sequence(), 6);
+        journal
+            .append_raw(RecordKind::ExecutionReport, &[6; 80])
+            .unwrap();
+        journal.close().unwrap();
+
+        let frames = SegmentedJournalReader::open(&directory, options)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(frames.len(), 5);
+        assert_eq!(frames[0].sequence(), 2);
+        assert_eq!(frames[0].decode::<CheckpointAnchor>().unwrap(), anchor);
+        for (frame, value) in frames[1..].iter().zip(3_u8..=6) {
+            assert_eq!(frame.sequence(), u64::from(value));
+            assert_eq!(frame.payload(), &[value; 80]);
+        }
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cutover_cursor_can_start_inside_a_growing_segment() {
+        let directory = test_directory("cutover-mid-segment");
+        let _ = fs::remove_dir_all(&directory);
+        let options = SegmentedJournalOptions {
+            maximum_segment_bytes: 512,
+            ..options()
+        };
+        let mut journal = SegmentedJournal::open(&directory, options).unwrap();
+        journal.append_raw(RecordKind::Command, &[1; 20]).unwrap();
+        journal
+            .append_raw(RecordKind::ExecutionReport, &[2; 20])
+            .unwrap();
+        let boundary = journal.cutover_boundary().unwrap();
+        assert_eq!(journal.segments().len(), 1);
+        journal.append_raw(RecordKind::Command, &[3; 20]).unwrap();
+        journal
+            .append_raw(RecordKind::ExecutionReport, &[4; 20])
+            .unwrap();
+        assert_eq!(journal.segments().len(), 1);
+        let anchor = CheckpointAnchor::from_parts(
+            SnapshotKind::MatchingCheckpoint,
+            CheckpointSlot::A,
+            2,
+            2,
+            99,
+            0x1234_5678,
+        );
+
+        journal
+            .replace_with_checkpoint_anchor_at(anchor, boundary)
+            .unwrap();
+        journal.close().unwrap();
+
+        let frames = SegmentedJournalReader::open(&directory, options)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].decode::<CheckpointAnchor>().unwrap(), anchor);
+        assert_eq!(frames[1].sequence(), 3);
+        assert_eq!(frames[1].payload(), &[3; 20]);
+        assert_eq!(frames[2].sequence(), 4);
+        assert_eq!(frames[2].payload(), &[4; 20]);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

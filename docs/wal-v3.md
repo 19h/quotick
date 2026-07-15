@@ -1,11 +1,33 @@
 # WAL Format Version 3
 
-This document preserves the historical byte-level schema for expired Quotick
-WAL version 3. The current runtime rejects this envelope and writes
-[WAL version 4](wal-v4.md). Version 4 incorporates record payloads `1` through
-`8` from this document byte-for-byte, while changing the envelope version and
-adding call-auction record kinds. All multibyte integers are little-endian. No
-Rust enum layout, padding, pointer, or platform ABI is persisted.
+**Expired historical format.** This document preserves the historical
+byte-level schema for expired Quotick WAL version 3; it is retained as
+provenance for the payloads carried forward by version 4. The current runtime
+rejects this envelope and writes [WAL version 4](wal-v4.md). Version 4
+incorporates record payloads `1` through `8` from this document byte-for-byte,
+while changing the envelope version and adding call-auction record kinds.
+
+All multibyte integers are little-endian. No Rust enum layout, padding,
+pointer, or platform ABI is persisted.
+
+## Contents
+
+- [Frame](#frame)
+- [Segmented-directory marker version 2](#segmented-directory-marker-version-2)
+- [Scalar notation](#scalar-notation)
+- [Instrument-definition payload](#instrument-definition-payload)
+- [Account-risk-definition payload](#account-risk-definition-payload)
+- [Command payload](#command-payload)
+- [Matching capacity and WAL admission](#matching-capacity-and-wal-admission)
+- [Execution-report payload](#execution-report-payload)
+- [Ledger-entry payload](#ledger-entry-payload)
+- [Ledger-correction payload](#ledger-correction-payload)
+- [Ledger-batch payload](#ledger-batch-payload)
+- [Recovery](#recovery)
+  - [Checkpoint-anchor payload and WAL
+    cutover](#checkpoint-anchor-payload-and-wal-cutover)
+- [Writer ownership and acknowledgement](#writer-ownership-and-acknowledgement)
+- [Primary-source provenance](#primary-source-provenance)
 
 ## Frame
 
@@ -178,7 +200,9 @@ append `PreparedCommand.command()` and then commit the same token, so capacity,
 identifier-space, FOK, and core business checks are not repeated after WAL
 append. Commit rejects foreign or stale tokens before mutation; recovery never
 serializes a token and instead prepares the persisted command against recovered
-state. Both stable-slot price-level AVL arenas, all five matching hash indexes,
+state.
+
+Both stable-slot price-level AVL arenas, all five matching hash indexes,
 and the complete coupled-risk profile and reservation indexes are fallibly
 reserved to their configured maxima when the shard is constructed. Preparation
 therefore borrows matching/risk state immutably, proves the safe report bound
@@ -190,6 +214,7 @@ Active-order/account, identity, control, history, profile, and risk-reservation
 indexes use fixed-capacity dense values with open-addressed lookup buckets and
 backward-shift deletion, so different-key churn cannot rehash or allocate after
 construction.
+
 The one arena `Arc` control block and unrelated codec/checkpoint buffers are
 outside this operational guarantee. AVL topology, vacant-slot links,
 and account/side membership links are derived in-memory state: they are absent
@@ -249,9 +274,11 @@ arithmetic overflow `24`, reserve unsupported `25`, display quantity off grid
 `30`, account admission blocked `31`, account-control revision mismatch `32`,
 account-control revision exhausted `33`, trading-state revision mismatch `34`,
 trading-state revision exhausted `35`, trading state unchanged `36`, and
-transition-and-cancel into open `37`. Cancellation-reason tags are user
-request `0`, unfilled remainder `1`, STP aggressor `2`, STP resting `3`, mass
-cancel `4`, account control `5`, and trading-state control `6`.
+transition-and-cancel into open `37`.
+
+Cancellation-reason tags are user request `0`, unfilled remainder `1`, STP
+aggressor `2`, STP resting `3`, mass cancel `4`, account control `5`, and
+trading-state control `6`.
 
 ## Execution-report payload
 
@@ -435,12 +462,13 @@ its first frame is rejected. Recovery compares the complete persisted
 definition with the requested definition before replay. A ledger journal
 accepts ledger-entry, ledger-correction, and ledger-batch records only.
 
-Semantic checkpoint payloads are not embedded in WAL frames. Period controls use ledger-entry
-record kind `3`; indivisible reversal-plus-replacement events use ledger-
-correction kind `6`; generalized multi-entry events use ledger-batch kind `7`.
-Matching, coupled risk/matching, and ledger checkpoints are separate `QSNP`
-files described by
+Semantic checkpoint payloads are not embedded in WAL frames. Period controls
+use ledger-entry record kind `3`; indivisible reversal-plus-replacement events
+use ledger-correction kind `6`; generalized multi-entry events use ledger-batch
+kind `7`. Matching, coupled risk/matching, and ledger checkpoints are separate
+`QSNP` files described by
 [Semantic snapshot format version 2](snapshot-v2.md).
+
 An uncut WAL uses prefix-proving recovery: open scans every frame, requires the
 checkpoint's complete command/report or ledger-record sequence to equal the
 exact WAL prefix, then applies the remaining suffix. A matching checkpoint
@@ -555,9 +583,11 @@ The requested count must fit `RiskManagedLimits`; count rejection and fallible
 canonical-vector reservation occur before the WAL path is created or opened.
 The in-memory profile index has complete constructor-owned headroom and becomes
 locked when the first command is sequenced.
+
 Commands and reports then follow the same alternating grammar, but replay uses
 the coupled matching/risk state machine so risk rejections, positions, and
 reservations are reconstructed deterministically.
+
 The coupled risk checkpoint stores the true first sequence `F`, embeds matching
 state whose metadata boundary is `M = F + A` for `A` canonical profiles, and
 ends at `G = M + 2C` for `C` complete command/report pairs. Assisted recovery

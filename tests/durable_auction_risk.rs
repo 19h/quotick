@@ -499,7 +499,7 @@ fn verified_coupled_auction_checkpoint_rejects_other_reopen_and_cutover_epoch() 
 }
 
 #[test]
-fn segmented_staged_coupled_checkpoint_replays_only_rotated_suffix() {
+fn segmented_verified_coupled_cutover_replays_only_rotated_suffix() {
     let area = TestArea::new("segmented-staged");
     let segments = area.join("segments");
     let snapshot = area.join("auction-risk.qsnp");
@@ -532,11 +532,39 @@ fn segmented_staged_coupled_checkpoint_replays_only_rotated_suffix() {
             order(2, 2, Side::Sell, AuctionOrderConstraint::Market, 2),
         ))
         .unwrap();
-    let verified = worker.join().unwrap();
     durable
-        .write_verified_checkpoint(&snapshot, &verified, SnapshotOptions::default())
+        .submit(phase(4, 1, CallAuctionPhase::Frozen))
         .unwrap();
+    durable
+        .submit(uncross(5, CallAuctionRemainderPolicy::RetainAll))
+        .unwrap();
+    let verified = worker.join().unwrap();
+    let cutover = durable
+        .compact_verified_checkpoint(&snapshot, &verified, SnapshotOptions::default())
+        .unwrap();
+    assert_eq!(cutover.snapshot().generation(), 7);
+    assert_eq!(cutover.wal_first_sequence(), 7);
     durable.close().unwrap();
+
+    let frames = SegmentedJournalReader::open(&segments, segmented_options)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(frames.len(), 7);
+    assert_eq!(frames[0].kind(), RecordKind::CheckpointAnchor);
+    assert_eq!(frames[0].sequence(), 7);
+    for (index, frame) in frames[1..].iter().enumerate() {
+        let sequence = u64::try_from(index).unwrap() + 8;
+        assert_eq!(frame.sequence(), sequence);
+        assert_eq!(
+            frame.kind(),
+            if sequence % 2 == 0 {
+                RecordKind::CallAuctionCommand
+            } else {
+                RecordKind::CallAuctionExecutionReport
+            }
+        );
+    }
 
     let recovered = DurableCallAuctionRiskEngine::open_segmented_with_checkpoint(
         &segments,
@@ -548,9 +576,26 @@ fn segmented_staged_coupled_checkpoint_replays_only_rotated_suffix() {
     )
     .unwrap();
     assert_eq!(recovered.recovery().checkpointed_commands, 2);
-    assert_eq!(recovered.recovery().replayed_commands, 1);
-    assert!(recovered.recovery().journal.segment_count >= 2);
-    assert_eq!(recovered.managed().risk().reservation_count(), 2);
+    assert_eq!(recovered.recovery().replayed_commands, 3);
+    assert_eq!(recovered.managed().risk().reservation_count(), 0);
+    assert_eq!(
+        recovered
+            .managed()
+            .risk()
+            .snapshot(account(1))
+            .unwrap()
+            .position_lots(),
+        2
+    );
+    assert_eq!(
+        recovered
+            .managed()
+            .risk()
+            .snapshot(account(2))
+            .unwrap()
+            .position_lots(),
+        -2
+    );
     recovered.managed().validate().unwrap();
 }
 

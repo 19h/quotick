@@ -3,10 +3,11 @@
 use std::path::Path;
 
 use crate::journal::{
-    DurableRecord, Journal, JournalError, JournalFrame, JournalLayout, JournalOptions,
-    JournalReader, SegmentedJournal, SegmentedJournalError, SegmentedJournalOptions,
-    SegmentedJournalReader, StorageRecoveryReport,
+    DurableRecord, Journal, JournalCutoverBoundary, JournalError, JournalFrame, JournalLayout,
+    JournalOptions, JournalReader, SegmentedJournal, SegmentedJournalError,
+    SegmentedJournalOptions, SegmentedJournalReader, StorageRecoveryReport,
 };
+use crate::segmented_journal::SegmentedJournalCutoverBoundary;
 use crate::snapshot::CheckpointAnchor;
 
 #[derive(Clone, Copy, Debug)]
@@ -19,6 +20,26 @@ pub(crate) enum StorageOptions {
 pub(crate) enum StorageError {
     Journal(JournalError),
     Segmented(SegmentedJournalError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StorageCutoverBoundary {
+    Single(JournalCutoverBoundary),
+    Segmented(SegmentedJournalCutoverBoundary),
+}
+
+impl StorageCutoverBoundary {
+    pub(crate) const fn wal_sequence(self) -> u64 {
+        match self {
+            Self::Single(boundary) => boundary.wal_sequence(),
+            Self::Segmented(boundary) => boundary.wal_sequence(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(wal_sequence: u64) -> Self {
+        Self::Single(JournalCutoverBoundary::for_test(wal_sequence))
+    }
 }
 
 #[derive(Debug)]
@@ -129,24 +150,65 @@ impl StorageWriter {
         }
     }
 
+    pub(crate) fn cutover_boundary(&self) -> Result<StorageCutoverBoundary, StorageError> {
+        match self {
+            Self::Single { journal, .. } => journal
+                .cutover_boundary()
+                .map(StorageCutoverBoundary::Single)
+                .map_err(StorageError::Journal),
+            Self::Segmented(journal) => journal
+                .cutover_boundary()
+                .map(StorageCutoverBoundary::Segmented)
+                .map_err(StorageError::Segmented),
+        }
+    }
+
     pub(crate) fn replace_with_checkpoint_anchor(
         &mut self,
         anchor: CheckpointAnchor,
+    ) -> Result<(), StorageError> {
+        let boundary = self.cutover_boundary()?;
+        self.replace_with_checkpoint_anchor_at(anchor, boundary)
+    }
+
+    pub(crate) fn replace_with_checkpoint_anchor_at(
+        &mut self,
+        anchor: CheckpointAnchor,
+        boundary: StorageCutoverBoundary,
     ) -> Result<(), StorageError> {
         match self {
             Self::Single {
                 journal,
                 initial_sequence,
             } => {
+                let StorageCutoverBoundary::Single(boundary) = boundary else {
+                    return Err(StorageError::Journal(
+                        JournalError::CheckpointAnchorSequenceMismatch {
+                            current: journal.next_sequence().checked_sub(1),
+                            proposed: anchor.wal_sequence(),
+                        },
+                    ));
+                };
                 journal
-                    .replace_with_checkpoint_anchor(anchor)
+                    .replace_with_checkpoint_anchor_at(anchor, boundary)
                     .map_err(StorageError::Journal)?;
                 *initial_sequence = anchor.wal_sequence();
                 Ok(())
             }
-            Self::Segmented(journal) => journal
-                .replace_with_checkpoint_anchor(anchor)
-                .map_err(StorageError::Segmented),
+            Self::Segmented(journal) => {
+                let StorageCutoverBoundary::Segmented(boundary) = boundary else {
+                    return Err(StorageError::Segmented(
+                        JournalError::CheckpointAnchorSequenceMismatch {
+                            current: journal.next_sequence().checked_sub(1),
+                            proposed: anchor.wal_sequence(),
+                        }
+                        .into(),
+                    ));
+                };
+                journal
+                    .replace_with_checkpoint_anchor_at(anchor, boundary)
+                    .map_err(StorageError::Segmented)
+            }
         }
     }
 

@@ -614,7 +614,7 @@ pub enum JournalError {
         /// Exact required byte or entry count, according to `resource`.
         maximum: usize,
     },
-    /// A checkpoint anchor does not describe the current complete WAL boundary.
+    /// A checkpoint anchor is not retained within the current WAL range.
     CheckpointAnchorSequenceMismatch {
         /// Last sequence in the current WAL.
         current: Option<u64>,
@@ -738,7 +738,7 @@ impl fmt::Display for JournalError {
             }
             Self::CheckpointAnchorSequenceMismatch { current, proposed } => write!(
                 formatter,
-                "checkpoint anchor sequence {proposed} does not equal current WAL boundary {current:?}"
+                "checkpoint anchor sequence {proposed} is not retained within the current WAL ending at {current:?}"
             ),
             Self::CutoverPendingExists { path } => write!(
                 formatter,
@@ -1025,6 +1025,83 @@ pub struct Journal {
     poisoned: bool,
     #[cfg(test)]
     injected_fault: Option<InjectedFault>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JournalCutoverBoundary {
+    initial_sequence: u64,
+    wal_sequence: u64,
+    suffix_offset: u64,
+}
+
+struct JournalCutoverPlan {
+    current_sequence: Option<u64>,
+    anchor_frame: Vec<u8>,
+    anchor_frame_length: u64,
+    pending_path: PathBuf,
+}
+
+struct StagedJournalCutover {
+    replacement: File,
+    valid_bytes: u64,
+}
+
+impl JournalCutoverBoundary {
+    pub(crate) const fn wal_sequence(self) -> u64 {
+        self.wal_sequence
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(wal_sequence: u64) -> Self {
+        Self {
+            initial_sequence: 1,
+            wal_sequence,
+            suffix_offset: 0,
+        }
+    }
+}
+
+fn copy_checkpoint_suffix(
+    replacement: &mut File,
+    anchor_frame: &[u8],
+    anchor_frame_length: u64,
+    reader: JournalReader,
+    current_sequence: Option<u64>,
+    anchor_sequence: u64,
+    maximum_payload_length: u32,
+) -> Result<u64, JournalError> {
+    replacement.write_all(anchor_frame)?;
+    let mut valid_bytes = anchor_frame_length;
+    let mut copied_last_sequence = anchor_sequence;
+    for result in reader {
+        let suffix = result?;
+        let payload_length =
+            u32::try_from(suffix.payload().len()).map_err(|_| JournalError::PayloadTooLarge {
+                length: suffix.payload().len(),
+                maximum: maximum_payload_length,
+            })?;
+        let encoded = encode_frame(
+            suffix.kind(),
+            suffix.sequence(),
+            payload_length,
+            suffix.payload(),
+        )?;
+        replacement.write_all(&encoded)?;
+        valid_bytes = valid_bytes
+            .checked_add(
+                u64::try_from(encoded.len()).map_err(|_| JournalError::FrameLengthOverflow)?,
+            )
+            .ok_or(JournalError::FrameLengthOverflow)?;
+        copied_last_sequence = suffix.sequence();
+    }
+    if Some(copied_last_sequence) != current_sequence {
+        return Err(JournalError::CheckpointAnchorSequenceMismatch {
+            current: current_sequence,
+            proposed: anchor_sequence,
+        });
+    }
+    replacement.sync_all()?;
+    Ok(valid_bytes)
 }
 
 #[cfg(test)]
@@ -1417,11 +1494,32 @@ impl Journal {
         Ok(receipts)
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_with_checkpoint_anchor(
         &mut self,
         anchor: CheckpointAnchor,
     ) -> Result<(), JournalError> {
+        let boundary = self.cutover_boundary()?;
+        self.replace_with_checkpoint_anchor_at(anchor, boundary)
+    }
+
+    pub(crate) fn replace_with_checkpoint_anchor_at(
+        &mut self,
+        anchor: CheckpointAnchor,
+        boundary: JournalCutoverBoundary,
+    ) -> Result<(), JournalError> {
         self.ensure_healthy()?;
+        let plan = self.prepare_checkpoint_cutover(anchor, boundary)?;
+        self.sync_all()?;
+        let staged = self.stage_checkpoint_cutover(anchor, boundary, &plan)?;
+        self.publish_checkpoint_cutover(anchor, &plan, staged)
+    }
+
+    fn prepare_checkpoint_cutover(
+        &self,
+        anchor: CheckpointAnchor,
+        boundary: JournalCutoverBoundary,
+    ) -> Result<JournalCutoverPlan, JournalError> {
         let current = if self.offset == 0 {
             None
         } else {
@@ -1431,7 +1529,11 @@ impl Journal {
                     .ok_or(JournalError::SequenceExhausted)?,
             )
         };
-        if current != Some(anchor.wal_sequence()) {
+        if anchor.wal_sequence() != boundary.wal_sequence
+            || boundary.initial_sequence != self.options.initial_sequence
+            || boundary.suffix_offset > self.offset
+            || current.is_none_or(|value| anchor.wal_sequence() > value)
+        {
             return Err(JournalError::CheckpointAnchorSequenceMismatch {
                 current,
                 proposed: anchor.wal_sequence(),
@@ -1450,28 +1552,81 @@ impl Journal {
             payload_length,
             &payload,
         )?;
-        let frame_length =
+        let anchor_frame_length =
             u64::try_from(frame.len()).map_err(|_| JournalError::FrameLengthOverflow)?;
-        let next_sequence = anchor
-            .wal_sequence()
+        Ok(JournalCutoverPlan {
+            current_sequence: current,
+            anchor_frame: frame,
+            anchor_frame_length,
+            pending_path: cutover_pending_path(&self.path),
+        })
+    }
+
+    fn stage_checkpoint_cutover(
+        &mut self,
+        anchor: CheckpointAnchor,
+        boundary: JournalCutoverBoundary,
+        plan: &JournalCutoverPlan,
+    ) -> Result<StagedJournalCutover, JournalError> {
+        let expected_suffix_sequence = boundary
+            .wal_sequence
             .checked_add(1)
             .ok_or(JournalError::SequenceExhausted)?;
-        let pending_path = cutover_pending_path(&self.path);
+        let reader = JournalReader::open_suffix(
+            &self.path,
+            boundary.suffix_offset,
+            expected_suffix_sequence,
+            self.options.max_payload_length,
+        )?;
         let mut replacement = match OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
-            .open(&pending_path)
+            .open(&plan.pending_path)
         {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(JournalError::CutoverPendingExists { path: pending_path });
+                return Err(JournalError::CutoverPendingExists {
+                    path: plan.pending_path.clone(),
+                });
             }
             Err(error) => return Err(JournalError::Io(error)),
         };
-        replacement.write_all(&frame)?;
-        replacement.sync_all()?;
-        fs::rename(&pending_path, &self.path)?;
+        let staged = copy_checkpoint_suffix(
+            &mut replacement,
+            &plan.anchor_frame,
+            plan.anchor_frame_length,
+            reader,
+            plan.current_sequence,
+            anchor.wal_sequence(),
+            self.options.max_payload_length,
+        );
+        let valid_bytes = match staged {
+            Ok(value) => value,
+            Err(error) => {
+                drop(replacement);
+                if let Err(cleanup) = fs::remove_file(&plan.pending_path)
+                    .and_then(|()| sync_parent(&plan.pending_path))
+                {
+                    self.poisoned = true;
+                    return Err(JournalError::Io(cleanup));
+                }
+                return Err(error);
+            }
+        };
+        Ok(StagedJournalCutover {
+            replacement,
+            valid_bytes,
+        })
+    }
+
+    fn publish_checkpoint_cutover(
+        &mut self,
+        anchor: CheckpointAnchor,
+        plan: &JournalCutoverPlan,
+        staged: StagedJournalCutover,
+    ) -> Result<(), JournalError> {
+        fs::rename(&plan.pending_path, &self.path)?;
         #[cfg(test)]
         if self.injected_fault == Some(InjectedFault::CutoverDirectoryBarrier) {
             self.injected_fault = None;
@@ -1484,14 +1639,13 @@ impl Journal {
             self.poisoned = true;
             return Err(JournalError::Io(error));
         }
-        self.file = replacement;
+        self.file = staged.replacement;
         self.options.initial_sequence = anchor.wal_sequence();
         self.recovery = RecoveryReport {
-            last_sequence: Some(anchor.wal_sequence()),
-            valid_bytes: frame_length,
+            last_sequence: plan.current_sequence,
+            valid_bytes: staged.valid_bytes,
             truncated_bytes: 0,
         };
-        self.next_sequence = next_sequence;
         self.offset = self.recovery.valid_bytes;
         Ok(())
     }
@@ -1541,6 +1695,24 @@ impl Journal {
 
     pub(crate) const fn current_offset(&self) -> u64 {
         self.offset
+    }
+
+    pub(crate) fn cutover_boundary(&self) -> Result<JournalCutoverBoundary, JournalError> {
+        self.ensure_healthy()?;
+        let wal_sequence = if self.offset == 0 {
+            None
+        } else {
+            self.next_sequence.checked_sub(1)
+        }
+        .ok_or(JournalError::CheckpointAnchorSequenceMismatch {
+            current: None,
+            proposed: self.options.initial_sequence,
+        })?;
+        Ok(JournalCutoverBoundary {
+            initial_sequence: self.options.initial_sequence,
+            wal_sequence,
+            suffix_offset: self.offset,
+        })
     }
 
     fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -1641,6 +1813,34 @@ impl JournalReader {
             offset: 0,
             expected_sequence: initial_sequence,
             maximum_payload_length: options.max_payload_length,
+            finished: false,
+        })
+    }
+
+    pub(crate) fn open_suffix(
+        path: impl AsRef<Path>,
+        offset: u64,
+        expected_sequence: u64,
+        maximum_payload_length: u32,
+    ) -> Result<Self, JournalError> {
+        if expected_sequence == 0 {
+            return Err(JournalError::InvalidInitialSequence);
+        }
+        let file = File::open(path)?;
+        let file_length = file.metadata()?.len();
+        if offset > file_length {
+            return Err(JournalError::TruncatedFrame {
+                offset: file_length,
+                expected_length: offset,
+                available_length: file_length,
+            });
+        }
+        Ok(Self {
+            file,
+            file_length,
+            offset,
+            expected_sequence,
+            maximum_payload_length,
             finished: false,
         })
     }
@@ -2074,11 +2274,15 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_cutover_replaces_the_file_without_releasing_writer_ownership() {
+    fn checkpoint_cutover_preserves_a_verified_suffix_and_writer_ownership() {
         let path = test_path("checkpoint-cutover");
         remove_test_files(&path);
         let mut journal = Journal::open(&path, buffered_options()).unwrap();
         journal.append_raw(RecordKind::Command, &[1]).unwrap();
+        let boundary = journal.cutover_boundary().unwrap();
+        journal
+            .append_raw(RecordKind::ExecutionReport, &[2])
+            .unwrap();
         let owner = journal.writer_lease_owner();
         let anchor = CheckpointAnchor::from_parts(
             SnapshotKind::MatchingCheckpoint,
@@ -2094,21 +2298,28 @@ mod tests {
         expected_anchor.extend_from_slice(&99_u64.to_le_bytes());
         expected_anchor.extend_from_slice(&0x1234_5678_u32.to_le_bytes());
         assert_eq!(anchor.encode().unwrap(), expected_anchor);
-        journal.replace_with_checkpoint_anchor(anchor).unwrap();
+        journal
+            .replace_with_checkpoint_anchor_at(anchor, boundary)
+            .unwrap();
         assert_eq!(journal.writer_lease_owner(), owner);
         assert_eq!(journal.initial_sequence(), 1);
-        assert_eq!(journal.next_sequence(), 2);
-        journal.append_raw(RecordKind::Command, &[2]).unwrap();
+        assert_eq!(journal.next_sequence(), 3);
+        journal.append_raw(RecordKind::Command, &[3]).unwrap();
         journal.close().unwrap();
 
         let frames = JournalReader::open(&path, buffered_options())
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(frames.len(), 2);
+        assert_eq!(frames.len(), 3);
         assert_eq!(frames[0].sequence(), 1);
         assert_eq!(frames[0].decode::<CheckpointAnchor>().unwrap(), anchor);
         assert_eq!(frames[1].sequence(), 2);
+        assert_eq!(frames[1].kind(), RecordKind::ExecutionReport);
+        assert_eq!(frames[1].payload(), &[2]);
+        assert_eq!(frames[2].sequence(), 3);
+        assert_eq!(frames[2].kind(), RecordKind::Command);
+        assert_eq!(frames[2].payload(), &[3]);
         remove_test_files(&path);
     }
 

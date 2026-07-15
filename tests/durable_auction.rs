@@ -353,7 +353,7 @@ fn verified_auction_checkpoint_rejects_other_reopen_and_cutover_epoch() {
 }
 
 #[test]
-fn segmented_staged_auction_checkpoint_recovers_across_rotated_suffix() {
+fn segmented_verified_auction_cutover_recovers_the_rotated_suffix() {
     let area = TestPath::directory("segmented-staged");
     fs::create_dir_all(area.path()).unwrap();
     let segments = area.join("segments");
@@ -376,11 +376,37 @@ fn segmented_staged_auction_checkpoint_recovers_across_rotated_suffix() {
     durable
         .submit(submit(3, order(2, 2, Side::Sell, 5)))
         .unwrap();
-    let verified = worker.join().unwrap();
     durable
-        .write_verified_checkpoint(&snapshot, &verified, SnapshotOptions::default())
+        .submit(phase(4, 1, CallAuctionPhase::Frozen))
         .unwrap();
+    durable.submit(uncross(5)).unwrap();
+    let verified = worker.join().unwrap();
+    let cutover = durable
+        .compact_verified_checkpoint(&snapshot, &verified, SnapshotOptions::default())
+        .unwrap();
+    assert_eq!(cutover.snapshot().generation(), 5);
+    assert_eq!(cutover.wal_first_sequence(), 5);
     durable.close().unwrap();
+
+    let frames = SegmentedJournalReader::open(&segments, segmented_options)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(frames.len(), 7);
+    assert_eq!(frames[0].kind(), RecordKind::CheckpointAnchor);
+    assert_eq!(frames[0].sequence(), 5);
+    for (index, frame) in frames[1..].iter().enumerate() {
+        let sequence = u64::try_from(index).unwrap() + 6;
+        assert_eq!(frame.sequence(), sequence);
+        assert_eq!(
+            frame.kind(),
+            if sequence % 2 == 0 {
+                RecordKind::CallAuctionCommand
+            } else {
+                RecordKind::CallAuctionExecutionReport
+            }
+        );
+    }
 
     let recovered = DurableCallAuctionEngine::open_segmented_with_checkpoint(
         &segments,
@@ -391,9 +417,13 @@ fn segmented_staged_auction_checkpoint_recovers_across_rotated_suffix() {
     )
     .unwrap();
     assert_eq!(recovered.recovery().checkpointed_commands, 2);
-    assert_eq!(recovered.recovery().replayed_commands, 1);
-    assert!(recovered.recovery().journal.segment_count >= 2);
-    assert_eq!(recovered.engine().book().active_order_count(), 2);
+    assert_eq!(recovered.recovery().replayed_commands, 3);
+    assert_eq!(
+        recovered.engine().phase_snapshot().phase(),
+        CallAuctionPhase::Closed
+    );
+    assert_eq!(recovered.engine().book().active_order_count(), 0);
+    assert_eq!(recovered.engine().book().next_trade_id(), 2);
 }
 
 #[test]

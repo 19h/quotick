@@ -7,7 +7,21 @@ The durable runtimes expose both single-file `open` and directory-backed
 machines from properties conditional on the operating system, filesystem, and
 storage device.
 
+## Contents
+
+- [Canonical-path writer ownership](#canonical-path-writer-ownership)
+- [Segmented directory ownership and format](#segmented-directory-ownership-and-format)
+- [Abandoned writer recovery](#abandoned-writer-recovery)
+- [Semantic snapshot ownership and replacement](#semantic-snapshot-ownership-and-replacement)
+- [Checkpoint WAL cutover](#checkpoint-wal-cutover)
+- [File and directory durability](#file-and-directory-durability)
+- [Failure and recovery matrix](#failure-and-recovery-matrix)
+- [Unimplemented storage properties](#unimplemented-storage-properties)
+
 ## Canonical-path writer ownership
+
+This section defines how a single-file WAL writer acquires, holds, and
+releases exclusive ownership through a lease sidecar.
 
 `Journal::open` first canonicalizes an existing WAL path. For a new WAL it
 canonicalizes the existing parent directory and joins the requested file name.
@@ -46,12 +60,19 @@ qualified.
 
 ## Segmented directory ownership and format
 
+This section defines the on-disk contents of a segmented WAL directory, its
+single manager lease, its marker format, and its rotation behavior.
+
+### Manager lease
+
 `SegmentedJournal` manages one dedicated canonical directory under a single
 manager lease. The manager lease uses the same 34-byte `QLCK` record and
 exclusive-create protocol as a raw journal; its path is
 `.quotick-segments.writer.lock`. Raw `Journal` writers reject files whose parent
 contains the segmented marker, so per-file writers cannot bypass the manager.
 Readers do not acquire the manager lease.
+
+### Directory inventory
 
 The directory inventory is deliberately closed:
 
@@ -60,8 +81,10 @@ The directory inventory is deliberately closed:
 | `format.qseg` | authoritative 46-byte CRC-32C generation selector and immutable configuration |
 | `format.qseg.pending` | synchronized next-generation marker staged during cutover |
 | `.quotick-segments.writer.lock` | live manager ownership, present only while owned or abandoned |
-| `.quotick-segments.cutover.pending` | one staged checkpoint-anchor segment |
+| `.quotick-segments.cutover.pending` | first staged next-generation segment |
 | `segment-GGGGGGGGGGGGGGGGGGGG-SSSSSSSSSSSSSSSSSSSS.qwal` | WAL segment; `G` is its physical generation and `S` its first global sequence |
+
+### Marker format
 
 The marker uses little-endian integers:
 
@@ -81,13 +104,22 @@ lease. Capacity, lineage origin, and maximum payload are immutable and must
 exactly equal the marker on reopen. The active generation starts at `1`; its
 first retained sequence begins at the lineage origin and advances only through
 checkpoint cutover. Acknowledgement and tail-recovery policies are runtime
-policies and are not marker fields. Unknown entries, noncanonical names, an
-absent marker in a nonempty directory, marker checksum failure, or immutable
-configuration drift fail closed.
+policies and are not marker fields.
+
+Each of the following conditions fails closed:
+
+- unknown entries;
+- noncanonical names;
+- an absent marker in a nonempty directory;
+- marker checksum failure;
+- immutable configuration drift.
+
 If termination interrupts the initial marker write before any segment exists,
 `recover_incomplete_initialization` acquires the manager lease and removes only
 an invalid marker in an otherwise empty persistent inventory. It refuses a
 valid marker and refuses to act when any segment or unknown entry exists.
+
+### Rotation
 
 Rotation is size-triggered and sequence-preserving:
 
@@ -107,6 +139,8 @@ segment, which is valid and reused. Only the final selected segment can use
 `RepairTornTail`; every earlier selected segment is opened strictly, and an
 empty non-final segment is invalid. Corruption, truncation, oversize files, or a
 sequence gap in the selected generation are never skipped or repaired.
+
+### Generation selection and readers
 
 Recognized non-selected generations and the two deterministic cutover staging
 files are not part of the logical WAL. Read-only open ignores them. Writer open
@@ -144,6 +178,7 @@ automatic:
 An owner mismatch is a compare failure and never removes the current lease.
 Comparison and deletion are separate filesystem operations, so the quiesced
 maintenance window is required; this is not an atomic compare-and-delete.
+
 If termination interrupted initial lease emission, the malformed lease remains
 fail-closed and `recover_abandoned_invalid_writer` removes it only after proving
 that it does not decode as a supported owner. This operation has the same
@@ -157,6 +192,10 @@ manager lease; individual managed segments do not carry writer leases.
 
 ## Semantic snapshot ownership and replacement
 
+This section defines snapshot-target ownership, the staged pending-file
+replacement protocol, and recovery of pending files left by a terminated
+writer.
+
 `SnapshotFile` canonicalizes its target and uses the raw-journal 34 B `QLCK`
 sidecar protocol at `<target>.writer.lock`. It rejects every mutating operation
 whose target parent carries `format.qseg`; the segmented directory inventory
@@ -164,10 +203,15 @@ therefore remains closed. Read-only snapshot access does not acquire a lease.
 
 The replacement staging path is `<target>.pending` in the same directory. A
 normal write refuses to proceed while that path exists. After validating
-generation and exact semantic lineage against any current snapshot, the writer
-exclusively creates the pending path, writes the complete bounded `QSNP` file,
-synchronizes it, renames it over the target, synchronizes the parent directory,
-and releases the lease.
+generation and exact semantic lineage against any current snapshot, the
+writer:
+
+1. exclusively creates the pending path,
+2. writes the complete bounded `QSNP` file,
+3. synchronizes it,
+4. renames it over the target,
+5. synchronizes the parent directory, and
+6. releases the lease.
 
 Rust specifies that `std::fs::rename` replaces an existing target and rejects a
 cross-mount operation ([Rust `rename`](https://doc.rust-lang.org/stable/std/fs/fn.rename.html)).
@@ -179,11 +223,15 @@ This namespace atomicity is distinct from persistence through power loss.
 An incomplete or complete pending file can survive a terminated writer. After
 resolving any abandoned lease under the same external liveness/quiescence
 preconditions as WAL recovery, `recover_pending` validates both files and uses
-semantic generation plus exact history lineage. It promotes a newer successor,
-removes a proven stale prefix or byte-identical duplicate, removes provably
-malformed pending content, and preserves both files on divergence or invalid
-current state. A pending file rejected only because its version/kind is
-unsupported or its size exceeds the caller's configured limit is preserved.
+semantic generation plus exact history lineage. It decides as follows:
+
+- it promotes a newer successor;
+- it removes a proven stale prefix or byte-identical duplicate;
+- it removes provably malformed pending content;
+- it preserves both files on divergence or invalid current state;
+- a pending file rejected only because its version/kind is unsupported or its
+  size exceeds the caller's configured limit is preserved.
+
 The complete wire and decision contract is
 [Semantic snapshot format version 4](snapshot-v4.md).
 
@@ -197,39 +245,81 @@ ledger, or call-auction image.
 
 ## Checkpoint WAL cutover
 
+This section defines how a checkpoint retires a WAL prefix: the anchor and
+A/B slot protocol shared by both layouts, then the single-file and segmented
+replacement sequences.
+
+### Anchor and slot protocol
+
 `compact_to_checkpoint` is implemented for both physical layouts of durable
-matching, coupled risk/matching, ledger, and call-auction runtimes. It alternates deterministic
-`<checkpoint base>.cutover-a` and `.cutover-b` snapshot slots. The inactive slot
-is published with the ordinary `QSNP` pending-file, file-barrier, rename, and
-directory-barrier protocol before the WAL selector changes. The anchor binds
-snapshot kind, A/B slot, semantic generation, retired physical WAL sequence,
-encoded snapshot payload length, and the complete `QSNP` envelope CRC-32C.
-Subsequent frames continue at the retired sequence plus one. Ordinary reopen
+matching, coupled risk/matching, ledger, and call-auction runtimes. Matching,
+coupled continuous risk, plain call-auction, and coupled call-auction/risk also
+accept an off-thread verified older checkpoint through
+`compact_verified_checkpoint`. Each verified value carries a private physical
+cursor recorded at its WAL barrier.
+
+Cutover alternates deterministic `<checkpoint base>.cutover-a` and
+`.cutover-b` snapshot slots. The inactive slot is published with the ordinary
+`QSNP` pending-file, file-barrier, rename, and directory-barrier protocol
+before the WAL selector changes. The anchor binds:
+
+- snapshot kind,
+- A/B slot,
+- semantic generation,
+- retired physical WAL sequence,
+- encoded snapshot payload length, and
+- the complete `QSNP` envelope CRC-32C.
+
+For an older generation `G` with current head `H`, the replacement WAL is the
+anchor at `G` followed by the verified original frames `G+1..H`; subsequent
+appends continue at `H+1`. Ordinary reopen
 without the checkpoint base fails explicitly; checkpoint-assisted reopen
 validates every anchor field before applying suffix frames.
 
-For a single-file WAL, the retained writer lease exclusively creates
-`<canonical WAL>.cutover.pending`, writes and synchronizes the one-frame anchor,
-renames it over the WAL, and synchronizes the parent directory. Before that
-rename, the prior WAL and any slot it selects remain authoritative. After its
-directory barrier, the anchor-selected WAL/slot pair is authoritative and the
-prior slot remains intact. An interrupted pre-rename attempt can leave the
-staging file. After prior-writer termination is established and its lease is
-explicitly recovered, `Journal::recover_abandoned_cutover_pending` removes that
-file under a new exclusive lease and synchronizes the directory; it never
-promotes staged content.
+### Single-file layout
 
-For a segmented WAL, the retained manager lease creates and synchronizes an
-anchor segment in the next non-zero physical generation, then synchronizes its
-canonical directory entry. It next writes and synchronizes `format.qseg.pending`,
-atomically renames that CRC-32C-protected marker over `format.qseg`, and
-synchronizes the directory. The marker is the sole generation selector: before
-its rename the prior generation is authoritative; afterward the next generation
-is authoritative. Old-generation files and recognized staging artifacts are
-removed only after the complete selected generation validates, and their
-removal is directory-synchronized. An interrupted cleanup cannot resurrect or
-mix the retired prefix. Reader open ignores inactive generations; writer open
+For a single-file WAL, the retained writer lease:
+
+1. exclusively creates `<canonical WAL>.cutover.pending`,
+2. writes the anchor,
+3. streams and verifies only bytes after the captured offset,
+4. re-encodes the unchanged suffix frames,
+5. synchronizes the complete anchor-plus-suffix file, and
+6. then renames that file over the WAL and synchronizes the parent
+   directory.
+
+Before that rename, the prior WAL and any slot it selects remain
+authoritative. After its directory barrier, the anchor-selected WAL/slot pair
+is authoritative and the prior slot remains intact.
+
+An interrupted pre-rename attempt can leave the staging file. After
+prior-writer termination is established and its lease is explicitly
+recovered, `Journal::recover_abandoned_cutover_pending` removes that file
+under a new exclusive lease and synchronizes the directory; it never promotes
+staged content.
+
+### Segmented layout
+
+For a segmented WAL, the retained manager lease:
+
+1. resumes at the captured segment and byte offset,
+2. verifies only the later global frames,
+3. repacks the anchor plus unchanged suffix into one or more bounded
+   segments in the next non-zero physical generation,
+4. synchronizes every new segment and its directory entry,
+5. next writes and synchronizes `format.qseg.pending`,
+6. atomically renames that CRC-32C-protected marker over `format.qseg`, and
+7. synchronizes the directory.
+
+The marker is the sole generation selector: before its rename the prior
+generation is authoritative; afterward the next generation is authoritative.
+Old-generation files and recognized staging artifacts are removed only after
+the complete selected generation validates, and their removal is
+directory-synchronized. An interrupted cleanup cannot resurrect or mix the
+retired prefix. Reader open ignores inactive generations; writer open
 validates the selected generation before cleaning them.
+
+### Path dedication
 
 Checkpoint path-conflict checks cover every layout-owned path and each A/B
 target's snapshot pending path and writer lease. Snapshot targets must remain
@@ -238,15 +328,24 @@ dedicated and on the same qualified local filesystem.
 
 ## File and directory durability
 
-Creating a WAL uses exclusive creation, `File::sync_all`, then parent-directory
-`sync_all`. Repairing a torn tail performs `set_len` followed by file
-`sync_all`. Lease creation and removal also synchronize their directory entry.
-Snapshot publication synchronizes the complete pending file before rename and
-synchronizes the parent after rename; pending removal and promotion also
-synchronize the parent. WAL cutover likewise synchronizes the complete anchor
-staging file and its canonical entry before changing the layout selector,
-synchronizes the selector's parent after publication, and synchronizes retired
-inventory removal.
+This section lists the synchronization barriers each storage operation
+performs and what a successful barrier does and does not prove.
+
+- Creating a WAL uses exclusive creation, `File::sync_all`, then
+  parent-directory `sync_all`.
+- Repairing a torn tail performs `set_len` followed by file `sync_all`.
+- Lease creation and removal also synchronize their directory entry.
+- Snapshot publication synchronizes the complete pending file before rename
+  and synchronizes the parent after rename; pending removal and promotion
+  also synchronize the parent.
+- WAL cutover likewise synchronizes the complete anchor staging file and its
+  canonical entry before changing the layout selector, synchronizes the
+  selector's parent after publication, and synchronizes retired inventory
+  removal.
+
+Cursor-based cutover memory is bounded by one configured payload/frame buffer
+plus the segmented suffix inventory; writer-held copy work is linear in
+suffix bytes and suffix segments, not the retired prefix.
 
 Append acknowledgement policies are:
 
@@ -273,6 +372,9 @@ loss and remount tests.
 
 ## Failure and recovery matrix
 
+This section tabulates each failure point, the in-process state it leaves,
+and how reopen interprets the resulting bytes.
+
 | Failure point | In-process state | Reopen interpretation |
 |---|---|---|
 | validation/encoding before write | unchanged, healthy | no new bytes |
@@ -297,6 +399,8 @@ loss and remount tests.
 | single-file WAL rename completes but directory barrier fails | writer is poisoned and result is ambiguous | reopen accepts only a complete old or anchor-selected new WAL/checkpoint pair; storage qualification determines power-loss persistence |
 | segmented anchor generation is staged before marker rename | prior marker generation remains authoritative | reader ignores the staged generation; validated writer open removes inactive artifacts |
 | segmented marker rename completes but its directory barrier fails | writer is poisoned and selector persistence is ambiguous | reopen accepts whichever CRC-valid marker survived; both possible selected generations were fully synchronized before publication |
+| verified cutover cursor ends inside a segment or exactly at a segment boundary | new generation contains the anchor plus every later verified frame | an empty remainder in the boundary segment is permitted; sequence verification resumes in the same or next segment without scanning the retired prefix |
+| suffix migration fails before selector publication | prior WAL/generation remains authoritative | staged output is never promoted; the writer is poisoned when segmented staging state requires reopen cleanup |
 | segmented cleanup is interrupted after marker publication | new marker generation remains authoritative | reader ignores old generations; validated writer open completes cleanup |
 | segmented marker checksum fails | open fails closed before selecting a generation | no inactive file is promoted or removed |
 | compacted WAL is opened without its checkpoint base, or its selected slot is missing/corrupt/mismatched | durable open fails | no suffix is applied; another slot is never guessed |
@@ -307,36 +411,47 @@ loss and remount tests.
 | ledger batch is complete but a member/order/lifecycle transition is invalid or members were committed under another grouping | durable ledger batch/open fails | balances, indexes, period/reversal state, and event sequence remain unchanged; no member prefix is accepted |
 | financial effective date is closed, booking time regresses, or close/reopen progression is invalid | durable ledger post/open fails before commit | balances, period boundary, booking timestamp, and WAL remain unchanged for live validation failures; an invalid persisted suffix is rejected during recovery |
 
-Deterministic injected-fault tests exercise partial frame writes, complete writes
-with failed acknowledgement barriers, partial grouped writes, explicit sync
-failures, poison behavior, strict reopening, and verified-prefix repair.
-Segment tests exercise exact-boundary and whole-batch rotation, configuration
-drift, closed-file corruption, active-tail repair, manager exclusion,
-interrupted empty-file creation, and pre-rotation sequence exhaustion. A
-forced-process-termination test additionally proves recovery after an abandoned
-writer lease and a possible torn tail. Snapshot/checkpoint tests exercise stable
-framing, payload bounds, corrupt and incomplete pending files, current/pending
-generation forks, exact matching-command/report and ledger-record lineage,
-matching FIFO/reserve/STP restoration, correction and generalized ledger-batch
-grouping, batch torn-tail repair and whole-frame segment rotation, managed-
-directory rejection, WAL-path alias rejection, single/segmented WAL-prefix
-proof, suffix replay, coupled risk rejection/position/reservation restoration,
-immutable-profile binding, and reversal-index recovery.
-Call-auction coverage additionally includes canonical phase/book/counter/cache
-restoration, multi-cycle retained remainders, exact retry suppression, uncut
-prefix forks/ahead state, corrupt/wrong A/B slots, and dangling suffix
-completion after an anchor.
-Cutover tests additionally cover repeated A/B replacement, non-genesis physical
-sequences, anchor/snapshot divergence, missing checkpoint context, suffix
-continuation, occupied and abandoned staging paths, path aliasing, generation
-selection and cleanup, invalid selected-generation preservation, marker checksum
-corruption, generation exhaustion, and injected post-publication directory-
-barrier failures in both layouts.
-Ledger-period tests additionally exercise inclusive boundary dates, non-
-advancing closes, backward/full reopen, timestamp regression, administrative-
-reversal rejection, and checkpoint-plus-WAL suffix reconstruction.
+### Test coverage
+
+- **Deterministic injected-fault tests** exercise partial frame writes,
+  complete writes with failed acknowledgement barriers, partial grouped
+  writes, explicit sync failures, poison behavior, strict reopening, and
+  verified-prefix repair.
+- **Segment tests** exercise exact-boundary and whole-batch rotation,
+  configuration drift, closed-file corruption, active-tail repair, manager
+  exclusion, interrupted empty-file creation, and pre-rotation sequence
+  exhaustion.
+- **A forced-process-termination test** additionally proves recovery after an
+  abandoned writer lease and a possible torn tail.
+- **Snapshot/checkpoint tests** exercise stable framing, payload bounds,
+  corrupt and incomplete pending files, current/pending generation forks,
+  exact matching-command/report and ledger-record lineage, matching
+  FIFO/reserve/STP restoration, correction and generalized ledger-batch
+  grouping, batch torn-tail repair and whole-frame segment rotation,
+  managed-directory rejection, WAL-path alias rejection, single/segmented
+  WAL-prefix proof, suffix replay, coupled risk
+  rejection/position/reservation restoration, immutable-profile binding, and
+  reversal-index recovery.
+- **Call-auction coverage** additionally includes canonical
+  phase/book/counter/cache restoration, multi-cycle retained remainders,
+  exact retry suppression, uncut prefix forks/ahead state, corrupt/wrong A/B
+  slots, and dangling suffix completion after an anchor.
+- **Cutover tests** additionally cover repeated A/B replacement, non-genesis
+  physical sequences, anchor/snapshot divergence, missing checkpoint context,
+  suffix continuation, occupied and abandoned staging paths, path aliasing,
+  generation selection and cleanup, invalid selected-generation preservation,
+  marker checksum corruption, generation exhaustion, captured cursors at
+  mid-segment and exact segment-end boundaries, multisegment suffix
+  repacking, off-thread verified matching/risk/auction prefix retirement, and
+  injected post-publication directory-barrier failures in both layouts.
+- **Ledger-period tests** additionally exercise inclusive boundary dates,
+  non-advancing closes, backward/full reopen, timestamp regression,
+  administrative-reversal rejection, and checkpoint-plus-WAL suffix
+  reconstruction.
 
 ## Unimplemented storage properties
+
+This section lists storage properties that are not implemented.
 
 - externally coordinated archival/handoff of retired generations;
 - bounded idempotency/audit history, semantic generation rollover, and

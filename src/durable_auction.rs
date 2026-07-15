@@ -22,7 +22,9 @@ use crate::auction_risk::{
     CallAuctionRiskManagedEngine,
 };
 use crate::domain::{InstrumentId, InstrumentVersion};
-use crate::durable_storage::{StorageError, StorageOptions, StorageReader, StorageWriter};
+use crate::durable_storage::{
+    StorageCutoverBoundary, StorageError, StorageOptions, StorageReader, StorageWriter,
+};
 use crate::instrument::InstrumentDefinition;
 use crate::journal::{
     Journal, JournalError, JournalFrame, JournalLayout, JournalOptions, RecordKind,
@@ -73,6 +75,7 @@ pub struct DurableCallAuctionCheckpointCapture {
     capture: CallAuctionCheckpointCapture,
     origin: Arc<AtomicBool>,
     cutover_epoch: u64,
+    cutover_boundary: StorageCutoverBoundary,
 }
 
 impl DurableCallAuctionCheckpointCapture {
@@ -121,12 +124,14 @@ impl DurableCallAuctionCheckpointCapture {
             capture,
             origin,
             cutover_epoch,
+            cutover_boundary,
         } = self;
         match capture.verify() {
             Ok(checkpoint) => Ok(VerifiedDurableCallAuctionCheckpoint {
                 checkpoint,
                 origin,
                 cutover_epoch,
+                cutover_boundary,
             }),
             Err(error) => {
                 record_checkpoint_verification_failure(&origin, &error);
@@ -142,6 +147,7 @@ pub struct VerifiedDurableCallAuctionCheckpoint {
     checkpoint: CallAuctionCheckpoint,
     origin: Arc<AtomicBool>,
     cutover_epoch: u64,
+    cutover_boundary: StorageCutoverBoundary,
 }
 
 impl VerifiedDurableCallAuctionCheckpoint {
@@ -186,6 +192,7 @@ pub struct DurableCallAuctionRiskCheckpointCapture {
     capture: CallAuctionRiskCheckpointCapture,
     origin: Arc<AtomicBool>,
     cutover_epoch: u64,
+    cutover_boundary: StorageCutoverBoundary,
 }
 
 impl DurableCallAuctionRiskCheckpointCapture {
@@ -240,12 +247,14 @@ impl DurableCallAuctionRiskCheckpointCapture {
             capture,
             origin,
             cutover_epoch,
+            cutover_boundary,
         } = self;
         match capture.verify() {
             Ok(checkpoint) => Ok(VerifiedDurableCallAuctionRiskCheckpoint {
                 checkpoint,
                 origin,
                 cutover_epoch,
+                cutover_boundary,
             }),
             Err(error) => {
                 record_risk_checkpoint_verification_failure(&origin, &error);
@@ -261,6 +270,7 @@ pub struct VerifiedDurableCallAuctionRiskCheckpoint {
     checkpoint: CallAuctionRiskCheckpoint,
     origin: Arc<AtomicBool>,
     cutover_epoch: u64,
+    cutover_boundary: StorageCutoverBoundary,
 }
 
 impl VerifiedDurableCallAuctionRiskCheckpoint {
@@ -1029,11 +1039,8 @@ impl DurableCallAuctionEngine {
         if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
-        let wal_sequence = self
-            .journal
-            .next_sequence()
-            .checked_sub(1)
-            .ok_or(CallAuctionEngineError::SequenceExhausted)?;
+        let cutover_boundary = self.journal.cutover_boundary()?;
+        let wal_sequence = cutover_boundary.wal_sequence();
         let capture = match self
             .engine
             .capture_checkpoint_candidate(self.wal_metadata_sequence, wal_sequence)
@@ -1048,6 +1055,7 @@ impl DurableCallAuctionEngine {
             capture,
             origin: Arc::clone(&self.checkpoint_verification_origin),
             cutover_epoch: self.cutover_epoch,
+            cutover_boundary,
         })
     }
 
@@ -1098,6 +1106,44 @@ impl DurableCallAuctionEngine {
         verified: &VerifiedDurableCallAuctionCheckpoint,
         options: SnapshotOptions,
     ) -> Result<SnapshotReceipt, DurableCallAuctionError> {
+        validate_auction_checkpoint_path(
+            self.journal.path(),
+            self.journal.layout(),
+            path.as_ref(),
+        )?;
+        self.validate_verified_checkpoint(verified)?;
+        SnapshotFile::write(path, &verified.checkpoint, options).map_err(Into::into)
+    }
+
+    /// Publishes a replay-verified auction checkpoint and retires its WAL prefix.
+    ///
+    /// Any auction command/report suffix appended after capture is synchronized
+    /// and migrated unchanged behind the new anchor. Full replay is not repeated
+    /// under writer exclusion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, origin/epoch, metadata,
+    /// or WAL-boundary drift, path conflict, snapshot persistence, suffix
+    /// migration, or physical publication failure.
+    pub fn compact_verified_checkpoint(
+        &mut self,
+        checkpoint_base: impl AsRef<Path>,
+        verified: &VerifiedDurableCallAuctionCheckpoint,
+        options: SnapshotOptions,
+    ) -> Result<CheckpointCutoverReceipt, DurableCallAuctionError> {
+        validate_auction_checkpoint_path(
+            self.journal.path(),
+            self.journal.layout(),
+            checkpoint_base.as_ref(),
+        )?;
+        self.compact_verified_checkpoint_validated(checkpoint_base.as_ref(), verified, options)
+    }
+
+    fn validate_verified_checkpoint(
+        &self,
+        verified: &VerifiedDurableCallAuctionCheckpoint,
+    ) -> Result<u64, DurableCallAuctionError> {
         if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
@@ -1109,14 +1155,6 @@ impl DurableCallAuctionEngine {
                 captured_epoch: verified.cutover_epoch,
                 current_epoch: self.cutover_epoch,
             });
-        }
-        validate_auction_checkpoint_path(
-            self.journal.path(),
-            self.journal.layout(),
-            path.as_ref(),
-        )?;
-        if self.is_poisoned() {
-            return Err(DurableCallAuctionError::Poisoned);
         }
         let wal_sequence = self
             .journal
@@ -1131,13 +1169,15 @@ impl DurableCallAuctionEngine {
                 },
             );
         }
-        if verified.checkpoint.generation() > wal_sequence {
+        if verified.checkpoint.generation() != verified.cutover_boundary.wal_sequence()
+            || verified.checkpoint.generation() > wal_sequence
+        {
             return Err(DurableCallAuctionError::CheckpointAheadOfWal {
                 checkpoint_sequence: verified.checkpoint.generation(),
                 wal_last_sequence: Some(wal_sequence),
             });
         }
-        SnapshotFile::write(path, &verified.checkpoint, options).map_err(Into::into)
+        Ok(wal_sequence)
     }
 
     /// Publishes an inactive A/B auction checkpoint and atomically retires the
@@ -1155,50 +1195,59 @@ impl DurableCallAuctionEngine {
         if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
-        let next_cutover_epoch = self
-            .cutover_epoch
-            .checked_add(1)
-            .ok_or(DurableCallAuctionError::CheckpointCutoverEpochExhausted)?;
         validate_auction_checkpoint_path(
             self.journal.path(),
             self.journal.layout(),
             checkpoint_base.as_ref(),
         )?;
-        self.sync_all()?;
-        let wal_sequence = self
-            .journal
-            .next_sequence()
-            .checked_sub(1)
-            .ok_or(CallAuctionEngineError::SequenceExhausted)?;
-        let checkpoint = match self
-            .engine
-            .checkpoint(self.wal_metadata_sequence, wal_sequence)
-        {
+        let capture = self.capture_checkpoint_candidate()?;
+        let verified = match capture.verify() {
             Ok(value) => value,
             Err(error) => {
                 self.poisoned = checkpoint_failure_requires_poison(&error);
                 return Err(DurableCallAuctionError::Checkpoint(error));
             }
         };
+        self.compact_verified_checkpoint_validated(checkpoint_base.as_ref(), &verified, options)
+    }
+
+    fn compact_verified_checkpoint_validated(
+        &mut self,
+        checkpoint_base: &Path,
+        verified: &VerifiedDurableCallAuctionCheckpoint,
+        options: SnapshotOptions,
+    ) -> Result<CheckpointCutoverReceipt, DurableCallAuctionError> {
+        self.validate_verified_checkpoint(verified)?;
+        let next_cutover_epoch = self
+            .cutover_epoch
+            .checked_add(1)
+            .ok_or(DurableCallAuctionError::CheckpointCutoverEpochExhausted)?;
         let slot = self
             .checkpoint_slot
             .map_or(CheckpointSlot::A, CheckpointSlot::alternate);
         let slot_path = SnapshotFile::slot_path(checkpoint_base, slot);
         validate_auction_checkpoint_path(self.journal.path(), self.journal.layout(), &slot_path)?;
-        let snapshot = SnapshotFile::write(&slot_path, &checkpoint, options)?;
+        let snapshot = SnapshotFile::write(&slot_path, &verified.checkpoint, options)?;
         let anchor = CheckpointAnchor::new(
             SnapshotKind::CallAuctionCheckpoint,
             slot,
             snapshot,
-            wal_sequence,
+            verified.checkpoint.generation(),
         );
-        if let Err(error) = self.journal.replace_with_checkpoint_anchor(anchor) {
+        if let Err(error) = self
+            .journal
+            .replace_with_checkpoint_anchor_at(anchor, verified.cutover_boundary)
+        {
             self.poisoned = self.journal.is_poisoned();
             return Err(error.into());
         }
         self.checkpoint_slot = Some(slot);
         self.cutover_epoch = next_cutover_epoch;
-        Ok(CheckpointCutoverReceipt::new(snapshot, slot, wal_sequence))
+        Ok(CheckpointCutoverReceipt::new(
+            snapshot,
+            slot,
+            verified.checkpoint.generation(),
+        ))
     }
 
     /// Synchronizes journal data and metadata.
@@ -1585,11 +1634,8 @@ impl DurableCallAuctionRiskEngine {
         if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
-        let wal_sequence = self
-            .journal
-            .next_sequence()
-            .checked_sub(1)
-            .ok_or(CallAuctionEngineError::SequenceExhausted)?;
+        let cutover_boundary = self.journal.cutover_boundary()?;
+        let wal_sequence = cutover_boundary.wal_sequence();
         let capture = match self.managed.capture_checkpoint_candidate(
             self.wal_first_sequence,
             self.wal_metadata_sequence,
@@ -1605,6 +1651,7 @@ impl DurableCallAuctionRiskEngine {
             capture,
             origin: Arc::clone(&self.checkpoint_verification_origin),
             cutover_epoch: self.cutover_epoch,
+            cutover_boundary,
         })
     }
 
@@ -1655,6 +1702,43 @@ impl DurableCallAuctionRiskEngine {
         verified: &VerifiedDurableCallAuctionRiskCheckpoint,
         options: SnapshotOptions,
     ) -> Result<SnapshotReceipt, DurableCallAuctionError> {
+        validate_auction_checkpoint_path(
+            self.journal.path(),
+            self.journal.layout(),
+            path.as_ref(),
+        )?;
+        self.validate_verified_checkpoint(verified)?;
+        SnapshotFile::write(path, &verified.checkpoint, options).map_err(Into::into)
+    }
+
+    /// Publishes a coupled-replay-verified checkpoint and retires its WAL prefix.
+    ///
+    /// Any later auction/risk command-report suffix is synchronized and migrated
+    /// unchanged. Coupled replay is not repeated under writer exclusion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, origin/epoch, lineage,
+    /// metadata, or WAL-boundary drift, path conflict, snapshot persistence,
+    /// suffix migration, or physical publication failure.
+    pub fn compact_verified_checkpoint(
+        &mut self,
+        checkpoint_base: impl AsRef<Path>,
+        verified: &VerifiedDurableCallAuctionRiskCheckpoint,
+        options: SnapshotOptions,
+    ) -> Result<CheckpointCutoverReceipt, DurableCallAuctionError> {
+        validate_auction_checkpoint_path(
+            self.journal.path(),
+            self.journal.layout(),
+            checkpoint_base.as_ref(),
+        )?;
+        self.compact_verified_checkpoint_validated(checkpoint_base.as_ref(), verified, options)
+    }
+
+    fn validate_verified_checkpoint(
+        &self,
+        verified: &VerifiedDurableCallAuctionRiskCheckpoint,
+    ) -> Result<u64, DurableCallAuctionError> {
         if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
@@ -1666,14 +1750,6 @@ impl DurableCallAuctionRiskEngine {
                 captured_epoch: verified.cutover_epoch,
                 current_epoch: self.cutover_epoch,
             });
-        }
-        validate_auction_checkpoint_path(
-            self.journal.path(),
-            self.journal.layout(),
-            path.as_ref(),
-        )?;
-        if self.is_poisoned() {
-            return Err(DurableCallAuctionError::Poisoned);
         }
         if verified.checkpoint.wal_first_sequence() != self.wal_first_sequence {
             return Err(DurableCallAuctionError::CheckpointWalLineageMismatch {
@@ -1697,13 +1773,15 @@ impl DurableCallAuctionRiskEngine {
             .next_sequence()
             .checked_sub(1)
             .ok_or(CallAuctionEngineError::SequenceExhausted)?;
-        if verified.checkpoint.generation() > wal_sequence {
+        if verified.checkpoint.generation() != verified.cutover_boundary.wal_sequence()
+            || verified.checkpoint.generation() > wal_sequence
+        {
             return Err(DurableCallAuctionError::CheckpointAheadOfWal {
                 checkpoint_sequence: verified.checkpoint.generation(),
                 wal_last_sequence: Some(wal_sequence),
             });
         }
-        SnapshotFile::write(path, &verified.checkpoint, options).map_err(Into::into)
+        Ok(wal_sequence)
     }
 
     /// Publishes an inactive A/B checkpoint and retires the selected WAL prefix.
@@ -1720,51 +1798,59 @@ impl DurableCallAuctionRiskEngine {
         if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
-        let next_cutover_epoch = self
-            .cutover_epoch
-            .checked_add(1)
-            .ok_or(DurableCallAuctionError::CheckpointCutoverEpochExhausted)?;
         validate_auction_checkpoint_path(
             self.journal.path(),
             self.journal.layout(),
             checkpoint_base.as_ref(),
         )?;
-        self.sync_all()?;
-        let wal_sequence = self
-            .journal
-            .next_sequence()
-            .checked_sub(1)
-            .ok_or(CallAuctionEngineError::SequenceExhausted)?;
-        let checkpoint = match self.managed.checkpoint(
-            self.wal_first_sequence,
-            self.wal_metadata_sequence,
-            wal_sequence,
-        ) {
+        let capture = self.capture_checkpoint_candidate()?;
+        let verified = match capture.verify() {
             Ok(value) => value,
             Err(error) => {
                 self.poisoned = risk_checkpoint_failure_requires_poison(&error);
                 return Err(DurableCallAuctionError::RiskCheckpoint(error));
             }
         };
+        self.compact_verified_checkpoint_validated(checkpoint_base.as_ref(), &verified, options)
+    }
+
+    fn compact_verified_checkpoint_validated(
+        &mut self,
+        checkpoint_base: &Path,
+        verified: &VerifiedDurableCallAuctionRiskCheckpoint,
+        options: SnapshotOptions,
+    ) -> Result<CheckpointCutoverReceipt, DurableCallAuctionError> {
+        self.validate_verified_checkpoint(verified)?;
+        let next_cutover_epoch = self
+            .cutover_epoch
+            .checked_add(1)
+            .ok_or(DurableCallAuctionError::CheckpointCutoverEpochExhausted)?;
         let slot = self
             .checkpoint_slot
             .map_or(CheckpointSlot::A, CheckpointSlot::alternate);
-        let slot_path = SnapshotFile::slot_path(checkpoint_base.as_ref(), slot);
+        let slot_path = SnapshotFile::slot_path(checkpoint_base, slot);
         validate_auction_checkpoint_path(self.journal.path(), self.journal.layout(), &slot_path)?;
-        let snapshot = SnapshotFile::write(&slot_path, &checkpoint, options)?;
+        let snapshot = SnapshotFile::write(&slot_path, &verified.checkpoint, options)?;
         let anchor = CheckpointAnchor::new(
             SnapshotKind::CallAuctionRiskCheckpoint,
             slot,
             snapshot,
-            wal_sequence,
+            verified.checkpoint.generation(),
         );
-        if let Err(error) = self.journal.replace_with_checkpoint_anchor(anchor) {
+        if let Err(error) = self
+            .journal
+            .replace_with_checkpoint_anchor_at(anchor, verified.cutover_boundary)
+        {
             self.poisoned = self.journal.is_poisoned();
             return Err(error.into());
         }
         self.checkpoint_slot = Some(slot);
         self.cutover_epoch = next_cutover_epoch;
-        Ok(CheckpointCutoverReceipt::new(snapshot, slot, wal_sequence))
+        Ok(CheckpointCutoverReceipt::new(
+            snapshot,
+            slot,
+            verified.checkpoint.generation(),
+        ))
     }
 
     /// Synchronizes journal data and metadata.
@@ -2717,6 +2803,7 @@ mod checkpoint_failure_tests {
             capture,
             origin: Arc::clone(&origin),
             cutover_epoch: 0,
+            cutover_boundary: crate::durable_storage::StorageCutoverBoundary::for_test(1),
         };
         assert!(matches!(
             durable.verify(),
@@ -2735,6 +2822,7 @@ mod checkpoint_failure_tests {
             capture,
             origin: Arc::clone(&origin),
             cutover_epoch: 0,
+            cutover_boundary: crate::durable_storage::StorageCutoverBoundary::for_test(1),
         };
         assert!(matches!(
             durable.verify(),

@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::domain::{InstrumentId, InstrumentVersion};
-use crate::durable_storage::{StorageError, StorageOptions, StorageReader, StorageWriter};
+use crate::durable_storage::{
+    StorageCutoverBoundary, StorageError, StorageOptions, StorageReader, StorageWriter,
+};
 use crate::instrument::InstrumentDefinition;
 use crate::journal::{
     Journal, JournalError, JournalFrame, JournalLayout, JournalOptions, RecordKind,
@@ -53,6 +55,7 @@ pub struct DurableRiskManagedCheckpointCapture {
     capture: RiskManagedCheckpointCapture,
     origin: Arc<AtomicBool>,
     cutover_epoch: u64,
+    cutover_boundary: StorageCutoverBoundary,
 }
 
 impl DurableRiskManagedCheckpointCapture {
@@ -114,12 +117,14 @@ impl DurableRiskManagedCheckpointCapture {
             capture,
             origin,
             cutover_epoch,
+            cutover_boundary,
         } = self;
         match capture.verify() {
             Ok(checkpoint) => Ok(VerifiedDurableRiskManagedCheckpoint {
                 checkpoint,
                 origin,
                 cutover_epoch,
+                cutover_boundary,
             }),
             Err(error) => {
                 record_checkpoint_verification_failure(&origin, &error);
@@ -131,15 +136,16 @@ impl DurableRiskManagedCheckpointCapture {
 
 /// A coupled-replay-verified checkpoint bound to one durable shard incarnation.
 ///
-/// Only this type is accepted by
-/// [`DurableRiskOrderBook::write_verified_checkpoint`]. Its private origin and
-/// cutover epoch prevent publication through another shard, a reopened shard,
-/// or the source shard after physical WAL-prefix retirement.
+/// Only this type is accepted by standalone or prefix-retiring verified
+/// publication. Its private origin and cutover epoch prevent publication
+/// through another shard, a reopened shard, or the source shard after physical
+/// WAL-prefix retirement.
 #[derive(Clone)]
 pub struct VerifiedDurableRiskManagedCheckpoint {
     checkpoint: RiskManagedCheckpoint,
     origin: Arc<AtomicBool>,
     cutover_epoch: u64,
+    cutover_boundary: StorageCutoverBoundary,
 }
 
 impl VerifiedDurableRiskManagedCheckpoint {
@@ -898,11 +904,8 @@ impl DurableRiskOrderBook {
         if self.is_poisoned() {
             return Err(DurableRiskError::Poisoned);
         }
-        let wal_sequence = self
-            .journal
-            .next_sequence()
-            .checked_sub(1)
-            .ok_or(MatchingError::SequenceExhausted)?;
+        let cutover_boundary = self.journal.cutover_boundary()?;
+        let wal_sequence = cutover_boundary.wal_sequence();
         let capture = match self.managed.capture_checkpoint_candidate(
             self.wal_first_sequence,
             self.wal_metadata_sequence,
@@ -918,6 +921,7 @@ impl DurableRiskOrderBook {
             capture,
             origin: Arc::clone(&self.checkpoint_verification_origin),
             cutover_epoch: self.cutover_epoch,
+            cutover_boundary,
         })
     }
 
@@ -955,8 +959,8 @@ impl DurableRiskOrderBook {
     /// Ordinary suffix growth after capture is allowed because the checkpoint
     /// remains an exact older WAL prefix. Publication rejects another/reopened
     /// shard and any source shard whose physical prefix was compacted after
-    /// capture. This method writes a standalone checkpoint only; asynchronous
-    /// WAL cutover is deliberately not exposed.
+    /// capture. This method writes a standalone checkpoint and does not retire
+    /// a WAL prefix.
     ///
     /// # Errors
     ///
@@ -969,6 +973,40 @@ impl DurableRiskOrderBook {
         verified: &VerifiedDurableRiskManagedCheckpoint,
         options: SnapshotOptions,
     ) -> Result<SnapshotReceipt, DurableRiskError> {
+        validate_checkpoint_path(self.journal.path(), self.journal.layout(), path.as_ref())?;
+        self.validate_verified_checkpoint(verified)?;
+        SnapshotFile::write(path, &verified.checkpoint, options).map_err(Into::into)
+    }
+
+    /// Publishes a coupled-replay-verified checkpoint and retires its WAL prefix.
+    ///
+    /// Any command/report suffix appended after capture is synchronized and
+    /// migrated unchanged behind the new checkpoint anchor. The coupled replay
+    /// proof is not repeated while the writer is excluded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableRiskError`] for poison, origin/epoch, lineage, metadata,
+    /// or WAL-boundary drift, path conflict, snapshot persistence, suffix
+    /// migration, or physical publication failure.
+    pub fn compact_verified_checkpoint(
+        &mut self,
+        checkpoint_base: impl AsRef<Path>,
+        verified: &VerifiedDurableRiskManagedCheckpoint,
+        options: SnapshotOptions,
+    ) -> Result<CheckpointCutoverReceipt, DurableRiskError> {
+        validate_checkpoint_path(
+            self.journal.path(),
+            self.journal.layout(),
+            checkpoint_base.as_ref(),
+        )?;
+        self.compact_verified_checkpoint_validated(checkpoint_base.as_ref(), verified, options)
+    }
+
+    fn validate_verified_checkpoint(
+        &self,
+        verified: &VerifiedDurableRiskManagedCheckpoint,
+    ) -> Result<u64, DurableRiskError> {
         if self.is_poisoned() {
             return Err(DurableRiskError::Poisoned);
         }
@@ -980,10 +1018,6 @@ impl DurableRiskOrderBook {
                 captured_epoch: verified.cutover_epoch,
                 current_epoch: self.cutover_epoch,
             });
-        }
-        validate_checkpoint_path(self.journal.path(), self.journal.layout(), path.as_ref())?;
-        if self.is_poisoned() {
-            return Err(DurableRiskError::Poisoned);
         }
         if verified.checkpoint.wal_first_sequence() != self.wal_first_sequence {
             return Err(DurableRiskError::CheckpointWalLineageMismatch {
@@ -1005,13 +1039,15 @@ impl DurableRiskOrderBook {
             .next_sequence()
             .checked_sub(1)
             .ok_or(MatchingError::SequenceExhausted)?;
-        if verified.checkpoint.generation() > wal_sequence {
+        if verified.checkpoint.generation() != verified.cutover_boundary.wal_sequence()
+            || verified.checkpoint.generation() > wal_sequence
+        {
             return Err(DurableRiskError::CheckpointAheadOfWal {
                 checkpoint_sequence: verified.checkpoint.generation(),
                 wal_last_sequence: Some(wal_sequence),
             });
         }
-        SnapshotFile::write(path, &verified.checkpoint, options).map_err(Into::into)
+        Ok(wal_sequence)
     }
 
     /// Writes the inactive coupled checkpoint slot and atomically retires the
@@ -1031,51 +1067,59 @@ impl DurableRiskOrderBook {
         if self.is_poisoned() {
             return Err(DurableRiskError::Poisoned);
         }
-        let next_cutover_epoch = self
-            .cutover_epoch
-            .checked_add(1)
-            .ok_or(DurableRiskError::CheckpointCutoverEpochExhausted)?;
         validate_checkpoint_path(
             self.journal.path(),
             self.journal.layout(),
             checkpoint_base.as_ref(),
         )?;
-        self.sync_all()?;
-        let wal_sequence = self
-            .journal
-            .next_sequence()
-            .checked_sub(1)
-            .ok_or(MatchingError::SequenceExhausted)?;
-        let checkpoint = match self.managed.checkpoint(
-            self.wal_first_sequence,
-            self.wal_metadata_sequence,
-            wal_sequence,
-        ) {
+        let capture = self.capture_checkpoint_candidate()?;
+        let verified = match capture.verify() {
             Ok(value) => value,
             Err(error) => {
                 self.poisoned = checkpoint_failure_requires_poison(&error);
                 return Err(DurableRiskError::Checkpoint(error));
             }
         };
+        self.compact_verified_checkpoint_validated(checkpoint_base.as_ref(), &verified, options)
+    }
+
+    fn compact_verified_checkpoint_validated(
+        &mut self,
+        checkpoint_base: &Path,
+        verified: &VerifiedDurableRiskManagedCheckpoint,
+        options: SnapshotOptions,
+    ) -> Result<CheckpointCutoverReceipt, DurableRiskError> {
+        self.validate_verified_checkpoint(verified)?;
+        let next_cutover_epoch = self
+            .cutover_epoch
+            .checked_add(1)
+            .ok_or(DurableRiskError::CheckpointCutoverEpochExhausted)?;
         let slot = self
             .checkpoint_slot
             .map_or(CheckpointSlot::A, CheckpointSlot::alternate);
         let slot_path = SnapshotFile::slot_path(checkpoint_base, slot);
         validate_checkpoint_path(self.journal.path(), self.journal.layout(), &slot_path)?;
-        let snapshot = SnapshotFile::write(&slot_path, &checkpoint, options)?;
+        let snapshot = SnapshotFile::write(&slot_path, &verified.checkpoint, options)?;
         let anchor = CheckpointAnchor::new(
             SnapshotKind::RiskManagedCheckpoint,
             slot,
             snapshot,
-            wal_sequence,
+            verified.checkpoint.generation(),
         );
-        if let Err(error) = self.journal.replace_with_checkpoint_anchor(anchor) {
+        if let Err(error) = self
+            .journal
+            .replace_with_checkpoint_anchor_at(anchor, verified.cutover_boundary)
+        {
             self.poisoned = self.journal.is_poisoned();
             return Err(error.into());
         }
         self.checkpoint_slot = Some(slot);
         self.cutover_epoch = next_cutover_epoch;
-        Ok(CheckpointCutoverReceipt::new(snapshot, slot, wal_sequence))
+        Ok(CheckpointCutoverReceipt::new(
+            snapshot,
+            slot,
+            verified.checkpoint.generation(),
+        ))
     }
 
     /// Synchronizes journal data and metadata.
@@ -1649,6 +1693,7 @@ mod checkpoint_failure_tests {
             capture,
             origin: Arc::clone(&origin),
             cutover_epoch: 0,
+            cutover_boundary: crate::durable_storage::StorageCutoverBoundary::for_test(1),
         };
 
         assert!(matches!(

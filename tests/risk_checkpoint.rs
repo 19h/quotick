@@ -697,7 +697,7 @@ fn risk_checkpoint_must_equal_exact_wal_prefix_and_cannot_be_ahead() {
 }
 
 #[test]
-fn segmented_risk_checkpoint_recovers_across_physical_boundaries() {
+fn segmented_verified_risk_cutover_preserves_the_post_capture_suffix() {
     let area = TestArea::new("segmented");
     let segments = area.join("segments");
     let snapshot = area.join("risk.qsnp");
@@ -706,18 +706,52 @@ fn segmented_risk_checkpoint_recovers_across_physical_boundaries() {
         maximum_segment_bytes: 512,
         journal: journal_options(),
     };
+    let maker = order(
+        1,
+        1,
+        11,
+        Side::Sell,
+        10,
+        OrderDisplay::FullyDisplayed,
+        100,
+        TimeInForce::GoodTilCancelled,
+    );
+    let taker = order(
+        2,
+        2,
+        12,
+        Side::Buy,
+        5,
+        OrderDisplay::FullyDisplayed,
+        100,
+        TimeInForce::ImmediateOrCancel,
+    );
     let mut durable =
         DurableRiskOrderBook::open_segmented(&segments, definition(), &profile_values, options)
             .unwrap();
-    durable.submit(resting(1, 1, 11, 5)).unwrap();
+    durable.submit(maker).unwrap();
     let capture = durable.capture_checkpoint_candidate().unwrap();
     let worker = std::thread::spawn(move || capture.verify().unwrap());
-    durable.submit(resting(2, 2, 12, 7)).unwrap();
+    durable.submit(taker).unwrap();
     let verified = worker.join().unwrap();
-    durable
-        .write_verified_checkpoint(&snapshot, &verified, SnapshotOptions::default())
+    let cutover = durable
+        .compact_verified_checkpoint(&snapshot, &verified, SnapshotOptions::default())
         .unwrap();
+    assert_eq!(cutover.snapshot().generation(), 5);
+    assert_eq!(cutover.wal_first_sequence(), 5);
     durable.close().unwrap();
+
+    let frames = SegmentedJournalReader::open(&segments, options)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(frames.len(), 3);
+    assert_eq!(frames[0].kind(), RecordKind::CheckpointAnchor);
+    assert_eq!(frames[0].sequence(), 5);
+    assert_eq!(frames[1].kind(), RecordKind::Command);
+    assert_eq!(frames[1].sequence(), 6);
+    assert_eq!(frames[2].kind(), RecordKind::ExecutionReport);
+    assert_eq!(frames[2].sequence(), 7);
 
     let recovered = DurableRiskOrderBook::open_segmented_with_checkpoint(
         &segments,
@@ -730,8 +764,36 @@ fn segmented_risk_checkpoint_recovers_across_physical_boundaries() {
     .unwrap();
     assert_eq!(recovered.recovery().checkpointed_commands, 1);
     assert_eq!(recovered.recovery().replayed_commands, 1);
-    assert!(recovered.recovery().journal.segment_count >= 2);
-    assert_eq!(recovered.managed().book().active_order_count(), 2);
+    assert_eq!(recovered.managed().book().active_order_count(), 1);
+    assert_eq!(recovered.managed().risk().reservation_count(), 1);
+    assert_eq!(
+        recovered
+            .managed()
+            .risk()
+            .reservation(OrderId::new(1).unwrap())
+            .unwrap()
+            .quantity_lots(),
+        5
+    );
+    assert_eq!(
+        recovered
+            .managed()
+            .risk()
+            .snapshot(account(11))
+            .unwrap()
+            .position_lots(),
+        -5
+    );
+    assert_eq!(
+        recovered
+            .managed()
+            .risk()
+            .snapshot(account(12))
+            .unwrap()
+            .position_lots(),
+        5
+    );
+    recovered.managed().validate().unwrap();
 }
 
 #[test]

@@ -10,7 +10,23 @@ version 4. Versions `1`, `2`, and `3` are expired envelopes and are rejected;
 the [version-3 schema](wal-v3.md) is retained only as historical provenance for
 the unchanged payloads incorporated here.
 
+## Contents
+
+- [Frame](#frame)
+- [Common scalar notation](#common-scalar-notation)
+- [Record kinds 1 through 8](#record-kinds-1-through-8)
+- [Call-auction command payload, kind 9](#call-auction-command-payload-kind-9)
+- [Call-auction execution-report payload,
+  kind 10](#call-auction-execution-report-payload-kind-10)
+- [Durable Call-Auction Journal
+  Grammar](#durable-call-auction-journal-grammar)
+- [Durable Coupled Call-Auction/Risk Journal
+  Grammar](#durable-coupled-call-auctionrisk-journal-grammar)
+- [Compatibility boundary](#compatibility-boundary)
+
 ## Frame
+
+This section defines the envelope that wraps every record.
 
 | Offset (B) | Width (B) | Field |
 |---:|---:|---|
@@ -22,10 +38,20 @@ the unchanged payloads incorporated here.
 | 16 | 8 | contiguous journal sequence `u64` |
 | 24 | payload length | typed payload |
 
-Record-kind tags are continuous matching command `1`, continuous matching
-execution report `2`, ledger entry `3`, instrument definition `4`, account risk
-definition `5`, ledger correction `6`, ledger batch `7`, checkpoint anchor `8`,
-call-auction command `9`, and call-auction execution report `10`.
+Record-kind tags are:
+
+| Tag | Record kind |
+|---:|---|
+| 1 | continuous matching command |
+| 2 | continuous matching execution report |
+| 3 | ledger entry |
+| 4 | instrument definition |
+| 5 | account risk definition |
+| 6 | ledger correction |
+| 7 | ledger batch |
+| 8 | checkpoint anchor |
+| 9 | call-auction command |
+| 10 | call-auction execution report |
 
 CRC-32C uses the reflected Castagnoli polynomial `0x82F63B78`, initial state
 `0xFFFFFFFF`, and final XOR `0xFFFFFFFF`. It covers the complete header with
@@ -58,6 +84,8 @@ expired version-3 frame.
 
 ## Call-auction command payload, kind 9
 
+This section defines the typed payload carried by kind-`9` frames.
+
 The first `u8` selects phase control `0`, submit `1`, cancel `2`, or uncross
 `3`. Fields follow in the exact order below.
 
@@ -68,25 +96,36 @@ The first `u8` selects phase control `0`, submit `1`, cancel `2`, or uncross
 | 2 | command ID, instrument ID, instrument version, account ID, order ID, receive timestamp |
 | 3 | command ID, instrument ID, instrument version, auction ID, expected phase revision `u64`, minimum price `i64`, maximum price `i64`, reference price `i64`, pressure rule `u8`, final tie break `u8`, remainder policy `u8`, self-trade policy `u8`, receive timestamp |
 
-Phase tags are closed `0`, collecting `1`, and frozen `2`. An auction order is
-order ID, account ID, instrument ID, instrument version, side, constraint, and
-quantity. Side tags are buy `0` and sell `1`. Constraint tags are market `0`
-and limit `1` followed by raw price `i64`.
+The component encodings referenced above are:
 
-Pressure-rule tags are ignore `0` and favor imbalance `1`. Final-price tie
-break tags are lower `0` and higher `1`. Remainder-policy tags are retain all
-`0`, cancel market `1`, and cancel all `2`. The only represented self-trade
-policy is permit `0`. An uncross band must have `minimum <= maximum`; tick,
-collar, reference, route, cycle, and phase validation occur against recovered
-instrument/engine state.
+- **Phase** tags are closed `0`, collecting `1`, and frozen `2`.
+- An **auction order** is order ID, account ID, instrument ID, instrument
+  version, side, constraint, and quantity.
+- **Side** tags are buy `0` and sell `1`.
+- **Constraint** tags are market `0` and limit `1` followed by raw price
+  `i64`.
+- **Pressure-rule** tags are ignore `0` and favor imbalance `1`.
+- **Final-price tie break** tags are lower `0` and higher `1`.
+- **Remainder-policy** tags are retain all `0`, cancel market `1`, and cancel
+  all `2`.
+- The only represented **self-trade policy** is permit `0`.
+
+An uncross band must have `minimum <= maximum`; tick, collar, reference,
+route, cycle, and phase validation occur against recovered instrument/engine
+state.
 
 ## Call-auction execution-report payload, kind 10
+
+This section defines the typed payload carried by kind-`10` frames and the
+validation rules a decoded report must satisfy.
 
 Fields are command ID `u64`, non-zero command sequence `u64`, outcome, event
 count `u32`, ordered events, and replay `bool`. Outcome is accepted `0`, or
 rejected `1` followed by a rejection reason. A canonical durable report always
 has replay false: exact retries are served from reconstructed history without
 new WAL frames.
+
+### Events
 
 Every event begins with non-zero event sequence `u64`, command ID `u64`,
 occurrence timestamp `u64`, and event-kind tag:
@@ -111,6 +150,8 @@ aggregate sell quantity `u128`. Executable quantity and absolute imbalance are
 derived by checked comparison/subtraction; executable quantity must be
 positive. A trade cannot name one order on both sides. For a remainder
 cancellation, `remaining quantity + already-executed lots` must fit `u64`.
+
+### Rejection reasons
 
 Rejection-reason tags are:
 
@@ -139,20 +180,35 @@ Rejection-reason tags are:
 | 20 | risk worst-case position limit |
 | 21 | risk arithmetic overflow |
 
-Action tags are phase control `0`, submit `1`, cancel `2`, and uncross `3`.
-Instrument-admission-error tags are wrong instrument `0`, wrong version `1`,
-continuous trading state disallows entry `2`, off-tick price `3`, outside-collar
-price `4`, off-grid quantity `5`, outside-limits quantity `6`, reserve unsupported
-`7`, display quantity off grid `8`, display quantity not below order `9`, and
-reserve replenishment limit `10`. The continuous-state error is retained as a
-stable domain union member; the auction engine's route/phase validation governs
-call-auction admission.
+**Action** tags are phase control `0`, submit `1`, cancel `2`, and uncross
+`3`.
+
+Instrument-admission-error tags are:
+
+| Tag | Instrument admission error |
+|---:|---|
+| 0 | wrong instrument |
+| 1 | wrong version |
+| 2 | continuous trading state disallows entry |
+| 3 | off-tick price |
+| 4 | outside-collar price |
+| 5 | off-grid quantity |
+| 6 | outside-limits quantity |
+| 7 | reserve unsupported |
+| 8 | display quantity off grid |
+| 9 | display quantity not below order |
+| 10 | reserve replenishment limit |
+
+The continuous-state error is retained as a stable domain union member; the
+auction engine's route/phase validation governs call-auction admission.
 
 Tags `12`--`21` are emitted only by the coupled call-auction/risk state
 machine. They remain part of the stable report union and checkpoint history.
 The plain durable call-auction runtime has no profile metadata and therefore
 cannot reproduce a WAL containing those outcomes; such a history fails its
 deterministic replay check rather than being interpreted as non-risk state.
+
+### Report trace validation
 
 Decoded report validation requires a non-empty, contiguous, command-bound event
 trace. A rejected report has exactly one matching tag-`6` event. An accepted
@@ -164,6 +220,9 @@ clearing price, trade quantities sum exactly to executable quantity, declared
 counts equal the body, and both final revisions are non-zero.
 
 ## Durable Call-Auction Journal Grammar
+
+This section defines the valid frame sequences of a plain durable
+call-auction shard and how recovery interprets them.
 
 An uncut call-auction shard contains exactly one instrument definition at
 physical sequence `M` followed by zero or more kind-`9`/kind-`10`
@@ -215,6 +274,9 @@ cost.
 
 ## Durable Coupled Call-Auction/Risk Journal Grammar
 
+This section defines the frame grammar of shards that couple call-auction
+commands with account-risk metadata, and its recovery rules.
+
 An uncut coupled shard begins with one instrument definition at physical
 sequence `F`, followed by `N` kind-`5` account-risk definitions in strictly
 increasing `AccountId` order. The final metadata sequence is:
@@ -251,7 +313,11 @@ pairs append. Standalone publication accepts only the verified typestate through
 the same open shard and unchanged process-local cutover epoch; coupled
 publication also rechecks `F` and `M`. Another shard, reopen, metadata drift, a
 checkpoint ahead of the WAL head, or successful prefix cutover is rejected
-before snapshot creation. A staged handle cannot drive kind-`8` cutover.
+before snapshot creation. `compact_verified_checkpoint` may instead publish the
+inactive A/B slot and drive kind-`8` cutover from the capture's private physical
+cursor. It synchronizes the current head `H`, retains the anchor at `G`, and
+streams only the original suffix frames `G+1..H`; successful publication
+advances the cutover epoch and invalidates every earlier handle.
 
 A compacted coupled shard begins at `G` with a kind-`8` anchor naming
 `CallAuctionRiskCheckpoint` kind `5`. The selected A/B snapshot must match the

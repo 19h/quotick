@@ -6,7 +6,20 @@ define a network transport, session protocol, compression envelope, or message
 authentication scheme. All multibyte integers are little-endian. No padding or
 native Rust representation is serialized.
 
+## Contents
+
+- [Semantic contract](#semantic-contract)
+- [Scalar notation](#scalar-notation)
+- [Aggregate level](#aggregate-level)
+- [Incremental update](#incremental-update)
+- [Full-depth snapshot](#full-depth-snapshot)
+- [Gap recovery protocol](#gap-recovery-protocol)
+- [Information boundary](#information-boundary)
+
 ## Semantic contract
+
+This section lists the guarantees that relate private matching events to the
+public updates and snapshots defined in the sections below.
 
 - One non-replayed matching event produces exactly one public update carrying
   the identical event sequence and timestamp.
@@ -70,6 +83,9 @@ An encoded level is exactly 33 bytes:
 
 ## Incremental update
 
+This section defines the common header shared by every update kind and the
+payload encoded after each kind tag.
+
 The common header is 32 bytes:
 
 | Offset | Type | Field |
@@ -88,21 +104,41 @@ The payload begins at offset 32 with a `u8` kind tag:
 | 2 | trade ID `u64`, price `i64`, quantity `u64`, aggressor side `u8`, one 33-byte maker level | 91 |
 | 3 | previous trading state `u8`, current trading state `u8`, revision `u64` | 43 |
 
-For tag 2, trade price equals maker-level price, aggressor side opposes maker
-side, and trade ID cannot exceed the event sequence. A replica additionally
-requires the prior maker-level quantity minus printed quantity to equal the new
-absolute quantity; maker order count must remain constant or decrease by one.
-For a fully depleted reserve slice, the count decreases even though the private
-order retains hidden leaves. Its subsequent refresh is an ordinary absolute
-level update at the next matching-event sequence and increases visible order
-count again.
+### Tag 2: trade constraints
 
-For tag 3, trading-state tags are open `0`, cancel-only `1`, halted `2`, and
-closed `3`. Prior and current state must differ. Revision is non-zero, cannot
-exceed the event sequence, and must equal the replica's current revision plus
-one; prior state must equal the replica's current state.
+For tag 2:
+
+- Trade price equals maker-level price.
+- Aggressor side opposes maker side.
+- Trade ID cannot exceed the event sequence.
+- A replica additionally requires the prior maker-level quantity minus printed
+  quantity to equal the new absolute quantity; maker order count must remain
+  constant or decrease by one.
+- For a fully depleted reserve slice, the count decreases even though the
+  private order retains hidden leaves. Its subsequent refresh is an ordinary
+  absolute level update at the next matching-event sequence and increases
+  visible order count again.
+
+### Tag 3: trading-state constraints
+
+For tag 3, the trading-state tags are:
+
+| Tag | Trading state |
+|---:|---|
+| `0` | open |
+| `1` | cancel-only |
+| `2` | halted |
+| `3` | closed |
+
+- Prior and current state must differ.
+- Revision is non-zero, cannot exceed the event sequence, and must equal the
+  replica's current revision plus one.
+- Prior state must equal the replica's current state.
 
 ## Full-depth snapshot
+
+This section defines the snapshot layout and the validation a decoder applies
+before accepting one.
 
 The snapshot begins with:
 
@@ -114,17 +150,31 @@ The snapshot begins with:
 | 24 | `u8` | last-trade presence tag: none `0`, some `1` |
 | 25 | conditional `u64` | last trade ID when the presence tag is `1` |
 
-The optional trade identifier is followed by effective trading state `u8`,
-trading-state revision `u64`, a bid count `u32`, that many 33-byte aggregate
-levels, an ask count `u32`, and that many aggregate levels. The last trade ID,
-when present, cannot exceed the snapshot event sequence. The trading-state
-revision cannot exceed that sequence. Revision zero denotes the immutable
-definition's initial state; a replica rejects another state at revision zero.
+The optional trade identifier is followed, in order, by:
 
-The decoder rejects invalid tags, zero identifiers, truncated collections,
-trailing bytes, empty occupied levels, wrong-side levels, duplicate or
-non-priority-ordered prices, infeasible state revisions, and crossed or locked
-snapshots.
+- effective trading state `u8`
+- trading-state revision `u64`
+- a bid count `u32`, then that many 33-byte aggregate levels
+- an ask count `u32`, then that many aggregate levels
+
+Constraints:
+
+- The last trade ID, when present, cannot exceed the snapshot event sequence.
+- The trading-state revision cannot exceed that sequence.
+- Revision zero denotes the immutable definition's initial state; a replica
+  rejects another state at revision zero.
+
+The decoder rejects:
+
+- invalid tags
+- zero identifiers
+- truncated collections
+- trailing bytes
+- empty occupied levels
+- wrong-side levels
+- duplicate or non-priority-ordered prices
+- infeasible state revisions
+- crossed or locked snapshots
 
 Snapshots contain displayed aggregate quantity only. Total hidden reserve
 leaves and private reserve order identifiers are intentionally absent.
@@ -142,15 +192,26 @@ race-free consumer procedure is:
    following update to be contiguous.
 5. If this condition fails, discard the buffer and repeat from step 1.
 
+### Replica behavior
+
 `MarketDataReplica` is initialized with the definition's trading state and
-implements snapshot replacement, contiguous batch application, nonmutating gap
-detection, state-revision comparison, finite batch/side capacity preflight, and
-fail-closed structural poisoning. It owns active and standby price trees for
-both sides: after all snapshot checks pass, the image is constructed in standby
-storage and both sides are swapped atomically. Snapshot cardinality failure
-therefore retains the prior depth and does not poison the replica. Incremental
-structural failure after mutation still requires a new snapshot.
+implements:
+
+- snapshot replacement
+- contiguous batch application
+- nonmutating gap detection
+- state-revision comparison
+- finite batch/side capacity preflight
+- fail-closed structural poisoning
+
+It owns active and standby price trees for both sides: after all snapshot
+checks pass, the image is constructed in standby storage and both sides are
+swapped atomically. Snapshot cardinality failure therefore retains the prior
+depth and does not poison the replica. Incremental structural failure after
+mutation still requires a new snapshot.
 Transport buffering and retry orchestration remain outside this payload layer.
+
+### Version compatibility
 
 Version 2 preserves the byte representation of incremental tags `0`–`2` and
 adds tag `3`. It changes every full-depth snapshot by inserting the 9-byte

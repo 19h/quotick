@@ -9,6 +9,15 @@ The [version-2 schema](snapshot-v2.md) remains the byte-level definition of
 kinds `1` through `3`. Version 3 changes their envelope version only; it does
 not reinterpret those payloads.
 
+## Contents
+
+- [`QSNP` Envelope](#qsnp-envelope)
+- [Call-Auction Checkpoint Payload, Kind 4](#call-auction-checkpoint-payload-kind-4)
+- [Call-Auction Semantic Validation](#call-auction-semantic-validation)
+- [Lineage and WAL Cutover](#lineage-and-wal-cutover)
+- [Compatibility Boundary](#compatibility-boundary)
+- [Primary-Source Provenance](#primary-source-provenance)
+
 ## `QSNP` Envelope
 
 The fixed header is 28 B:
@@ -97,25 +106,31 @@ A kind-`4` image is accepted only when all of the following hold:
    before allocating live indexes. Rebuilt AVL arenas, FIFO links, aggregates,
    phase state, counters, and exact-retry cache then pass the full engine audit.
 
-Capture audits the live engine, constructs the direct image, independently
+**Capture** audits the live engine, constructs the direct image, independently
 replays the complete retained command history, and requires exact report and
-checkpoint equality before publication. Restore rebuilds indexed book state
-and retry history directly rather than rerunning auction discovery or uncross
-algorithms.
+checkpoint equality before publication.
+
+**Restore** rebuilds indexed book state and retry history directly rather than
+rerunning auction discovery or uncross algorithms.
 
 ## Lineage and WAL Cutover
+
+This section defines the snapshot lineage requirements and how recovery uses a
+kind-`4` snapshot against an uncut or compacted WAL.
 
 Auction snapshot lineage requires equal `M`, equal immutable definition, a
 nondecreasing `G`, and exact command/report prefix equality. Numeric generation
 alone is insufficient.
 
-With an uncut WAL, checkpoint-assisted open verifies every physical frame
-through `G` against the snapshot before applying only the suffix. With a
-compacted WAL, publication first synchronizes the inactive A/B kind-`4` slot,
-then replaces the physical prefix with a version-4 checkpoint anchor containing
-the exact slot, semantic generation, payload length, checksum, and physical
-sequence. Recovery never guesses the alternate slot. The anchor and selected
-snapshot must agree exactly before suffix replay or dangling-command completion.
+With an **uncut WAL**, checkpoint-assisted open verifies every physical frame
+through `G` against the snapshot before applying only the suffix.
+
+With a **compacted WAL**, publication first synchronizes the inactive A/B
+kind-`4` slot, then replaces the physical prefix with a version-4 checkpoint
+anchor containing the exact slot, semantic generation, payload length,
+checksum, and physical sequence. Recovery never guesses the alternate slot.
+The anchor and selected snapshot must agree exactly before suffix replay or
+dangling-command completion.
 
 Cutover bounds WAL bytes scanned at reopen, but the checkpoint deliberately
 retains complete exact-retry and audit history. Payload size remains
@@ -127,9 +142,10 @@ costs is removed by physical WAL cutover.
 
 ## Compatibility Boundary
 
-Envelope version 3 is expired and rejected before payload interpretation. If an authoritative earlier deployment
-exists, migration requires an explicit provenance-preserving converter;
-changing version bytes in place is invalid because the CRC covers the envelope.
+Envelope version 3 is expired and rejected before payload interpretation.
+If an authoritative earlier deployment exists, migration requires an explicit
+provenance-preserving converter; changing version bytes in place is invalid
+because the CRC covers the envelope.
 
 ## Primary-Source Provenance
 

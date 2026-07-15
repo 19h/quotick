@@ -1,16 +1,32 @@
 # Semantic snapshot format version 2
 
-Version 2 is retained as historical provenance for payload kinds `1` through
-`3`. Snapshot version 3 subsequently preserved those payload bytes and added
-call-auction kind `4`. The current runtime rejects both expired envelopes and
-uses [snapshot version 4](snapshot-v4.md), which also adds coupled
-call-auction/risk kind `5`.
+**Expired historical format.** This document preserves the byte-level schema
+of snapshot version 2. Version 2 is retained as historical provenance for
+payload kinds `1` through `3`. Snapshot version 3 subsequently preserved those
+payload bytes and added call-auction kind `4`. The current runtime rejects
+both expired envelopes and uses [snapshot version 4](snapshot-v4.md), which
+also adds coupled call-auction/risk kind `5`.
 
 `SnapshotFile` stores a complete typed semantic value in a bounded, versioned,
 CRC-32C envelope. Version 2 assigns payload kind `1` to `LedgerCheckpoint`,
 kind `2` to `OrderBookCheckpoint`, and kind `3` to
 `RiskManagedCheckpoint`. The payload trait is sealed, so downstream codecs
 cannot claim a reserved kind. All integers are little-endian.
+
+Contents:
+
+- [`QSNP` envelope](#qsnp-envelope)
+- [Ledger-checkpoint payload](#ledger-checkpoint-payload)
+- [Matching-checkpoint payload](#matching-checkpoint-payload)
+- [Coupled risk-checkpoint payload](#coupled-risk-checkpoint-payload)
+- [Semantic validation](#semantic-validation)
+- [Replacement protocol](#replacement-protocol)
+- [Two-slot WAL-cutover checkpoints](#two-slot-wal-cutover-checkpoints)
+- [Explicit pending recovery](#explicit-pending-recovery)
+- [Durable-matching checkpoint recovery](#durable-matching-checkpoint-recovery)
+- [Durable-risk checkpoint recovery](#durable-risk-checkpoint-recovery)
+- [Durable-ledger checkpoint recovery](#durable-ledger-checkpoint-recovery)
+- [Primary-source provenance](#primary-source-provenance)
 
 ## `QSNP` envelope
 
@@ -182,11 +198,12 @@ A ledger checkpoint is accepted only if all of the following hold:
 record and transaction sequences, deterministic replay, and independently
 accumulated positive and negative totals for every asset, plus reconstructed
 reversal, accounting-period, and last-recorded-time state.
-`Ledger::checkpoint` runs that audit before capture. Zero balances are omitted
-from the image, while the complete record sequence is retained to preserve
-correction grouping, exact transaction idempotency, and reconstruct the period
-fence. Ordered batch grouping and all member transaction identifiers are
-retained by the same record history.
+`Ledger::checkpoint` runs that audit before capture.
+
+Zero balances are omitted from the image, while the complete record sequence
+is retained to preserve correction grouping, exact transaction idempotency,
+and reconstruct the period fence. Ordered batch grouping and all member
+transaction identifiers are retained by the same record history.
 
 For ledger snapshots, generation lineage is the exact ledger-record prefix
 relation. A generation `g₂` is a successor of `g₁` only when `g₂ ≥ g₁` and its
@@ -221,24 +238,30 @@ and requires it to equal live semantics. The resulting
 Its consuming `verify` transition independently replays every retained command,
 requires every report, and compares a fresh canonical projection with the
 candidate before returning `OrderBookCheckpoint`. `OrderBook::checkpoint`
-invokes both phases synchronously. The durable layer can instead synchronize
-the represented WAL prefix, hand off an origin/epoch-bound candidate, and later
-accept only the verified typestate from the same open shard before cutover. This typestate boundary
+invokes both phases synchronously.
+
+The durable layer can instead synchronize the represented WAL prefix, hand
+off an origin/epoch-bound candidate, and later accept only the verified
+typestate from the same open shard before cutover. This typestate boundary
 prevents publication of a structurally valid image that contradicts its own
 history while permitting a direct-book caller to move replay verification to
-another thread. Read-time decoding performs the structural checks above; it
-does not repeat prefix matching. The envelope checksum detects accidental image changes.
-An actor able to rewrite both image and checksum remains outside the authenticity
-model under A14, A39, and A40.
+another thread.
+
+Read-time decoding performs the structural checks above; it does not repeat
+prefix matching. The envelope checksum detects accidental image changes. An
+actor able to rewrite both image and checksum remains outside the
+authenticity model under A14, A39, and A40.
 
 Matching and registered-risk-profile limits are operational process policy, not
 financial snapshot payload, and are therefore not encoded in snapshot kind `2`
 or `3`. A kind-3 restore selects `RiskManagedLimits`, which embeds matching
 limits and independently bounds canonical profiles. Equal or larger limits
-preserve current state; insufficient limits fail restoration explicitly. A checkpoint can bypass
-historical matching transitions, so only retained/current checkpoint
-cardinalities are tested; raw WAL replay additionally exercises every retained
-historical peak under the selected policy.
+preserve current state; insufficient limits fail restoration explicitly.
+
+A checkpoint can bypass historical matching transitions, so only
+retained/current checkpoint cardinalities are tested; raw WAL replay
+additionally exercises every retained historical peak under the selected
+policy.
 
 Matching snapshot lineage requires identical `M` (and therefore `F` for kind
 `2`) and definition plus exact chronological command/report-prefix equality. A
@@ -290,11 +313,13 @@ power loss remains conditional on the qualified filesystem, mount, controller,
 and device behavior despite successful file and directory barriers.
 
 A direct `SnapshotFile` caller must dedicate the target and its `.pending` and
-`.writer.lock` sidecars to snapshot use. `DurableOrderBook::write_checkpoint`,
+`.writer.lock` sidecars to snapshot use.
+
+`DurableOrderBook::write_checkpoint`,
 `DurableRiskOrderBook::write_checkpoint`, and
 `DurableLedger::write_checkpoint` additionally reject aliases of their single
-WAL, lease, and `.cutover.pending` namespace and reject every path inside their managed segmented-WAL
-directory.
+WAL, lease, and `.cutover.pending` namespace and reject every path inside
+their managed segmented-WAL directory.
 
 ## Two-slot WAL-cutover checkpoints
 
@@ -315,6 +340,7 @@ prior WAL/checkpoint pair authoritative, and a crash after a directory-
 synchronized selector change leaves the new pair authoritative. Repeated
 cutovers alternate slots, so the currently selected snapshot is never
 overwritten before the WAL selects its successor.
+
 Open reads only the slot named by the anchor and fails on missing, malformed,
 wrong-kind, wrong-generation, wrong-length, or wrong-checksum content. An
 unselected valid or invalid slot cannot influence recovery.
@@ -348,8 +374,9 @@ an atomic compare-and-delete operation.
 
 `DurableOrderBook::write_checkpoint` rejects poisoned state and path conflicts,
 synchronizes the WAL, captures and independently replay-audits matching state,
-then publishes the snapshot. For an uncut WAL, `open_with_checkpoint` and
-`open_segmented_with_checkpoint`:
+then publishes the snapshot.
+
+For an uncut WAL, `open_with_checkpoint` and `open_segmented_with_checkpoint`:
 
 1. acquire WAL ownership and complete physical recovery;
 2. require the WAL and checkpoint to carry the identical first sequence and
@@ -378,15 +405,17 @@ uses `O(W + C + O log P + suffix matching work)` time. It does not perform the
 matching transitions for the first `C` commands. Memory remains
 `O(min(C,C_max) + O + P + S)` because exact retries and never-reusable accepted
 order IDs retain complete history only through the finite generation bounds
-under A9/A39/A46. Direct `OrderBook` callers may capture a nonencodable
-candidate under exclusive access and move complete-history replay to another
-thread; canonical row copying and structural/lineage audit remain
-history-dependent writer work. `DurableOrderBook` first synchronizes the exact
-represented WAL prefix, then supports the same off-thread replay. Verified
-publication is accepted after ordinary suffix growth only through the same open
-shard and unchanged physical-cutover epoch. Reopen or cutover rejects the
-handle; asynchronous prefix retirement remains unavailable because it requires
-crash-consistent suffix migration.
+under A9/A39/A46.
+
+Direct `OrderBook` callers may capture a nonencodable candidate under
+exclusive access and move complete-history replay to another thread; canonical
+row copying and structural/lineage audit remain history-dependent writer work.
+`DurableOrderBook` first synchronizes the exact represented WAL prefix, then
+supports the same off-thread replay. Verified publication is accepted after
+ordinary suffix growth only through the same open shard and unchanged
+physical-cutover epoch. Reopen or cutover rejects the handle; asynchronous
+prefix retirement remains unavailable because it requires crash-consistent
+suffix migration.
 
 ## Durable-risk checkpoint recovery
 
@@ -398,8 +427,9 @@ history through the coupled risk/matching state machine before releasing the
 only snapshot-capable checkpoint type. The durable capture is bound to one open
 shard and physical-cutover epoch; verified standalone publication accepts an
 append-only suffix but rejects another shard, reopen, or successful cutover.
-The synchronous method composes these stages. For an uncut WAL,
-`open_with_checkpoint` and `open_segmented_with_checkpoint`:
+The synchronous method composes these stages.
+
+For an uncut WAL, `open_with_checkpoint` and `open_segmented_with_checkpoint`:
 
 1. acquire WAL ownership and complete physical recovery;
 2. prove the checkpoint's `F`, `M`, definition, and canonical immutable profile
@@ -409,38 +439,41 @@ The synchronous method composes these stages. For an uncut WAL,
 4. stream the verified WAL and compare every checkpoint command/report with
    the exact frame at its global sequence;
 5. reject kind/content divergence or a checkpoint ahead of the WAL;
-6. prove the canonical profile count and matching cardinalities fit the selected
-   coupled resource policy, then reconstruct matching indices, FIFO/reserve/STP state, profiles, executed
-   positions, total-leaves reservations, exposure aggregates, and retry caches;
+6. prove the canonical profile count and matching cardinalities fit the
+   selected coupled resource policy, then reconstruct matching indices,
+   FIFO/reserve/STP state, profiles, executed positions, total-leaves
+   reservations, exposure aggregates, and retry caches;
 7. replay only complete coupled command/report pairs after `G`;
 8. complete at most one final command lacking its report; and
 9. run the complete matching/risk cross-audit.
 
-For an anchored risk WAL in either physical layout, the checkpoint itself supplies and is
-validated against the original `F`, metadata boundary `M`, immutable
-definition, and canonical profile set. Recovery then reads only the anchor and
-suffix frames. The A/B protocol never rewrites the slot selected by the current
-WAL.
+For an anchored risk WAL in either physical layout, the checkpoint itself
+supplies and is validated against the original `F`, metadata boundary `M`,
+immutable definition, and canonical profile set. Recovery then reads only the
+anchor and suffix frames. The A/B protocol never rewrites the slot selected by
+the current WAL.
 
 For `W` verified WAL bytes across `S` segments, `C` retained checkpoint
 commands, `O` active orders over `P` price levels, `A` accounts, and `N` suffix
 commands, open uses `O(W + C + O log P + A + suffix matching/risk work)` time
-and `O(C + O + P + A + S)` memory. Writer-side capture performs structural and
-command-derived lineage audits, account sorting, and direct coupled
-reconstruction, but no matching/risk history transitions. Complete replay may
-run off-thread while the serialized source appends a suffix. The writer pause
-and worker memory remain history-dependent and the checkpoint retains `O(C)`
-history. Uncut recovery scans `O(W)` bytes; anchored recovery in either physical
-layout replaces that term with the compacted suffix bytes. The finite
-matching limits bound current in-process history but no automatic shard
-generation rollover is established.
+and `O(C + O + P + A + S)` memory.
+
+Writer-side capture performs structural and command-derived lineage audits,
+account sorting, and direct coupled reconstruction, but no matching/risk
+history transitions. Complete replay may run off-thread while the serialized
+source appends a suffix. The writer pause and worker memory remain
+history-dependent and the checkpoint retains `O(C)` history. Uncut recovery
+scans `O(W)` bytes; anchored recovery in either physical layout replaces that
+term with the compacted suffix bytes. The finite matching limits bound current
+in-process history but no automatic shard generation rollover is established.
 
 ## Durable-ledger checkpoint recovery
 
 `DurableLedger::write_checkpoint` first rejects poisoned state and path
 conflicts, synchronizes the WAL with `sync_all`, audits the live ledger, and
-then publishes the snapshot. For an uncut WAL, `open_with_checkpoint` and
-`open_segmented_with_checkpoint`:
+then publishes the snapshot.
+
+For an uncut WAL, `open_with_checkpoint` and `open_segmented_with_checkpoint`:
 
 1. acquire WAL writer ownership and complete ordinary WAL recovery;
 2. read and semantically validate the checkpoint;
@@ -451,11 +484,11 @@ then publishes the snapshot. For an uncut WAL, `open_with_checkpoint` and
 6. apply only WAL records after the checkpoint generation; and
 7. run the complete live-ledger invariant audit.
 
-For an anchored ledger WAL in either physical layout, the anchor independently stores
-semantic record generation and physical WAL sequence. Recovery restores the
-selected A/B checkpoint, initializes the verified record count from its
-semantic generation, then applies only suffix frames. This remains correct for
-a WAL whose configured first sequence is not `1`.
+For an anchored ledger WAL in either physical layout, the anchor
+independently stores semantic record generation and physical WAL sequence.
+Recovery restores the selected A/B checkpoint, initializes the verified record
+count from its semantic generation, then applies only suffix frames. This
+remains correct for a WAL whose configured first sequence is not `1`.
 
 Uncut recovery retains and scans the complete WAL. If `W` is
 verified WAL bytes, `S` physical segments, `R` checkpoint records, and `N` WAL
@@ -470,10 +503,12 @@ apart from diagnostic ordered-map factors.
 
 Version 2 checkpoint payloads still retain complete semantic history. Version
 3 WAL cutover in either physical layout removes prefix bytes from subsequent
-WAL scans and disk occupancy while preserving that history in the selected checkpoint.
-Live retained cardinality and checkpoints captured from it are finite under
-`LedgerLimits`; the independent snapshot payload limit also bounds accepted
-wire bytes. This does not pool or preallocate checkpoint capture/decode memory,
+WAL scans and disk occupancy while preserving that history in the selected
+checkpoint. Live retained cardinality and checkpoints captured from it are
+finite under `LedgerLimits`; the independent snapshot payload limit also
+bounds accepted wire bytes.
+
+This does not pool or preallocate checkpoint capture/decode memory,
 provide semantic generation rollover, or prove external archival and
 idempotency continuity. Those require separately fenced lifecycle and external
 audit/idempotency proofs.

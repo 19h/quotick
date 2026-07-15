@@ -3,7 +3,7 @@
 `SnapshotFile` stores one complete typed semantic value in a bounded,
 versioned CRC-32C envelope. Version 4 preserves the version-3 payload bytes and
 kind tags for ledger `1`, continuous matching `2`, continuous coupled risk `3`,
-and plain call auction `4`; it assigns previously invalid kind `5` to the
+and plain call auction `4`. It assigns previously invalid kind `5` to the
 coupled call-auction/risk checkpoint. All multibyte integers are little-endian.
 The payload trait is sealed, so downstream codecs cannot claim a reserved kind.
 
@@ -12,6 +12,8 @@ kinds `1` through `4`. Version 4 changes their envelope version only and does
 not reinterpret those payloads.
 
 ## `QSNP` Envelope
+
+This section defines the fixed header layout and its integrity rules.
 
 The fixed header is 28 B:
 
@@ -33,6 +35,9 @@ CRC-32C detects accidental corruption. It is not a message-authentication code
 and does not protect against an actor able to rewrite both payload and checksum.
 
 ## Coupled Call-Auction/Risk Payload, Kind 5
+
+This section defines the kind-`5` payload, its decode-time verification, and
+the staged capture path that publishes it.
 
 Kind `5` contains the exact
 [coupled call-auction risk checkpoint payload version 1](auction-risk-checkpoint-v1.md).
@@ -59,27 +64,36 @@ Live plain and coupled auction capture are staged independently of these stable
 payloads. `CallAuctionCheckpointCapture` and
 `CallAuctionRiskCheckpointCapture` expose no codec or snapshot implementation.
 They perform structural/lineage projection (and coupled direct reconstruction)
-without command execution; consuming verification releases the respective
+without command execution. Consuming verification releases the respective
 stable checkpoint only after exact replay and canonical projection equality.
+
 Durable capture first synchronizes the represented WAL prefix and binds a
 verified standalone publication to the same open shard incarnation and
 pre-cutover epoch. Append-only suffix growth is permitted; reopen and physical
-prefix retirement reject the handle. A/B cutover remains a synchronous
-current-head operation.
+prefix retirement reject the handle.
+
+A verified handle may also drive A/B prefix retirement through its private
+physical cursor: the WAL replacement is `anchor(G)` plus the verified
+post-capture suffix through the current head, and the epoch advances only
+after publication.
 
 ## Lineage and WAL Cutover
+
+This section defines lineage acceptance for kind-`5` checkpoints and their
+role in checkpoint-assisted WAL recovery.
 
 Kind-`5` lineage requires equal WAL origin, immutable definition, canonical
 account identity/profile set, and exact command/report prefix; generation must
 not regress. Position and exposure values may advance only as consequences of
 that retained command lineage.
 
-With an uncut WAL, checkpoint-assisted open verifies every definition, profile,
-command, and report frame through the checkpoint generation before applying
-only the suffix. With a compacted WAL, publication synchronizes the inactive
-A/B kind-`5` slot before replacing the physical prefix with a version-4 WAL
-checkpoint anchor containing exact slot, kind, generation, payload length,
-checksum, and physical sequence. Recovery never guesses the alternate slot.
+With an **uncut WAL**, checkpoint-assisted open verifies every definition,
+profile, command, and report frame through the checkpoint generation before
+applying only the suffix. With a **compacted WAL**, publication synchronizes
+the inactive A/B kind-`5` slot before replacing the physical prefix with a
+version-4 WAL checkpoint anchor containing exact slot, kind, generation,
+payload length, checksum, and physical sequence. Recovery never guesses the
+alternate slot.
 
 Cutover bounds WAL bytes scanned at reopen, but the checkpoint deliberately
 retains complete exact-retry and audit history. It does not bound snapshot size,

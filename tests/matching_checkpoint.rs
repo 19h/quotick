@@ -293,6 +293,70 @@ fn durable_staged_checkpoint_publishes_an_exact_prefix_after_suffix_growth() {
 }
 
 #[test]
+fn verified_matching_cutover_retires_prefix_and_preserves_live_suffix() {
+    let area = TestArea::new("verified-cutover-suffix");
+    let wal = area.join("matching.wal");
+    let checkpoint_base = area.join("matching.qsnp");
+    let first = resting(1, 1, 5);
+    let second = resting(2, 2, 6);
+    let suffix = resting(3, 3, 7);
+    let mut durable = DurableOrderBook::open(&wal, definition(), journal_options()).unwrap();
+    durable.submit(first).unwrap();
+    durable.submit(second).unwrap();
+    let capture = durable.capture_checkpoint_candidate().unwrap();
+    let worker = std::thread::spawn(move || capture.verify().unwrap());
+    let suffix_report = durable.submit(suffix).unwrap();
+    let verified = worker.join().unwrap();
+
+    let cutover = durable
+        .compact_verified_checkpoint(&checkpoint_base, &verified, SnapshotOptions::default())
+        .unwrap();
+
+    assert_eq!(cutover.snapshot().generation(), 5);
+    assert_eq!(cutover.wal_first_sequence(), 5);
+    assert!(matches!(
+        durable.compact_verified_checkpoint(
+            &checkpoint_base,
+            &verified,
+            SnapshotOptions::default()
+        ),
+        Err(DurableError::CheckpointCaptureStale {
+            captured_epoch: 0,
+            current_epoch: 1
+        })
+    ));
+    durable.close().unwrap();
+
+    let frames = JournalReader::open(&wal, journal_options())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(frames.len(), 3);
+    assert_eq!(frames[0].kind(), RecordKind::CheckpointAnchor);
+    assert_eq!(frames[0].sequence(), 5);
+    assert_eq!(frames[1].kind(), RecordKind::Command);
+    assert_eq!(frames[1].sequence(), 6);
+    assert_eq!(frames[2].kind(), RecordKind::ExecutionReport);
+    assert_eq!(frames[2].sequence(), 7);
+
+    let mut recovered = DurableOrderBook::open_with_checkpoint(
+        &wal,
+        &checkpoint_base,
+        definition(),
+        journal_options(),
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().checkpointed_commands, 2);
+    assert_eq!(recovered.recovery().replayed_commands, 1);
+    assert_eq!(recovered.book().active_order_count(), 3);
+    let mut expected_retry = suffix_report;
+    expected_retry.replayed = true;
+    assert_eq!(recovered.submit(suffix).unwrap(), expected_retry);
+    recovered.close().unwrap();
+}
+
+#[test]
 fn durable_verified_checkpoint_rejects_another_reopen_or_cutover_epoch() {
     let area = TestArea::new("durable-staged-fences");
     let wal = area.join("matching.wal");
