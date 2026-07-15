@@ -1987,7 +1987,9 @@ impl MarketDataPublisher {
                         .ok_or(MarketDataError::ArithmeticOverflow)?;
                     mass_cancel_progress.last_expiry = Some(key);
                 }
-                CancelReason::UnfilledRemainder | CancelReason::SelfTradeAggressor => {
+                CancelReason::UnfilledRemainder
+                | CancelReason::SelfTradeAggressor
+                | CancelReason::MinimumQuantityUnavailable => {
                     return Err(MarketDataError::TraceMismatch(
                         "an incoming-only cancellation targeted a resting order",
                     ));
@@ -2005,7 +2007,9 @@ impl MarketDataPublisher {
         } else {
             let incoming_reason = matches!(
                 reason,
-                CancelReason::UnfilledRemainder | CancelReason::SelfTradeAggressor
+                CancelReason::UnfilledRemainder
+                    | CancelReason::SelfTradeAggressor
+                    | CancelReason::MinimumQuantityUnavailable
             );
             if let Command::StopTriggerSweep(_) = command {
                 let active = stop_trigger_progress
@@ -2140,6 +2144,7 @@ impl MarketDataPublisher {
             CancelReason::SelfTradeAggressor
             | CancelReason::SelfTradeResting
             | CancelReason::UnfilledRemainder
+            | CancelReason::MinimumQuantityUnavailable
             | CancelReason::TriggeredFokUnfilled
             | CancelReason::TriggeredPostOnlyWouldCross
             | CancelReason::TriggeredCapacityUnavailable => {

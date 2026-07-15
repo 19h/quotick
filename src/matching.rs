@@ -198,6 +198,12 @@ pub enum TimeInForce {
     },
     /// Execute immediately and cancel any unfilled remainder.
     ImmediateOrCancel,
+    /// Execute only if the minimum quantity is immediately available, then
+    /// cancel any unfilled remainder.
+    ImmediateOrCancelWithMinimum {
+        /// Minimum quantity that must execute before matching may begin.
+        minimum_quantity: Quantity,
+    },
     /// Execute the complete quantity immediately or reject without mutation.
     FillOrKill,
     /// Reject if any quantity would execute immediately; otherwise rest.
@@ -220,6 +226,20 @@ impl TimeInForce {
         match self {
             Self::GoodTilTimestamp { expires_at } => Some(expires_at),
             Self::GoodTilCancelled
+            | Self::ImmediateOrCancel
+            | Self::ImmediateOrCancelWithMinimum { .. }
+            | Self::FillOrKill
+            | Self::PostOnly => None,
+        }
+    }
+
+    /// Returns the minimum immediate execution constraint, if any.
+    #[must_use]
+    pub const fn minimum_quantity(self) -> Option<Quantity> {
+        match self {
+            Self::ImmediateOrCancelWithMinimum { minimum_quantity } => Some(minimum_quantity),
+            Self::GoodTilCancelled
+            | Self::GoodTilTimestamp { .. }
             | Self::ImmediateOrCancel
             | Self::FillOrKill
             | Self::PostOnly => None,
@@ -574,6 +594,10 @@ pub enum RejectReason {
     MarketOrderCannotPost,
     /// Fill-or-kill with decrement-and-cancel has ambiguous full-fill semantics.
     UnsupportedFokSelfTradePolicy,
+    /// A minimum quantity was off grid or exceeded the order quantity.
+    InvalidMinimumQuantity,
+    /// Minimum quantity with decrement-and-cancel has ambiguous execution semantics.
+    UnsupportedMinimumQuantitySelfTradePolicy,
     /// Available eligible liquidity cannot completely fill a fill-or-kill order.
     InsufficientLiquidity,
     /// A post-only order would execute on entry.
@@ -708,6 +732,8 @@ pub enum CancelReason {
     TriggeredPostOnlyWouldCross,
     /// A triggered stop-limit residual could not enter its bounded price arena.
     TriggeredCapacityUnavailable,
+    /// Eligible immediate liquidity was below the order's minimum quantity.
+    MinimumQuantityUnavailable,
 }
 
 /// Whether a filled order supplied or removed liquidity.
@@ -5055,6 +5081,18 @@ impl OrderBook {
                 {
                     return Err(RejectReason::AccountAdmissionBlocked);
                 }
+                if let Some(minimum_quantity) = command.time_in_force.minimum_quantity() {
+                    if minimum_quantity.lots() > command.quantity.lots()
+                        || minimum_quantity.lots()
+                            % self.definition.quantity_rules().increment_lots()
+                            != 0
+                    {
+                        return Err(RejectReason::InvalidMinimumQuantity);
+                    }
+                    if command.self_trade_prevention == SelfTradePrevention::DecrementAndCancel {
+                        return Err(RejectReason::UnsupportedMinimumQuantitySelfTradePolicy);
+                    }
+                }
                 if command
                     .time_in_force
                     .expires_at()
@@ -5166,6 +5204,13 @@ impl OrderBook {
                     .is_some_and(|stop| stop.activation == StopActivation::Market)
                 {
                     return Err(RejectReason::StopMarketCannotBeReplaced);
+                }
+                if order
+                    .stop
+                    .and_then(|stop| stop.time_in_force.minimum_quantity())
+                    .is_some_and(|minimum_quantity| minimum_quantity > command.new_quantity)
+                {
+                    return Err(RejectReason::InvalidMinimumQuantity);
                 }
             }
             Command::MassCancel(command) => {
@@ -7008,6 +7053,15 @@ impl OrderBook {
             });
         }
 
+        if self.cancel_unavailable_minimum(command, &mut events)? {
+            return Ok(ExecutionReport {
+                command_id: command.command_id,
+                outcome: CommandOutcome::Accepted,
+                events: events.finish(),
+                replayed: false,
+            });
+        }
+
         let incoming = IncomingOrder {
             order_id: command.order_id,
             account_id: command.account_id,
@@ -7031,6 +7085,28 @@ impl OrderBook {
             events: events.finish(),
             replayed: false,
         })
+    }
+
+    fn cancel_unavailable_minimum(
+        &mut self,
+        command: NewOrder,
+        events: &mut EventTraceBuilder,
+    ) -> Result<bool, MatchingError> {
+        let Some(minimum_quantity) = command.time_in_force.minimum_quantity() else {
+            return Ok(false);
+        };
+        if self.can_execute_quantity(IncomingPreview::from(command), minimum_quantity.lots()) {
+            return Ok(false);
+        }
+        self.push_cancelled(
+            events,
+            command.command_id,
+            command.received_at,
+            command.order_id,
+            command.quantity.lots(),
+            CancelReason::MinimumQuantityUnavailable,
+        )?;
+        Ok(true)
     }
 
     fn apply_cancel(
@@ -7424,33 +7500,40 @@ impl OrderBook {
                 display: removed.display,
                 self_trade_prevention: removed.self_trade_prevention,
             };
-            if stop.time_in_force == TimeInForce::FillOrKill {
-                let candidate = NewOrder {
-                    command_id: command.command_id,
-                    order_id,
-                    account_id: removed.account_id,
-                    instrument_id: command.instrument_id,
-                    instrument_version: command.instrument_version,
-                    side: removed.side,
-                    quantity: Quantity::new(removed.leaves)
-                        .expect("dormant stop leaves must be non-zero"),
-                    display: removed.display,
-                    order_type: active_order_type,
-                    time_in_force: TimeInForce::FillOrKill,
-                    self_trade_prevention: removed.self_trade_prevention,
-                    received_at: command.received_at,
-                };
-                if !self.can_fill(&candidate) {
-                    self.push_cancelled(
-                        &mut events,
-                        command.command_id,
-                        command.received_at,
-                        order_id,
-                        removed.leaves,
-                        CancelReason::TriggeredFokUnfilled,
-                    )?;
-                    continue;
+            let immediate_requirement = match stop.time_in_force {
+                TimeInForce::FillOrKill => {
+                    Some((removed.leaves, CancelReason::TriggeredFokUnfilled))
                 }
+                TimeInForce::ImmediateOrCancelWithMinimum { minimum_quantity } => Some((
+                    minimum_quantity.lots(),
+                    CancelReason::MinimumQuantityUnavailable,
+                )),
+                TimeInForce::GoodTilCancelled
+                | TimeInForce::GoodTilTimestamp { .. }
+                | TimeInForce::ImmediateOrCancel
+                | TimeInForce::PostOnly => None,
+            };
+            if let Some((required_quantity, cancellation_reason)) = immediate_requirement
+                && !self.can_execute_quantity(
+                    IncomingPreview {
+                        account_id: removed.account_id,
+                        side: removed.side,
+                        order_type: active_order_type,
+                        leaves: removed.leaves,
+                        self_trade_prevention: removed.self_trade_prevention,
+                    },
+                    required_quantity,
+                )
+            {
+                self.push_cancelled(
+                    &mut events,
+                    command.command_id,
+                    command.received_at,
+                    order_id,
+                    removed.leaves,
+                    cancellation_reason,
+                )?;
+                continue;
             }
             if stop.time_in_force == TimeInForce::PostOnly
                 && self.would_cross(removed.side, active_order_type)
@@ -8220,7 +8303,21 @@ impl OrderBook {
     }
 
     fn can_fill(&self, incoming: &NewOrder) -> bool {
-        let mut remaining = incoming.quantity.lots();
+        self.can_execute_quantity(IncomingPreview::from(*incoming), incoming.quantity.lots())
+    }
+
+    /// Returns whether the required external quantity can execute immediately.
+    ///
+    /// The caller rejects decrement-and-cancel before this non-mutating scan:
+    /// prevented self quantity is not executed quantity, and reserve refresh
+    /// makes the distinction priority-sensitive.
+    fn can_execute_quantity(&self, incoming: IncomingPreview, required: u64) -> bool {
+        debug_assert!(required > 0 && required <= incoming.leaves);
+        debug_assert_ne!(
+            incoming.self_trade_prevention,
+            SelfTradePrevention::DecrementAndCancel
+        );
+        let mut remaining = required;
         let mut price = self.best_price(incoming.side.opposite());
         while let Some(current_price) = price {
             let crosses = match (incoming.side, incoming.order_type) {
@@ -8238,7 +8335,7 @@ impl OrderBook {
                 .levels(incoming.side.opposite())
                 .get(current_price)
                 .expect("enumerated price must have a level");
-            match self.fok_level_liquidity(incoming, level.head, remaining) {
+            match self.immediate_level_liquidity(incoming, level.head, remaining) {
                 LevelLiquidity::Filled => return true,
                 LevelLiquidity::Remaining(next) => remaining = next,
                 LevelLiquidity::BlockedBySelfTrade => return false,
@@ -8248,7 +8345,7 @@ impl OrderBook {
         false
     }
 
-    /// Determines FOK liquidity at one price without materializing reserve
+    /// Determines eligible immediate liquidity without materializing reserve
     /// slices.
     ///
     /// With no self order, every external order's total leaves are reachable
@@ -8258,9 +8355,9 @@ impl OrderBook {
     /// blocks reserve slices that requeue behind it. If the first self order is
     /// hidden, every displayed order's total leaves remain reachable because
     /// reserve refreshes stay ahead of the hidden class.
-    fn fok_level_liquidity(
+    fn immediate_level_liquidity(
         &self,
-        incoming: &NewOrder,
+        incoming: IncomingPreview,
         head: OrderId,
         remaining: u64,
     ) -> LevelLiquidity {

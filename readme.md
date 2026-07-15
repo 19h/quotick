@@ -219,7 +219,8 @@ book applies it.
 - Deterministic price-time priority with ordered price levels, intrusive FIFO
   links, and mutation-maintained best-level caches giving `O(1)` best-price
   reads and `O(1)` maker-level mutation.
-- Market and limit orders with GTC, GTD, IOC, FOK, and post-only behavior
+- Market and limit orders with GTC, GTD, IOC, minimum-quantity IOC, FOK, and
+  post-only behavior
   (market orders can neither rest nor post); native reserve (iceberg) orders with
   fixed displayed peaks, hidden total leaves, bounded replenishment, and
   displayed-class-tail priority on refresh; and instrument-gated fully hidden
@@ -433,12 +434,12 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 104 tagged assumptions (A1–A104), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 105 tagged assumptions (A1–A105), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
-| [WAL format v7](docs/wal-v7.md) | Current write-ahead-log frame and record schema |
-| [Snapshot format v7](docs/snapshot-v7.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
+| [WAL format v8](docs/wal-v8.md) | Current write-ahead-log frame and record schema |
+| [Snapshot format v8](docs/snapshot-v8.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
 | [Market-data payload v3](docs/market-data-v3.md) | Current continuous market-data update/snapshot payloads |
 | [Auction market-data payload v1](docs/auction-market-data-v1.md) | Current call-auction market-data payloads |
 | [Auction-risk checkpoint payload v1](docs/auction-risk-checkpoint-v1.md) | Current coupled call-auction risk checkpoint payload |
@@ -448,11 +449,13 @@ byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/wal-v4.md](docs/wal-v4.md),
 [docs/wal-v5.md](docs/wal-v5.md),
 [docs/wal-v6.md](docs/wal-v6.md),
+[docs/wal-v7.md](docs/wal-v7.md),
 [docs/snapshot-v2.md](docs/snapshot-v2.md), and
 [docs/snapshot-v3.md](docs/snapshot-v3.md), and
 [docs/snapshot-v4.md](docs/snapshot-v4.md), and
 [docs/snapshot-v5.md](docs/snapshot-v5.md), and
-[docs/snapshot-v6.md](docs/snapshot-v6.md), plus continuous
+[docs/snapshot-v6.md](docs/snapshot-v6.md), and
+[docs/snapshot-v7.md](docs/snapshot-v7.md), plus continuous
 [market-data v2](docs/market-data-v2.md).
 
 ## Build and verify

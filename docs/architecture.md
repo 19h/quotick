@@ -95,12 +95,24 @@ shard, from command admission through checkpoint capture.
    class, so later displayed liquidity precedes older fully hidden liquidity.
 8. Trade price is the resting order price and every trade carries the book's
    immutable instrument version.
-9. FOK validation precedes every matching-state mutation.
+9. FOK and minimum-quantity IOC validation precede every matching-state
+   mutation.
 10. Exact command replays reproduce the original event sequence and cannot
    reapply state.
 11. A command identifier reused for different content cannot mutate state.
 12. Event sequences are strictly increasing within a book.
 13. Order identifiers cannot be reused after an accepted new order.
+    - `ImmediateOrCancelWithMinimum` requires a non-zero, lot-grid-aligned
+      minimum no greater than original quantity. The minimum can be below the
+      instrument's new-order size minimum because it constrains execution, not
+      entry.
+    - The shared immediate-liquidity scan counts only external trade quantity.
+      An unmet minimum accepts and cancels the incoming order without matching
+      or STP mutation. A met minimum permits ordinary IOC execution beyond the
+      threshold and cancels any final remainder. Decrement-and-cancel is
+      rejected for this TIF because prevented self quantity is not execution.
+    - A dormant stop retains the constraint and evaluates it at activation.
+      Stop-limit replacement cannot reduce leaves below the minimum.
     - A GTD qualifier is valid only for a resting-capable limit order. Its
       absolute UTC nanosecond deadline must be strictly later than both the
       command receive time and any committed expiry watermark.
@@ -181,7 +193,7 @@ shard, from command admission through checkpoint capture.
       duplicate or cycle exceeds the active-order bound before another
       dereference.
 
-### Price-level arena and FOK inspection
+### Price-level arena and immediate-liquidity inspection
 
 23. Each side stores executable occupied prices in one finitely bounded stable-
     slot AVL arena and public occupied prices in a second. It caches the best
@@ -210,15 +222,16 @@ shard, from command admission through checkpoint capture.
       intrusive free-list coverage without transient vectors. This costs
       `O(P log(P + 1))` time over `P` initialized slots and `O(1)` auxiliary
       space.
-24. FOK inspection never mutates state or materializes reserve slices. At a
-    crossed price without self liquidity, every external total leaf is
-    eligible. Cancel-resting excludes self orders and retains all external
-    total leaves. For cancel-aggressor and cancel-both, a self order in the
-    displayed class is a barrier after only the current slices before it. A
-    self order in the hidden class is a barrier after every total leaf in the
-    preceding displayed class because refresh remains ahead of hidden orders,
-    plus all earlier hidden-class leaves. The scan visits each inspected order
-    once and uses constant auxiliary space.
+24. FOK and minimum-quantity IOC inspection never mutate state or materialize
+    reserve slices. At a crossed price without self liquidity, every external
+    total leaf is eligible. Cancel-resting excludes self orders and retains all
+    external total leaves. For cancel-aggressor and cancel-both, a self order
+    in the displayed class is a barrier after only the current slices before
+    it. A self order in the hidden class is a barrier after every total leaf in
+    the preceding displayed class because refresh remains ahead of hidden
+    orders, plus all earlier hidden-class leaves. FOK requires original
+    quantity; minimum-quantity IOC requires its explicit threshold. The scan
+    visits each inspected order once and uses constant auxiliary space.
 
 ### Capacity bounds and prepared commands
 
@@ -305,7 +318,8 @@ shard, from command admission through checkpoint capture.
     foreign token or an unrelated intervening command before mutation; an
     intervening exact command returns its cached replay. Direct, risk-managed,
     durable, and durable-risk submission consume this token without repeating
-    capacity, identifier, FOK, core business, or event-bound preparation.
+    capacity, identifier, immediate-liquidity, core business, or event-bound
+    preparation.
     Durable paths append the token's command only after all headroom exists.
 
 ### Account and instrument state controls
@@ -632,8 +646,8 @@ interest for discovery, allocation, and uncross preparation.
       preparation, stale commit, or committed result returns that set.
     - The book primitive itself has no command sequence, phase, idempotency,
       or durability semantics. `CallAuctionEngine` supplies the first three,
-      and the version-7 durable wrapper supplies stable wire encoding,
-      full-WAL recovery, and snapshot-version-7 checkpoint/cutover recovery.
+      and the version-8 durable wrapper supplies stable wire encoding,
+      full-WAL recovery, and snapshot-version-8 checkpoint/cutover recovery.
     - The separate `CallAuctionRiskManagedEngine` supplies optional profile
       admission, reservations, positions, and independently replayed coupled
       checkpoints; settlement, public/private auction transport, preventive
@@ -773,7 +787,7 @@ admission and tracks reservations and positions.
    coupled core-first risk gate; validation capacity includes historically
    risk-rejected submits because they still require core preparation.
 8. The coupled checkpoint has a stable complete-value little-endian codec and
-   direct restore under default or explicit limits. Snapshot version 7 assigns
+   direct restore under default or explicit limits. Snapshot version 8 assigns
    it `QSNP` kind `5`. `DurableCallAuctionRiskEngine` binds a canonical
    definition/profile prefix, persists command/report pairs, completes at most
    one dangling non-retry command, verifies risk-aware replay, and supports
@@ -785,14 +799,14 @@ admission and tracks reservations and positions.
 This section defines WAL persistence, recovery, and checkpoint rules for the
 call-auction engine.
 
-1. WAL version 7 retains stable record-kind tags `9` and `10` for one
+1. WAL version 8 retains stable record-kind tags `9` and `10` for one
    call-auction command and its complete execution report. All multibyte fields
    are little-endian, enum tags are explicit, and decoding reconstructs and
    validates domain values, contiguous event sequencing, report outcome/event
    grammar, clearing totals, trade identity, and uncross body counts.
 2. An uncut auction journal contains one immutable instrument definition
    followed by strict command/report pairs. A compacted journal instead begins
-   with one kind-`8` anchor bound to snapshot-version-7 call-auction kind `4`,
+   with one kind-`8` anchor bound to snapshot-version-8 call-auction kind `4`,
    followed by the same suffix grammar. A report without a command, consecutive
    commands, a second definition, an interior anchor, a
    continuous-matching/risk/ledger record, or any other kind fails recovery. At
@@ -1124,11 +1138,11 @@ accounting for the continuous-matching risk layer.
    over `[limit, collar maximum]`, and market orders over the full collar. A
    dormant stop uses the identical rule for its activation constraint, not its
    trigger threshold. Units are raw price quanta multiplied by lots (`u128`).
-5. IOC, FOK, and market commands cannot retain a reservation and therefore do
-   not consume active count/quantity/notional capacity when immediately
-   executed. A dormant stop retains a reservation regardless of activation
-   TIF; its complete quantity consumes worst-case position and per-order
-   capacity.
+5. IOC, including minimum-quantity IOC, FOK, and market commands cannot retain
+   a reservation and therefore do not consume active count/quantity/notional
+   capacity when immediately executed. A dormant stop retains a reservation
+   regardless of activation TIF; its complete quantity consumes worst-case
+   position and per-order capacity.
 6. Once an order rests or becomes dormant, its reservation retains the
    conservative per-lot
    reachable-price magnitude used at admission. This can exceed
@@ -1450,7 +1464,7 @@ storage, and recovery grammar.
     generation and first-retained-sequence selector after the new generation is
     synchronized.
 22. Matching, coupled risk, ledger, and call-auction cutover publishes an inactive A/B
-    checkpoint slot before publishing a synchronized version-7 anchor and any
+    checkpoint slot before publishing a synchronized version-8 anchor and any
     retained suffix. Single-file storage atomically renames the complete
     anchor-plus-suffix file over the WAL. Segmented storage synchronizes every
     next-generation anchor/suffix segment, then atomically replaces and
@@ -1470,7 +1484,7 @@ storage, and recovery grammar.
 This section defines the semantic snapshot file format and the checkpoint
 capture, verification, and cutover rules.
 
-1. A version-7 `QSNP` file carries a fixed 28 B header with magic, typed payload
+1. A version-8 `QSNP` file carries a fixed 28 B header with magic, typed payload
    kind (`1` ledger, `2` matching, `3` coupled risk/matching, `4` call auction,
    `5` coupled call-auction risk),
    bounded `u64` length, CRC-32C, and semantic generation.
@@ -1495,8 +1509,8 @@ capture, verification, and cutover rules.
 8. CRC-32C is an accidental-corruption detector, not an authenticity proof.
 9. Ledger, matching, coupled risk, and call-auction checkpoints retain complete
    semantic history. Uncut recovery scans the complete WAL to prove the prefix.
-   Version-6 cutover in either physical layout replaces that prefix with an
-   anchor bound to one version-7 A/B snapshot slot, so reopen scans only the
+   Cutover in either physical layout replaces that prefix with an anchor bound
+   to one version-8 A/B snapshot slot, so reopen scans only the
    anchor and suffix. This does not bound checkpoint memory, capture pause,
    retained idempotency/audit history, or semantic shard-generation lifetime.
 10. Matching candidate capture requires exact live topology and command-derived
@@ -1550,8 +1564,8 @@ capture, verification, and cutover rules.
       namespace mutation.
 
 The authoritative persisted framing and payload schemas are
-[WAL format version 7](wal-v7.md) and
-[Semantic snapshot format version 7](snapshot-v7.md). Filesystem and device
+[WAL format version 8](wal-v8.md) and
+[Semantic snapshot format version 8](snapshot-v8.md). Filesystem and device
 assumptions are bounded by the [Local storage contract](storage.md).
 
 ## Failure model
@@ -1602,6 +1616,11 @@ market/limit activation, FOK/post-only/capacity terminal cancellation,
 replacement priority, cancellation/expiry/control removal, risk reservation,
 publisher canonical-order rejection, checkpoint lineage corruption, durable
 reopen, and exact retry without frame growth.
+Minimum-quantity tests cover grid and total-quantity admission, unsupported
+decrement-and-cancel, atomic threshold failure under cancel-resting, execution
+beyond a met threshold, reserve refresh behind a self barrier, market-data
+no-change projection, dormant-stop replacement/activation, checkpoint restore,
+stable tags, WAL recovery, and exact retry.
 Account-control tests cover stale/exhausted revisions, exact retry, atomic
 canonical cancellation, admission fencing, re-enable, protected-history use,
 constructor capacity stability/exhaustion, unprofiled risk rejection,
@@ -1822,6 +1841,13 @@ There is no additional claim that semantic checkpoint history is size bounded.
   Quotick maps its explicit calendar-relative ingress variants to an absolute
   internal GTD deadline; it does not interpret a missing field or claim FIX
   message compatibility.
+- FIX `MinQty(110)` defines the minimum quantity of an order to be executed,
+  and `TimeInForce(59)` defines IOC (`3`) as immediate whole-or-part execution
+  with cancellation of the unexecuted portion, in the
+  [FIX Latest field registry](https://fiximate.fixtrading.org/en/FIX.Latest/fields_sorted_by_tagnum.html).
+  Quotick combines those concepts in one explicit TIF and specifies its own
+  atomic STP, reserve, stop-activation, and remainder semantics; it does not
+  claim FIX message compatibility.
 - FIX `TradingSessionID(336)` identifies a trading session and specifies the
   Day-plus-session-ID pattern when a session spans more than one calendar day
   in the
@@ -1864,7 +1890,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Snapshots and compaction | single-file and segmented matching/risk/ledger/call-auction WAL cutover plus off-thread direct and WAL-synchronized plain/coupled continuous-matching and call-auction replay verification are implemented; verified matching/risk/auction handles can retire an older prefix by cursor-streaming only its synchronized suffix. Remaining evidence is bounded checkpoint memory and writer audit-copy/projection/direct-reconstruction pause, bounded suffix-copy pause, semantic generation rollover, and externally retained audit/idempotency proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
-| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, explicit-reference stop-market/stop-limit activation, native reserve and fully hidden continuous queue classes, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, aggregate depth queries, banded discovery, price-time allocation, deterministic pairing/atomic uncross, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, and plain/coupled-risk full-WAL plus cutover recovery are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authoritative external stop-reference ingestion, auction reference and dynamic-band derivation, venue-specific display/priority/allocation policies, preventive self-trade policies, ledger integration, volatility/interruption auctions, pegged, discretionary, venue-specific amendment/uncross/publication semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
+| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, explicit-reference stop-market/stop-limit activation, native reserve and fully hidden continuous queue classes, atomic minimum-quantity IOC, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, aggregate depth queries, banded discovery, price-time allocation, deterministic pairing/atomic uncross, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, and plain/coupled-risk full-WAL plus cutover recovery are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authoritative external stop-reference ingestion, auction reference and dynamic-band derivation, venue-specific display/priority/allocation policies, preventive self-trade policies, ledger integration, volatility/interruption auctions, pegged, discretionary, venue-specific amendment/uncross/publication semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
 | High | Instrument lifecycle expansion | authoritative calendar ingestion/distribution/activation, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |

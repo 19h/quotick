@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A104 are stable and are referenced from code comments and other
+identifiers A1-A105 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -266,16 +266,16 @@ integrity; concern about the second requires authenticated records.
 
 ## A15 — format version immutability
 
-**Assumption.** WAL format version 7, snapshot format version 7, continuous
+**Assumption.** WAL format version 8, snapshot format version 8, continuous
 market-data payload version 3, and trading-calendar payload version 1 are
-immutable. WAL and snapshot versions `1` through `6` are expired and rejected
-explicitly rather than inferred or migrated. WAL v7 preserves the v6 frame and
-record-kind registry, adds one
-instrument-definition boolean, fully hidden display tag `2`, continuous
-rejection tags `48`/`49`, and call-auction admission-error tag `11`.
-Snapshot v7 preserves ledger kind `1`, embeds the changed definition in kinds
-`2` through `5`, and permits canonical fully hidden continuous rows in kinds
-`2`/`3`. Market-data v3 preserves v2 bytes but adds the absent-public-maker
+immutable. WAL and snapshot versions `1` through `7` are expired and rejected
+explicitly rather than inferred or migrated. WAL v8 preserves the v7 frame,
+record-kind registry, instrument definition, and existing value bytes; it adds
+minimum-quantity IOC TIF tag `5`, continuous rejection tags `50`/`51`, and
+cancellation tag `11`. Snapshot v8 preserves the v7 kind registry and direct
+rows while embedding WAL-v8 continuous command/report histories in kinds
+`2`/`3`; kinds `1`, `4`, and `5` retain their v7 value schemas. Market-data v3
+preserves v2 bytes but adds the absent-public-maker
 trade interpretation required for fully hidden execution. Trading-calendar v1
 is a complete value with no self-describing schema field; an enclosing protocol
 selects it explicitly, while its encoded `CalendarVersion` identifies schedule
@@ -288,12 +288,12 @@ authoritative predecessors exist.
 recovery, anchor interpretation, stable auction records/images, stable calendar
 images, and fail-closed format boundaries.
 
-**Falsification probe.** Byte-compare golden WAL-v7, snapshot-v7, market-data-
+**Falsification probe.** Byte-compare golden WAL-v8, snapshot-v8, market-data-
 v3, and trading-calendar-v1 fixtures through every supported release; mutate
-valid WAL frames and images to versions `1` through `6`; verify definition
-booleans, every display and hidden rejection tag, continuous expiry/stop tags,
-raw auction record tags `9`/`10`, snapshot kinds `1` through `5`, hidden-maker
-trade application, and every calendar scalar/row offset.
+valid WAL frames and images to versions `1` through `7`; verify definition
+booleans, every display, TIF, rejection, and cancellation tag, continuous
+expiry/stop tags, raw auction record tags `9`/`10`, snapshot kinds `1` through
+`5`, hidden-maker trade application, and every calendar scalar/row offset.
 Any changed supported bytes/interpretation or acceptance across an expired
 envelope boundary falsifies A15.
 
@@ -519,7 +519,7 @@ A28.
 
 **Assumption.** A ledger checkpoint and its recovery WAL represent one
 immutable ledger-record history; numeric generation is never treated as lineage
-without exact prefix equality or an exact version-7 checkpoint anchor. An
+without exact prefix equality or an exact version-8 checkpoint anchor. An
 anchored WAL separately binds semantic record count and physical retired-prefix
 sequence. Capture/audit resource or replay-constructor failure under A89 occurs
 before snapshot/cutover mutation and leaves the durable ledger unpoisoned; live
@@ -625,12 +625,12 @@ environment.
 **Assumption.** The dated 47 B fixed ledger-entry payload, ledger-correction
 WAL kind `6`, ledger-batch WAL kind `7`, and tagged record-based checkpoint
 schema first defined under version 3 are retained byte-for-byte by the
-deployable version-7 WAL/version-7 snapshot accounting formats; no earlier
+deployable version-8 WAL/version-8 snapshot accounting formats; no earlier
 undated or flat-entry expired `QWAL`/`QSNP` ledger artifact requires
 compatibility. Older development envelopes fail before payload interpretation
 rather than receiving inferred dates, times, or grouping.
 
-**Dependent results.** A version-7 WAL/version-7 snapshot dated atomic
+**Dependent results.** A version-8 WAL/version-8 snapshot dated atomic
 grouped-event accounting schema with an explicit rejection boundary for expired
 artifacts.
 
@@ -659,25 +659,25 @@ effect, accepted partial state, or incorrect final balance falsifies A36.
 
 ## A37 — retained matching payload formats
 
-**Assumption.** The reserve-, mass-cancel-, account-control-, GTD-, and stop-
-enabled command/report variants defined through version 6 remain explicit
-variants inside deployable WAL version 7. Version 7 adds the instrument hidden-
-support boolean, fully hidden display tag, working-rest quantity semantics, and
-typed hidden rejections; it does not infer them from WAL version 6. No earlier
-matching WAL requires runtime compatibility. Expired envelopes fail before
-payload interpretation rather than receiving inferred display, mass-cancel,
-control, expiry, stop, reference, trigger-priority, hidden, or anchor semantics.
+**Assumption.** The reserve-, mass-cancel-, account-control-, GTD-, stop-, and
+fully hidden command/report variants defined through version 7 remain explicit
+variants inside deployable WAL version 8. Version 8 adds explicit minimum-
+quantity IOC and typed outcomes; it does not infer them from WAL version 7. No
+earlier matching WAL requires runtime compatibility. Expired envelopes fail
+before payload interpretation rather than receiving inferred display, mass-
+cancel, control, expiry, stop, reference, trigger-priority, hidden, minimum-
+quantity, or anchor semantics.
 
 **Dependent results.** Explicit fully displayed/reserve/fully hidden/GTD/stop
 state, refresh, expiry, and trigger events, canonical mass cancellation,
 revisioned account fencing, and anchored cutover under WAL envelope version
-`7`.
+`8`.
 
 **Falsification probe.** Inventory every persisted matching WAL and decode
-golden version-7 fixtures before deployment. Reject version-6 artifacts with
-and without re-labelled headers, and mutate every hidden/expiry/stop tag,
-definition flag, deadline, watermark, reference, trigger, activation,
-aggregate, and ordering relation.
+golden version-8 fixtures before deployment. Reject version-7 artifacts with
+and without re-labelled headers, and mutate every hidden/minimum-quantity/
+expiry/stop tag, definition flag, threshold, deadline, watermark, reference,
+trigger, activation, aggregate, and ordering relation.
 Discovery of an authoritative
 predecessor that must remain readable falsifies A37 and requires a
 provenance-preserving migration; silently inferring absent fields is not
@@ -1269,8 +1269,8 @@ risk profiles remain immutable under A18. Authentication and authorization of
 the controller are external inputs; coupled risk requires the target profile to
 exist.
 
-**Dependent results.** Deterministic, idempotent, version-7
-WAL/version-7-checkpoint-recoverable local admission control; no active order
+**Dependent results.** Deterministic, idempotent, version-8
+WAL/version-8-checkpoint-recoverable local admission control; no active order
 survives an accepted block; blocked new/replacement admission fails while
 cancellation remains available. For `K` selected orders, block is `O(K(log K +
 log P))` time and `O(K)` constructor-leased scratch under A87; enable is
@@ -1338,7 +1338,7 @@ session identifiers, controller authentication, and venue transition graphs are
 external and currently unrepresented.
 
 **Dependent results.** Deterministic entry gating with cancel/control
-availability in every state; exact retry; version-7 WAL and version-7
+availability in every state; exact retry; version-8 WAL and version-8
 checkpoint reconstruction; account-independent risk bypass with
 cancellation-derived reservation release; public market-data state/revision
 recovery. For `O` active orders, transition-and-cancel is `O(O log O + O log
@@ -1558,7 +1558,7 @@ A65/A66.
 ## A65 — durable auction WAL grammar
 
 **Assumption.** One `DurableCallAuctionEngine` owns the only writer lease for
-one WAL-version-7 single-file or marker-selected segmented auction shard. Its
+one WAL-version-8 single-file or marker-selected segmented auction shard. Its
 uncut grammar is one immutable definition followed by command/report pairs and
 at most one final dangling command. Submission prepares before command append,
 commits the same token, then appends the exact report; acknowledgement strength
@@ -1585,13 +1585,14 @@ only a torn active tail; replay exact state/trade IDs/cache identity; retry
 before/after reopen and prove zero frame growth. Inject definition drift,
 unexpected records, consecutive/dangling duplicates, persisted `replayed =
 true`, report mutation, segment corruption, insufficient limits, and frame
-versions `1`/`2`/`3`/`4`/`5`/`6`. Any accepted divergent/noncanonical history,
+versions `1`/`2`/`3`/`4`/`5`/`6`/`7`. Any accepted
+divergent/noncanonical history,
 duplicate transition, retry frame, cross-layout semantic difference, or
 unaudited dangling completion falsifies A65.
 
 ## A66 — auction checkpoint lineage
 
-**Assumption.** A snapshot-version-7 call-auction checkpoint and its recovery
+**Assumption.** A snapshot-version-8 call-auction checkpoint and its recovery
 WAL represent one immutable A65 command/report lineage. The image retains the
 definition/WAL origin, completed report boundary, phase/cycle, book revision,
 next priority/trade counters, canonical accepted identities and active orders,
@@ -1599,7 +1600,7 @@ and complete exact-retry history. A completed checkpoint is released only after
 independent replay requires exact direct-state equality; A97/A98 separate
 non-replaying capture from that proof. Numeric generation is never accepted
 without exact uncut prefix equality or a kind/checksum/generation/slot-bound
-version-7 anchor. Capture/validation resource or temporary-constructor failure
+version-8 anchor. Capture/validation resource or temporary-constructor failure
 under A78 occurs before snapshot/cutover mutation and leaves the durable shard
 unpoisoned; semantic contradiction poisons it.
 
@@ -1710,7 +1711,7 @@ A66-style auction image, reconstructs reservations from active orders, and is
 released only after full history replay through the coupled gate; A99/A100
 stage that proof.
 
-Snapshot-v7 kind `5` and `DurableCallAuctionRiskEngine` bind a canonical
+Snapshot-v8 kind `5` and `DurableCallAuctionRiskEngine` bind a canonical
 definition/profile prefix, risk-aware command/report replay, one
 dangling-command completion, exact uncut prefix proof, and
 single-file/segmented A/B cutover. Dynamic profile/control mutation,
@@ -2989,15 +2990,16 @@ fully hidden continuous-order admission. A fully hidden qualifier is valid only
 for a limit order whose time in force may rest. At one price, fully displayed
 and native-reserve orders form the first execution class and fully hidden
 orders the second; FIFO applies within each class, and reserve refresh rejoins
-the first class's tail. Every hidden leaf is executable for matching, FOK, STP,
-risk, checkpoint, and replay, while public quantity and public order count are
-zero. Venue-specific alternative hidden classes, midpoint/non-displayed types,
-minimum-quantity constraints, and discretionary interaction are not inferred.
+the first class's tail. Every hidden leaf is executable for matching, FOK,
+minimum-quantity IOC, STP, risk, checkpoint, and replay, while public quantity
+and public order count are zero. Venue-specific alternative hidden classes,
+midpoint/non-displayed types, minimum-quantity priority, and discretionary
+interaction are not inferred.
 
 **Dependent results.** [A1, A15, A20, A21, A22, A44, A45, A47, A50, A55,
 A70, A72, A83, A88, A103] Deterministic displayed-before-hidden execution,
 hidden FIFO, reserve refresh priority, hidden-aware FOK/STP barriers, total-
-leaves risk, version-7 WAL/snapshot recovery, and version-3 public projection.
+leaves risk, version-8 WAL/snapshot recovery, and version-3 public projection.
 A hidden-only price can be the private execution best while being absent from
 public best/depth. A hidden-maker trade prints at its execution price with a
 canonical absent public maker level when no visible same-price level exists.
@@ -3060,6 +3062,44 @@ changed supported bytes, matching replay divergence, or publisher schedule
 disagreement falsifies A104 or its environment. Authenticated distribution,
 atomic activation, original-request durability, multi-shard synchronization,
 and sequenced session-state transitions require additional protocols.
+
+## A105 — atomic minimum-quantity IOC
+
+**Assumption.** An explicit `ImmediateOrCancelWithMinimum` order combines an
+IOC lifetime with one non-zero execution threshold. The threshold is lot-grid
+aligned and no greater than original quantity; it may be below the instrument's
+new-order size minimum because it constrains execution rather than entry. Only
+external traded quantity counts. Cancel-resting excludes self orders, while
+cancel-aggressor and cancel-both stop eligibility at the same reserve/hidden
+self barriers used by FOK. Decrement-and-cancel is inadmissible because
+prevented self quantity is not executed quantity.
+
+The nonmutating preflight precedes matching and STP effects. If eligible
+quantity is below the threshold, the order is accepted and its complete
+quantity is cancelled with `MinimumQuantityUnavailable`; no maker changes. If
+the threshold is met, ordinary IOC matching can execute beyond it and cancels
+only the final remainder. A dormant stop retains the constraint, evaluates it
+against activation-time liquidity, and cannot be replaced below the threshold.
+This pairing, cancellation reason, and STP/reserve policy are Quotick internal
+contracts; FIX `MinQty(110)` and IOC terminology do not supply those venue-
+specific rules.
+
+**Dependent results.** [A1, A5, A9, A15, A20, A21, A22, A37, A39, A45, A50,
+A70, A83, A88, A102, A103, A105] Allocation-free `O(1)`-space threshold
+inspection, atomic failure, reserve/hidden-aware eligibility, stop activation,
+no-change public projection, risk release, stable WAL-v8/snapshot-v8 bytes,
+checkpoint/WAL recovery, and exact retry are deterministic.
+
+**Falsification probe.** Exercise thresholds below, equal to, and above
+available external quantity across multiple prices; thresholds off grid, above
+original quantity, and below the entry minimum; every STP policy; displayed,
+reserve, and hidden makers; displayed- and hidden-class self barriers; ordinary
+and stop activation; replacement; public projection; risk; checkpoint/WAL
+recovery; and exact/different-content retries. Compare accepted executions with
+an independent literal reserve-refresh queue. Any partial maker/STP mutation
+on threshold failure, prevented self quantity counted as execution, execution
+below threshold, artificial cap at the threshold, unsupported decrement-and-
+cancel admission, replay divergence, or tag drift falsifies A105.
 
 ## Bounded scope expansion
 
@@ -3148,8 +3188,9 @@ capability, a remaining risk, or an opportunity.
   Checkpoints preserve complete exact-retry lineage and do not conceal this
   lifecycle boundary.
 - **High impact:** matching includes one continuous single-instrument
-  price-time-priority book with market/limit, GTC/GTD/IOC/FOK/post-only, native
-  reserve, fully hidden displayed-priority queue classes,
+  price-time-priority book with market/limit,
+  GTC/GTD/IOC/minimum-quantity-IOC/FOK/post-only, native reserve, fully hidden
+  displayed-priority queue classes,
   stop-market/stop-limit, replace/cancel, canonical explicit expiry and
   stop-reference sweeps, mass cancellation, four STP policies, and revisioned
   open/cancel-only/halted/closed controls. A
@@ -3261,12 +3302,14 @@ capability, a remaining risk, or an opportunity.
   prices and can reject a narrow nonmarketable limit order early near sequence,
   per-report, or total-event exhaustion; it no longer retains that conservative
   slack as per-report vector capacity.
-- **Medium impact:** FOK preflight now allocates no queue and scans each active
-  order in crossed levels at most once. For `O_c` inspected orders and `P_c`
-  crossed levels, time is `O(O_c + P_c log P)` and auxiliary space is `O(1)`,
-  independent of reserve replenishment count. A 20,000-case deterministic
-  differential test matches the prior literal slice/requeue model. Maximum-book
-  scan latency and interaction with CPU cache residency remain unknown until
+- **Medium impact:** FOK and minimum-quantity IOC preflight allocate no queue
+  and scan each active order in crossed levels at most once. For `O_c`
+  inspected orders and `P_c` crossed levels, time is
+  `O(O_c + P_c log P)` and auxiliary space is `O(1)`, independent of reserve
+  replenishment count. A 20,000-case deterministic FOK differential test
+  matches the prior literal slice/requeue model; targeted minimum-quantity
+  tests cover atomic failure and reserve self barriers. Maximum-book scan
+  latency and interaction with CPU cache residency remain unknown until
   measured on declared production capacities and hardware.
 - **Medium impact:** all four execution/public price AVL arenas, the GTD-expiry
   AVL, and both stop-trigger AVL arenas are always fallibly reserved during

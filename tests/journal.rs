@@ -96,7 +96,7 @@ fn append_reopen_and_typed_decode_preserve_sequence_and_payload() {
 
     let bytes = fs::read(file.path()).expect("journal bytes read");
     assert_eq!(&bytes[..4], b"QWAL");
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 7);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 8);
 
     let frames = read_frames(file.path());
     assert_eq!(frames.len(), 2);
@@ -118,7 +118,7 @@ fn append_reopen_and_typed_decode_preserve_sequence_and_payload() {
 
 #[test]
 fn expired_wal_versions_are_rejected_explicitly() {
-    for version in [1_u16, 2, 3, 4, 5, 6] {
+    for version in [1_u16, 2, 3, 4, 5, 6, 7] {
         let file = TestFile::new("expired-version");
         let mut journal = Journal::open(file.path(), buffered_options()).unwrap();
         journal.append(&command(1, 1)).unwrap();
@@ -130,7 +130,7 @@ fn expired_wal_versions_are_rejected_explicitly() {
             .unwrap()
             .next()
             .expect("one frame exists")
-            .expect_err("expired WAL version is not interpreted as version seven");
+            .expect_err("expired WAL version is not interpreted as version eight");
         assert!(matches!(
             error,
             JournalError::UnsupportedVersion {

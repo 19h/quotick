@@ -824,6 +824,48 @@ fn execution_report_codec_has_a_stable_little_endian_layout() {
 }
 
 #[test]
+fn minimum_quantity_ioc_has_a_stable_little_endian_layout() {
+    let mut value = command(1, 2, Side::Buy);
+    let Command::New(order) = &mut value else {
+        unreachable!("command fixture is a new order");
+    };
+    order.time_in_force = TimeInForce::ImmediateOrCancelWithMinimum {
+        minimum_quantity: Quantity::new(3).unwrap(),
+    };
+
+    let mut expected = command(1, 2, Side::Buy).encode().unwrap();
+    expected[60] = 5;
+    expected.splice(61..61, 3_u64.to_le_bytes());
+    assert_eq!(value.encode().unwrap(), expected);
+    assert_eq!(Command::decode(&expected).unwrap(), value);
+}
+
+#[test]
+fn minimum_quantity_cancellation_has_a_stable_tag() {
+    let command_id = id(CommandId::new(1));
+    let report = ExecutionReport {
+        command_id,
+        outcome: CommandOutcome::Accepted,
+        events: vec![Event {
+            sequence: 1,
+            command_id,
+            occurred_at: TimestampNs::from_unix_nanos(2),
+            kind: EventKind::OrderCancelled {
+                order_id: id(OrderId::new(3)),
+                quantity: Quantity::new(4).unwrap(),
+                reason: CancelReason::MinimumQuantityUnavailable,
+            },
+        }]
+        .into(),
+        replayed: false,
+    };
+
+    let encoded = report.encode().unwrap();
+    assert_eq!(encoded.last(), Some(&11));
+    assert_eq!(ExecutionReport::decode(&encoded).unwrap(), report);
+}
+
+#[test]
 fn report_decoder_rejects_cross_field_outcome_contradictions() {
     let command_id = id(CommandId::new(1));
     let invalid = ExecutionReport {
@@ -901,6 +943,8 @@ fn every_rejection_reason_has_a_stable_round_trip() {
         RejectReason::StopMarketCannotBeReplaced,
         RejectReason::HiddenOrderNotSupported,
         RejectReason::HiddenOrderCannotBeImmediate,
+        RejectReason::InvalidMinimumQuantity,
+        RejectReason::UnsupportedMinimumQuantitySelfTradePolicy,
     ];
     for (index, reason) in reasons.into_iter().enumerate() {
         let command_id = id(CommandId::new(
@@ -1050,6 +1094,11 @@ fn every_event_variant_round_trips() {
             order_id,
             quantity,
             reason: CancelReason::TriggeredCapacityUnavailable,
+        },
+        EventKind::OrderCancelled {
+            order_id,
+            quantity,
+            reason: CancelReason::MinimumQuantityUnavailable,
         },
     ];
     let events: Vec<Event> = kinds

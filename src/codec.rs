@@ -813,6 +813,10 @@ fn encode_time_in_force(encoder: &mut Encoder, value: TimeInForce) {
             encoder.u8(4);
             encoder.u64(expires_at.as_unix_nanos());
         }
+        TimeInForce::ImmediateOrCancelWithMinimum { minimum_quantity } => {
+            encoder.u8(5);
+            encoder.u64(minimum_quantity.lots());
+        }
     }
 }
 
@@ -824,6 +828,9 @@ fn decode_time_in_force(decoder: &mut Decoder<'_>) -> Result<TimeInForce, CodecE
         3 => Ok(TimeInForce::PostOnly),
         4 => Ok(TimeInForce::GoodTilTimestamp {
             expires_at: TimestampNs::from_unix_nanos(decoder.u64()?),
+        }),
+        5 => Ok(TimeInForce::ImmediateOrCancelWithMinimum {
+            minimum_quantity: quantity(decoder)?,
         }),
         tag => Err(CodecError::InvalidTag {
             type_name: "TimeInForce",
@@ -906,6 +913,8 @@ fn encode_reject_reason(encoder: &mut Encoder, value: RejectReason) {
         RejectReason::StopMarketCannotBeReplaced => 47,
         RejectReason::HiddenOrderNotSupported => 48,
         RejectReason::HiddenOrderCannotBeImmediate => 49,
+        RejectReason::InvalidMinimumQuantity => 50,
+        RejectReason::UnsupportedMinimumQuantitySelfTradePolicy => 51,
     });
 }
 
@@ -961,6 +970,8 @@ fn decode_reject_reason(decoder: &mut Decoder<'_>) -> Result<RejectReason, Codec
         47 => Ok(RejectReason::StopMarketCannotBeReplaced),
         48 => Ok(RejectReason::HiddenOrderNotSupported),
         49 => Ok(RejectReason::HiddenOrderCannotBeImmediate),
+        50 => Ok(RejectReason::InvalidMinimumQuantity),
+        51 => Ok(RejectReason::UnsupportedMinimumQuantitySelfTradePolicy),
         tag => Err(CodecError::InvalidTag {
             type_name: "RejectReason",
             tag,
@@ -981,6 +992,7 @@ fn encode_cancel_reason(encoder: &mut Encoder, value: CancelReason) {
         CancelReason::TriggeredFokUnfilled => 8,
         CancelReason::TriggeredPostOnlyWouldCross => 9,
         CancelReason::TriggeredCapacityUnavailable => 10,
+        CancelReason::MinimumQuantityUnavailable => 11,
     });
 }
 
@@ -997,6 +1009,7 @@ fn decode_cancel_reason(decoder: &mut Decoder<'_>) -> Result<CancelReason, Codec
         8 => Ok(CancelReason::TriggeredFokUnfilled),
         9 => Ok(CancelReason::TriggeredPostOnlyWouldCross),
         10 => Ok(CancelReason::TriggeredCapacityUnavailable),
+        11 => Ok(CancelReason::MinimumQuantityUnavailable),
         tag => Err(CodecError::InvalidTag {
             type_name: "CancelReason",
             tag,
