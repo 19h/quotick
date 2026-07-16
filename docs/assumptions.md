@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A114 are stable and are referenced from code comments and other
+identifiers A1-A115 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -267,11 +267,15 @@ integrity; concern about the second requires authenticated records.
 
 ## A15 — format version immutability
 
-**Assumption.** WAL format version 17, snapshot format version 17, continuous
+**Assumption.** WAL format version 18, snapshot format version 18, continuous
 market-data payload version 3, call-auction market-data payload version 5, and
 trading-calendar payload version 1 are immutable. WAL and snapshot versions
-`1` through `16` are expired and rejected explicitly rather than inferred or
-migrated. WAL v17 preserves v16 values and changes continuous FOK decrement-
+`1` through `17` are expired and rejected explicitly rather than inferred or
+migrated. WAL v18 preserves v17 values and changes minimum-quantity IOC under
+decrement-and-cancel from unsupported to the A115 exact two-counter execution
+interpretation. Snapshot v18 preserves v17 direct rows and embeds WAL-v18
+values in chronological histories. WAL v17 preserves v16 values and changes
+continuous FOK decrement-
 and-cancel from unsupported to the A114 external-fill-before-self-barrier
 interpretation. Snapshot v17 preserves v16 direct rows and embeds WAL-v17
 values in chronological histories. WAL v16 preserved v15 values and added
@@ -306,10 +310,10 @@ authoritative predecessors exist.
 recovery, anchor interpretation, stable auction records/images, stable calendar
 images, and fail-closed format boundaries.
 
-**Falsification probe.** Byte-compare golden WAL-v17, snapshot-v17,
+**Falsification probe.** Byte-compare golden WAL-v18, snapshot-v18,
 market-data-v3, auction-market-data-v5, and trading-calendar-v1 fixtures through
 every supported release; mutate valid WAL frames and images to versions `1`
-through `16`; verify definition booleans, every display, TIF, rejection, and
+through `17`; verify definition booleans, every display, TIF, rejection, and
 cancellation tag, continuous expiry/stop/source tags, raw auction record tags
 `9`/`10`, replacement, mass-cancel, amendment, and allocation-policy tags,
 priority-class scalars, uncross self-trade tags, rejection tag `23`, indicative
@@ -683,7 +687,7 @@ effect, accepted partial state, or incorrect final balance falsifies A36.
 
 **Assumption.** The reserve-, mass-cancel-, account-control-, GTD-, stop-, fully
 hidden, and minimum-quantity command/report variants defined through version 8
-remain explicit variants inside deployable WAL version 17. Version 9 added
+remain explicit variants inside deployable WAL version 18. Version 9 added
 durable stop-reference source identity, source version, source sequence, and
 typed discontinuity/collision outcomes; it does not infer them from WAL version
 8. No earlier matching WAL requires runtime compatibility. Expired envelopes
@@ -694,10 +698,10 @@ minimum-quantity, or anchor semantics.
 **Dependent results.** Explicit fully displayed/reserve/fully hidden/GTD/stop
 state, refresh, expiry, and trigger events, canonical mass cancellation,
 revisioned account fencing, and anchored cutover under WAL envelope version
-`17`.
+`18`.
 
 **Falsification probe.** Inventory every persisted matching WAL and decode
-golden version-12 fixtures before deployment. Reject version-11 artifacts with
+golden version-18 fixtures before deployment. Reject version-17 artifacts with
 and without re-labelled headers, and mutate every hidden/minimum-quantity/
 expiry/stop/source tag, definition flag, threshold, deadline, watermark,
 reference, trigger, activation, aggregate, and ordering relation.
@@ -1661,7 +1665,7 @@ continuity is bounded by A65/A66.
 ## A65 — durable auction WAL grammar
 
 **Assumption.** One `DurableCallAuctionEngine` owns the only writer lease for
-one WAL-version-17 single-file or marker-selected segmented auction shard. Its
+one WAL-version-18 single-file or marker-selected segmented auction shard. Its
 uncut grammar is one immutable definition followed by command/report pairs and
 at most one final dangling command. Submission prepares before command append,
 commits the same token, then appends the exact report; acknowledgement strength
@@ -1697,14 +1701,14 @@ retention, mass-cancel account/scope/order/count/quantity/revision corruption,
 amendment owner/quantity/immutable-field/priority/revision corruption,
 indicative auction/phase/book/band/reference/policy/presence corruption,
 abort policy/rejection mismatch, segment corruption, insufficient limits, and
-frame versions `1` through `16`. Any accepted
+frame versions `1` through `17`. Any accepted
 divergent/noncanonical history,
 duplicate transition, retry frame, cross-layout semantic difference, or
 unaudited dangling completion falsifies A65.
 
 ## A66 — auction checkpoint lineage
 
-**Assumption.** A snapshot-version-17 call-auction checkpoint and its recovery
+**Assumption.** A snapshot-version-18 call-auction checkpoint and its recovery
 WAL represent one immutable A65 command/report lineage. The image retains the
 definition/WAL origin, completed report boundary, phase/cycle, book revision,
 next priority/trade counters, canonical accepted identities and active orders,
@@ -1714,7 +1718,7 @@ row. A completed checkpoint is released only after
 independent replay requires exact direct-state equality; A97/A98 separate
 non-replaying capture from that proof. Numeric generation is never accepted
 without exact uncut prefix equality or a kind/checksum/generation/slot-bound
-version-17 anchor. Capture/validation resource or temporary-constructor failure
+version-18 anchor. Capture/validation resource or temporary-constructor failure
 under A78 occurs before snapshot/cutover mutation and leaves the durable shard
 unpoisoned; semantic contradiction poisons it.
 
@@ -1883,7 +1887,7 @@ A66-style auction image, reconstructs reservations from active orders, and is
 released only after full history replay through the coupled gate; A99/A100
 stage that proof.
 
-Snapshot-v17 kind `5` and `DurableCallAuctionRiskEngine` bind a canonical
+Snapshot-v18 kind `5` and `DurableCallAuctionRiskEngine` bind a canonical
 definition/profile prefix, risk-aware command/report replay, one
 dangling-command completion, exact uncut prefix proof, and
 single-file/segmented A/B cutover. Dynamic profile/control mutation,
@@ -3281,24 +3285,28 @@ aligned and no greater than original quantity; it may be below the instrument's
 new-order size minimum because it constrains execution rather than entry. Only
 external traded quantity counts. Cancel-resting excludes self orders, while
 cancel-aggressor and cancel-both stop eligibility at the same reserve/hidden
-self barriers used by FOK. Decrement-and-cancel is inadmissible because
-prevented self quantity is not executed quantity.
+self barriers used by FOK. Decrement-and-cancel instead follows A115: prevented
+self quantity does not satisfy the threshold, but it consumes both incoming
+leaves and the maker's current executable slice.
 
 The nonmutating preflight precedes matching and STP effects. If eligible
 quantity is below the threshold, the order is accepted and its complete
-quantity is cancelled with `MinimumQuantityUnavailable`; no maker changes. If
-the threshold is met, ordinary IOC matching can execute beyond it and cancels
-only the final remainder. A dormant stop retains the constraint, evaluates it
-against activation-time liquidity, and cannot be replaced below the threshold.
-This pairing, cancellation reason, and STP/reserve policy are Quotick internal
-contracts; FIX `MinQty(110)` and IOC terminology do not supply those venue-
-specific rules.
+quantity is cancelled with `MinimumQuantityUnavailable`; no maker, STP, risk,
+reservation, position, or public state changes. If the threshold is met,
+ordinary IOC matching can execute beyond it and cancels only the final
+remainder. A dormant stop retains the constraint, evaluates it against
+activation-time liquidity, and cannot be replaced below the threshold. This
+pairing, cancellation reason, and STP/reserve policy are Quotick internal
+contracts; FIX `MinQty(110)` and IOC terminology do not supply those
+venue-specific rules.
 
 **Dependent results.** [A1, A5, A9, A15, A20, A21, A22, A37, A39, A45, A50,
-A70, A83, A88, A102, A103, A105] Allocation-free `O(1)`-space threshold
+A70, A83, A88, A102, A103, A105, A115] Allocation-free `O(1)`-space threshold
 inspection, atomic failure, reserve/hidden-aware eligibility, stop activation,
-no-change public projection, risk release, stable WAL-v17/snapshot-v17 bytes,
-checkpoint/WAL recovery, and exact retry are deterministic.
+no-change public projection, risk release, stable WAL-v18/snapshot-v18 bytes,
+checkpoint/WAL recovery, and exact retry are deterministic. The specialized
+A115 scan has the time bound stated there; other policies retain the one-pass
+FOK eligibility bound.
 
 **Falsification probe.** Exercise thresholds below, equal to, and above
 available external quantity across multiple prices; thresholds off grid, above
@@ -3308,8 +3316,8 @@ and stop activation; replacement; public projection; risk; checkpoint/WAL
 recovery; and exact/different-content retries. Compare accepted executions with
 an independent literal reserve-refresh queue. Any partial maker/STP mutation
 on threshold failure, prevented self quantity counted as execution, execution
-below threshold, artificial cap at the threshold, unsupported decrement-and-
-cancel admission, replay divergence, or tag drift falsifies A105.
+below threshold, artificial cap at the threshold, incorrect decrement-and-
+cancel admission or execution, replay divergence, or tag drift falsifies A105.
 
 ## A106 — sequenced stop-reference source cursor
 
@@ -3460,7 +3468,7 @@ aggregate reduction. It emits one replayable `OrderAmended` event in the
 ordinary history lane. Coupled risk removes the exact quantity and conservative
 notional delta without a new entry gate. Public payload v5 emits one anonymous
 `Amended` aggregate delta with unchanged order count and invalidates any prior
-indication. WAL/snapshot v17 preserve
+indication. WAL/snapshot v18 preserve
 exact retry and checkpoint-plus-suffix recovery.
 
 **Falsification probe.** Exercise market and limit orders at head, middle, and
@@ -3504,7 +3512,7 @@ construction. Validation and fill construction are `O(B + A)` time with
 instrument quantity increment, the engine emits the resulting deterministic
 trade/remainder trace, risk consumes that trace without an independent
 allocation inference, and auction market-data payload v5 projects the same
-events while adding A112. WAL v17 and snapshot v17 persist the explicit policy
+events while adding A112. WAL v18 and snapshot v18 persist the explicit policy
 for
 full replay, checkpoint recovery, and exact retry. A61 price-time behavior
 remains separately selectable and byte-tagged.
@@ -3545,7 +3553,7 @@ queues remain mutation-time FIFO structures; rebuilding caller-owned order
 scratch resolves their identities and performs an allocation-free unstable
 sort in `O(O log O + P)` time. Both `PriceTime` and `ProRataTime` therefore
 honor market/price/class/time/ID order. Risk consumes the resulting execution
-trace without independently inferring class. WAL v17 and snapshot v17 preserve
+trace without independently inferring class. WAL v18 and snapshot v18 preserve
 the class through full replay, direct checkpoint restore, suffix recovery, and
 exact retry.
 
@@ -3591,8 +3599,8 @@ constructor-owned scratch and the existing allocation-free kernel. One command
 adds one fixed-size event and one optional fixed-size live state. Risk
 authorization and application are `O(1)` no-ops.
 
-WAL v17 retains command/action tag `7` and event-kind tag `9`; nullable reports
-are 98 B or 138 B. Snapshot v17 derives the current value from accepted
+WAL v18 retains command/action tag `7` and event-kind tag `9`; nullable reports
+are 98 B or 138 B. Snapshot v18 derives the current value from accepted
 history and checkpoint-plus-suffix invalidation. Auction market-data v5 uses
 kind tag `6`, 84 B or 124 B updates, complete one-update replay batches, and an
 optional snapshot value. Publisher, replica, direct restore, full-WAL recovery,
@@ -3656,8 +3664,8 @@ the current indication. Exact retry reuses the report. Coupled risk changes no
 reservation, exposure, position, or netting scratch. Public payload version 5
 emits `NoPublicChange` for the original rejection and no retry update.
 
-WAL v17 encodes self-trade policy tag `1` and rejection tag `23`; its generic
-one-event rejected report is 49 B. Snapshot v17 retains the command/report row
+WAL v18 encodes self-trade policy tag `1` and rejection tag `23`; its generic
+one-event rejected report is 49 B. Snapshot v18 retains the command/report row
 without changing direct order, counter, phase, indication, or risk rows. An
 accepted `Abort` uncross is valid only when all canonical pairs have unequal
 account IDs. `Permit` retains the prior same-account trade and coupled net-zero
@@ -3699,43 +3707,91 @@ order and emits no STP event. Otherwise the command returns
 `InsufficientLiquidity` before any maker, STP, sequence, risk, reservation, or
 public-depth mutation. Dormant FOK stops apply the identical rule at activation
 and use `TriggeredFokUnfilled` on failure. A105 remains separate because a
-minimum-quantity IOC could continue after meeting its threshold; decrement-
-and-cancel remains inadmissible for that TIF until an exact two-counter virtual
-reserve-queue simulation is specified.
+minimum-quantity IOC can continue after meeting its threshold. A115 supplies
+that TIF's distinct exact two-counter virtual reserve-queue simulation; it must
+not be reused for FOK's first-self-barrier rule.
 
 **Dependent results.** [A1, A9, A15, A20, A21, A22, A37, A39, A45, A49,
-A50, A70, A83, A88, A102, A103, A105, A114] Direct and dormant activation,
+A50, A70, A83, A88, A102, A103, A105, A114, A115] Direct and dormant activation,
 coupled risk, market-data publication, checkpoint restoration, WAL recovery,
 and exact retry reproduce one atomic result. Preflight remains
-`O(O_c + P_c log P)` time for `O_c` inspected orders across `P_c` crossed
+`O(O_c + P_c log(P + 1))` time for `O_c` inspected orders across `P_c` crossed
 levels, uses `O(1)` auxiliary space, and allocates nothing.
 
 **Falsification probe.** Place displayed, reserve, and fully hidden self orders
 before, within, and after sufficient external liquidity at the same and worse
 prices. Exercise partial current reserve slices, multiple refreshes, direct and
 dormant entry, both sides, risk reservations, public no-change/trade
-projection, stable WAL-v17/snapshot-v17 recovery, exact retry, and later
+projection, stable WAL-v18/snapshot-v18 recovery, exact retry, and later
 successful external continuation. Differentially compare at least 20,000
 generated books with a literal slice/requeue reference queue. Any accepted
 partial FOK, counted self decrement, reachable self STP event, mutation on
 failure, ignored earlier barrier, rejection despite a complete external fill
-before self, allocation, replay divergence, or minimum-quantity decrement-and-
-cancel admission falsifies A114.
+before self, allocation, replay divergence, or reuse of A115 continuation
+semantics falsifies A114.
+
+## A115 — exact minimum-quantity decrement-and-cancel
+
+**Assumption.** For `ImmediateOrCancelWithMinimum` under
+`DecrementAndCancel`, the minimum is satisfied only by external traded
+quantity. A self maker instead consumes the lesser of incoming leaves and that
+maker's current executable slice from both sides, emits no trade, and supplies
+no threshold credit. The immutable preflight follows the exact execution
+priority walk: initial displayed and reserve slices in FIFO order, refreshed
+reserve slices requeued at the displayed-class tail, fully hidden FIFO only
+after every displayed reserve is exhausted, and then the next crossed price.
+
+The scanner carries separate incoming-leaves and remaining-external-threshold
+counters. It aggregates complete reserve-refresh rounds, evaluates at most one
+partial round in FIFO order, and never materializes a virtual queue. If
+incoming leaves reach zero before the external threshold, the accepted command
+cancels its complete original quantity with
+`MinimumQuantityUnavailable`; maker, STP, risk, reservation, position,
+and public state remain unchanged. If the threshold reaches zero
+first, ordinary IOC execution proceeds from the original state, may execute
+beyond the threshold, emits the ordinary decrement/refresh/trade trace, and
+cancels only remaining incoming leaves. Dormant minimum-quantity stops apply
+the identical rule against activation-time liquidity.
+
+**Dependent results.** [A1, A5, A9, A15, A20, A21, A22, A37, A39, A45, A50,
+A70, A83, A88, A102, A103, A105, A114, A115] For `O_c` initially inspected
+orders over `P_c` crossed prices, `D_p` displayed orders at price `p`, and at
+most `R_p` remaining reserve rounds there, the scan costs
+`O(O_c + P_c log(P + 1) + sum_p D_p log(R_p + 1))` time, `O(1)` auxiliary
+space, and zero allocations. Instrument admission bounds each replenishment
+count by `u32`, so the binary search performs at most 32 aggregate passes per
+price. Direct and dormant entry, risk, private/public projection, checkpoint,
+WAL-v18, snapshot-v18, exact retry, and subsequent execution reproduce the
+same result. Legacy rejection tag `51` remains decodable but is not emitted for
+a well-formed A115 command.
+
+**Falsification probe.** Place external and self displayed, reserve, and fully
+hidden orders before and after the threshold at one or multiple crossed prices
+on both sides. Exercise threshold-minus-one, exact-threshold, and
+threshold-plus-one external quantities; partial initial slices; zero, one, and
+maximum replenishments; a partial final reserve round; hidden-class entry;
+incoming exhaustion on self decrement; direct and dormant activation; risk
+reservations and positions; public no-change/trade projection; checkpoint and
+WAL recovery; exact retry; and later accepted continuation. Differentially
+compare at least 20,000 generated cases with a literal slice/requeue reference
+queue. Any self threshold credit, priority inversion, skipped or duplicated
+refresh, hidden-before-displayed execution, maker/STP/risk/public mutation on
+failure, threshold-capped success, allocation, nontermination, replay
+divergence, or current emission of rejection tag `51` falsifies A115.
 
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
 
-- **High impact:** continuous FOK now has atomic behavior under all four STP
-  policies. Decrement-and-cancel requires the full original quantity in
-  external trades before the first priority-reachable self barrier and is
-  covered through reserve/hidden priority, dormant activation, coupled risk,
-  market data, WAL/snapshot recovery, and exact retry. Venue-specific
-  beneficial-owner mapping and protocol conformance remain external. Minimum-
-  quantity IOC decrement-and-cancel remains a distinct unsupported policy; a
-  future implementation requires an exact two-counter virtual reserve-queue
-  model rather than reusing FOK eligibility.
+- **High impact:** continuous FOK and minimum-quantity IOC now have atomic
+  behavior under all four STP policies. FOK decrement-and-cancel requires the
+  full original quantity before the first priority-reachable self barrier;
+  minimum-quantity decrement-and-cancel uses the separate exact two-counter
+  reserve-queue simulation in A115. Both are covered through reserve/hidden
+  priority, dormant activation, coupled risk, market data, WAL/snapshot
+  recovery, and exact retry. Authenticated venue beneficial-owner mapping and
+  protocol conformance remain external.
 
 - **High impact:** source identity/version/sequence now accompanies every
   continuous stop reference through matching, risk, private publication state,
@@ -3763,7 +3819,7 @@ capability, a remaining risk, or an opportunity.
 - **High impact:** call-auction uncross now selects explicit price-time or
   price/class-tier pro-rata-time allocation. Pro-rata shares use exact
   instrument-increment floors, FIFO residual quanta, deterministic trade
-  pairing, and WAL-v17/snapshot-v17 recovery. Every live order carries one
+  pairing, and WAL-v18/snapshot-v18 recovery. Every live order carries one
   authoritative typed priority-class scalar used by both policies after
   market/price ordering and before time. An authenticated venue-category-to-
   scalar mapping remains adapter conformance work. Venue algorithms that rank by
@@ -3773,7 +3829,7 @@ capability, a remaining risk, or an opportunity.
 - **High impact:** call-auction self-trade policy now supports fail-closed
   `Abort` on the first canonical equal-`AccountId` pair. The complete uncross
   is rejected before book, trade-ID, phase, risk, or public-depth mutation and
-  recovers exactly through WAL/snapshot version 17. Authenticated beneficial-
+  recovers exactly through WAL/snapshot version 18. Authenticated beneficial-
   owner mapping, alternative-counterparty rearrangement, and venue-specific
   cancel/decrement or aggressor/resting instructions remain external.
 - **High impact:** call-auction collection and sequencing now support bounded
@@ -3781,7 +3837,7 @@ capability, a remaining risk, or an opportunity.
   command selects `K` orders independently of unrelated active interest, emits
   canonical ascending removals plus one aggregate completion, increments the
   book revision exactly once when `K > 0`, releases each risk reservation, and
-  recovers under WAL/snapshot version 17. Public payload version 5 projects the
+  recovers under WAL/snapshot version 18. Public payload version 5 projects the
   same complete batch without account or scope identity. Authenticated firm,
   session, or cross-shard scope and completion aggregation remain external.
 - **High impact risk:** the auction writer lease is local ownership, not a
@@ -3985,15 +4041,15 @@ capability, a remaining risk, or an opportunity.
   prices and can reject a narrow nonmarketable limit order early near sequence,
   per-report, or total-event exhaustion; it no longer retains that conservative
   slack as per-report vector capacity.
-- **Medium impact:** FOK and minimum-quantity IOC preflight allocate no queue
-  and scan each active order in crossed levels at most once. For `O_c`
-  inspected orders and `P_c` crossed levels, time is
-  `O(O_c + P_c log P)` and auxiliary space is `O(1)`, independent of reserve
-  replenishment count. A 20,000-case deterministic FOK differential test
-  matches the prior literal slice/requeue model; targeted minimum-quantity
-  tests cover atomic failure and reserve self barriers. Maximum-book scan
-  latency and interaction with CPU cache residency remain unknown until
-  measured on declared production capacities and hardware.
+- **Medium impact:** FOK and minimum-quantity IOC preflight allocate no queue.
+  FOK and non-decrement minimum scans visit each crossed order at most once in
+  `O(O_c + P_c log(P + 1))` time. A115 decrement-and-cancel minimum scanning
+  adds `sum_p D_p log(R_p + 1)` aggregate work for exact reserve rounds while
+  retaining `O(1)` auxiliary space; `R_p` is `u32`-bounded. Independent
+  20,000-case deterministic differential tests compare both FOK and minimum-
+  quantity behavior with literal slice/requeue models. Maximum-book scan
+  latency and interaction with CPU cache residency are unknown until measured
+  on declared production capacities and hardware.
 - **Medium impact:** all four execution/public price AVL arenas, the GTD-expiry
   AVL, and both stop-trigger AVL arenas are always fallibly reserved during
   book construction. Price reservation is

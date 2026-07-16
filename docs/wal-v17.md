@@ -1,4 +1,7 @@
-# WAL Format Version 17
+# Expired WAL Format Version 17
+
+This is a historical byte-level record. The runtime rejects version 17. The
+authoritative current schema is [WAL format version 18](wal-v18.md).
 
 This document is the authoritative byte-level schema for Quotick WAL version
 17. All multibyte integers are little-endian. Rust enum layout, padding,

@@ -665,7 +665,7 @@ pub enum RejectReason {
     UnsupportedFokSelfTradePolicy,
     /// A minimum quantity was off grid or exceeded the order quantity.
     InvalidMinimumQuantity,
-    /// Minimum quantity with decrement-and-cancel has ambiguous execution semantics.
+    /// Legacy rejection retained for stable decoding of historical reports.
     UnsupportedMinimumQuantitySelfTradePolicy,
     /// Available eligible liquidity cannot completely fill a fill-or-kill order.
     InsufficientLiquidity,
@@ -4568,6 +4568,19 @@ impl From<NewOrder> for IncomingPreview {
     }
 }
 
+impl IncomingPreview {
+    fn crosses(self, price: Price) -> bool {
+        match (self.side, self.order_type) {
+            (_, OrderType::Market) => true,
+            (Side::Buy, OrderType::Limit(limit)) => limit >= price,
+            (Side::Sell, OrderType::Limit(limit)) => limit <= price,
+            (_, OrderType::Stop { .. }) => {
+                unreachable!("dormant stop constraint cannot enter liquidity inspection")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ReserveRefresh {
     order_id: OrderId,
@@ -4581,6 +4594,39 @@ enum LevelLiquidity {
     Filled,
     Remaining(u64),
     BlockedBySelfTrade,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MinimumScanProgress {
+    Continue,
+    Satisfied,
+    IncomingExhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MinimumScanState {
+    incoming_remaining: u64,
+    external_required: u64,
+}
+
+impl MinimumScanState {
+    fn consume_slice(&mut self, available: u64, external: bool) -> MinimumScanProgress {
+        let consumed = self.incoming_remaining.min(available);
+        self.consume_totals(consumed, u64::from(external) * consumed)
+    }
+
+    fn consume_totals(&mut self, total: u64, external: u64) -> MinimumScanProgress {
+        debug_assert!(total <= self.incoming_remaining && external <= total);
+        self.incoming_remaining -= total;
+        self.external_required = self.external_required.saturating_sub(external);
+        if self.external_required == 0 {
+            MinimumScanProgress::Satisfied
+        } else if self.incoming_remaining == 0 {
+            MinimumScanProgress::IncomingExhausted
+        } else {
+            MinimumScanProgress::Continue
+        }
+    }
 }
 
 /// A deterministic single-instrument central limit order book.
@@ -5215,9 +5261,6 @@ impl OrderBook {
                             != 0
                     {
                         return Err(RejectReason::InvalidMinimumQuantity);
-                    }
-                    if command.self_trade_prevention == SelfTradePrevention::DecrementAndCancel {
-                        return Err(RejectReason::UnsupportedMinimumQuantitySelfTradePolicy);
                     }
                 }
                 if command
@@ -7215,7 +7258,9 @@ impl OrderBook {
         let Some(minimum_quantity) = command.time_in_force.minimum_quantity() else {
             return Ok(false);
         };
-        if self.can_execute_quantity(IncomingPreview::from(command), minimum_quantity.lots()) {
+        if self
+            .can_execute_minimum_quantity(IncomingPreview::from(command), minimum_quantity.lots())
+        {
             return Ok(false);
         }
         self.push_cancelled(
@@ -7621,31 +7666,30 @@ impl OrderBook {
                 display: removed.display,
                 self_trade_prevention: removed.self_trade_prevention,
             };
-            let immediate_requirement = match stop.time_in_force {
-                TimeInForce::FillOrKill => {
-                    Some((removed.leaves, CancelReason::TriggeredFokUnfilled))
+            let preview = IncomingPreview {
+                account_id: removed.account_id,
+                side: removed.side,
+                order_type: active_order_type,
+                leaves: removed.leaves,
+                self_trade_prevention: removed.self_trade_prevention,
+            };
+            let unavailable_reason = match stop.time_in_force {
+                TimeInForce::FillOrKill if !self.can_execute_quantity(preview, removed.leaves) => {
+                    Some(CancelReason::TriggeredFokUnfilled)
                 }
-                TimeInForce::ImmediateOrCancelWithMinimum { minimum_quantity } => Some((
-                    minimum_quantity.lots(),
-                    CancelReason::MinimumQuantityUnavailable,
-                )),
+                TimeInForce::ImmediateOrCancelWithMinimum { minimum_quantity }
+                    if !self.can_execute_minimum_quantity(preview, minimum_quantity.lots()) =>
+                {
+                    Some(CancelReason::MinimumQuantityUnavailable)
+                }
                 TimeInForce::GoodTilCancelled
                 | TimeInForce::GoodTilTimestamp { .. }
                 | TimeInForce::ImmediateOrCancel
-                | TimeInForce::PostOnly => None,
+                | TimeInForce::PostOnly
+                | TimeInForce::FillOrKill
+                | TimeInForce::ImmediateOrCancelWithMinimum { .. } => None,
             };
-            if let Some((required_quantity, cancellation_reason)) = immediate_requirement
-                && !self.can_execute_quantity(
-                    IncomingPreview {
-                        account_id: removed.account_id,
-                        side: removed.side,
-                        order_type: active_order_type,
-                        leaves: removed.leaves,
-                        self_trade_prevention: removed.self_trade_prevention,
-                    },
-                    required_quantity,
-                )
-            {
+            if let Some(cancellation_reason) = unavailable_reason {
                 self.push_cancelled(
                     &mut events,
                     command.command_id,
@@ -8427,27 +8471,231 @@ impl OrderBook {
         self.can_execute_quantity(IncomingPreview::from(*incoming), incoming.quantity.lots())
     }
 
+    /// Returns whether the required external quantity executes before an IOC
+    /// aggressor is exhausted.
+    ///
+    /// Policies that do not decrement both sides reuse the FOK liquidity
+    /// theorem. Decrement-and-cancel requires an exact virtual queue because a
+    /// self slice consumes incoming leaves without contributing to the external
+    /// minimum.
+    fn can_execute_minimum_quantity(&self, incoming: IncomingPreview, required: u64) -> bool {
+        debug_assert!(required > 0 && required <= incoming.leaves);
+        if incoming.self_trade_prevention == SelfTradePrevention::DecrementAndCancel {
+            self.can_execute_decrement_and_cancel_minimum(incoming, required)
+        } else {
+            self.can_execute_quantity(incoming, required)
+        }
+    }
+
+    /// Scans the exact decrement-and-cancel execution path without mutation or
+    /// allocation.
+    ///
+    /// Initial displayed slices and a possible final partial reserve round are
+    /// visited in FIFO order. Complete reserve rounds are aggregated with a
+    /// monotone binary search, avoiding work proportional to the number of
+    /// refresh events. Hidden liquidity is visited only after every reserve at
+    /// the price is exhausted, matching the displayed-priority class rule.
+    fn can_execute_decrement_and_cancel_minimum(
+        &self,
+        incoming: IncomingPreview,
+        required: u64,
+    ) -> bool {
+        let mut state = MinimumScanState {
+            incoming_remaining: incoming.leaves,
+            external_required: required,
+        };
+        let mut price = self.best_price(incoming.side.opposite());
+        while let Some(current_price) = price {
+            if !incoming.crosses(current_price) {
+                return false;
+            }
+            let level = self
+                .levels(incoming.side.opposite())
+                .get(current_price)
+                .expect("enumerated price must have a level");
+            match self.scan_decrement_and_cancel_minimum_level(
+                level,
+                incoming.account_id,
+                &mut state,
+            ) {
+                MinimumScanProgress::Continue => {}
+                MinimumScanProgress::Satisfied => return true,
+                MinimumScanProgress::IncomingExhausted => return false,
+            }
+            price = self.next_worse_price(incoming.side.opposite(), current_price);
+        }
+        false
+    }
+
+    fn scan_decrement_and_cancel_minimum_level(
+        &self,
+        level: &PriceLevel,
+        incoming_account_id: AccountId,
+        state: &mut MinimumScanState,
+    ) -> MinimumScanProgress {
+        let mut hidden_head = Some(level.head);
+        let mut maximum_reserve_rounds = 0_u64;
+        if let Some(displayed_tail) = level.displayed_tail {
+            let mut current = Some(level.head);
+            loop {
+                let order_id = current.expect("displayed class ended before its tail");
+                let order = self
+                    .orders
+                    .get(&order_id)
+                    .expect("price-level order must exist");
+                debug_assert!(!order.display.is_hidden());
+                let progress =
+                    state.consume_slice(order.displayed, order.account_id != incoming_account_id);
+                if progress != MinimumScanProgress::Continue {
+                    return progress;
+                }
+                if let OrderDisplay::Reserve { peak } = order.display
+                    && order.leaves > order.displayed
+                {
+                    maximum_reserve_rounds = maximum_reserve_rounds
+                        .max((order.leaves - order.displayed).div_ceil(peak.lots()));
+                }
+                hidden_head = order.next;
+                if order_id == displayed_tail {
+                    break;
+                }
+                current = order.next;
+            }
+            let progress = self.scan_minimum_reserve_rounds(
+                level.head,
+                displayed_tail,
+                maximum_reserve_rounds,
+                incoming_account_id,
+                state,
+            );
+            if progress != MinimumScanProgress::Continue {
+                return progress;
+            }
+        }
+
+        let mut current = hidden_head;
+        while let Some(order_id) = current {
+            let order = self
+                .orders
+                .get(&order_id)
+                .expect("price-level order must exist");
+            debug_assert!(order.display.is_hidden());
+            current = order.next;
+            let progress =
+                state.consume_slice(order.displayed, order.account_id != incoming_account_id);
+            if progress != MinimumScanProgress::Continue {
+                return progress;
+            }
+        }
+        MinimumScanProgress::Continue
+    }
+
+    fn scan_minimum_reserve_rounds(
+        &self,
+        head: OrderId,
+        displayed_tail: OrderId,
+        maximum_rounds: u64,
+        incoming_account_id: AccountId,
+        state: &mut MinimumScanState,
+    ) -> MinimumScanProgress {
+        let mut completed_rounds = 0_u64;
+        let mut upper = maximum_rounds;
+        while completed_rounds < upper {
+            let candidate = completed_rounds + (upper - completed_rounds).div_ceil(2);
+            let (total, _) =
+                self.reserve_round_totals(head, displayed_tail, candidate, incoming_account_id);
+            if total <= u128::from(state.incoming_remaining) {
+                completed_rounds = candidate;
+            } else {
+                upper = candidate - 1;
+            }
+        }
+
+        let (total, external) =
+            self.reserve_round_totals(head, displayed_tail, completed_rounds, incoming_account_id);
+        let total = u64::try_from(total).expect("bounded reserve consumption must fit leaves");
+        let external = u64::try_from(external)
+            .expect("external reserve consumption cannot exceed total consumption");
+        let progress = state.consume_totals(total, external);
+        if progress != MinimumScanProgress::Continue || completed_rounds == maximum_rounds {
+            return progress;
+        }
+
+        let mut current = Some(head);
+        loop {
+            let order_id = current.expect("displayed class ended before its tail");
+            let order = self
+                .orders
+                .get(&order_id)
+                .expect("price-level order must exist");
+            if let OrderDisplay::Reserve { peak } = order.display {
+                let reserve = order.leaves - order.displayed;
+                let consumed_before =
+                    u128::from(reserve).min(u128::from(completed_rounds) * u128::from(peak.lots()));
+                let remaining = reserve
+                    - u64::try_from(consumed_before)
+                        .expect("consumed reserve is bounded by u64 leaves");
+                let progress = state.consume_slice(
+                    remaining.min(peak.lots()),
+                    order.account_id != incoming_account_id,
+                );
+                if progress != MinimumScanProgress::Continue {
+                    return progress;
+                }
+            }
+            if order_id == displayed_tail {
+                break;
+            }
+            current = order.next;
+        }
+        unreachable!("maximal complete-round search requires incoming exhaustion")
+    }
+
+    fn reserve_round_totals(
+        &self,
+        head: OrderId,
+        displayed_tail: OrderId,
+        rounds: u64,
+        incoming_account_id: AccountId,
+    ) -> (u128, u128) {
+        let mut total = 0_u128;
+        let mut external = 0_u128;
+        let mut current = Some(head);
+        loop {
+            let order_id = current.expect("displayed class ended before its tail");
+            let order = self
+                .orders
+                .get(&order_id)
+                .expect("price-level order must exist");
+            if let OrderDisplay::Reserve { peak } = order.display {
+                let reserve = u128::from(order.leaves - order.displayed);
+                let consumed = reserve.min(u128::from(rounds) * u128::from(peak.lots()));
+                total += consumed;
+                if order.account_id != incoming_account_id {
+                    external += consumed;
+                }
+            }
+            if order_id == displayed_tail {
+                break;
+            }
+            current = order.next;
+        }
+        (total, external)
+    }
+
     /// Returns whether the required external quantity can execute immediately.
     ///
     /// Decrement-and-cancel uses the same barrier theorem as cancel-aggressor:
     /// a FOK can execute its original quantity only when external liquidity
     /// completes the order before the first priority-reachable self encounter.
-    /// Minimum-quantity IOC is rejected separately because its threshold can be
+    /// Minimum-quantity IOC dispatches separately because its threshold can be
     /// met after a self decrement and requires a two-counter virtual-queue scan.
     fn can_execute_quantity(&self, incoming: IncomingPreview, required: u64) -> bool {
         debug_assert!(required > 0 && required <= incoming.leaves);
         let mut remaining = required;
         let mut price = self.best_price(incoming.side.opposite());
         while let Some(current_price) = price {
-            let crosses = match (incoming.side, incoming.order_type) {
-                (_, OrderType::Market) => true,
-                (Side::Buy, OrderType::Limit(limit)) => limit >= current_price,
-                (Side::Sell, OrderType::Limit(limit)) => limit <= current_price,
-                (_, OrderType::Stop { .. }) => {
-                    unreachable!("dormant stop constraint cannot enter FOK inspection")
-                }
-            };
-            if !crosses {
+            if !incoming.crosses(current_price) {
                 return false;
             }
             let level = self
@@ -9344,6 +9592,54 @@ mod price_level_index_tests {
         false
     }
 
+    fn reference_can_execute_decrement_and_cancel_minimum(
+        book: &OrderBook,
+        incoming: &NewOrder,
+        required: u64,
+    ) -> bool {
+        let mut incoming_remaining = incoming.quantity.lots();
+        let mut external_required = required;
+        let mut price = book.best_price(incoming.side.opposite());
+        while let Some(current_price) = price {
+            if !IncomingPreview::from(*incoming).crosses(current_price) {
+                return false;
+            }
+            let level = book
+                .levels(incoming.side.opposite())
+                .get(current_price)
+                .unwrap();
+            let mut queue = std::collections::VecDeque::new();
+            let mut order_id = Some(level.head);
+            while let Some(current_id) = order_id {
+                let order = *book.orders.get(&current_id).unwrap();
+                order_id = order.next;
+                queue.push_back(order);
+            }
+            while let Some(mut order) = queue.pop_front() {
+                let consumed = incoming_remaining.min(order.displayed);
+                incoming_remaining -= consumed;
+                if order.account_id != incoming.account_id {
+                    external_required = external_required.saturating_sub(consumed);
+                    if external_required == 0 {
+                        return true;
+                    }
+                }
+                if incoming_remaining == 0 {
+                    return false;
+                }
+                order.leaves -= consumed;
+                if order.leaves > 0 {
+                    order.displayed = order.display.working_lots(order.leaves);
+                    order.previous = None;
+                    order.next = None;
+                    queue.push_back(order);
+                }
+            }
+            price = book.next_worse_price(incoming.side.opposite(), current_price);
+        }
+        false
+    }
+
     fn generated_book_and_fok(generator: &mut Generator) -> (OrderBook, NewOrder) {
         let limits = OrderBookLimits::new(OrderBookLimitsSpec {
             max_active_orders: 32,
@@ -9949,6 +10245,21 @@ mod price_level_index_tests {
                 book.can_fill(&incoming),
                 reference_can_fill(&book, &incoming),
                 "FOK model divergence in generated case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn allocation_free_minimum_scan_matches_slice_queue_reference() {
+        let mut generator = Generator(0xa73d_0be2_91f6_4c85);
+        for case in 0..20_000 {
+            let (book, mut incoming) = generated_book_and_fok(&mut generator);
+            incoming.self_trade_prevention = SelfTradePrevention::DecrementAndCancel;
+            let required = generator.bounded(incoming.quantity.lots()) + 1;
+            assert_eq!(
+                book.can_execute_minimum_quantity(IncomingPreview::from(incoming), required),
+                reference_can_execute_decrement_and_cancel_minimum(&book, &incoming, required),
+                "minimum-quantity model divergence in generated case {case}"
             );
         }
     }

@@ -119,8 +119,9 @@ commit is bounded by
 `O(K log(O + 1) + E + (L + K) log(P + 1))`; this includes trigger-index
 removal and possible stop-limit residual insertion. FOK or minimum-quantity IOC
 activation can add its ordinary crossed-order inspection; FOK decrement-and-
-cancel uses the same nonmutating self-barrier scan as direct entry. Counting
-retained eligible backlog is
+cancel uses the same nonmutating self-barrier scan as direct entry, while
+minimum-quantity decrement-and-cancel uses its exact two-counter reserve-round
+scan. Counting retained eligible backlog is
 `O(R + 1)` for `R` stops remaining at the committed reference. A sweep with no
 eligible stop is `O(1)` and still records the reference; a partial sweep
 requires exact-reference continuation before cursor advancement. Source-ID,
@@ -306,17 +307,32 @@ semantic validation time.
 
 ## Immediate-quantity preflight
 
-FOK or minimum-quantity IOC preflight over `O_c` active orders in `P_c` crossed
-levels is
-`O(O_c + P_c log P)` time and `O(1)` auxiliary space. Each inspected order is
-visited at most once; complexity is independent of the number of reserve
-slices that subsequent execution emits. A displayed-class self barrier admits
-only preceding working slices; a hidden-class self barrier admits the total
-leaves of the preceding displayed class and earlier hidden leaves. FOK scans
-for original external-trade quantity and applies the barrier to cancel-
-aggressor, cancel-both, and decrement-and-cancel. Minimum-quantity IOC scans
-for its explicit threshold and rejects decrement-and-cancel at admission. The
-new FOK policy changes no asymptotic time, space, or allocation bound.
+FOK and minimum-quantity IOC under permit, cancel-aggressor, cancel-resting, or
+cancel-both preflight over `O_c` active orders in `P_c` crossed levels in
+`O(O_c + P_c log(P + 1))` time and `O(1)` auxiliary space. Each inspected
+order is visited at most once; complexity is independent of the number of
+reserve slices that subsequent execution emits. A displayed-class self barrier
+admits only preceding working slices; a hidden-class self barrier admits the
+total leaves of the preceding displayed class and earlier hidden leaves. FOK
+scans for original external-trade quantity and applies the barrier to cancel-
+aggressor, cancel-both, and decrement-and-cancel.
+
+Minimum-quantity IOC under decrement-and-cancel requires exact coupled
+incoming-leaves and external-trade counters. For `D_p` displayed orders and a
+maximum of `R_p` remaining reserve rounds at crossed price `p`, its preflight
+is
+
+```text
+O(O_c + P_c log(P + 1) + sum_p D_p log(R_p + 1)) time
+O(1) auxiliary space
+```
+
+The scanner visits initial displayed slices in FIFO order, binary-searches
+monotone complete-round totals, visits at most one partial round exactly, and
+then visits hidden orders. Admission bounds `R_p` by `u32`, so each per-price
+binary search requires at most 32 aggregate passes. The scan allocates no
+queue and does not mutate matching, risk, reservation, sequence, or public
+state.
 
 ## Default matching limits and memory
 

@@ -241,8 +241,12 @@ shard, from command admission through checkpoint capture.
     is a barrier after every total leaf in the preceding displayed class
     because refresh remains ahead of hidden orders, plus all earlier hidden-
     class leaves. FOK requires original quantity. Minimum-quantity IOC requires
-    its explicit threshold and rejects decrement-and-cancel at admission. The
-    scan visits each inspected order once and uses constant auxiliary space.
+    its explicit external-trade threshold. Under decrement-and-cancel its exact
+    two-counter simulation consumes both incoming leaves and each self maker's
+    current slice, bulk-counts complete reserve-refresh rounds, evaluates at
+    most one partial round in FIFO order, and then visits the hidden class.
+    Failure leaves all maker, STP, risk, reservation, and public state
+    unchanged. Both paths use constant auxiliary space and allocate nothing.
 
 ### Capacity bounds and prepared commands
 
@@ -709,8 +713,8 @@ interest for discovery, allocation, and uncross preparation.
       preparation, stale commit, or committed result returns that set.
     - The book primitive itself has no command sequence, phase, idempotency,
       or durability semantics. `CallAuctionEngine` supplies the first three,
-      and the version-17 durable wrapper supplies stable wire encoding,
-      full-WAL recovery, and snapshot-version-17 checkpoint/cutover recovery.
+      and the version-18 durable wrapper supplies stable wire encoding,
+      full-WAL recovery, and snapshot-version-18 checkpoint/cutover recovery.
     - The separate `CallAuctionRiskManagedEngine` supplies optional profile
       admission, reservations, positions, and independently replayed coupled
       checkpoints; settlement, public/private auction transport, venue-specific
@@ -900,7 +904,7 @@ admission and tracks reservations and positions.
    risk-rejected submits and replacements because they still require core
    preparation.
 8. The coupled checkpoint has a stable complete-value little-endian codec and
-   direct restore under default or explicit limits. Snapshot version 17 assigns
+   direct restore under default or explicit limits. Snapshot version 18 assigns
    it `QSNP` kind `5`. `DurableCallAuctionRiskEngine` binds a canonical
    definition/profile prefix, persists command/report pairs, completes at most
    one dangling non-retry command, verifies risk-aware replay, and supports
@@ -912,7 +916,7 @@ admission and tracks reservations and positions.
 This section defines WAL persistence, recovery, and checkpoint rules for the
 call-auction engine.
 
-1. WAL version 17 retains stable record-kind tags `9` and `10` for one
+1. WAL version 18 retains stable record-kind tags `9` and `10` for one
    call-auction command and its complete execution report. All multibyte fields
    are little-endian, enum tags are explicit, and decoding reconstructs and
    validates domain values, contiguous event sequencing, report outcome/event
@@ -929,7 +933,7 @@ call-auction engine.
    private identities.
 2. An uncut auction journal contains one immutable instrument definition
    followed by strict command/report pairs. A compacted journal instead begins
-   with one kind-`8` anchor bound to snapshot-version-17 call-auction kind `4`,
+   with one kind-`8` anchor bound to snapshot-version-18 call-auction kind `4`,
    followed by the same suffix grammar. A report without a command, consecutive
    commands, a second definition, an interior anchor, a
    continuous-matching/risk/ledger record, or any other kind fails recovery. At
@@ -1655,7 +1659,7 @@ storage, and recovery grammar.
     generation and first-retained-sequence selector after the new generation is
     synchronized.
 22. Matching, coupled risk, ledger, and call-auction cutover publishes an
-    inactive A/B checkpoint slot before publishing a synchronized version-17
+    inactive A/B checkpoint slot before publishing a synchronized version-18
     anchor and any
     retained suffix. Single-file storage atomically renames the complete
     anchor-plus-suffix file over the WAL. Segmented storage synchronizes every
@@ -1676,7 +1680,7 @@ storage, and recovery grammar.
 This section defines the semantic snapshot file format and the checkpoint
 capture, verification, and cutover rules.
 
-1. A version-17 `QSNP` file carries a fixed 28 B header with magic, typed
+1. A version-18 `QSNP` file carries a fixed 28 B header with magic, typed
    payload kind (`1` ledger, `2` matching, `3` coupled risk/matching, `4` call
    auction,
    `5` coupled call-auction risk),
@@ -1703,7 +1707,7 @@ capture, verification, and cutover rules.
 9. Ledger, matching, coupled risk, and call-auction checkpoints retain complete
    semantic history. Uncut recovery scans the complete WAL to prove the prefix.
    Cutover in either physical layout replaces that prefix with an anchor bound
-   to one version-17 A/B snapshot slot, so reopen scans only the
+   to one version-18 A/B snapshot slot, so reopen scans only the
    anchor and suffix. This does not bound checkpoint memory, capture pause,
    retained idempotency/audit history, or semantic shard-generation lifetime.
 10. Matching candidate capture requires exact live topology and command-derived
@@ -1758,8 +1762,8 @@ capture, verification, and cutover rules.
       namespace mutation.
 
 The authoritative persisted framing and payload schemas are
-[WAL format version 17](wal-v17.md) and
-[Semantic snapshot format version 17](snapshot-v17.md). Filesystem and device
+[WAL format version 18](wal-v18.md) and
+[Semantic snapshot format version 18](snapshot-v18.md). Filesystem and device
 assumptions are bounded by the [Local storage contract](storage.md).
 
 ## Failure model
@@ -1811,11 +1815,13 @@ market/limit activation, FOK/post-only/capacity terminal cancellation,
 replacement priority, cancellation/expiry/control removal, risk reservation,
 publisher canonical-order rejection, checkpoint lineage corruption, durable
 reopen, and exact retry without frame growth.
-Minimum-quantity tests cover grid and total-quantity admission, unsupported
-decrement-and-cancel, atomic threshold failure under cancel-resting, execution
-beyond a met threshold, reserve refresh behind a self barrier, market-data
-no-change projection, dormant-stop replacement/activation, checkpoint restore,
-stable tags, WAL recovery, and exact retry.
+Minimum-quantity tests cover grid and total-quantity admission, atomic threshold
+failure under cancel-resting and decrement-and-cancel, execution beyond a met
+threshold, self decrement without false threshold credit, reserve refresh and
+hidden-class priority, market-data no-change/trade projection, dormant-stop
+replacement/activation, coupled-risk checkpoint restoration, stable tags, WAL
+recovery, exact retry, and 20,000 generated comparisons with a literal
+slice/requeue reference queue.
 Account-control tests cover stale/exhausted revisions, exact retry, atomic
 canonical cancellation, admission fencing, re-enable, protected-history use,
 constructor capacity stability/exhaustion, unprofiled risk rejection,
@@ -2077,8 +2083,10 @@ There is no additional claim that semantic checkpoint history is size bounded.
   with cancellation of the unexecuted portion, in the
   [FIX Latest field registry](https://fiximate.fixtrading.org/en/FIX.Latest/fields_sorted_by_tagnum.html).
   Quotick combines those concepts in one explicit TIF and specifies its own
-  atomic STP, reserve, stop-activation, and remainder semantics; it does not
-  claim FIX message compatibility.
+  atomic STP, reserve, stop-activation, and remainder semantics. Under
+  decrement-and-cancel, only external trades satisfy `MinQty`; prevented self
+  quantity still consumes incoming leaves. This is an internal deterministic
+  contract, not FIX message or venue compatibility.
 - FIX 5.0 SP2 `TimeInForce(59)` assigns `4` to Fill or Kill in the
   [FIX field definition](https://fiximate.fixtrading.org/legacy/en/FIX.5.0SP2/tag59.html).
   Quotick requires the original FOK quantity to execute as external trades and
