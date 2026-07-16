@@ -933,6 +933,14 @@ fn reserve_definition_commands_and_post_refresh_state_survive_wal_recovery() {
     let private = recovered.book().order(OrderId::new(1).unwrap()).unwrap();
     assert_eq!(private.leaves_quantity.lots(), 15);
     assert_eq!(private.working_quantity.lots(), 5);
+    assert_eq!(
+        recovered
+            .book()
+            .try_price_level_orders(Side::Sell, Price::from_raw(100))
+            .unwrap()
+            .collect::<Vec<_>>(),
+        [private]
+    );
     assert_eq!(recovered.book().best_ask().unwrap().quantity, 5);
     assert!(
         live_report

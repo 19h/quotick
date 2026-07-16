@@ -4429,6 +4429,56 @@ duplicate, omitted, reordered, cloned, or wrongly grouped posting; linear leg
 scan; silent contradiction; mutation; allocation; recovery difference; or
 implied authorization falsifies A126.
 
+## A127 — prevalidated private price-level order traversal
+
+**Assumption.** One `try_price_level_orders` query observes one immutable
+continuous `OrderBook` borrow at an exact `(Side, Price)` key. An unoccupied
+key returns an empty iterator. An occupied key is fully validated before the
+iterator is returned: every member must resolve through the active-order
+index, match the selected side and price, be non-dormant, have valid positive
+working/total leaves and display policy, follow reciprocal FIFO links in
+displayed/reserve-before-hidden class order, and reproduce the level tail,
+displayed tail, order counts, public quantity, and future-event aggregate.
+
+After validation, `PriceLevelOrders` yields complete `OrderSnapshot` values in
+executable displayed-class FIFO then hidden-class FIFO order. It is exact-size,
+double-ended, and fused; mixed front/back consumption cannot duplicate or omit
+a row. It retains only the immutable book borrow, selected key, front/back
+identities, and remaining count. Raw FIFO links and internal level aggregates
+are not public output. Safe Rust cannot mutate the borrowed book between
+validation and exhaustion.
+
+The query creates no second queue or owned output, allocates no successful-
+path storage, and changes no order, level, account, sequence, history, risk,
+WAL, snapshot, or market-data state. Human-readable failure detail after
+pre-output corruption detection remains an A12 allocation boundary. The view
+is process-local private state and supplies no authentication, authorization,
+entitlement, remote pagination, or transport.
+
+**Dependent results.** [A1, A3, A10, A12, A22, A44, A45, A47, A72, A83,
+A103, A127] For `K` orders at the selected key among `O` active orders and `P`
+occupied prices, lookup is `O(log(P + 1))`; prevalidation and complete
+iteration each perform `K` expected `O(1)` active-order resolutions. Total
+expected time is `O(log(P + 1) + K)` with `O(1)` iterator state and zero output
+allocation. A full adversarial active-order collision cluster can increase
+each pass to `O(K O)` without storage growth. Checkpoint and WAL restoration
+reproduce the same queue because they rebuild the validated private FIFO; no
+wire-version change follows.
+
+**Falsification probe.** Exercise both sides, multiple and signed prices,
+unoccupied and hidden-only levels, fully displayed/reserve/hidden members,
+partial current slices, reserve refresh to the displayed-class tail, and mixed
+front/back traversal while checking exact size after each step. Compare every
+price level in at least 20,000 generated books with an independent forward-
+link model in both directions. Corrupt missing identity, side, price, dormant
+state, previous/next topology, cycle, working/leaves relationship, display
+class order, head/tail, count, public aggregate, displayed tail, and event work;
+require a typed constructor failure before any row exists. Repeat after direct
+checkpoint and full-WAL recovery while checking complete state and telemetry
+before and after the query. Any partial output before validation, duplicate,
+omission, order/class divergence, leaked raw link, mutation, allocation,
+recovery difference, or implied authorization falsifies A127.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -4491,6 +4541,17 @@ capability, a remaining risk, or an opportunity.
   complete order snapshot, and instrument/version/event-sequence provenance
   without output allocation under A125. Reserve refresh and hidden-class
   semantics are checked against every order in 20,000 generated books.
+
+- **Medium impact:** prevalidated private price-level traversal now exposes
+  complete displayed/reserve/hidden executable FIFO order in both directions
+  under A127 without an output allocation or raw-link disclosure. Every level
+  in the same 20,000 generated books is compared with an independent link
+  model; target-hardware validation and traversal latency remain unknown.
+
+- **High impact risk:** the price-level iterator exposes private account,
+  order, total-leaves, working-slice, display, and expiry state to its local
+  in-process caller. Authentication, entitlement, venue disclosure policy,
+  conflation, remote pagination, and transport remain separate interfaces.
 
 - **Medium impact risk:** queue position is a state observation, not a fill-
   probability or latency estimate. Subsequent execution, cancellation,

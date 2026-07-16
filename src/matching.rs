@@ -1666,6 +1666,117 @@ impl OrderQueuePosition {
     }
 }
 
+/// Prevalidated private resting orders at one price level.
+///
+/// The iterator follows executable displayed-then-hidden FIFO priority. It is
+/// exact-size, double-ended, allocation-free, and bound to one immutable book
+/// borrow.
+#[derive(Clone)]
+pub struct PriceLevelOrders<'a> {
+    book: &'a OrderBook,
+    side: Side,
+    price: Price,
+    front: Option<OrderId>,
+    back: Option<OrderId>,
+    remaining: usize,
+}
+
+impl fmt::Debug for PriceLevelOrders<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PriceLevelOrders")
+            .field("side", &self.side)
+            .field("price", &self.price)
+            .field("remaining", &self.remaining)
+            .finish()
+    }
+}
+
+impl<'a> PriceLevelOrders<'a> {
+    fn empty(book: &'a OrderBook, side: Side, price: Price) -> Self {
+        Self {
+            book,
+            side,
+            price,
+            front: None,
+            back: None,
+            remaining: 0,
+        }
+    }
+
+    fn new(
+        book: &'a OrderBook,
+        side: Side,
+        price: Price,
+        level: PriceLevel,
+        remaining: usize,
+    ) -> Self {
+        Self {
+            book,
+            side,
+            price,
+            front: Some(level.head),
+            back: Some(level.tail),
+            remaining,
+        }
+    }
+
+    fn prevalidated_order(&self, order_id: OrderId) -> (RestingOrder, OrderSnapshot) {
+        let order = self
+            .book
+            .orders
+            .get(&order_id)
+            .copied()
+            .expect("prevalidated price-level order must remain indexed");
+        let snapshot = order
+            .order_snapshot()
+            .expect("prevalidated price-level order must remain valid")
+            .expect("prevalidated price-level order cannot become dormant");
+        (order, snapshot)
+    }
+}
+
+impl Iterator for PriceLevelOrders<'_> {
+    type Item = OrderSnapshot;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let order_id = self.front?;
+        let (order, snapshot) = self.prevalidated_order(order_id);
+        self.remaining -= 1;
+        if self.remaining == 0 {
+            debug_assert_eq!(self.back, Some(order_id));
+            self.front = None;
+            self.back = None;
+        } else {
+            self.front = order.next;
+        }
+        Some(snapshot)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl DoubleEndedIterator for PriceLevelOrders<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let order_id = self.back?;
+        let (order, snapshot) = self.prevalidated_order(order_id);
+        self.remaining -= 1;
+        if self.remaining == 0 {
+            debug_assert_eq!(self.front, Some(order_id));
+            self.front = None;
+            self.back = None;
+        } else {
+            self.back = order.previous;
+        }
+        Some(snapshot)
+    }
+}
+
+impl ExactSizeIterator for PriceLevelOrders<'_> {}
+impl std::iter::FusedIterator for PriceLevelOrders<'_> {}
+
 /// One immutable private-book immediate-execution query.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImmediateExecutionRequest {
@@ -7045,6 +7156,31 @@ impl OrderBook {
             .map(|level| Self::level_snapshot(price, level))
     }
 
+    /// Validates and iterates private resting orders at one price.
+    ///
+    /// Output follows executable priority: fully displayed and reserve orders
+    /// in FIFO order, followed by fully hidden orders in FIFO order. A missing
+    /// price returns an empty exact-size iterator. Validation and iteration
+    /// allocate no output or auxiliary storage and do not mutate the book.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] before exposing any order if the selected
+    /// price level contradicts its side, price, FIFO, display-class, order
+    /// state, tail, count, public aggregate, or event-work invariants.
+    pub fn try_price_level_orders(
+        &self,
+        side: Side,
+        price: Price,
+    ) -> Result<PriceLevelOrders<'_>, InvariantViolation> {
+        let Some(level) = self.levels(side).get(price).copied() else {
+            return Ok(PriceLevelOrders::empty(self, side, price));
+        };
+        let mut indexed_orders = 0;
+        let order_count = self.validate_price_level(side, price, &level, &mut indexed_orders)?;
+        Ok(PriceLevelOrders::new(self, side, price, level, order_count))
+    }
+
     /// Returns a resting order by identifier.
     #[must_use]
     pub fn order(&self, order_id: OrderId) -> Option<OrderSnapshot> {
@@ -8034,120 +8170,132 @@ impl OrderBook {
         }
     }
 
+    fn validate_side(&self, side: Side) -> Result<usize, InvariantViolation> {
+        let mut indexed_orders = 0_usize;
+        for (&price, level) in self.levels(side).iter() {
+            self.validate_price_level(side, price, level, &mut indexed_orders)?;
+        }
+        Ok(indexed_orders)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "one allocation-free pass audits links, display classes, and aggregates"
     )]
-    fn validate_side(&self, side: Side) -> Result<usize, InvariantViolation> {
-        let mut indexed_orders = 0_usize;
-        for (&price, level) in self.levels(side).iter() {
-            if level.order_count == 0 {
-                return Err(InvariantViolation::new(format!(
-                    "empty {side:?} level at price {}",
-                    price.raw()
-                )));
-            }
-            let mut current = Some(level.head);
-            let mut previous = None;
-            let mut count = 0_u64;
-            let mut visible_count = 0_u64;
-            let mut total = 0_u128;
-            let mut event_units = 0_u128;
-            let mut displayed_tail = None;
-            let mut hidden_class_started = false;
-            while let Some(order_id) = current {
-                if indexed_orders >= self.orders.len() {
-                    return Err(InvariantViolation::new(format!(
-                        "order {order_id} is duplicated or participates in a FIFO cycle"
-                    )));
-                }
-                let order = self.orders.get(&order_id).ok_or_else(|| {
-                    InvariantViolation::new(format!("level references missing order {order_id}"))
-                })?;
-                if order.side != side || order.price != price {
-                    return Err(InvariantViolation::new(format!(
-                        "order {order_id} is indexed under the wrong side or price"
-                    )));
-                }
-                if order.is_dormant_stop() {
-                    return Err(InvariantViolation::new(format!(
-                        "dormant stop {order_id} appears in a price level"
-                    )));
-                }
-                if order.previous != previous {
-                    return Err(InvariantViolation::new(format!(
-                        "order {order_id} has a broken previous FIFO link"
-                    )));
-                }
-                if order.displayed == 0 || order.displayed > order.leaves {
-                    return Err(InvariantViolation::new(format!(
-                        "order {order_id} has invalid working/total leaves"
-                    )));
-                }
-                match order.display {
-                    OrderDisplay::FullyDisplayed if order.displayed != order.leaves => {
-                        return Err(InvariantViolation::new(format!(
-                            "fully displayed order {order_id} hides leaves"
-                        )));
-                    }
-                    OrderDisplay::Reserve { peak } if order.displayed > peak.lots() => {
-                        return Err(InvariantViolation::new(format!(
-                            "reserve order {order_id} exceeds its display peak"
-                        )));
-                    }
-                    OrderDisplay::Hidden if order.displayed != order.leaves => {
-                        return Err(InvariantViolation::new(format!(
-                            "hidden order {order_id} has a partial working quantity"
-                        )));
-                    }
-                    _ => {}
-                }
-                if order.display.is_hidden() {
-                    hidden_class_started = true;
-                } else {
-                    if hidden_class_started {
-                        return Err(InvariantViolation::new(format!(
-                            "displayed-priority order {order_id} follows hidden liquidity"
-                        )));
-                    }
-                    displayed_tail = Some(order_id);
-                    visible_count += 1;
-                    total += u128::from(order.displayed);
-                }
-                count += 1;
-                indexed_orders = indexed_orders.checked_add(1).ok_or_else(|| {
-                    InvariantViolation::new("price-index total order count is exhausted")
-                })?;
-                event_units = event_units
-                    .checked_add(order.remaining_event_units())
-                    .expect("active level event work must fit u128");
-                previous = Some(order_id);
-                current = order.next;
-            }
-            if previous != Some(level.tail) {
-                return Err(InvariantViolation::new(format!(
-                    "{side:?} level at {} has an incorrect tail",
-                    price.raw()
-                )));
-            }
-            if displayed_tail != level.displayed_tail {
-                return Err(InvariantViolation::new(format!(
-                    "{side:?} level at {} has an incorrect displayed-class tail",
-                    price.raw()
-                )));
-            }
-            if count != level.order_count
-                || visible_count != level.visible_order_count
-                || total != level.total_quantity
-                || event_units != level.event_units
-            {
-                return Err(InvariantViolation::new(format!(
-                    "{side:?} level at {} has inconsistent aggregates",
-                    price.raw()
-                )));
-            }
+    fn validate_price_level(
+        &self,
+        side: Side,
+        price: Price,
+        level: &PriceLevel,
+        indexed_orders: &mut usize,
+    ) -> Result<usize, InvariantViolation> {
+        if level.order_count == 0 {
+            return Err(InvariantViolation::new(format!(
+                "empty {side:?} level at price {}",
+                price.raw()
+            )));
         }
-        Ok(indexed_orders)
+        let initial_indexed_orders = *indexed_orders;
+        let mut current = Some(level.head);
+        let mut previous = None;
+        let mut count = 0_u64;
+        let mut visible_count = 0_u64;
+        let mut total = 0_u128;
+        let mut event_units = 0_u128;
+        let mut displayed_tail = None;
+        let mut hidden_class_started = false;
+        while let Some(order_id) = current {
+            if *indexed_orders >= self.orders.len() {
+                return Err(InvariantViolation::new(format!(
+                    "order {order_id} is duplicated or participates in a FIFO cycle"
+                )));
+            }
+            let order = self.orders.get(&order_id).ok_or_else(|| {
+                InvariantViolation::new(format!("level references missing order {order_id}"))
+            })?;
+            if order.side != side || order.price != price {
+                return Err(InvariantViolation::new(format!(
+                    "order {order_id} is indexed under the wrong side or price"
+                )));
+            }
+            if order.is_dormant_stop() {
+                return Err(InvariantViolation::new(format!(
+                    "dormant stop {order_id} appears in a price level"
+                )));
+            }
+            if order.previous != previous {
+                return Err(InvariantViolation::new(format!(
+                    "order {order_id} has a broken previous FIFO link"
+                )));
+            }
+            if order.displayed == 0 || order.displayed > order.leaves {
+                return Err(InvariantViolation::new(format!(
+                    "order {order_id} has invalid working/total leaves"
+                )));
+            }
+            match order.display {
+                OrderDisplay::FullyDisplayed if order.displayed != order.leaves => {
+                    return Err(InvariantViolation::new(format!(
+                        "fully displayed order {order_id} hides leaves"
+                    )));
+                }
+                OrderDisplay::Reserve { peak } if order.displayed > peak.lots() => {
+                    return Err(InvariantViolation::new(format!(
+                        "reserve order {order_id} exceeds its display peak"
+                    )));
+                }
+                OrderDisplay::Hidden if order.displayed != order.leaves => {
+                    return Err(InvariantViolation::new(format!(
+                        "hidden order {order_id} has a partial working quantity"
+                    )));
+                }
+                _ => {}
+            }
+            if order.display.is_hidden() {
+                hidden_class_started = true;
+            } else {
+                if hidden_class_started {
+                    return Err(InvariantViolation::new(format!(
+                        "displayed-priority order {order_id} follows hidden liquidity"
+                    )));
+                }
+                displayed_tail = Some(order_id);
+                visible_count += 1;
+                total += u128::from(order.displayed);
+            }
+            count += 1;
+            *indexed_orders = indexed_orders.checked_add(1).ok_or_else(|| {
+                InvariantViolation::new("price-index total order count is exhausted")
+            })?;
+            event_units = event_units
+                .checked_add(order.remaining_event_units())
+                .expect("active level event work must fit u128");
+            previous = Some(order_id);
+            current = order.next;
+        }
+        if previous != Some(level.tail) {
+            return Err(InvariantViolation::new(format!(
+                "{side:?} level at {} has an incorrect tail",
+                price.raw()
+            )));
+        }
+        if displayed_tail != level.displayed_tail {
+            return Err(InvariantViolation::new(format!(
+                "{side:?} level at {} has an incorrect displayed-class tail",
+                price.raw()
+            )));
+        }
+        if count != level.order_count
+            || visible_count != level.visible_order_count
+            || total != level.total_quantity
+            || event_units != level.event_units
+        {
+            return Err(InvariantViolation::new(format!(
+                "{side:?} level at {} has inconsistent aggregates",
+                price.raw()
+            )));
+        }
+        Ok(*indexed_orders - initial_indexed_orders)
     }
 
     fn apply_new(
@@ -10589,6 +10737,16 @@ mod price_level_index_tests {
         }
     }
 
+    fn reference_level_order_ids(book: &OrderBook, level: &PriceLevel) -> Vec<OrderId> {
+        let mut order_ids = Vec::new();
+        let mut current = Some(level.head);
+        while let Some(order_id) = current {
+            order_ids.push(order_id);
+            current = book.orders.get(&order_id).unwrap().next;
+        }
+        order_ids
+    }
+
     fn reference_can_fill(book: &OrderBook, incoming: &NewOrder) -> bool {
         let mut remaining = incoming.quantity.lots();
         let mut price = book.best_price(incoming.side.opposite());
@@ -11586,7 +11744,52 @@ mod price_level_index_tests {
                     order.order_id
                 );
             }
+            for side in [Side::Buy, Side::Sell] {
+                for (&price, level) in book.levels(side).iter() {
+                    let expected = reference_level_order_ids(&book, level);
+                    let actual = book
+                        .try_price_level_orders(side, price)
+                        .unwrap()
+                        .map(|order| order.order_id)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual, expected,
+                        "forward price-level order diverged in generated case {case}"
+                    );
+                    assert_eq!(
+                        book.try_price_level_orders(side, price)
+                            .unwrap()
+                            .rev()
+                            .map(|order| order.order_id)
+                            .collect::<Vec<_>>(),
+                        expected.iter().rev().copied().collect::<Vec<_>>(),
+                        "reverse price-level order diverged in generated case {case}"
+                    );
+                }
+            }
         }
+    }
+
+    #[test]
+    fn price_level_order_query_rejects_corruption_before_iteration() {
+        let mut generator = Generator(0x5cd1_42a8_e709_b36f);
+        let (mut book, target) = loop {
+            let (book, _) = generated_book_and_fok(&mut generator);
+            let target = book
+                .orders
+                .values()
+                .find(|order| order.previous.is_some())
+                .copied();
+            if let Some(target) = target {
+                break (book, target);
+            }
+        };
+        book.orders.get_mut(&target.order_id).unwrap().previous = None;
+
+        let error = book
+            .try_price_level_orders(target.side, target.price)
+            .unwrap_err();
+        assert!(error.detail().contains("broken previous FIFO link"));
     }
 
     #[test]

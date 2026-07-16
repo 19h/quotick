@@ -193,6 +193,17 @@ full adversarial active-order hash collision cluster can increase traversal to
 `O(K O)` for `O` active orders without growing storage. Human-readable
 invariant detail may allocate only after relevant path corruption is detected.
 
+For one selected private price level containing `K` orders among `P` occupied
+prices and `O` active orders, `try_price_level_orders` first performs one
+`O(log(P + 1))` level lookup and an expected `O(K)` allocation-free validation
+pass. Complete forward, reverse, or mixed traversal then performs another `K`
+expected `O(1)` active-order lookups. Total expected construction-plus-
+consumption time is `O(log(P + 1) + K)` with `O(1)` iterator state and no
+caller-owned output. A full adversarial active-order hash collision cluster can
+increase each pass to `O(K O)` without storage growth. An absent level is
+`O(log(P + 1))` and empty. Human-readable invariant detail may allocate only
+after validation detects corruption and before an iterator is returned.
+
 ## Call-auction discovery and allocation
 
 For `B` canonical aggregate bid levels and `A` canonical aggregate ask

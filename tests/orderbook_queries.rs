@@ -5,8 +5,8 @@ use quotick::instrument::{
 use quotick::matching::{
     Command, CommandOutcome, EventKind, ImmediateExecutionRequest, ImmediateExecutionTermination,
     MassCancelScope, MatchingHashIndex, NewOrder, OrderBook, OrderBookQueryError,
-    OrderBookQueryResource, OrderDisplay, OrderQueueClass, OrderType, RejectReason,
-    SelfTradePrevention, StopActivation, TimeInForce,
+    OrderBookQueryResource, OrderDisplay, OrderQueueClass, OrderType, PriceLevelOrders,
+    RejectReason, SelfTradePrevention, StopActivation, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -374,6 +374,14 @@ fn queue_positions_model_current_slices_reserve_refresh_and_hidden_priority() {
         received_at: TimestampNs::from_unix_nanos(6),
     });
     assert_eq!(book.submit(take).unwrap().outcome, CommandOutcome::Accepted);
+    assert_eq!(
+        book.try_price_level_orders(Side::Sell, Price::from_raw(100))
+            .unwrap()
+            .map(|order| order.order_id.get())
+            .collect::<Vec<_>>(),
+        [2, 3, 1, 4, 5],
+        "the refreshed reserve slice must rejoin the displayed-class tail"
+    );
 
     let refreshed = book
         .try_order_queue_position(OrderId::new(1).unwrap())
@@ -391,6 +399,68 @@ fn queue_positions_model_current_slices_reserve_refresh_and_hidden_priority() {
         .unwrap();
     assert_eq!(hidden_after_refresh.order_count_ahead(), 3);
     assert_eq!(hidden_after_refresh.executable_quantity_ahead_lots(), 17);
+    book.validate().unwrap();
+}
+
+#[test]
+fn private_price_level_orders_are_prevalidated_exact_and_double_ended() {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<PriceLevelOrders<'static>>();
+
+    let book = queue_position_book();
+    let before_commands = book.retained_command_count();
+    let before_depth = book.depth_iter(Side::Sell).collect::<Vec<_>>();
+    let mut orders = book
+        .try_price_level_orders(Side::Sell, Price::from_raw(100))
+        .unwrap();
+    assert_eq!(orders.len(), 5);
+    assert_eq!(orders.next().unwrap().order_id, OrderId::new(1).unwrap());
+    assert_eq!(orders.len(), 4);
+    assert_eq!(
+        orders.next_back().unwrap().order_id,
+        OrderId::new(5).unwrap()
+    );
+    assert_eq!(orders.len(), 3);
+    assert_eq!(orders.next().unwrap().order_id, OrderId::new(2).unwrap());
+    assert_eq!(
+        orders.next_back().unwrap().order_id,
+        OrderId::new(4).unwrap()
+    );
+    let reserve = orders.next().unwrap();
+    assert_eq!(reserve.order_id, OrderId::new(3).unwrap());
+    assert_eq!(reserve.leaves_quantity, Quantity::new(8).unwrap());
+    assert_eq!(reserve.working_quantity, Quantity::new(2).unwrap());
+    assert!(orders.next().is_none());
+    assert!(orders.next_back().is_none());
+
+    let hidden_only = populated_book();
+    let hidden = hidden_only
+        .try_price_level_orders(Side::Buy, Price::from_raw(110))
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert_eq!(hidden.len(), 1);
+    assert_eq!(hidden[0].order_id, OrderId::new(20).unwrap());
+    assert_eq!(hidden[0].display, OrderDisplay::Hidden);
+    assert_eq!(
+        book.try_price_level_orders(Side::Buy, Price::from_raw(100))
+            .unwrap()
+            .len(),
+        0
+    );
+    let restored = OrderBook::from_checkpoint(&book.checkpoint(1, 11).unwrap()).unwrap();
+    assert_eq!(
+        restored
+            .try_price_level_orders(Side::Sell, Price::from_raw(100))
+            .unwrap()
+            .map(|order| order.order_id.get())
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5]
+    );
+    assert_eq!(book.retained_command_count(), before_commands);
+    assert_eq!(
+        book.depth_iter(Side::Sell).collect::<Vec<_>>(),
+        before_depth
+    );
     book.validate().unwrap();
 }
 
