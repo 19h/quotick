@@ -551,6 +551,28 @@ no allocation, and decline or predicate unwind mutates nothing. Durable
 acceptance and core or risk rejection append the existing command and report
 frames; decline, unwind, and exact replay append zero frames.
 
+`try_submit_immediate_execution_curve_if` reuses that same command preflight
+and its first quote scan `Q`, then requests exactly `C` curve rows and performs
+one identical population scan before a predicate of cost `F`. For ordinary IOC
+commit cost `M`, acceptance is
+
+```text
+O(2Q + C + F + M) = O(Q + F + M) time
+O(C) retained caller-owned curve output
+```
+
+and decline is `O(2Q + C + F) = O(Q + F)` time with the same `O(C)` returned
+curve. Scanner auxiliary state remains `O(1)`. The allocator may grant more
+capacity than the exact `C`-row request, but population does not grow the
+vector. Curve allocation failure occurs after ordinary immutable preparation
+and the first scan but before predicate, identity, sequence, risk, matching, or
+WAL mutation. Core/risk rejection and exact replay skip curve allocation, the
+second scan, and `F`. Coupled risk retains the two expected `O(1)` checks on
+acceptance. Durable acceptance and business rejection append the existing two
+frames; allocation failure, decline, unwind, and replay append zero. All
+quantity, count, and signed-notional reconciliation uses exact integer
+arithmetic, so numerical approximation error is zero.
+
 ## Default matching limits and memory
 
 This section states the default resource envelopes, the buffer pools, the

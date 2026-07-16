@@ -19,8 +19,11 @@ use crate::journal::{
     SegmentedJournalError, SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
 };
 use crate::matching::{
-    Command, CommandPreparation, ExecutionReport, ImmediateExecutionOutcome,
-    ImmediateExecutionQuote, ImmediateExecutionSubmission, MatchingError, PreparedCommand,
+    Command, CommandPreparation, ConditionalImmediateExecutionDecision,
+    ConditionalImmediateExecutionPreparation, ExecutionReport, ImmediateExecutionCurve,
+    ImmediateExecutionCurveOutcome, ImmediateExecutionOutcome, ImmediateExecutionQuote,
+    ImmediateExecutionSubmission, MatchingError, OrderBook, OrderBookQueryError, PreparedCommand,
+    evaluate_conditional_immediate_execution,
 };
 use crate::risk::{
     AccountRiskDefinition, RiskError, RiskInvariantViolation, RiskManagedCheckpoint,
@@ -213,6 +216,8 @@ pub enum DurableRiskError {
     SegmentedJournal(SegmentedJournalError),
     /// Matching operational failure.
     Matching(MatchingError),
+    /// Exact caller-owned order-book query output could not be constructed.
+    OrderBookQuery(OrderBookQueryError),
     /// Risk-profile validation failure.
     Risk(RiskError),
     /// Reconstructed matching/risk state violated an invariant.
@@ -351,6 +356,7 @@ impl fmt::Display for DurableRiskError {
             Self::Journal(error) => error.fmt(formatter),
             Self::SegmentedJournal(error) => error.fmt(formatter),
             Self::Matching(error) => error.fmt(formatter),
+            Self::OrderBookQuery(error) => error.fmt(formatter),
             Self::Risk(error) => error.fmt(formatter),
             Self::Invariant(error) => error.fmt(formatter),
             Self::Checkpoint(error) => error.fmt(formatter),
@@ -473,6 +479,7 @@ impl std::error::Error for DurableRiskError {
             Self::Journal(error) => Some(error),
             Self::SegmentedJournal(error) => Some(error),
             Self::Matching(error) => Some(error),
+            Self::OrderBookQuery(error) => Some(error),
             Self::Risk(error) => Some(error),
             Self::Invariant(error) => Some(error),
             Self::Checkpoint(error) => Some(error),
@@ -506,6 +513,12 @@ impl From<StorageError> for DurableRiskError {
 impl From<MatchingError> for DurableRiskError {
     fn from(error: MatchingError) -> Self {
         Self::Matching(error)
+    }
+}
+
+impl From<OrderBookQueryError> for DurableRiskError {
+    fn from(error: OrderBookQueryError) -> Self {
+        Self::OrderBookQuery(error)
     }
 }
 
@@ -883,32 +896,76 @@ impl DurableRiskOrderBook {
         submission: ImmediateExecutionSubmission,
         accept: impl FnOnce(ImmediateExecutionQuote) -> bool,
     ) -> Result<ImmediateExecutionOutcome, DurableRiskError> {
+        self.submit_conditional_immediate_execution(
+            submission,
+            |_, quote| Ok(quote),
+            |quote| accept(*quote),
+        )
+        .map(Into::into)
+    }
+
+    /// Durably risk-gates, constructs an exact private execution curve, and
+    /// conditionally submits one canonical IOC order.
+    ///
+    /// Replay plus core or risk rejection bypass curve allocation and
+    /// `accept`. Allocation failure, decline, or predicate unwind occurs
+    /// before WAL or coupled-state mutation. Acceptance persists the command,
+    /// commits the curve-bound coupled preparation, and persists its report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableRiskError`] for poison, preparation, exact curve
+    /// construction, journal, or coupled commit failure. A failure after
+    /// command acknowledgement poisons the instance for deterministic reopen
+    /// recovery.
+    pub fn try_submit_immediate_execution_curve_if(
+        &mut self,
+        submission: ImmediateExecutionSubmission,
+        accept: impl FnOnce(&ImmediateExecutionCurve) -> bool,
+    ) -> Result<ImmediateExecutionCurveOutcome, DurableRiskError> {
+        self.submit_conditional_immediate_execution(
+            submission,
+            |book, quote| Ok(book.try_immediate_execution_curve_for_quote(quote)?),
+            accept,
+        )
+        .map(Into::into)
+    }
+
+    fn submit_conditional_immediate_execution<T>(
+        &mut self,
+        submission: ImmediateExecutionSubmission,
+        observe: impl FnOnce(&OrderBook, ImmediateExecutionQuote) -> Result<T, DurableRiskError>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalImmediateExecutionDecision<T>, DurableRiskError> {
         if self.is_poisoned() {
             return Err(DurableRiskError::Poisoned);
         }
         let preflight = self
             .managed
             .prepare_conditional_immediate_execution(submission)?;
-        let (prepared, quote) = match preflight.preparation {
-            CommandPreparation::Replay(report) => {
+        match evaluate_conditional_immediate_execution(
+            preflight,
+            |quote| observe(self.managed.book(), quote),
+            accept,
+        )? {
+            ConditionalImmediateExecutionPreparation::Complete(decision) => {
                 if self.is_poisoned() {
                     return Err(DurableRiskError::Poisoned);
                 }
-                return Ok(ImmediateExecutionOutcome::reported(None, report));
+                Ok(decision)
             }
-            CommandPreparation::Ready(prepared) => (prepared, preflight.quote),
-        };
-        if let Some(value) = quote
-            && !accept(value)
-        {
-            if self.is_poisoned() {
-                return Err(DurableRiskError::Poisoned);
+            ConditionalImmediateExecutionPreparation::Commit {
+                prepared,
+                observation,
+            } => {
+                let report = self.commit_prepared(prepared)?;
+                let retained_observation = if report.replayed { None } else { observation };
+                Ok(ConditionalImmediateExecutionDecision::Reported {
+                    observation: retained_observation,
+                    report,
+                })
             }
-            return Ok(ImmediateExecutionOutcome::Declined(value));
         }
-        let report = self.commit_prepared(prepared)?;
-        let retained_quote = if report.replayed { None } else { quote };
-        Ok(ImmediateExecutionOutcome::reported(retained_quote, report))
     }
 
     fn commit_prepared(

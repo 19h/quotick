@@ -16,11 +16,14 @@ use crate::bounded_hash::BoundedHashMap;
 use crate::domain::{AccountId, OrderId, Price, Side};
 use crate::instrument::InstrumentDefinition;
 use crate::matching::{
-    Command, CommandOutcome, CommandPreparation, EventKind, ExecutionReport,
+    Command, CommandOutcome, CommandPreparation, ConditionalImmediateExecutionDecision,
+    ConditionalImmediateExecutionPreparation, EventKind, ExecutionReport, ImmediateExecutionCurve,
+    ImmediateExecutionCurveOutcome, ImmediateExecutionCurveSubmissionError,
     ImmediateExecutionOutcome, ImmediateExecutionPreflight, ImmediateExecutionQuote,
     ImmediateExecutionSubmission, MatchingCapacity, MatchingError, NewOrder, OrderBook,
     OrderBookCheckpoint, OrderBookCheckpointError, OrderBookLimits, OrderBookLimitsSpec, OrderType,
     PreparedCommand, RejectReason, ReplaceOrder, SelfTradePrevention, Trade,
+    evaluate_conditional_immediate_execution,
 };
 
 /// Account-level order-entry state.
@@ -2009,21 +2012,72 @@ impl RiskManagedOrderBook {
         submission: ImmediateExecutionSubmission,
         accept: impl FnOnce(ImmediateExecutionQuote) -> bool,
     ) -> Result<ImmediateExecutionOutcome, MatchingError> {
-        let preflight = self.prepare_conditional_immediate_execution(submission)?;
-        match preflight.preparation {
-            CommandPreparation::Replay(report) => {
-                Ok(ImmediateExecutionOutcome::reported(None, report))
-            }
-            CommandPreparation::Ready(prepared) => {
-                let quote = preflight.quote;
-                if let Some(value) = quote
-                    && !accept(value)
-                {
-                    return Ok(ImmediateExecutionOutcome::Declined(value));
-                }
-                let report = self.commit(prepared)?;
-                let retained_quote = if report.replayed { None } else { quote };
-                Ok(ImmediateExecutionOutcome::reported(retained_quote, report))
+        self.submit_conditional_immediate_execution(
+            submission,
+            |_, quote| Ok(quote),
+            |quote| accept(*quote),
+        )
+        .map(Into::into)
+    }
+
+    /// Atomically risk-gates, constructs a private execution curve, and
+    /// conditionally submits one canonical IOC order.
+    ///
+    /// Exact replay plus core or risk rejection bypass curve allocation and
+    /// `accept`. A curve-allocation failure, decline, or predicate unwind
+    /// mutates neither matching nor risk state. Acceptance commits the same
+    /// coupled preparation observed by the predicate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImmediateExecutionCurveSubmissionError::Matching`] for
+    /// matching preparation or coupled commit failure and
+    /// [`ImmediateExecutionCurveSubmissionError::Query`] when exact curve
+    /// construction fails.
+    pub fn try_submit_immediate_execution_curve_if(
+        &mut self,
+        submission: ImmediateExecutionSubmission,
+        accept: impl FnOnce(&ImmediateExecutionCurve) -> bool,
+    ) -> Result<ImmediateExecutionCurveOutcome, ImmediateExecutionCurveSubmissionError> {
+        self.submit_conditional_immediate_execution(
+            submission,
+            |book, quote| {
+                book.try_immediate_execution_curve_for_quote(quote)
+                    .map_err(Into::into)
+            },
+            accept,
+        )
+        .map(Into::into)
+    }
+
+    fn submit_conditional_immediate_execution<T, E>(
+        &mut self,
+        submission: ImmediateExecutionSubmission,
+        observe: impl FnOnce(&OrderBook, ImmediateExecutionQuote) -> Result<T, E>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalImmediateExecutionDecision<T>, E>
+    where
+        E: From<MatchingError>,
+    {
+        let preflight = self
+            .prepare_conditional_immediate_execution(submission)
+            .map_err(E::from)?;
+        match evaluate_conditional_immediate_execution(
+            preflight,
+            |quote| observe(&self.book, quote),
+            accept,
+        )? {
+            ConditionalImmediateExecutionPreparation::Complete(decision) => Ok(decision),
+            ConditionalImmediateExecutionPreparation::Commit {
+                prepared,
+                observation,
+            } => {
+                let report = self.commit(prepared).map_err(E::from)?;
+                let retained_observation = if report.replayed { None } else { observation };
+                Ok(ConditionalImmediateExecutionDecision::Reported {
+                    observation: retained_observation,
+                    report,
+                })
             }
         }
     }

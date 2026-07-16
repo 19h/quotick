@@ -279,12 +279,13 @@ Run any program with `cargo run --example <name>`.
   decrement-and-cancel preflight counts only external trades while consuming
   prevented self quantity and is atomic on threshold failure.
 - Typed conditional immediate execution maps one request to a canonical fully
-  displayed market or limit IOC, exposes its exact private quote to a local
-  predicate under the same exclusive shard borrow, and commits that prepared
-  command only on acceptance. Core or risk rejection and exact replay bypass
-  the predicate; decline or unwind changes no identity, sequence, matching,
-  risk, or WAL state. Plain, coupled-risk, and both durable paths share the
-  contract.
+  displayed market or limit IOC and exposes either its fixed-size private quote
+  or its exact caller-owned per-price curve to a local predicate under the same
+  exclusive shard borrow. Acceptance commits that prepared command. Core or
+  risk rejection and exact replay bypass curve allocation and the predicate;
+  allocation failure, decline, or unwind changes no identity, sequence,
+  matching, risk, or WAL state. Plain, coupled-risk, and both durable paths
+  share the contract.
 - A fallible private immediate-execution curve uses that same reserve/hidden/
   STP scanner to return one exact market-ordered aggregate per contributing
   price. It requests capacity for the exact row count before copying, then
@@ -368,8 +369,8 @@ Run any program with `cargo run --example <name>`.
   business rejections always precede risk, and risk rejections are ordinary
   sequenced reports, never errors.
 - Conditional immediate execution performs the coupled-risk gate before its
-  quote-acceptance predicate and retains the existing risk authorization and
-  trace application on commit.
+  quote- or curve-acceptance predicate and retains the existing risk
+  authorization and trace application on commit.
 - Reservation lifecycle derived from the sequenced trace across fills,
   cancellation, GTD expiry, stop arming/activation, replacement, mass
   cancellation, account controls, and self-trade prevention; dormant stops
@@ -532,9 +533,11 @@ transport, account filtering, entitlement, pagination, audit export, eviction,
 or generation rollover.
 Conditional immediate-execution predicates are likewise process-local and are
 not persisted, authenticated, transported, or valid across shard borrows.
-Private immediate-execution curves can disclose executable reserve-hidden and
-fully hidden quantity by price; this local API supplies no authentication,
-entitlement, disclosure policy, remote pagination, or transport.
+Their synchronous execution extends the exclusive local shard borrow. Private
+immediate-execution curves can disclose executable reserve-hidden and fully
+hidden quantity by price; this local API supplies no authentication,
+entitlement, disclosure policy, remote pagination, callback deadline, or
+transport.
 
 The matching model is a continuous price-time-priority book with sequenced
 instrument-wide trading-state controls, plus a separate bounded call-auction
@@ -572,7 +575,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 141 tagged assumptions (A1–A141), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 142 tagged assumptions (A1–A142), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -640,9 +643,9 @@ includes:
 
 - **Matching and risk:** displayed/hidden queue classes, hidden and reserve
   admission and replenishment, frozen-best market-to-limit pricing and
-  residuals, conditional immediate-execution accept/decline/unwind and core,
-  risk, replay, WAL, and recovery boundaries, exact private per-price
-  execution curves, GTD intake and canonical expiry sweeps, dormant
+  residuals, conditional fixed-quote and exact per-price-curve execution
+  accept/decline/unwind and core, risk, replay, WAL, and recovery boundaries,
+  GTD intake and canonical expiry sweeps, dormant
   stop intake, canonical bounded trigger sweeps, activation-time failures,
   mass cancellation, account and trading-state controls, every self-trade
   policy, atomic FOK decrement-and-cancel barriers and exact minimum-quantity

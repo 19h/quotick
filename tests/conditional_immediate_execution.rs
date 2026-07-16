@@ -6,9 +6,10 @@ use quotick::instrument::{
     QuantityRules, ReserveOrderRules, TradingState,
 };
 use quotick::matching::{
-    Command, CommandOutcome, EventKind, ImmediateExecutionOutcome, ImmediateExecutionRequest,
-    ImmediateExecutionSubmission, ImmediateExecutionTermination, NewOrder, OrderBook, OrderDisplay,
-    OrderType, RejectReason, SelfTradePrevention, StopActivation, TimeInForce,
+    Command, CommandOutcome, EventKind, ImmediateExecutionCurveOutcome, ImmediateExecutionOutcome,
+    ImmediateExecutionRequest, ImmediateExecutionSubmission, ImmediateExecutionTermination,
+    NewOrder, OrderBook, OrderDisplay, OrderType, RejectReason, SelfTradePrevention,
+    StopActivation, TimeInForce,
 };
 use quotick::risk::{
     AccountRiskState, RiskLimitSpec, RiskLimits, RiskManagedOrderBook, RiskProfile,
@@ -113,6 +114,26 @@ fn report_execution_totals(report: &quotick::matching::ExecutionReport) -> (u64,
             total.1 + i128::from(trade.price.raw()) * i128::from(trade.quantity.lots()),
         )
     })
+}
+
+fn report_execution_levels(report: &quotick::matching::ExecutionReport) -> Vec<(Price, u64, i128)> {
+    let mut levels = Vec::<(Price, u64, i128)>::new();
+    for event in &report.events {
+        let EventKind::Trade(trade) = event.kind else {
+            continue;
+        };
+        let quantity = trade.quantity.lots();
+        let notional = i128::from(trade.price.raw()) * i128::from(quantity);
+        if let Some(last) = levels.last_mut()
+            && last.0 == trade.price
+        {
+            last.1 += quantity;
+            last.2 += notional;
+        } else {
+            levels.push((trade.price, quantity, notional));
+        }
+    }
+    levels
 }
 
 #[test]
@@ -241,6 +262,156 @@ fn core_and_risk_rejections_bypass_the_acceptance_predicate() {
         accepted,
         ImmediateExecutionOutcome::Reported {
             quote: Some(_),
+            report
+        } if report.outcome == CommandOutcome::Accepted
+    ));
+    assert_eq!(
+        managed
+            .risk()
+            .snapshot(AccountId::new(13).unwrap())
+            .unwrap()
+            .position_lots(),
+        3
+    );
+    managed.validate().unwrap();
+}
+
+#[test]
+fn conditional_curve_is_atomic_and_matches_the_committed_price_trace() {
+    let mut book = OrderBook::new(definition());
+    book.submit(limit(1, 1, 11, Side::Sell, 5, 99)).unwrap();
+    book.submit(limit(2, 2, 12, Side::Sell, 4, 100)).unwrap();
+    let value = submission(3, 3, 13, 1, 7);
+    let sequence_before = book.last_event_sequence();
+
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        let _ =
+            book.try_submit_immediate_execution_curve_if(value, |_| panic!("curve policy failure"));
+    }));
+    assert!(panicked.is_err());
+    assert_eq!(book.last_event_sequence(), sequence_before);
+    assert!(book.order(OrderId::new(3).unwrap()).is_none());
+
+    let declined = book
+        .try_submit_immediate_execution_curve_if(value, |curve| {
+            assert_eq!(curve.quote().book_event_sequence(), sequence_before);
+            assert_eq!(curve.quote().executed_quantity_lots(), 7);
+            assert_eq!(curve.levels().len(), 2);
+            assert_eq!(curve.levels()[0].price(), Price::from_raw(99));
+            assert_eq!(curve.levels()[0].executed_quantity_lots(), 5);
+            assert_eq!(curve.levels()[1].price(), Price::from_raw(100));
+            assert_eq!(curve.levels()[1].executed_quantity_lots(), 2);
+            false
+        })
+        .unwrap();
+    let ImmediateExecutionCurveOutcome::Declined(curve) = declined else {
+        panic!("the predicate declined the exact curve");
+    };
+    assert_eq!(curve.quote().request(), value.request());
+    assert_eq!(book.last_event_sequence(), sequence_before);
+    assert_eq!(book.best_ask().unwrap().quantity, 5);
+
+    let accepted = book
+        .try_submit_immediate_execution_curve_if(value, |curve| {
+            curve.quote().termination() == ImmediateExecutionTermination::Filled
+        })
+        .unwrap();
+    let ImmediateExecutionCurveOutcome::Reported {
+        curve: Some(committed_curve),
+        report,
+    } = accepted
+    else {
+        panic!("accepted curve decision retains its observation and report");
+    };
+    assert_eq!(report.outcome, CommandOutcome::Accepted);
+    assert_eq!(
+        report_execution_levels(&report),
+        committed_curve
+            .levels()
+            .iter()
+            .map(|level| {
+                (
+                    level.price(),
+                    level.executed_quantity_lots(),
+                    level.raw_price_notional(),
+                )
+            })
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(book.best_ask().unwrap().quantity, 2);
+
+    let replay = book
+        .try_submit_immediate_execution_curve_if(value, |_| {
+            panic!("replay must bypass curve allocation and predicate")
+        })
+        .unwrap();
+    assert!(matches!(
+        replay,
+        ImmediateExecutionCurveOutcome::Reported {
+            curve: None,
+            report
+        } if report.replayed
+    ));
+    book.validate().unwrap();
+}
+
+#[test]
+fn core_and_risk_rejections_bypass_curve_construction_and_predicate() {
+    let mut book = OrderBook::new(definition());
+    let called = Cell::new(false);
+    let outcome = book
+        .try_submit_immediate_execution_curve_if(submission(1, 1, 12, 2, 3), |_| {
+            called.set(true);
+            true
+        })
+        .unwrap();
+    assert!(!called.get());
+    assert!(matches!(
+        outcome,
+        ImmediateExecutionCurveOutcome::Reported {
+            curve: None,
+            report
+        } if report.outcome == CommandOutcome::Rejected(RejectReason::WrongInstrument)
+    ));
+
+    let mut managed = RiskManagedOrderBook::new(definition());
+    managed
+        .register_account(AccountId::new(11).unwrap(), profile(10))
+        .unwrap();
+    managed
+        .register_account(AccountId::new(12).unwrap(), profile(2))
+        .unwrap();
+    managed
+        .register_account(AccountId::new(13).unwrap(), profile(10))
+        .unwrap();
+    managed.submit(limit(2, 2, 11, Side::Sell, 5, 100)).unwrap();
+
+    called.set(false);
+    let rejected = managed
+        .try_submit_immediate_execution_curve_if(submission(3, 3, 12, 1, 3), |_| {
+            called.set(true);
+            true
+        })
+        .unwrap();
+    assert!(!called.get());
+    assert!(matches!(
+        rejected,
+        ImmediateExecutionCurveOutcome::Reported {
+            curve: None,
+            report
+        } if report.outcome == CommandOutcome::Rejected(RejectReason::RiskOrderQuantityLimit)
+    ));
+    assert_eq!(managed.book().best_ask().unwrap().quantity, 5);
+
+    let accepted = managed
+        .try_submit_immediate_execution_curve_if(submission(4, 4, 13, 1, 3), |curve| {
+            curve.levels().len() == 1 && curve.quote().raw_price_notional() == 300
+        })
+        .unwrap();
+    assert!(matches!(
+        accepted,
+        ImmediateExecutionCurveOutcome::Reported {
+            curve: Some(_),
             report
         } if report.outcome == CommandOutcome::Accepted
     ));

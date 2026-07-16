@@ -12,10 +12,10 @@ use quotick::journal::{
     Durability, Journal, JournalError, JournalOptions, JournalReader, RecordKind, RecoveryMode,
 };
 use quotick::matching::{
-    CancelReason, Command, CommandOutcome, EventKind, ExpirySweep, ImmediateExecutionOutcome,
-    ImmediateExecutionRequest, ImmediateExecutionSubmission, MatchingError, NewOrder, OrderBook,
-    OrderType, RejectReason, SelfTradePrevention, StopActivation, StopReference,
-    StopReferenceCursor, StopTriggerSweep, TimeInForce,
+    CancelReason, Command, CommandOutcome, EventKind, ExpirySweep, ImmediateExecutionCurveOutcome,
+    ImmediateExecutionOutcome, ImmediateExecutionRequest, ImmediateExecutionSubmission,
+    MatchingError, NewOrder, OrderBook, OrderType, RejectReason, SelfTradePrevention,
+    StopActivation, StopReference, StopReferenceCursor, StopTriggerSweep, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -307,6 +307,78 @@ fn durable_conditional_immediate_execution_writes_only_an_accepted_decision() {
         replay,
         ImmediateExecutionOutcome::Reported {
             quote: None,
+            report
+        } if report.replayed
+    ));
+    assert_eq!(frame_kinds(file.path(), options()).len(), frames_after);
+    durable.sync_all().unwrap();
+    drop(durable);
+
+    let reopened = DurableOrderBook::open(file.path(), definition(), options()).unwrap();
+    assert_eq!(reopened.book().best_ask().unwrap().quantity, 2);
+    reopened.book().validate().unwrap();
+}
+
+#[test]
+fn durable_conditional_curve_writes_only_acceptance_and_recovers_exact_state() {
+    let file = TestFile::new("conditional-immediate-curve");
+    let mut durable = DurableOrderBook::open(file.path(), definition(), options()).unwrap();
+    durable
+        .submit(limit_command(
+            1,
+            1,
+            11,
+            Side::Sell,
+            5,
+            100,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ))
+        .unwrap();
+    let value = immediate_submission(2, 2, 3);
+    let frames_before = frame_kinds(file.path(), options()).len();
+
+    let panicked = catch_unwind(AssertUnwindSafe(|| {
+        let _ = durable
+            .try_submit_immediate_execution_curve_if(value, |_| panic!("curve policy failure"));
+    }));
+    assert!(panicked.is_err());
+    assert_eq!(frame_kinds(file.path(), options()).len(), frames_before);
+    assert_eq!(durable.book().best_ask().unwrap().quantity, 5);
+
+    let declined = durable
+        .try_submit_immediate_execution_curve_if(value, |_| false)
+        .unwrap();
+    assert!(matches!(
+        declined,
+        ImmediateExecutionCurveOutcome::Declined(_)
+    ));
+    assert_eq!(frame_kinds(file.path(), options()).len(), frames_before);
+    assert_eq!(durable.book().best_ask().unwrap().quantity, 5);
+
+    let accepted = durable
+        .try_submit_immediate_execution_curve_if(value, |curve| {
+            curve.quote().raw_price_notional() == 300
+        })
+        .unwrap();
+    assert!(matches!(
+        accepted,
+        ImmediateExecutionCurveOutcome::Reported {
+            curve: Some(_),
+            report
+        } if !report.replayed && report.outcome == CommandOutcome::Accepted
+    ));
+    assert_eq!(frame_kinds(file.path(), options()).len(), frames_before + 2);
+    let frames_after = frame_kinds(file.path(), options()).len();
+    let replay = durable
+        .try_submit_immediate_execution_curve_if(value, |_| {
+            panic!("replay bypasses curve allocation and predicate")
+        })
+        .unwrap();
+    assert!(matches!(
+        replay,
+        ImmediateExecutionCurveOutcome::Reported {
+            curve: None,
             report
         } if report.replayed
     ));

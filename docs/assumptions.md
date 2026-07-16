@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A141 are stable and are referenced from code comments and other
+identifiers A1-A142 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -5302,6 +5302,65 @@ duplicate/zero or misordered row, quote/curve/model divergence, hidden/reserve
 priority drift, post-request growth, mutation, or implied commitment falsifies
 A141.
 
+## A142 — atomic curve-aware conditional immediate execution
+
+**Assumption.** One `try_submit_immediate_execution_curve_if` call on an
+`OrderBook`, `RiskManagedOrderBook`, `DurableOrderBook`, or
+`DurableRiskOrderBook` holds the corresponding exclusive mutable shard borrow
+through A140 preparation, A141 curve construction, a caller predicate, and
+commit of the same canonical fully displayed market-or-limit IOC preparation.
+It reuses the exact A124 quote computed during A140 preflight, fallibly requests
+capacity for that quote's `C` contributing prices, and performs one identical
+private scanner pass to populate the curve. The repeated scan must reproduce
+the supplied quote exactly; contradiction is a typed order-book query invariant
+failure in release and returns no curve.
+
+Exact replay plus core or coupled-risk rejection bypass curve allocation and
+the predicate and return a reported outcome without a current curve. On an
+otherwise admissible command, the predicate borrows the complete curve while
+the preparation and curve remain owned by the call. Curve reservation failure,
+predicate decline, or unwind drops both before consuming order identity or
+changing sequence, event, trade, matching, risk, history, public, or WAL state.
+Acceptance commits without an intervening shard mutation and returns that exact
+curve with the report.
+
+Durable variants construct the curve and invoke the predicate before appending
+the command. Acceptance and core or risk rejection retain the existing
+command-before-state-before-report protocol; allocation failure, decline,
+unwind, and replay append zero frames. Query allocation failure is typed by the
+plain combined matching/query error or the durable wrapper's order-book-query
+variant and does not poison the wrapper. A142 persists neither the curve nor
+the callback decision and reuses the existing command/report encodings without
+a wire-version change.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A7, A9, A10, A12, A15, A18,
+A19, A22, A37, A39, A44, A45, A47, A55, A57, A67, A72, A80, A81, A82,
+A83, A85, A103, A115, A117, A124, A140, A141, A142] For A124 scan cost
+`Q`, `C` contributing prices, ordinary IOC commit cost `M`, and predicate cost
+`F`, acceptance costs `O(2Q + C + F + M) = O(Q + F + M)` and decline costs
+`O(2Q + C + F) = O(Q + F)`. The first `Q` is A140 preflight; the second is
+A141 population from that prepared quote. Core/risk rejection and replay skip
+the second scan, allocation, and `F`. Coupled risk adds the existing expected
+`O(1)` authorization precheck and commit recheck. Scanner auxiliary state is
+`O(1)` and the returned/retained curve owns `O(C)` caller output. Durable
+acceptance and business rejection append two existing frames; allocation
+failure, decline, unwind, and replay append zero.
+
+**Falsification probe.** Across all four surfaces, both sides, market and limit
+constraints, signed prices, all four self-trade policies, every termination,
+and displayed, reserve, and fully hidden self/external liquidity, run predicates
+that accept, decline, and unwind. Compare every predicate curve row and quote
+with the committed trade trace and the A141 literal two-class model. Inject
+unrepresentable curve output, a supplied-quote/second-scan contradiction, core
+and every applicable risk rejection, exact retry, command-ID collision, and
+durable write/report failures. Count predicate calls, allocation attempts,
+identity/sequence availability, coupled positions/reservations, book state,
+poison, and WAL frames; reopen plain and coupled-risk logs. Any allocation or
+predicate call on rejection/replay, partial curve, quote/curve/trace mismatch,
+mutation or WAL growth before acceptance, missing typed query provenance,
+interposed shard mutation, durable protocol drift, recovery divergence, or new
+wire value falsifies A142.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -5493,14 +5552,30 @@ capability, a remaining risk, or an opportunity.
   A124 quote, and shares the 20,000-case literal reserve/hidden/STP
   differential.
 
+- **High impact:** A142 now binds the complete A141 curve, a borrowed local
+  acceptance predicate, coupled-risk authorization, and the same canonical IOC
+  commit under one exclusive shard borrow. Replay and business rejection avoid
+  curve allocation; allocation failure, decline, and unwind precede all
+  matching, risk, identity, sequence, and WAL mutation.
+
+- **Medium impact opportunity:** exact per-price predicate input permits local
+  deterministic maximum-level, stepwise slippage, and liquidity-concentration
+  admission without reconstructing private depth or risking a second-borrow
+  state change. Fee, routing, and cross-venue inputs remain external.
+
+- **Medium impact risk:** quote and curve predicates execute synchronously
+  while the shard is exclusively borrowed. Their latency and any external
+  blocking directly extend local command latency; no callback deadline,
+  scheduling isolation, or persisted decision evidence is provided.
+
 - **High impact risk:** the curve exposes executable fully hidden and reserve-
   hidden quantity by price to its process-local caller. Authentication,
   entitlement, disclosure/conflation policy, remote pagination/transport, and
   query-rate controls remain outside the order-book API.
 
-- **High impact risk:** a standalone A124 quote still neither reserves
-  liquidity nor fences a later borrow. A140 closes only the process-local
-  canonical IOC path. Remote or asynchronous quote validity, callback
+- **High impact risk:** a standalone A124 quote or A141 curve still neither
+  reserves liquidity nor fences a later borrow. A140 and A142 close only the
+  process-local canonical IOC paths. Remote or asynchronous validity, callback
   authentication/durability, fees, arbitrary display/lifetime/order types,
   cross-shard execution, and projected cancel-resting or cancel-both maker
   effects require separately specified protocols.

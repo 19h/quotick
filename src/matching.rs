@@ -2533,6 +2533,45 @@ impl From<InvariantViolation> for OrderBookQueryError {
     }
 }
 
+/// Failure while atomically binding a private execution curve to IOC submission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ImmediateExecutionCurveSubmissionError {
+    /// Command preparation or prepared commit failed.
+    Matching(MatchingError),
+    /// Exact caller-owned curve output could not be constructed.
+    Query(OrderBookQueryError),
+}
+
+impl fmt::Display for ImmediateExecutionCurveSubmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Matching(error) => error.fmt(formatter),
+            Self::Query(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ImmediateExecutionCurveSubmissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Matching(error) => Some(error),
+            Self::Query(error) => Some(error),
+        }
+    }
+}
+
+impl From<MatchingError> for ImmediateExecutionCurveSubmissionError {
+    fn from(error: MatchingError) -> Self {
+        Self::Matching(error)
+    }
+}
+
+impl From<OrderBookQueryError> for ImmediateExecutionCurveSubmissionError {
+    fn from(error: OrderBookQueryError) -> Self {
+        Self::Query(error)
+    }
+}
+
 /// Execution-priority class of one continuous resting order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OrderQueueClass {
@@ -3027,6 +3066,14 @@ pub struct ImmediateExecutionCurve {
     levels: Vec<ImmediateExecutionLevel>,
 }
 
+pub(crate) enum ConditionalImmediateExecutionDecision<T> {
+    Declined(T),
+    Reported {
+        observation: Option<T>,
+        report: ExecutionReport,
+    },
+}
+
 impl ImmediateExecutionCurve {
     fn new(quote: ImmediateExecutionQuote, levels: Vec<ImmediateExecutionLevel>) -> Self {
         debug_assert_eq!(quote.contributing_level_count(), levels.len());
@@ -3120,10 +3167,133 @@ impl ImmediateExecutionOutcome {
     }
 }
 
+impl From<ConditionalImmediateExecutionDecision<ImmediateExecutionQuote>>
+    for ImmediateExecutionOutcome
+{
+    fn from(decision: ConditionalImmediateExecutionDecision<ImmediateExecutionQuote>) -> Self {
+        match decision {
+            ConditionalImmediateExecutionDecision::Declined(quote) => Self::Declined(quote),
+            ConditionalImmediateExecutionDecision::Reported {
+                observation,
+                report,
+            } => Self::reported(observation, report),
+        }
+    }
+}
+
+/// Result of atomically evaluating a private execution-curve predicate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ImmediateExecutionCurveOutcome {
+    /// The predicate declined the curve before command or state consumption.
+    Declined(ImmediateExecutionCurve),
+    /// Matching produced a report. A curve is present only for a newly
+    /// accepted command; replay and business/risk rejection bypass curve
+    /// construction and the predicate.
+    Reported {
+        /// Exact pre-commit private execution curve for a new acceptance.
+        curve: Option<ImmediateExecutionCurve>,
+        /// Complete matching report or exact cached replay.
+        report: ExecutionReport,
+    },
+}
+
+impl ImmediateExecutionCurveOutcome {
+    /// Returns the curve associated with either decline or new acceptance.
+    #[must_use]
+    pub const fn curve(&self) -> Option<&ImmediateExecutionCurve> {
+        match self {
+            Self::Declined(curve) => Some(curve),
+            Self::Reported { curve, .. } => curve.as_ref(),
+        }
+    }
+
+    /// Returns the matching report, or `None` when the predicate declined.
+    #[must_use]
+    pub const fn report(&self) -> Option<&ExecutionReport> {
+        match self {
+            Self::Declined(_) => None,
+            Self::Reported { report, .. } => Some(report),
+        }
+    }
+
+    /// Consumes the outcome and returns its report, if matching ran.
+    #[must_use]
+    pub fn into_report(self) -> Option<ExecutionReport> {
+        match self {
+            Self::Declined(_) => None,
+            Self::Reported { report, .. } => Some(report),
+        }
+    }
+
+    pub(crate) fn reported(
+        curve: Option<ImmediateExecutionCurve>,
+        report: ExecutionReport,
+    ) -> Self {
+        Self::Reported { curve, report }
+    }
+}
+
+impl From<ConditionalImmediateExecutionDecision<ImmediateExecutionCurve>>
+    for ImmediateExecutionCurveOutcome
+{
+    fn from(decision: ConditionalImmediateExecutionDecision<ImmediateExecutionCurve>) -> Self {
+        match decision {
+            ConditionalImmediateExecutionDecision::Declined(curve) => Self::Declined(curve),
+            ConditionalImmediateExecutionDecision::Reported {
+                observation,
+                report,
+            } => Self::reported(observation, report),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ImmediateExecutionPreflight {
     pub(crate) preparation: CommandPreparation,
     pub(crate) quote: Option<ImmediateExecutionQuote>,
+}
+
+pub(crate) enum ConditionalImmediateExecutionPreparation<T> {
+    Complete(ConditionalImmediateExecutionDecision<T>),
+    Commit {
+        prepared: PreparedCommand,
+        observation: Option<T>,
+    },
+}
+
+pub(crate) fn evaluate_conditional_immediate_execution<T, E>(
+    preflight: ImmediateExecutionPreflight,
+    observe: impl FnOnce(ImmediateExecutionQuote) -> Result<T, E>,
+    accept: impl FnOnce(&T) -> bool,
+) -> Result<ConditionalImmediateExecutionPreparation<T>, E> {
+    match preflight.preparation {
+        CommandPreparation::Replay(report) => {
+            Ok(ConditionalImmediateExecutionPreparation::Complete(
+                ConditionalImmediateExecutionDecision::Reported {
+                    observation: None,
+                    report,
+                },
+            ))
+        }
+        CommandPreparation::Ready(prepared) => {
+            let observation = match preflight.quote {
+                Some(quote) => Some(observe(quote)?),
+                None => None,
+            };
+            let observation = match observation {
+                Some(value) if !accept(&value) => {
+                    return Ok(ConditionalImmediateExecutionPreparation::Complete(
+                        ConditionalImmediateExecutionDecision::Declined(value),
+                    ));
+                }
+                value => value,
+            };
+            Ok(ConditionalImmediateExecutionPreparation::Commit {
+                prepared,
+                observation,
+            })
+        }
+    }
 }
 
 fn reserve_order_book_query_vec<T>(
@@ -8354,21 +8524,75 @@ impl OrderBook {
         submission: ImmediateExecutionSubmission,
         accept: impl FnOnce(ImmediateExecutionQuote) -> bool,
     ) -> Result<ImmediateExecutionOutcome, MatchingError> {
-        let preflight = self.prepare_conditional_immediate_execution(submission)?;
-        match preflight.preparation {
-            CommandPreparation::Replay(report) => {
-                Ok(ImmediateExecutionOutcome::reported(None, report))
-            }
-            CommandPreparation::Ready(prepared) => {
-                let quote = preflight.quote;
-                if let Some(value) = quote
-                    && !accept(value)
-                {
-                    return Ok(ImmediateExecutionOutcome::Declined(value));
-                }
-                let report = self.commit(prepared)?;
-                let retained_quote = (!report.replayed).then_some(quote).flatten();
-                Ok(ImmediateExecutionOutcome::reported(retained_quote, report))
+        self.submit_conditional_immediate_execution(
+            submission,
+            |_, quote| Ok(quote),
+            |quote| accept(*quote),
+        )
+        .map(Into::into)
+    }
+
+    /// Atomically constructs a private execution curve and conditionally
+    /// submits one canonical IOC order.
+    ///
+    /// Core matching rejection and exact replay bypass curve allocation and
+    /// `accept`. Otherwise the predicate borrows the exact private per-price
+    /// execution curve while this method holds exclusive access to the book.
+    /// Decline, curve-allocation failure, or predicate unwind drops the same
+    /// preparation without consuming command/order identity, sequence, trade,
+    /// event, or book state. Acceptance commits that preparation without an
+    /// intervening book mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImmediateExecutionCurveSubmissionError::Matching`] for
+    /// command preparation or commit failure and
+    /// [`ImmediateExecutionCurveSubmissionError::Query`] when the exact
+    /// caller-owned curve cannot be constructed.
+    pub fn try_submit_immediate_execution_curve_if(
+        &mut self,
+        submission: ImmediateExecutionSubmission,
+        accept: impl FnOnce(&ImmediateExecutionCurve) -> bool,
+    ) -> Result<ImmediateExecutionCurveOutcome, ImmediateExecutionCurveSubmissionError> {
+        self.submit_conditional_immediate_execution(
+            submission,
+            |book, quote| {
+                book.try_immediate_execution_curve_for_quote(quote)
+                    .map_err(Into::into)
+            },
+            accept,
+        )
+        .map(Into::into)
+    }
+
+    fn submit_conditional_immediate_execution<T, E>(
+        &mut self,
+        submission: ImmediateExecutionSubmission,
+        observe: impl FnOnce(&Self, ImmediateExecutionQuote) -> Result<T, E>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalImmediateExecutionDecision<T>, E>
+    where
+        E: From<MatchingError>,
+    {
+        let preflight = self
+            .prepare_conditional_immediate_execution(submission)
+            .map_err(E::from)?;
+        match evaluate_conditional_immediate_execution(
+            preflight,
+            |quote| observe(self, quote),
+            accept,
+        )? {
+            ConditionalImmediateExecutionPreparation::Complete(decision) => Ok(decision),
+            ConditionalImmediateExecutionPreparation::Commit {
+                prepared,
+                observation,
+            } => {
+                let report = self.commit(prepared).map_err(E::from)?;
+                let retained_observation = if report.replayed { None } else { observation };
+                Ok(ConditionalImmediateExecutionDecision::Reported {
+                    observation: retained_observation,
+                    report,
+                })
             }
         }
     }
@@ -8434,14 +8658,28 @@ impl OrderBook {
         request: ImmediateExecutionRequest,
     ) -> Result<ImmediateExecutionCurve, OrderBookQueryError> {
         let quote = self.immediate_execution_quote(request);
+        self.try_immediate_execution_curve_for_quote(quote)
+    }
+
+    pub(crate) fn try_immediate_execution_curve_for_quote(
+        &self,
+        quote: ImmediateExecutionQuote,
+    ) -> Result<ImmediateExecutionCurve, OrderBookQueryError> {
         let mut levels = reserve_order_book_query_vec(
             quote.contributing_level_count(),
             OrderBookQueryResource::ImmediateExecutionLevels,
         )?;
-        let repeated_quote = self.scan_immediate_execution(request, |price, quantity_lots| {
-            levels.push(ImmediateExecutionLevel::new(price, quantity_lots));
-        });
-        debug_assert_eq!(repeated_quote, quote);
+        let repeated_quote =
+            self.scan_immediate_execution(quote.request(), |price, quantity_lots| {
+                levels.push(ImmediateExecutionLevel::new(price, quantity_lots));
+            });
+        if repeated_quote != quote {
+            return Err(OrderBookQueryError::InvariantViolation(
+                InvariantViolation::new(
+                    "immediate-execution curve scan diverged from its prepared quote",
+                ),
+            ));
+        }
         Ok(ImmediateExecutionCurve::new(quote, levels))
     }
 
@@ -14422,6 +14660,29 @@ mod price_level_index_tests {
                 maximum: usize::MAX,
             })
         );
+    }
+
+    #[test]
+    fn immediate_execution_curve_reconciles_the_supplied_preflight_quote() {
+        let book = OrderBook::new(reserve_definition());
+        let request = ImmediateExecutionRequest::new(
+            AccountId::new(1).unwrap(),
+            Side::Buy,
+            Quantity::new(1).unwrap(),
+            StopActivation::Market,
+            SelfTradePrevention::CancelAggressor,
+        );
+        let mut quote = book.immediate_execution_quote(request);
+        quote.book_event_sequence = 1;
+        let error = book
+            .try_immediate_execution_curve_for_quote(quote)
+            .expect_err("a curve must match its supplied preflight quote");
+        assert!(matches!(
+            error,
+            OrderBookQueryError::InvariantViolation(ref violation)
+                if violation.detail()
+                    == "immediate-execution curve scan diverged from its prepared quote"
+        ));
     }
 
     #[test]
