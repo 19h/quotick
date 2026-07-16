@@ -5,14 +5,15 @@ use quotick::auction_book::{
 };
 use quotick::auction_engine::{
     CallAuctionCancelOrder, CallAuctionCommand, CallAuctionEngine, CallAuctionExecutionReport,
-    CallAuctionPhase, CallAuctionPhaseControl, CallAuctionReplaceOrder, CallAuctionSubmitOrder,
-    CallAuctionUncrossCommand,
+    CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl, CallAuctionReplaceOrder,
+    CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use quotick::codec::{BinaryCodec, CodecError};
 use quotick::instrument::{
     InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
     QuantityRules, ReserveOrderRules, TradingState,
 };
+use quotick::matching::MassCancelScope;
 use quotick::{
     AccountId, AssetId, AuctionId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price,
     Quantity, Side, TimestampNs,
@@ -87,6 +88,17 @@ fn cancel(command_id: u64, account_id: u64, order_id: u64) -> CallAuctionCommand
     })
 }
 
+fn mass_cancel(command_id: u64, account_id: u64, scope: MassCancelScope) -> CallAuctionCommand {
+    CallAuctionCommand::MassCancel(CallAuctionMassCancel {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: InstrumentId::new(7).unwrap(),
+        instrument_version: InstrumentVersion::new(2).unwrap(),
+        account_id: AccountId::new(account_id).unwrap(),
+        scope,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
 fn replace(
     command_id: u64,
     target_order_id: u64,
@@ -151,6 +163,7 @@ fn every_call_auction_command_variant_round_trips() {
         cancel(3, 1, 1),
         replace(4, 1, auction_order(2, 1, Side::Sell, 3)),
         uncross(5),
+        mass_cancel(6, 1, MassCancelScope::Side(Side::Buy)),
     ];
     for command in commands {
         let encoded = command.encode().unwrap();
@@ -178,16 +191,22 @@ fn representative_reports() -> Vec<CallAuctionExecutionReport> {
             .unwrap(),
         engine.submit(cancel(6, 3, 3)).unwrap(),
         engine
-            .submit(phase(7, 1, CallAuctionPhase::Frozen))
+            .submit(submit(7, auction_order(4, 4, Side::Buy, 1)))
             .unwrap(),
-        engine.submit(uncross(8)).unwrap(),
+        engine
+            .submit(mass_cancel(8, 4, MassCancelScope::All))
+            .unwrap(),
+        engine
+            .submit(phase(9, 1, CallAuctionPhase::Frozen))
+            .unwrap(),
+        engine.submit(uncross(10)).unwrap(),
         engine
             .submit(CallAuctionCommand::Submit(CallAuctionSubmitOrder {
-                command_id: CommandId::new(9).unwrap(),
+                command_id: CommandId::new(11).unwrap(),
                 auction_id: auction_id(),
                 expected_phase_revision: 3,
-                order: auction_order(4, 4, Side::Buy, 1),
-                received_at: TimestampNs::from_unix_nanos(9),
+                order: auction_order(5, 5, Side::Buy, 1),
+                received_at: TimestampNs::from_unix_nanos(11),
             }))
             .unwrap(),
     ]
@@ -285,7 +304,7 @@ fn call_auction_codecs_reject_invalid_tags_lengths_bands_and_report_grammar() {
         ))
     );
 
-    let uncross = representative_reports().remove(7).encode().unwrap();
+    let uncross = representative_reports().remove(9).encode().unwrap();
     let mut self_pair = uncross.clone();
     self_pair[70..78].copy_from_slice(&uncross[54..62]);
     assert_eq!(

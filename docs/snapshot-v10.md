@@ -1,4 +1,9 @@
-# Semantic Snapshot Format Version 10
+# Expired Semantic Snapshot Format Version 10
+
+The current runtime writes and accepts only
+[snapshot version 11](snapshot-v11.md). This document remains the
+authoritative historical schema for version 10; version-10 envelopes are
+rejected before payload interpretation.
 
 `SnapshotFile` stores one complete typed semantic value in a bounded,
 versioned CRC-32C envelope. Version 10 preserves the version-9 kind registry,

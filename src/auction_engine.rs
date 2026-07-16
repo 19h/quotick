@@ -19,12 +19,14 @@ use crate::auction::{AuctionClearing, AuctionError, AuctionPriceBand, AuctionPri
 use crate::auction_book::{
     CallAuctionAdmissionError, CallAuctionBook, CallAuctionBookLimits, CallAuctionCancelError,
     CallAuctionCancellation, CallAuctionCommitError, CallAuctionConstructionError,
-    CallAuctionIndicative, CallAuctionInvariantViolation, CallAuctionOrder,
-    CallAuctionOrderSnapshot, CallAuctionPrepareError, CallAuctionReplaceError, CallAuctionTrade,
-    CallAuctionUncrossPolicy, PreparedCallAuctionUncross,
+    CallAuctionIndicative, CallAuctionInvariantViolation, CallAuctionMassCancelError,
+    CallAuctionMassCancelResult, CallAuctionOrder, CallAuctionOrderSnapshot,
+    CallAuctionPrepareError, CallAuctionReplaceError, CallAuctionTrade, CallAuctionUncrossPolicy,
+    PreparedCallAuctionUncross,
 };
 use crate::bounded_hash::{BoundedHashMap, BoundedHashSet};
 use crate::instrument::{AdmissionError, InstrumentDefinition};
+use crate::matching::MassCancelScope;
 use crate::trace_arena::AppendOnlyTraceArena;
 use crate::{
     AccountId, AuctionId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity,
@@ -327,6 +329,8 @@ pub enum CallAuctionEngineConstructionError {
     CommandHistoryReservationFailed,
     /// Constructor-owned retained-event arena reservation failed.
     EventArenaReservationFailed,
+    /// Constructor-owned canonical mass-cancel snapshot reservation failed.
+    MassCancelScratchReservationFailed,
     /// Process-local engine identity was exhausted.
     EngineInstanceIdExhausted,
 }
@@ -341,6 +345,9 @@ impl fmt::Display for CallAuctionEngineConstructionError {
             Self::EventArenaReservationFailed => {
                 formatter.write_str("call-auction retained-event arena reservation failed")
             }
+            Self::MassCancelScratchReservationFailed => {
+                formatter.write_str("call-auction mass-cancel scratch reservation failed")
+            }
             Self::EngineInstanceIdExhausted => {
                 formatter.write_str("call-auction engine instance identity exhausted")
             }
@@ -354,6 +361,7 @@ impl std::error::Error for CallAuctionEngineConstructionError {
             Self::Book(error) => Some(error),
             Self::CommandHistoryReservationFailed
             | Self::EventArenaReservationFailed
+            | Self::MassCancelScratchReservationFailed
             | Self::EngineInstanceIdExhausted => None,
         }
     }
@@ -477,6 +485,23 @@ pub struct CallAuctionCancelOrder {
     pub received_at: TimestampNs,
 }
 
+/// Sequenced account-scoped cancellation of active auction interest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionMassCancel {
+    /// Idempotency key.
+    pub command_id: CommandId,
+    /// Routed instrument.
+    pub instrument_id: InstrumentId,
+    /// Immutable instrument version.
+    pub instrument_version: InstrumentVersion,
+    /// Beneficial owner whose active orders are selected.
+    pub account_id: AccountId,
+    /// All owned orders or only one owned side.
+    pub scope: MassCancelScope,
+    /// Gateway receive time.
+    pub received_at: TimestampNs,
+}
+
 /// Sequenced new-identity cancel/replace during active collection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CallAuctionReplaceOrder {
@@ -530,6 +555,8 @@ pub enum CallAuctionCommand {
     Submit(CallAuctionSubmitOrder),
     /// Cancel active owned interest.
     Cancel(CallAuctionCancelOrder),
+    /// Cancel a canonical account-scoped set of active interest.
+    MassCancel(CallAuctionMassCancel),
     /// Atomically cancel active interest and admit a new-identity replacement.
     Replace(CallAuctionReplaceOrder),
     /// Discover, allocate, pair, and consume one frozen auction.
@@ -544,6 +571,7 @@ impl CallAuctionCommand {
             Self::PhaseControl(command) => command.command_id,
             Self::Submit(command) => command.command_id,
             Self::Cancel(command) => command.command_id,
+            Self::MassCancel(command) => command.command_id,
             Self::Replace(command) => command.command_id,
             Self::Uncross(command) => command.command_id,
         }
@@ -556,6 +584,7 @@ impl CallAuctionCommand {
             Self::PhaseControl(command) => command.received_at,
             Self::Submit(command) => command.received_at,
             Self::Cancel(command) => command.received_at,
+            Self::MassCancel(command) => command.received_at,
             Self::Replace(command) => command.received_at,
             Self::Uncross(command) => command.received_at,
         }
@@ -571,6 +600,8 @@ pub enum CallAuctionAction {
     Submit,
     /// Owner cancellation.
     Cancel,
+    /// Account-scoped owner mass cancellation.
+    MassCancel,
     /// New-identity cancel/replace.
     Replace,
     /// Final uncross.
@@ -658,6 +689,8 @@ pub enum CallAuctionCancellationReason {
     UserRequested,
     /// Target removed by an accepted atomic cancel/replace command.
     Replaced,
+    /// Order selected by an accepted account-scoped mass cancel.
+    MassCancel,
     /// Unexecuted remainder selected by the uncross policy.
     UncrossRemainder,
 }
@@ -684,6 +717,19 @@ pub enum CallAuctionEventKind {
         order: CallAuctionOrderSnapshot,
         /// Removal cause.
         reason: CallAuctionCancellationReason,
+    },
+    /// Account-scoped mass cancellation completed, including an empty selection.
+    MassCancelCompleted {
+        /// Account whose active orders were selected.
+        account_id: AccountId,
+        /// Selection applied within this instrument-version shard.
+        scope: MassCancelScope,
+        /// Number of cancelled active orders.
+        cancelled_order_count: u64,
+        /// Sum of cancelled active quantity in instrument-defined lots.
+        cancelled_quantity_lots: u128,
+        /// Collection-book revision after the command.
+        book_revision: u64,
     },
     /// One deterministic auction counterparty pair executed.
     Trade(CallAuctionTrade),
@@ -1792,6 +1838,53 @@ impl CallAuctionCheckpoint {
                                 )
                             })?;
                     }
+                    CallAuctionCommand::MassCancel(_) => {
+                        let Some(CallAuctionEvent {
+                            kind:
+                                CallAuctionEventKind::MassCancelCompleted {
+                                    cancelled_order_count,
+                                    book_revision,
+                                    ..
+                                },
+                            ..
+                        }) = entry.report.events.last()
+                        else {
+                            return Err(CallAuctionCheckpointError::new(
+                                "auction checkpoint mass-cancel completion is absent",
+                            ));
+                        };
+                        for event in entry
+                            .report
+                            .events
+                            .iter()
+                            .take(entry.report.events.len() - 1)
+                        {
+                            let CallAuctionEventKind::OrderCancelled { order, .. } = event.kind
+                            else {
+                                return Err(CallAuctionCheckpointError::new(
+                                    "auction checkpoint mass-cancel body is invalid",
+                                ));
+                            };
+                            if projected.remove(&order.order_id) != Some(order) {
+                                return Err(CallAuctionCheckpointError::new(
+                                    "auction checkpoint mass cancellation contradicts projected state",
+                                ));
+                            }
+                        }
+                        if *cancelled_order_count != 0 {
+                            expected_book_revision =
+                                expected_book_revision.checked_add(1).ok_or_else(|| {
+                                    CallAuctionCheckpointError::new(
+                                        "auction checkpoint book revision is exhausted",
+                                    )
+                                })?;
+                        }
+                        if *book_revision != expected_book_revision {
+                            return Err(CallAuctionCheckpointError::new(
+                                "auction checkpoint mass-cancel book revision is invalid",
+                            ));
+                        }
+                    }
                     CallAuctionCommand::Uncross(_) => {
                         project_checkpoint_uncross(
                             &entry.report,
@@ -2124,6 +2217,9 @@ fn validate_call_auction_checkpoint_capacity(
 }
 
 fn decoded_accepted_event_grammar_is_valid(events: &[CallAuctionEvent]) -> bool {
+    if mass_cancel_event_grammar_is_valid(events.iter(), None) {
+        return true;
+    }
     match events {
         [
             CallAuctionEvent {
@@ -2266,6 +2362,8 @@ pub enum CallAuctionEngineError {
     BookAdmission(CallAuctionAdmissionError),
     /// Collection cancellation encountered an operational failure.
     BookCancellation(CallAuctionCancelError),
+    /// Collection mass cancellation encountered an operational failure.
+    BookMassCancellation(CallAuctionMassCancelError),
     /// Collection cancel/replace encountered an operational failure.
     BookReplacement(CallAuctionReplaceError),
     /// Indicative discovery encountered invalid/arithmetic input.
@@ -2307,6 +2405,9 @@ impl fmt::Display for CallAuctionEngineError {
             Self::BookAdmission(error) => write!(formatter, "call-auction admission: {error}"),
             Self::BookCancellation(error) => {
                 write!(formatter, "call-auction cancellation: {error}")
+            }
+            Self::BookMassCancellation(error) => {
+                write!(formatter, "call-auction mass cancellation: {error}")
             }
             Self::BookReplacement(error) => {
                 write!(formatter, "call-auction replacement: {error}")
@@ -2351,6 +2452,11 @@ enum PreparedCallAuctionAction {
         account_id: AccountId,
         order_id: OrderId,
     },
+    MassCancel {
+        account_id: AccountId,
+        scope: MassCancelScope,
+        preflight: CallAuctionMassCancelResult,
+    },
     Replace {
         account_id: AccountId,
         target_order_id: OrderId,
@@ -2366,6 +2472,12 @@ enum PreparedCallAuctionAction {
 impl PreparedCallAuctionAction {
     fn maximum_events(&self) -> Result<usize, CallAuctionEngineError> {
         match self {
+            Self::MassCancel { preflight, .. } => {
+                usize::try_from(preflight.cancelled_order_count())
+                    .ok()
+                    .and_then(|count| count.checked_add(1))
+                    .ok_or(CallAuctionEngineError::SequenceExhausted)
+            }
             Self::Uncross { prepared, .. } => prepared
                 .trades()
                 .len()
@@ -2381,18 +2493,21 @@ impl PreparedCallAuctionAction {
     }
 
     const fn is_terminal_lane_eligible(&self, command: CallAuctionCommand) -> bool {
-        matches!(
-            (self, command),
+        match (self, command) {
+            (Self::MassCancel { preflight, .. }, CallAuctionCommand::MassCancel(_)) => {
+                preflight.cancelled_order_count() != 0
+            }
             (Self::Cancel { .. }, CallAuctionCommand::Cancel(_))
-                | (Self::Uncross { .. }, CallAuctionCommand::Uncross(_))
-                | (
-                    Self::PhaseTransition { .. },
-                    CallAuctionCommand::PhaseControl(CallAuctionPhaseControl {
-                        target_phase: CallAuctionPhase::Frozen | CallAuctionPhase::Closed,
-                        ..
-                    }),
-                )
-        )
+            | (Self::Uncross { .. }, CallAuctionCommand::Uncross(_))
+            | (
+                Self::PhaseTransition { .. },
+                CallAuctionCommand::PhaseControl(CallAuctionPhaseControl {
+                    target_phase: CallAuctionPhase::Frozen | CallAuctionPhase::Closed,
+                    ..
+                }),
+            ) => true,
+            _ => false,
+        }
     }
 }
 
@@ -2460,6 +2575,10 @@ pub struct CallAuctionEngineResourceStatus {
     pub terminal_event_reserve: usize,
     /// Maximum events per report.
     pub max_report_events: usize,
+    /// Constructor-owned canonical mass-cancel snapshot capacity.
+    pub mass_cancel_scratch_capacity: usize,
+    /// Snapshots currently retained in transient mass-cancel scratch.
+    pub mass_cancel_scratch_len: usize,
 }
 
 /// Unsequenced indicative-query failure.
@@ -2505,6 +2624,7 @@ pub struct CallAuctionEngine {
     reports: BoundedHashMap<CommandId, CachedCallAuctionReport>,
     event_arena: Arc<CallAuctionEventArena>,
     retained_event_count: usize,
+    mass_cancel_scratch: Vec<CallAuctionOrderSnapshot>,
 }
 
 impl CallAuctionEngine {
@@ -2534,6 +2654,10 @@ impl CallAuctionEngine {
             .map_err(|_| CallAuctionEngineConstructionError::CommandHistoryReservationFailed)?;
         let event_arena = CallAuctionEventArena::try_with_capacity(limits.max_retained_events())
             .map_err(|_| CallAuctionEngineConstructionError::EventArenaReservationFailed)?;
+        let mut mass_cancel_scratch = Vec::new();
+        mass_cancel_scratch
+            .try_reserve_exact(limits.book().max_active_orders())
+            .map_err(|_| CallAuctionEngineConstructionError::MassCancelScratchReservationFailed)?;
         let instance_id = next_call_auction_engine_instance_id()?;
         Ok(Self {
             instance_id,
@@ -2548,6 +2672,7 @@ impl CallAuctionEngine {
             reports,
             event_arena,
             retained_event_count: 0,
+            mass_cancel_scratch,
         })
     }
 
@@ -2601,6 +2726,8 @@ impl CallAuctionEngine {
             ordinary_event_capacity: self.limits.ordinary_event_capacity(),
             terminal_event_reserve: self.limits.terminal_event_reserve(),
             max_report_events: self.limits.max_report_events(),
+            mass_cancel_scratch_capacity: self.mass_cancel_scratch.capacity(),
+            mass_cancel_scratch_len: self.mass_cancel_scratch.len(),
         }
     }
 
@@ -2977,7 +3104,7 @@ impl CallAuctionEngine {
         action: PreparedCallAuctionAction,
         events: &mut CallAuctionEventTraceBuilder,
     ) -> Result<CallAuctionCommandOutcome, CallAuctionEngineError> {
-        let outcome = match action {
+        Ok(match action {
             PreparedCallAuctionAction::Rejected(reason) => {
                 self.push_event(
                     command,
@@ -3040,6 +3167,11 @@ impl CallAuctionEngine {
                 );
                 CallAuctionCommandOutcome::Accepted
             }
+            PreparedCallAuctionAction::MassCancel {
+                account_id,
+                scope,
+                preflight,
+            } => self.apply_mass_cancel(command, account_id, scope, preflight, events)?,
             PreparedCallAuctionAction::Replace {
                 account_id,
                 target_order_id,
@@ -3071,8 +3203,56 @@ impl CallAuctionEngine {
             } => {
                 self.apply_prepared_uncross(command, auction_id, phase_revision, prepared, events)?
             }
-        };
-        Ok(outcome)
+        })
+    }
+
+    fn apply_mass_cancel(
+        &mut self,
+        command: CallAuctionCommand,
+        account_id: AccountId,
+        scope: MassCancelScope,
+        preflight: CallAuctionMassCancelResult,
+        events: &mut CallAuctionEventTraceBuilder,
+    ) -> Result<CallAuctionCommandOutcome, CallAuctionEngineError> {
+        if self
+            .book
+            .preflight_mass_cancel(account_id, scope)
+            .map_err(|_| CallAuctionEngineError::InternalInvariantViolation)?
+            != preflight
+        {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        }
+        debug_assert!(self.mass_cancel_scratch.is_empty());
+        let result = self
+            .book
+            .mass_cancel_into(account_id, scope, &mut self.mass_cancel_scratch)
+            .map_err(|_| CallAuctionEngineError::InternalInvariantViolation)?;
+        debug_assert_eq!(result, preflight);
+        let selected_count = self.mass_cancel_scratch.len();
+        for index in 0..selected_count {
+            let snapshot = self.mass_cancel_scratch[index];
+            self.push_event(
+                command,
+                CallAuctionEventKind::OrderCancelled {
+                    order: snapshot,
+                    reason: CallAuctionCancellationReason::MassCancel,
+                },
+                events,
+            );
+        }
+        self.mass_cancel_scratch.clear();
+        self.push_event(
+            command,
+            CallAuctionEventKind::MassCancelCompleted {
+                account_id,
+                scope,
+                cancelled_order_count: result.cancelled_order_count(),
+                cancelled_quantity_lots: result.cancelled_quantity_lots(),
+                book_revision: result.state_revision(),
+            },
+            events,
+        );
+        Ok(CallAuctionCommandOutcome::Accepted)
     }
 
     fn apply_prepared_uncross(
@@ -3178,6 +3358,22 @@ impl CallAuctionEngine {
                     ),
                     Err(error) => Err(CallAuctionEngineError::BookCancellation(error)),
                 }
+            }
+            CallAuctionCommand::MassCancel(mass_cancel) => {
+                if let Some(reason) =
+                    self.route_rejection(mass_cancel.instrument_id, mass_cancel.instrument_version)
+                {
+                    return Ok(PreparedCallAuctionAction::Rejected(reason));
+                }
+                let preflight = self
+                    .book
+                    .preflight_mass_cancel(mass_cancel.account_id, mass_cancel.scope)
+                    .map_err(CallAuctionEngineError::BookMassCancellation)?;
+                Ok(PreparedCallAuctionAction::MassCancel {
+                    account_id: mass_cancel.account_id,
+                    scope: mass_cancel.scope,
+                    preflight,
+                })
             }
             CallAuctionCommand::Uncross(uncross) => self.prepare_uncross_command(uncross),
         }
@@ -3505,6 +3701,13 @@ impl CallAuctionEngine {
                 "auction report cache contradicts configured capacity",
             ));
         }
+        if !self.mass_cancel_scratch.is_empty()
+            || self.mass_cancel_scratch.capacity() < self.limits.book().max_active_orders()
+        {
+            return Err(CallAuctionEngineInvariantViolation::new(
+                "auction mass-cancel scratch contradicts its constructor reservation",
+            ));
+        }
         self.validate_event_capacity()?;
         if (self.phase == CallAuctionPhase::Closed) != self.active_auction_id.is_none() {
             return Err(CallAuctionEngineInvariantViolation::new(
@@ -3709,6 +3912,10 @@ fn cached_report_grammar_is_valid(cached: &CachedCallAuctionReport) -> bool {
                         }) if order.order_id == cancel.order_id && order.account_id == cancel.account_id
                     )
             }
+            CallAuctionCommand::MassCancel(mass_cancel) => mass_cancel_event_grammar_is_valid(
+                report.events.iter(),
+                Some((mass_cancel.account_id, mass_cancel.scope)),
+            ),
             CallAuctionCommand::Replace(replace) => {
                 report.events.len() == 2
                     && matches!(
@@ -3740,6 +3947,60 @@ fn cached_report_grammar_is_valid(cached: &CachedCallAuctionReport) -> bool {
             }
         },
     }
+}
+
+fn mass_cancel_event_grammar_is_valid<'a>(
+    mut events: impl DoubleEndedIterator<Item = &'a CallAuctionEvent> + ExactSizeIterator,
+    expected: Option<(AccountId, MassCancelScope)>,
+) -> bool {
+    let event_count = events.len();
+    let Some(CallAuctionEvent {
+        kind:
+            CallAuctionEventKind::MassCancelCompleted {
+                account_id,
+                scope,
+                cancelled_order_count,
+                cancelled_quantity_lots,
+                ..
+            },
+        ..
+    }) = events.next_back()
+    else {
+        return false;
+    };
+    if expected.is_some_and(|expected| expected != (*account_id, *scope)) {
+        return false;
+    }
+    let Ok(body_count) = u64::try_from(event_count.saturating_sub(1)) else {
+        return false;
+    };
+    if body_count != *cancelled_order_count {
+        return false;
+    }
+    let mut previous_order_id = None;
+    let mut quantity_lots = 0_u128;
+    for event in events {
+        let CallAuctionEventKind::OrderCancelled {
+            order,
+            reason: CallAuctionCancellationReason::MassCancel,
+        } = event.kind
+        else {
+            return false;
+        };
+        if order.account_id != *account_id
+            || !scope.includes(order.side)
+            || previous_order_id.is_some_and(|previous| previous >= order.order_id)
+        {
+            return false;
+        }
+        let Some(next_quantity) = quantity_lots.checked_add(u128::from(order.quantity.lots()))
+        else {
+            return false;
+        };
+        quantity_lots = next_quantity;
+        previous_order_id = Some(order.order_id);
+    }
+    quantity_lots == *cancelled_quantity_lots
 }
 
 const fn is_external_risk_rejection(reason: CallAuctionRejectReason) -> bool {
@@ -3902,6 +4163,9 @@ impl CallAuctionPhaseAudit {
                 submit.order.instrument_version(),
             ),
             CallAuctionCommand::Cancel(cancel) => (cancel.instrument_id, cancel.instrument_version),
+            CallAuctionCommand::MassCancel(mass_cancel) => {
+                (mass_cancel.instrument_id, mass_cancel.instrument_version)
+            }
             CallAuctionCommand::Replace(replace) => (
                 replace.replacement.instrument_id(),
                 replace.replacement.instrument_version(),
@@ -3958,7 +4222,9 @@ impl CallAuctionPhaseAudit {
                     CallAuctionControllerPreflight::Applicable
                 }
             }
-            CallAuctionCommand::Cancel(_) => CallAuctionControllerPreflight::Applicable,
+            CallAuctionCommand::Cancel(_) | CallAuctionCommand::MassCancel(_) => {
+                CallAuctionControllerPreflight::Applicable
+            }
         }
     }
 
@@ -4107,6 +4373,7 @@ impl CallAuctionPhaseAudit {
             }
             CallAuctionCommand::Submit(_)
             | CallAuctionCommand::Cancel(_)
+            | CallAuctionCommand::MassCancel(_)
             | CallAuctionCommand::Replace(_) => true,
         }
     }

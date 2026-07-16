@@ -5,9 +5,9 @@ use quotick::auction_book::{
 };
 use quotick::auction_engine::{
     CallAuctionCommand, CallAuctionCommandOutcome, CallAuctionEngineError, CallAuctionEngineLimits,
-    CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionPhase, CallAuctionPhaseControl,
-    CallAuctionRejectReason, CallAuctionReplaceOrder, CallAuctionSubmitOrder,
-    CallAuctionUncrossCommand,
+    CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionMassCancel, CallAuctionPhase,
+    CallAuctionPhaseControl, CallAuctionRejectReason, CallAuctionReplaceOrder,
+    CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use quotick::auction_risk::{
     CallAuctionRiskLimits, CallAuctionRiskLimitsSpec, CallAuctionRiskManagedEngine,
@@ -17,6 +17,7 @@ use quotick::instrument::{
     InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
     QuantityRules, ReserveOrderRules, TradingState,
 };
+use quotick::matching::MassCancelScope;
 use quotick::risk::{
     AccountRiskState, RiskError, RiskHashIndex, RiskLimitSpec, RiskLimits, RiskProfile,
 };
@@ -178,6 +179,17 @@ fn cancel_command(command_id: u64, owner: u64, order_id: u64) -> CallAuctionComm
         instrument_version: version(),
         account_id: account(owner),
         order_id: OrderId::new(order_id).unwrap(),
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+fn mass_cancel_command(command_id: u64, owner: u64, scope: MassCancelScope) -> CallAuctionCommand {
+    CallAuctionCommand::MassCancel(CallAuctionMassCancel {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        account_id: account(owner),
+        scope,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
@@ -382,6 +394,78 @@ fn signed_collar_valuation_is_conservative_and_owner_cancel_releases_exactly() {
             .reservation(OrderId::new(2).unwrap())
             .is_none()
     );
+    engine.validate().unwrap();
+}
+
+#[test]
+fn mass_cancel_releases_every_selected_reservation_once() {
+    let mut engine = managed(4);
+    engine
+        .register_account(account(1), broad_profile(AccountRiskState::Active, 0))
+        .unwrap();
+    engine
+        .register_account(account(2), broad_profile(AccountRiskState::Active, 0))
+        .unwrap();
+    engine
+        .submit(phase_command(1, 1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            2,
+            order(10, 1, Side::Buy, AuctionOrderConstraint::Market, 3),
+        ))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            3,
+            order(
+                20,
+                1,
+                Side::Sell,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                5,
+            ),
+        ))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            4,
+            order(30, 2, Side::Buy, AuctionOrderConstraint::Market, 7),
+        ))
+        .unwrap();
+    assert_eq!(engine.risk().reservation_count(), 3);
+
+    let command = mass_cancel_command(5, 1, MassCancelScope::All);
+    let report = engine.submit(command).unwrap();
+    assert_eq!(report.outcome, CallAuctionCommandOutcome::Accepted);
+    assert_eq!(report.events.len(), 3);
+    assert!(
+        engine
+            .risk()
+            .reservation(OrderId::new(10).unwrap())
+            .is_none()
+    );
+    assert!(
+        engine
+            .risk()
+            .reservation(OrderId::new(20).unwrap())
+            .is_none()
+    );
+    assert!(
+        engine
+            .risk()
+            .reservation(OrderId::new(30).unwrap())
+            .is_some()
+    );
+    let exposure = engine.risk().snapshot(account(1)).unwrap();
+    assert_eq!(exposure.open_orders(), 0);
+    assert_eq!(exposure.open_buy_lots(), 0);
+    assert_eq!(exposure.open_sell_lots(), 0);
+    assert_eq!(exposure.open_notional(), 0);
+
+    let replay = engine.submit(command).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(engine.risk().reservation_count(), 1);
     engine.validate().unwrap();
 }
 

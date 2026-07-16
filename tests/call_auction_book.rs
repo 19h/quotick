@@ -7,13 +7,14 @@ use quotick::auction::{
 use quotick::auction_book::{
     CallAuctionAdmissionError, CallAuctionBook, CallAuctionBookLimits, CallAuctionBookLimitsError,
     CallAuctionBookLimitsSpec, CallAuctionCancelError, CallAuctionCapacity,
-    CallAuctionConstructionError, CallAuctionIndicative, CallAuctionOrder, CallAuctionPlanError,
-    CallAuctionReplaceError,
+    CallAuctionConstructionError, CallAuctionIndicative, CallAuctionMassCancelError,
+    CallAuctionOrder, CallAuctionPlanError, CallAuctionReplaceError,
 };
 use quotick::instrument::{
     AdmissionError, InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol,
     PriceRules, QuantityRules, ReserveOrderRules, TradingState,
 };
+use quotick::matching::MassCancelScope;
 use quotick::{
     AccountId, AssetId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
     TimestampNs,
@@ -338,6 +339,125 @@ fn cancellation_checks_owner_unlinks_middle_and_never_reuses_identity() {
             .lots(),
         3
     );
+    book.validate().unwrap();
+}
+
+#[test]
+fn account_mass_cancel_is_indexed_canonical_and_revision_atomic() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(8, 8, 16)).unwrap();
+    for command in [
+        order(70, 7, Side::Buy, AuctionOrderConstraint::Market, 2),
+        order(
+            20,
+            8,
+            Side::Sell,
+            AuctionOrderConstraint::Limit(Price::from_raw(95)),
+            11,
+        ),
+        order(
+            50,
+            7,
+            Side::Sell,
+            AuctionOrderConstraint::Limit(Price::from_raw(105)),
+            5,
+        ),
+        order(
+            10,
+            7,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+            3,
+        ),
+        order(40, 7, Side::Sell, AuctionOrderConstraint::Market, 7),
+        order(30, 9, Side::Buy, AuctionOrderConstraint::Market, 13),
+    ] {
+        book.admit(command).unwrap();
+    }
+
+    assert_eq!(
+        book.account_active_order_count(account(7), MassCancelScope::All),
+        4
+    );
+    assert_eq!(
+        book.account_active_order_count(account(7), MassCancelScope::Side(Side::Sell)),
+        2
+    );
+    let preflight = book
+        .preflight_mass_cancel(account(7), MassCancelScope::Side(Side::Sell))
+        .unwrap();
+    assert_eq!(preflight.cancelled_order_count(), 2);
+    assert_eq!(preflight.cancelled_quantity_lots(), 12);
+    assert_eq!(preflight.state_revision(), 7);
+
+    let allocation = book.resource_status();
+    let mut removed = Vec::with_capacity(8);
+    let result = book
+        .mass_cancel_into(account(7), MassCancelScope::Side(Side::Sell), &mut removed)
+        .unwrap();
+    assert_eq!(result, preflight);
+    assert_eq!(
+        removed
+            .iter()
+            .map(|order| order.order_id.get())
+            .collect::<Vec<_>>(),
+        vec![40, 50]
+    );
+    assert_eq!(book.state_revision(), 7);
+    assert_eq!(book.active_order_count(), 4);
+    assert_eq!(book.accepted_order_id_count(), 6);
+    assert_eq!(book.market_quantity(Side::Sell), 0);
+    assert_eq!(book.price_level_count(Side::Sell), 1);
+    assert_eq!(
+        book.resource_status().allocated_active_accounts,
+        allocation.allocated_active_accounts
+    );
+    assert_eq!(
+        book.resource_status().account_index_buckets,
+        allocation.account_index_buckets
+    );
+    book.validate().unwrap();
+
+    removed.clear();
+    let empty = book
+        .mass_cancel_into(account(77), MassCancelScope::All, &mut removed)
+        .unwrap();
+    assert_eq!(empty.cancelled_order_count(), 0);
+    assert_eq!(empty.cancelled_quantity_lots(), 0);
+    assert_eq!(empty.state_revision(), 7);
+    assert!(removed.is_empty());
+    book.validate().unwrap();
+}
+
+#[test]
+fn mass_cancel_output_failure_precedes_all_mutation() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(4, 4, 8)).unwrap();
+    book.admit(order(2, 1, Side::Buy, AuctionOrderConstraint::Market, 3))
+        .unwrap();
+    book.admit(order(1, 1, Side::Sell, AuctionOrderConstraint::Market, 5))
+        .unwrap();
+    let before_revision = book.state_revision();
+    let before_status = book.resource_status();
+    let mut undersized = Vec::with_capacity(1);
+
+    assert_eq!(
+        book.mass_cancel_into(account(1), MassCancelScope::All, &mut undersized),
+        Err(CallAuctionMassCancelError::OutputCapacityExceeded {
+            required: 2,
+            available: 1,
+        })
+    );
+    assert_eq!(book.state_revision(), before_revision);
+    assert_eq!(book.resource_status(), before_status);
+    assert!(undersized.is_empty());
+
+    let mut nonempty = Vec::with_capacity(4);
+    nonempty.push(book.order(OrderId::new(1).unwrap()).unwrap());
+    assert_eq!(
+        book.mass_cancel_into(account(1), MassCancelScope::All, &mut nonempty),
+        Err(CallAuctionMassCancelError::OutputNotEmpty)
+    );
+    assert_eq!(book.state_revision(), before_revision);
+    assert_eq!(book.resource_status(), before_status);
     book.validate().unwrap();
 }
 

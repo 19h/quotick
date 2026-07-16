@@ -31,6 +31,7 @@ use crate::domain::{
 use crate::indexed_avl::IndexedAvlMap;
 use crate::instrument::InstrumentDefinition;
 pub use crate::market_data::{CallAuctionMarketDataReplay, CallAuctionMarketDataReplayBatch};
+use crate::matching::MassCancelScope;
 
 /// Failure before a call-auction replay buffer owns usable storage.
 pub type CallAuctionMarketDataReplayConstructionError =
@@ -404,6 +405,8 @@ pub enum CallAuctionBookChangeReason {
     UserCancelled,
     /// Active interest was removed before accepting its new identity.
     Replaced,
+    /// Active interest was removed by an account-scoped mass cancel.
+    MassCancelled,
     /// Unexecuted interest was removed by the final uncross policy.
     UncrossRemainder,
 }
@@ -505,6 +508,15 @@ pub enum CallAuctionMarketDataKind {
         book_revision: u64,
         /// Authoritative phase revision after closure.
         phase_revision: u64,
+    },
+    /// One account-scoped mass cancellation completed.
+    MassCancelCompleted {
+        /// Number of anonymized order removals in this command batch.
+        cancelled_order_count: u64,
+        /// Sum of removed quantity in instrument-defined lots.
+        cancelled_quantity_lots: u128,
+        /// Authoritative collection-book revision after the command.
+        book_revision: u64,
     },
 }
 
@@ -982,6 +994,14 @@ struct UncrossProgress {
     completed: bool,
 }
 
+#[derive(Debug, Default)]
+struct MassCancelProgress {
+    order_count: u64,
+    quantity_lots: u128,
+    previous_order_id: Option<OrderId>,
+    completed: bool,
+}
+
 /// Stateful adapter from private auction traces to anonymized public state.
 #[derive(Debug)]
 pub struct CallAuctionMarketDataPublisher {
@@ -1296,6 +1316,7 @@ impl CallAuctionMarketDataPublisher {
             ));
         }
         let mut uncross = UncrossProgress::default();
+        let mut mass_cancel = MassCancelProgress::default();
         self.uncross_sources.clear();
         for event in report.events.iter().copied() {
             let expected = self
@@ -1308,7 +1329,7 @@ impl CallAuctionMarketDataPublisher {
                     actual: event.sequence,
                 });
             }
-            let kind = match self.apply_event(command, event, &mut uncross) {
+            let kind = match self.apply_event(command, event, &mut uncross, &mut mass_cancel) {
                 Ok(kind) => kind,
                 Err(error) => return self.fail(error),
             };
@@ -1326,6 +1347,13 @@ impl CallAuctionMarketDataPublisher {
         if uncross.completed != accepted_uncross {
             return self.fail(CallAuctionMarketDataError::TraceMismatch(
                 "auction uncross command and completion event disagree",
+            ));
+        }
+        let accepted_mass_cancel = matches!(command, CallAuctionCommand::MassCancel(_))
+            && report.outcome == CallAuctionCommandOutcome::Accepted;
+        if mass_cancel.completed != accepted_mass_cancel {
+            return self.fail(CallAuctionMarketDataError::TraceMismatch(
+                "auction mass-cancel command and completion event disagree",
             ));
         }
         self.last_command_sequence = report.command_sequence;
@@ -1451,6 +1479,7 @@ impl CallAuctionMarketDataPublisher {
         command: CallAuctionCommand,
         event: CallAuctionEvent,
         uncross: &mut UncrossProgress,
+        mass_cancel: &mut MassCancelProgress,
     ) -> Result<CallAuctionMarketDataKind, CallAuctionMarketDataError> {
         match event.kind {
             CallAuctionEventKind::PhaseChanged {
@@ -1466,6 +1495,9 @@ impl CallAuctionMarketDataPublisher {
                 }
                 crate::auction_engine::CallAuctionCancellationReason::Replaced => {
                     self.apply_replace_cancel(command, order)
+                }
+                crate::auction_engine::CallAuctionCancellationReason::MassCancel => {
+                    self.apply_mass_cancel(command, order, mass_cancel)
                 }
                 crate::auction_engine::CallAuctionCancellationReason::UncrossRemainder => {
                     Err(CallAuctionMarketDataError::TraceMismatch(
@@ -1506,6 +1538,21 @@ impl CallAuctionMarketDataPublisher {
                     uncross,
                 )
             }
+            CallAuctionEventKind::MassCancelCompleted {
+                account_id,
+                scope,
+                cancelled_order_count,
+                cancelled_quantity_lots,
+                book_revision,
+            } => self.complete_mass_cancel(
+                command,
+                account_id,
+                scope,
+                cancelled_order_count,
+                cancelled_quantity_lots,
+                book_revision,
+                mass_cancel,
+            ),
             CallAuctionEventKind::CommandRejected(_) => {
                 Ok(CallAuctionMarketDataKind::NoPublicChange)
             }
@@ -1677,6 +1724,95 @@ impl CallAuctionMarketDataPublisher {
             reason: CallAuctionBookChangeReason::Replaced,
             quantity: order.quantity,
             level,
+        })
+    }
+
+    fn apply_mass_cancel(
+        &mut self,
+        command: CallAuctionCommand,
+        order: CallAuctionOrderSnapshot,
+        progress: &mut MassCancelProgress,
+    ) -> Result<CallAuctionMarketDataKind, CallAuctionMarketDataError> {
+        let CallAuctionCommand::MassCancel(source) = command else {
+            return Err(CallAuctionMarketDataError::TraceMismatch(
+                "non-mass-cancel command emitted a mass cancellation",
+            ));
+        };
+        let tracked = self.orders.get(&order.order_id).copied().ok_or(
+            CallAuctionMarketDataError::TraceMismatch("mass-cancelled auction order is absent"),
+        )?;
+        if progress.completed
+            || source.account_id != order.account_id
+            || !source.scope.includes(order.side)
+            || progress
+                .previous_order_id
+                .is_some_and(|previous| previous >= order.order_id)
+            || TrackedOrder::from(order) != tracked
+        {
+            return Err(CallAuctionMarketDataError::TraceMismatch(
+                "mass-cancelled order contradicts its command, canonical order, or tracked state",
+            ));
+        }
+        let level = self.remove_order(order.order_id, order.quantity.lots())?;
+        progress.order_count = progress
+            .order_count
+            .checked_add(1)
+            .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
+        progress.quantity_lots = progress
+            .quantity_lots
+            .checked_add(u128::from(order.quantity.lots()))
+            .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
+        progress.previous_order_id = Some(order.order_id);
+        Ok(CallAuctionMarketDataKind::Book {
+            reason: CallAuctionBookChangeReason::MassCancelled,
+            quantity: order.quantity,
+            level,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the mass-cancel completion event is a fixed private audit record"
+    )]
+    fn complete_mass_cancel(
+        &mut self,
+        command: CallAuctionCommand,
+        account_id: AccountId,
+        scope: MassCancelScope,
+        cancelled_order_count: u64,
+        cancelled_quantity_lots: u128,
+        book_revision: u64,
+        progress: &mut MassCancelProgress,
+    ) -> Result<CallAuctionMarketDataKind, CallAuctionMarketDataError> {
+        let CallAuctionCommand::MassCancel(source) = command else {
+            return Err(CallAuctionMarketDataError::TraceMismatch(
+                "non-mass-cancel command emitted mass-cancel completion",
+            ));
+        };
+        let expected_book_revision = if cancelled_order_count == 0 {
+            self.book_revision
+        } else {
+            self.book_revision
+                .checked_add(1)
+                .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?
+        };
+        if progress.completed
+            || source.account_id != account_id
+            || source.scope != scope
+            || progress.order_count != cancelled_order_count
+            || progress.quantity_lots != cancelled_quantity_lots
+            || book_revision != expected_book_revision
+        {
+            return Err(CallAuctionMarketDataError::TraceMismatch(
+                "mass-cancel completion contradicts its command or removal trace",
+            ));
+        }
+        self.book_revision = book_revision;
+        progress.completed = true;
+        Ok(CallAuctionMarketDataKind::MassCancelCompleted {
+            cancelled_order_count,
+            cancelled_quantity_lots,
+            book_revision,
         })
     }
 
@@ -2307,6 +2443,17 @@ impl CallAuctionMarketDataReplica {
                 "auction replacement removal requires a complete command batch",
             ));
         }
+        if matches!(
+            update.kind,
+            CallAuctionMarketDataKind::Book {
+                reason: CallAuctionBookChangeReason::MassCancelled,
+                ..
+            } | CallAuctionMarketDataKind::MassCancelCompleted { .. }
+        ) {
+            return Err(CallAuctionMarketDataError::InvalidUpdate(
+                "auction mass cancellation requires a complete command batch",
+            ));
+        }
         self.preflight_identity(update)?;
         let expected = self
             .last_event_sequence
@@ -2562,11 +2709,6 @@ impl CallAuctionMarketDataReplica {
                             .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
                     }
                     CallAuctionBookChangeReason::UserCancelled => {
-                        if self.phase.phase() == CallAuctionPhase::Closed {
-                            return Err(CallAuctionMarketDataError::InvalidUpdate(
-                                "user cancellation has no active auction cycle",
-                            ));
-                        }
                         self.book_revision = self
                             .book_revision
                             .checked_add(1)
@@ -2579,6 +2721,7 @@ impl CallAuctionMarketDataReplica {
                             ));
                         }
                     }
+                    CallAuctionBookChangeReason::MassCancelled => {}
                     CallAuctionBookChangeReason::UncrossRemainder => {
                         if self.phase.phase() != CallAuctionPhase::Frozen {
                             return Err(CallAuctionMarketDataError::InvalidUpdate(
@@ -2689,6 +2832,25 @@ impl CallAuctionMarketDataReplica {
                 );
                 self.reset_cycle_trace();
             }
+            CallAuctionMarketDataKind::MassCancelCompleted {
+                cancelled_order_count,
+                cancelled_quantity_lots: _,
+                book_revision,
+            } => {
+                let expected_book = if cancelled_order_count == 0 {
+                    self.book_revision
+                } else {
+                    self.book_revision
+                        .checked_add(1)
+                        .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?
+                };
+                if book_revision != expected_book {
+                    return Err(CallAuctionMarketDataError::InvalidUpdate(
+                        "auction mass-cancel completion has an invalid book revision",
+                    ));
+                }
+                self.book_revision = book_revision;
+            }
         }
         self.last_event_sequence = update.sequence;
         Ok(())
@@ -2746,6 +2908,7 @@ impl CallAuctionMarketDataReplica {
             ),
             CallAuctionBookChangeReason::UserCancelled
             | CallAuctionBookChangeReason::Replaced
+            | CallAuctionBookChangeReason::MassCancelled
             | CallAuctionBookChangeReason::UncrossRemainder => (
                 previous.quantity.checked_sub(changed).ok_or(
                     CallAuctionMarketDataError::InvalidUpdate(
@@ -2949,11 +3112,20 @@ where
     let mut replacement_index = None;
     let mut first_occurred_at = None;
     let mut accepted_index = None;
+    let mut timestamps_match = true;
+    let mut mass_cancel_count = 0_usize;
+    let mut mass_cancel_quantity = 0_u128;
+    let mut mass_cancel_completion = None;
     for (index, update) in updates.enumerate() {
         if index == 0 {
             first_occurred_at = Some(update.occurred_at);
+        } else if first_occurred_at != Some(update.occurred_at) {
+            timestamps_match = false;
         }
-        if let CallAuctionMarketDataKind::Book { reason, .. } = update.kind {
+        if let CallAuctionMarketDataKind::Book {
+            reason, quantity, ..
+        } = update.kind
+        {
             match reason {
                 CallAuctionBookChangeReason::Accepted => accepted_index = Some(index),
                 CallAuctionBookChangeReason::Replaced => {
@@ -2963,8 +3135,31 @@ where
                         ));
                     }
                 }
+                CallAuctionBookChangeReason::MassCancelled => {
+                    mass_cancel_count = mass_cancel_count
+                        .checked_add(1)
+                        .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
+                    mass_cancel_quantity = mass_cancel_quantity
+                        .checked_add(u128::from(quantity.lots()))
+                        .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
+                }
                 CallAuctionBookChangeReason::UserCancelled
                 | CallAuctionBookChangeReason::UncrossRemainder => {}
+            }
+        }
+        if let CallAuctionMarketDataKind::MassCancelCompleted {
+            cancelled_order_count,
+            cancelled_quantity_lots,
+            ..
+        } = update.kind
+        {
+            if mass_cancel_completion
+                .replace((index, cancelled_order_count, cancelled_quantity_lots))
+                .is_some()
+            {
+                return Err(CallAuctionMarketDataError::InvalidUpdate(
+                    "auction command batch repeats a mass-cancel completion",
+                ));
             }
         }
         if replacement_index.is_some() && update.occurred_at != first_occurred_at.unwrap() {
@@ -2979,6 +3174,26 @@ where
         return Err(CallAuctionMarketDataError::InvalidUpdate(
             "auction replacement must be Replaced then Accepted in one two-update batch",
         ));
+    }
+    if mass_cancel_count != 0 || mass_cancel_completion.is_some() {
+        let Some((completion_index, declared_count, declared_quantity)) = mass_cancel_completion
+        else {
+            return Err(CallAuctionMarketDataError::InvalidUpdate(
+                "auction mass-cancel removals lack a final completion",
+            ));
+        };
+        let observed_count = u64::try_from(mass_cancel_count)
+            .map_err(|_| CallAuctionMarketDataError::ArithmeticOverflow)?;
+        if completion_index.checked_add(1) != Some(update_count)
+            || mass_cancel_count.checked_add(1) != Some(update_count)
+            || observed_count != declared_count
+            || mass_cancel_quantity != declared_quantity
+            || !timestamps_match
+        {
+            return Err(CallAuctionMarketDataError::InvalidUpdate(
+                "auction mass cancel must contain only reconciled removals followed by one completion",
+            ));
+        }
     }
     Ok(())
 }
@@ -3028,6 +3243,20 @@ fn validate_update_kind(
             {
                 return Err(CallAuctionMarketDataError::InvalidUpdate(
                     "auction completion contains an infeasible clearing or revision",
+                ));
+            }
+            Ok(())
+        }
+        CallAuctionMarketDataKind::MassCancelCompleted {
+            cancelled_order_count,
+            cancelled_quantity_lots,
+            book_revision,
+        } => {
+            if (cancelled_order_count == 0) != (cancelled_quantity_lots == 0)
+                || book_revision > sequence
+            {
+                return Err(CallAuctionMarketDataError::InvalidUpdate(
+                    "auction mass-cancel completion contains inconsistent totals or revision",
                 ));
             }
             Ok(())
@@ -3208,6 +3437,7 @@ fn command_instrument(command: CallAuctionCommand) -> InstrumentId {
         CallAuctionCommand::PhaseControl(value) => value.instrument_id,
         CallAuctionCommand::Submit(value) => value.order.instrument_id(),
         CallAuctionCommand::Cancel(value) => value.instrument_id,
+        CallAuctionCommand::MassCancel(value) => value.instrument_id,
         CallAuctionCommand::Replace(value) => value.replacement.instrument_id(),
         CallAuctionCommand::Uncross(value) => value.instrument_id,
     }
@@ -3218,6 +3448,7 @@ fn command_version(command: CallAuctionCommand) -> InstrumentVersion {
         CallAuctionCommand::PhaseControl(value) => value.instrument_version,
         CallAuctionCommand::Submit(value) => value.order.instrument_version(),
         CallAuctionCommand::Cancel(value) => value.instrument_version,
+        CallAuctionCommand::MassCancel(value) => value.instrument_version,
         CallAuctionCommand::Replace(value) => value.replacement.instrument_version(),
         CallAuctionCommand::Uncross(value) => value.instrument_version,
     }
@@ -3358,7 +3589,8 @@ const fn update_levels(
         CallAuctionMarketDataKind::Trade { buy, sell, .. } => [Some(buy), Some(sell)],
         CallAuctionMarketDataKind::NoPublicChange
         | CallAuctionMarketDataKind::PhaseChanged { .. }
-        | CallAuctionMarketDataKind::UncrossCompleted { .. } => [None, None],
+        | CallAuctionMarketDataKind::UncrossCompleted { .. }
+        | CallAuctionMarketDataKind::MassCancelCompleted { .. } => [None, None],
     }
 }
 
@@ -3554,5 +3786,67 @@ mod tests {
         assert_eq!(replica.last_sequence(), u64::MAX);
         assert_eq!(replica.last_command_sequence(), 1);
         replica.validate().unwrap();
+    }
+
+    #[test]
+    fn mass_cancel_batch_preflight_rejects_incomplete_or_inconsistent_aggregates() {
+        let definition = definition();
+        let removal = CallAuctionMarketDataUpdate {
+            instrument_id: definition.instrument_id(),
+            instrument_version: definition.version(),
+            sequence: 1,
+            occurred_at: TimestampNs::from_unix_nanos(7),
+            kind: CallAuctionMarketDataKind::Book {
+                reason: CallAuctionBookChangeReason::MassCancelled,
+                quantity: Quantity::new(2).unwrap(),
+                level: CallAuctionMarketDataLevel {
+                    side: Side::Buy,
+                    constraint: AuctionOrderConstraint::Market,
+                    quantity: 0,
+                    order_count: 0,
+                },
+            },
+        };
+        let completion = CallAuctionMarketDataUpdate {
+            instrument_id: definition.instrument_id(),
+            instrument_version: definition.version(),
+            sequence: 2,
+            occurred_at: TimestampNs::from_unix_nanos(7),
+            kind: CallAuctionMarketDataKind::MassCancelCompleted {
+                cancelled_order_count: 1,
+                cancelled_quantity_lots: 2,
+                book_revision: 1,
+            },
+        };
+
+        preflight_complete_batch_grammar([removal, completion].into_iter()).unwrap();
+        assert!(matches!(
+            preflight_complete_batch_grammar([removal].into_iter()),
+            Err(CallAuctionMarketDataError::InvalidUpdate(
+                "auction mass-cancel removals lack a final completion"
+            ))
+        ));
+
+        let mut wrong_count = completion;
+        wrong_count.kind = CallAuctionMarketDataKind::MassCancelCompleted {
+            cancelled_order_count: 2,
+            cancelled_quantity_lots: 2,
+            book_revision: 1,
+        };
+        assert!(matches!(
+            preflight_complete_batch_grammar([removal, wrong_count].into_iter()),
+            Err(CallAuctionMarketDataError::InvalidUpdate(
+                "auction mass cancel must contain only reconciled removals followed by one completion"
+            ))
+        ));
+
+        let mut wrong_time = completion;
+        wrong_time.occurred_at = TimestampNs::from_unix_nanos(8);
+        assert!(matches!(
+            preflight_complete_batch_grammar([removal, wrong_time].into_iter()),
+            Err(CallAuctionMarketDataError::InvalidUpdate(
+                "auction mass cancel must contain only reconciled removals followed by one completion"
+            ))
+        ));
     }
 }

@@ -11,9 +11,9 @@ use quotick::auction_book::{
 };
 use quotick::auction_engine::{
     CallAuctionCheckpoint, CallAuctionCheckpointCapture, CallAuctionCommand, CallAuctionEngine,
-    CallAuctionEngineError, CallAuctionEngineLimits, CallAuctionEngineLimitsSpec, CallAuctionPhase,
-    CallAuctionPhaseControl, CallAuctionReplaceOrder, CallAuctionSubmitOrder,
-    CallAuctionUncrossCommand,
+    CallAuctionEngineError, CallAuctionEngineLimits, CallAuctionEngineLimitsSpec,
+    CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl, CallAuctionReplaceOrder,
+    CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use quotick::codec::{BinaryCodec, CodecError};
 use quotick::durable_auction::{
@@ -28,6 +28,7 @@ use quotick::journal::{
     Durability, Journal, JournalLayout, JournalOptions, JournalReader, RecordKind, RecoveryMode,
     SegmentedJournalOptions, SegmentedJournalReader,
 };
+use quotick::matching::MassCancelScope;
 use quotick::snapshot::{CheckpointSlot, SnapshotFile, SnapshotOptions};
 use quotick::{
     AccountId, AssetId, AuctionId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price,
@@ -159,6 +160,17 @@ fn replace(
         account_id: replacement.account_id(),
         target_order_id: OrderId::new(target_order_id).unwrap(),
         replacement,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+fn mass_cancel(command_id: u64, account_id: u64, scope: MassCancelScope) -> CallAuctionCommand {
+    CallAuctionCommand::MassCancel(CallAuctionMassCancel {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: InstrumentId::new(71).unwrap(),
+        instrument_version: InstrumentVersion::new(1).unwrap(),
+        account_id: AccountId::new(account_id).unwrap(),
+        scope,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
@@ -311,6 +323,58 @@ fn durable_staged_auction_checkpoint_replays_only_post_capture_suffix() {
     assert_eq!(recovered.recovery().replayed_commands, 1);
     assert_eq!(recovered.engine().book().active_order_count(), 2);
     recovered.engine().validate().unwrap();
+}
+
+#[test]
+fn mass_cancel_recovers_across_checkpoint_and_wal_suffix() {
+    let area = TestPath::directory("mass-cancel-recovery");
+    fs::create_dir_all(area.path()).unwrap();
+    let wal = area.join("auction.wal");
+    let snapshot = area.join("auction.qsnp");
+    let mut durable = DurableCallAuctionEngine::open(&wal, definition(), options()).unwrap();
+    durable
+        .submit(phase(1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    durable
+        .submit(submit(2, order(10, 1, Side::Buy, 3)))
+        .unwrap();
+    durable
+        .submit(submit(3, order(20, 1, Side::Sell, 5)))
+        .unwrap();
+    durable
+        .submit(submit(4, order(30, 2, Side::Buy, 7)))
+        .unwrap();
+    durable
+        .submit(mass_cancel(5, 1, MassCancelScope::Side(Side::Buy)))
+        .unwrap();
+    durable
+        .write_checkpoint(&snapshot, SnapshotOptions::default())
+        .unwrap();
+    let suffix = mass_cancel(6, 1, MassCancelScope::All);
+    durable.submit(suffix).unwrap();
+    durable.close().unwrap();
+
+    let mut recovered = DurableCallAuctionEngine::open_with_checkpoint(
+        &wal,
+        &snapshot,
+        definition(),
+        options(),
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().replayed_commands, 1);
+    assert_eq!(recovered.engine().book().active_order_count(), 1);
+    assert!(
+        recovered
+            .engine()
+            .book()
+            .order(OrderId::new(30).unwrap())
+            .is_some()
+    );
+    let replay = recovered.submit(suffix).unwrap();
+    assert!(replay.replayed);
+    recovered.engine().validate().unwrap();
+    recovered.close().unwrap();
 }
 
 #[test]
@@ -838,7 +902,7 @@ fn auction_checkpoint_has_stable_kind_codec_and_direct_restore() {
     SnapshotFile::write(&snapshot, &shared, SnapshotOptions::default()).unwrap();
     let bytes = fs::read(snapshot).unwrap();
     assert_eq!(&bytes[0..4], b"QSNP");
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 10);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 11);
     assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 4);
 }
 

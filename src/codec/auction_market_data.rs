@@ -95,6 +95,7 @@ fn encode_reason(encoder: &mut Encoder, reason: CallAuctionBookChangeReason) {
         CallAuctionBookChangeReason::UserCancelled => 1,
         CallAuctionBookChangeReason::UncrossRemainder => 2,
         CallAuctionBookChangeReason::Replaced => 3,
+        CallAuctionBookChangeReason::MassCancelled => 4,
     });
 }
 
@@ -104,6 +105,7 @@ fn decode_reason(decoder: &mut Decoder<'_>) -> Result<CallAuctionBookChangeReaso
         1 => Ok(CallAuctionBookChangeReason::UserCancelled),
         2 => Ok(CallAuctionBookChangeReason::UncrossRemainder),
         3 => Ok(CallAuctionBookChangeReason::Replaced),
+        4 => Ok(CallAuctionBookChangeReason::MassCancelled),
         tag => Err(CodecError::InvalidTag {
             type_name: "CallAuctionBookChangeReason",
             tag,
@@ -194,6 +196,16 @@ impl BinaryCodec for CallAuctionMarketDataUpdate {
                 encoder.u64(book_revision);
                 encoder.u64(phase_revision);
             }
+            CallAuctionMarketDataKind::MassCancelCompleted {
+                cancelled_order_count,
+                cancelled_quantity_lots,
+                book_revision,
+            } => {
+                encoder.u8(5);
+                encoder.u64(cancelled_order_count);
+                encoder.u128(cancelled_quantity_lots);
+                encoder.u64(book_revision);
+            }
         }
         encoder.finish()
     }
@@ -229,6 +241,11 @@ impl BinaryCodec for CallAuctionMarketDataUpdate {
                 cancellation_count: decoder.u64()?,
                 book_revision: decoder.u64()?,
                 phase_revision: decoder.u64()?,
+            },
+            5 => CallAuctionMarketDataKind::MassCancelCompleted {
+                cancelled_order_count: decoder.u64()?,
+                cancelled_quantity_lots: decoder.u128()?,
+                book_revision: decoder.u64()?,
             },
             tag => {
                 return Err(CodecError::InvalidTag {

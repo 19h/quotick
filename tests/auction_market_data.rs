@@ -5,19 +5,20 @@ use quotick::auction_book::{
 };
 use quotick::auction_engine::{
     CallAuctionCancelOrder, CallAuctionCommand, CallAuctionEngine, CallAuctionEngineLimits,
-    CallAuctionEngineLimitsSpec, CallAuctionPhase, CallAuctionPhaseControl,
+    CallAuctionEngineLimitsSpec, CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl,
     CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use quotick::auction_market_data::{
-    CallAuctionMarketDataBatch, CallAuctionMarketDataError, CallAuctionMarketDataKind,
-    CallAuctionMarketDataPublisher, CallAuctionMarketDataReplica, CallAuctionMarketDataSnapshot,
-    CallAuctionMarketDataUpdate,
+    CallAuctionBookChangeReason, CallAuctionMarketDataBatch, CallAuctionMarketDataError,
+    CallAuctionMarketDataKind, CallAuctionMarketDataPublisher, CallAuctionMarketDataReplica,
+    CallAuctionMarketDataSnapshot, CallAuctionMarketDataUpdate,
 };
 use quotick::codec::BinaryCodec;
 use quotick::instrument::{
     InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
     QuantityRules, ReserveOrderRules, TradingState,
 };
+use quotick::matching::MassCancelScope;
 use quotick::{
     AccountId, AssetId, AuctionId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price,
     Quantity, Side, TimestampNs,
@@ -153,6 +154,17 @@ fn cancel(command_id: u64, account_id: u64, order_id: u64) -> CallAuctionCommand
         instrument_version: version(),
         account_id: AccountId::new(account_id).unwrap(),
         order_id: OrderId::new(order_id).unwrap(),
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+fn mass_cancel(command_id: u64, account_id: u64, scope: MassCancelScope) -> CallAuctionCommand {
+    CallAuctionCommand::MassCancel(CallAuctionMassCancel {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        account_id: AccountId::new(account_id).unwrap(),
+        scope,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
@@ -617,6 +629,135 @@ fn cancel_replace_projects_two_updates_but_one_command_boundary() {
         engine.book().best_limit_price(Side::Sell),
         Some(Price::from_raw(105))
     );
+    assert_mirrors(&engine, &replica);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end batch scenario proves privacy, atomicity, empty selection, and closed-phase cancellation"
+)]
+fn mass_cancel_public_batch_is_atomic_anonymized_and_empty_safe() {
+    let mut engine = engine();
+    let mut publisher = CallAuctionMarketDataPublisher::from_engine(&engine).unwrap();
+    let mut replica = CallAuctionMarketDataReplica::new(definition());
+    execute(
+        &mut engine,
+        &mut publisher,
+        &mut replica,
+        phase(1, 1, 0, CallAuctionPhase::Collecting),
+    );
+    for command in [
+        submit(
+            2,
+            1,
+            1,
+            50,
+            7,
+            Side::Sell,
+            AuctionOrderConstraint::Market,
+            5,
+        ),
+        submit(
+            3,
+            1,
+            1,
+            10,
+            7,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+            3,
+        ),
+        submit(
+            4,
+            1,
+            1,
+            40,
+            7,
+            Side::Sell,
+            AuctionOrderConstraint::Market,
+            7,
+        ),
+        submit(
+            5,
+            1,
+            1,
+            30,
+            8,
+            Side::Sell,
+            AuctionOrderConstraint::Market,
+            11,
+        ),
+    ] {
+        execute(&mut engine, &mut publisher, &mut replica, command);
+    }
+    let before = publisher.snapshot();
+    let mut split = CallAuctionMarketDataReplica::new(definition());
+    split.apply_snapshot(&before).unwrap();
+
+    let batch = execute(
+        &mut engine,
+        &mut publisher,
+        &mut replica,
+        mass_cancel(6, 7, MassCancelScope::Side(Side::Sell)),
+    );
+    assert_eq!(batch.updates().len(), 3);
+    assert!(batch.updates()[..2].iter().all(|update| matches!(
+        update.kind(),
+        CallAuctionMarketDataKind::Book {
+            reason: CallAuctionBookChangeReason::MassCancelled,
+            ..
+        }
+    )));
+    assert!(matches!(
+        batch.updates()[2].kind(),
+        CallAuctionMarketDataKind::MassCancelCompleted {
+            cancelled_order_count: 2,
+            cancelled_quantity_lots: 12,
+            book_revision: 5,
+        }
+    ));
+    assert_eq!(
+        split.apply(batch.updates()[0]),
+        Err(CallAuctionMarketDataError::InvalidUpdate(
+            "auction mass cancellation requires a complete command batch"
+        ))
+    );
+    assert_eq!(split.last_sequence(), before.as_of_sequence());
+    assert_eq!(split.book_revision(), before.book_revision());
+    split.apply_batch(&batch).unwrap();
+    assert_mirrors(&engine, &split);
+
+    execute(
+        &mut engine,
+        &mut publisher,
+        &mut replica,
+        phase(7, 1, 1, CallAuctionPhase::Closed),
+    );
+    let empty = execute(
+        &mut engine,
+        &mut publisher,
+        &mut replica,
+        mass_cancel(8, 77, MassCancelScope::All),
+    );
+    assert_eq!(empty.updates().len(), 1);
+    assert!(matches!(
+        empty.updates()[0].kind(),
+        CallAuctionMarketDataKind::MassCancelCompleted {
+            cancelled_order_count: 0,
+            cancelled_quantity_lots: 0,
+            book_revision: 5,
+        }
+    ));
+
+    let closed_cancel = execute(&mut engine, &mut publisher, &mut replica, cancel(9, 7, 10));
+    assert!(matches!(
+        closed_cancel.updates()[0].kind(),
+        CallAuctionMarketDataKind::Book {
+            reason: CallAuctionBookChangeReason::UserCancelled,
+            ..
+        }
+    ));
     assert_mirrors(&engine, &replica);
 }
 

@@ -168,12 +168,18 @@ orders, and `P` occupied limit prices:
   `O(log I + log O + log P)`; owner-checked cancellation is
   `O(log O + log P)`. Replacement uses `O(1)` auxiliary space and accounts for
   the released target slot and singleton price level during preflight.
+- A bounded account index maintains separate intrusive buy/sell lanes with
+  exact counts and `u128` quantities. Account/scope mass-cancel preflight is
+  expected `O(1)`. For `K` selected orders, application traverses only those
+  links, sorts snapshots in `O(K log K)`, and removes them in
+  `O(K(log O + log P))`; it is independent of unrelated active orders.
 - Aggregate scratch construction and discovery are `O(B + A)`.
 - Canonical order scratch construction is `O(O log O + P)` because intrusive
   FIFO identities are resolved through a stable AVL; allocation then adds
   `O(O)` work and `O(F_b + F_a)` result memory.
-- Constructor-reserved collection state is `O(I_max + O_max + P_max)` and
-  does not grow during bounded mutation or analysis scratch reconstruction.
+- Constructor-reserved collection state, including the account index, is
+  `O(I_max + O_max + P_max)` and does not grow during bounded mutation, mass
+  cancellation, or analysis scratch reconstruction.
 
 For `T` buyer/seller trade pairs, `C` remainder cancellations, and `M <= O`
 affected orders, uncross preparation is `O(O log O + P + F_b + F_a + T)` time
@@ -198,12 +204,19 @@ Uncross preparation has the preceding book bound plus `O(T + C)` exact
 report-capacity derivation, and commit adds `O(T + C)` event emission into the
 already reserved trace without vector growth.
 
+Mass-cancel preflight inherits the expected `O(1)` account lookup. Commit adds
+the collection-book `O(K(log K + log O + log P))` work plus `O(K)` event
+emission. It emits `K` removals and one completion; `K = 0` emits only the
+completion. One engine-owned `O_max` snapshot vector is reserved at
+construction and never grows.
+
 The never-evicted report cache retains insertion order, so the independent
 engine audit validates `H` commands and `E` events directly in `O(H + E)`
 time with `O(1)` auxiliary space and no successful-path allocation, then
 applies the underlying collection-book bound above. Checkpoint capture reuses
 the same canonical order and does not sort the retained history. Engine state
-occupies `O(H_max + I_max + O_max + P_max)` memory.
+occupies `O(H_max + I_max + O_max + P_max)` memory, including the mass-cancel
+scratch vector.
 
 ## Auction risk
 
@@ -220,6 +233,9 @@ Replacement authorization subtracts the target reservation and checks the
 replacement in expected `O(1)` time and `O(1)` auxiliary space before the
 underlying book transition. Applying the two-event trace performs one expected
 `O(1)` removal and one expected `O(1)` insertion.
+
+An accepted mass cancel applies `K` ordinary reservation removals in expected
+`O(K)` risk time. Its aggregate completion has no second risk-state effect.
 
 ## Durable auction recovery
 
@@ -337,7 +353,10 @@ The sequenced call-auction engine defaults to:
 - 8,193 events per report (`2 O_max + 1`).
 
 Its monotonic command-history hash and append-only event arena are reserved
-to their complete finite maxima and never delete entries.
+to their complete finite maxima and never delete entries. The engine also
+requests one 4,096-element `CallAuctionOrderSnapshot` mass-cancel scratch
+vector at construction; its ABI byte size and allocator/page overhead are
+target-dependent.
 
 ### Coupled shard hash headroom
 
@@ -525,6 +544,9 @@ updates and `U` unique affected limit identities:
   mutation.
 - An accepted replacement fixes `E = 2`; projection and replica application
   therefore retain the ordinary bounds while advancing the book revision once.
+- A mass cancel with `K` selected orders fixes `E = K + 1`. Publisher and
+  replica work is expected `O(E + U log P)` for `U` affected limit identities;
+  the complete batch advances book revision once exactly when `K > 0`.
 - Snapshot output is `O(P)`; double-buffered snapshot application is
   allocation-free after construction and `O(P log P)`.
 
@@ -547,7 +569,7 @@ The page never splits a batch. Diagnosing an evicted partial oldest batch can
 scan up to `N` slots to report the earliest later complete boundary. Applying
 each replay batch has the ordinary replica `O(E + U)` capacity-preflight and
 `O(E log P)` mutation bounds. Typed slot bytes, allocator rounding, and page
-residency are target-dependent; version-2 payload bytes are unchanged by the
+residency are target-dependent; version-3 payload bytes are unchanged by the
 process-local replay ring.
 
 ## WAL and journal

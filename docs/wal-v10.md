@@ -1,4 +1,8 @@
-# WAL Format Version 10
+# Expired WAL Format Version 10
+
+The current runtime writes and accepts only [WAL version 11](wal-v11.md).
+This document remains the authoritative historical schema for version 10;
+version-10 frames are rejected before payload interpretation.
 
 This document is the authoritative byte-level schema for Quotick WAL version
 10. All multibyte integers are little-endian. Rust enum layout, padding,

@@ -1,4 +1,9 @@
-# Call-auction market-data payload format version 2
+# Expired Call-auction market-data payload format version 2
+
+The current API emits
+[call-auction market-data version 3](auction-market-data-v3.md). This document
+remains the authoritative historical schema for version 2; transports must not
+decode current payloads under this registry.
 
 This document defines the complete-value little-endian binary payloads
 implemented by `BinaryCodec` for `CallAuctionMarketDataUpdate` and

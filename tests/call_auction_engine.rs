@@ -7,14 +7,15 @@ use quotick::auction_engine::{
     CallAuctionAction, CallAuctionCancelOrder, CallAuctionCommand, CallAuctionCommandOutcome,
     CallAuctionEngine, CallAuctionEngineCapacity, CallAuctionEngineConstructionError,
     CallAuctionEngineError, CallAuctionEngineLimits, CallAuctionEngineLimitsError,
-    CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionPhase, CallAuctionPhaseControl,
-    CallAuctionRejectReason, CallAuctionReplaceOrder, CallAuctionSubmitOrder,
-    CallAuctionUncrossCommand,
+    CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionMassCancel, CallAuctionPhase,
+    CallAuctionPhaseControl, CallAuctionRejectReason, CallAuctionReplaceOrder,
+    CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use quotick::instrument::{
     InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
     QuantityRules, ReserveOrderRules, TradingState,
 };
+use quotick::matching::MassCancelScope;
 use quotick::{
     AccountId, AssetId, AuctionId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price,
     Quantity, Side, TimestampNs,
@@ -139,6 +140,17 @@ fn cancel_command(command_id: u64, owner: u64, order_id: u64) -> CallAuctionComm
         instrument_version: version(),
         account_id: account(owner),
         order_id: OrderId::new(order_id).unwrap(),
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+fn mass_cancel_command(command_id: u64, owner: u64, scope: MassCancelScope) -> CallAuctionCommand {
+    CallAuctionCommand::MassCancel(CallAuctionMassCancel {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        account_id: account(owner),
+        scope,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
@@ -470,6 +482,122 @@ fn protected_history_accepts_only_valid_terminal_controls() {
     assert_eq!(engine.resource_status().retained_commands, 5);
     assert_eq!(engine.phase_snapshot().phase(), CallAuctionPhase::Closed);
     assert_eq!(engine.book().active_order_count(), 0);
+    engine.validate().unwrap();
+}
+
+#[test]
+fn mass_cancel_sequences_canonical_events_and_exact_empty_replay_in_every_phase() {
+    let mut engine =
+        CallAuctionEngine::try_with_limits(definition(), engine_limits(8, 16, 24)).unwrap();
+    engine
+        .submit(phase_command(1, 1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    for (command_id, order) in [
+        (
+            2,
+            order(50, 7, Side::Sell, AuctionOrderConstraint::Market, 5),
+        ),
+        (
+            3,
+            order(10, 7, Side::Buy, AuctionOrderConstraint::Market, 3),
+        ),
+        (
+            4,
+            order(30, 8, Side::Buy, AuctionOrderConstraint::Market, 11),
+        ),
+        (
+            5,
+            order(40, 7, Side::Sell, AuctionOrderConstraint::Market, 7),
+        ),
+    ] {
+        engine.submit(submit_command(command_id, order)).unwrap();
+    }
+    engine
+        .submit(phase_command(6, 1, 1, CallAuctionPhase::Frozen))
+        .unwrap();
+
+    let command = mass_cancel_command(7, 7, MassCancelScope::Side(Side::Sell));
+    let report = engine.submit(command).unwrap();
+    assert_eq!(report.outcome, CallAuctionCommandOutcome::Accepted);
+    assert_eq!(report.events.len(), 3);
+    assert!(matches!(
+        report.events[0].kind,
+        CallAuctionEventKind::OrderCancelled { order, reason: quotick::auction_engine::CallAuctionCancellationReason::MassCancel }
+            if order.order_id == OrderId::new(40).unwrap()
+    ));
+    assert!(matches!(
+        report.events[1].kind,
+        CallAuctionEventKind::OrderCancelled { order, reason: quotick::auction_engine::CallAuctionCancellationReason::MassCancel }
+            if order.order_id == OrderId::new(50).unwrap()
+    ));
+    assert!(matches!(
+        report.events[2].kind,
+        CallAuctionEventKind::MassCancelCompleted {
+            account_id,
+            scope: MassCancelScope::Side(Side::Sell),
+            cancelled_order_count: 2,
+            cancelled_quantity_lots: 12,
+            book_revision: 5,
+        } if account_id == account(7)
+    ));
+    assert_eq!(engine.book().active_order_count(), 2);
+    let replay = engine.submit(command).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.events, report.events);
+
+    engine
+        .submit(phase_command(8, 1, 2, CallAuctionPhase::Closed))
+        .unwrap();
+    let empty_command = mass_cancel_command(9, 77, MassCancelScope::All);
+    let empty = engine.submit(empty_command).unwrap();
+    assert_eq!(empty.events.len(), 1);
+    assert!(matches!(
+        empty.events[0].kind,
+        CallAuctionEventKind::MassCancelCompleted {
+            account_id,
+            scope: MassCancelScope::All,
+            cancelled_order_count: 0,
+            cancelled_quantity_lots: 0,
+            book_revision: 5,
+        } if account_id == account(77)
+    ));
+    let replay = engine.submit(empty_command).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.events, empty.events);
+    engine.validate().unwrap();
+}
+
+#[test]
+fn protected_lane_accepts_only_nonempty_mass_cancel() {
+    let mut engine =
+        CallAuctionEngine::try_with_limits(definition(), engine_limits(2, 4, 7)).unwrap();
+    engine
+        .submit(phase_command(1, 1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            2,
+            order(1, 1, Side::Buy, AuctionOrderConstraint::Market, 2),
+        ))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            3,
+            order(2, 2, Side::Sell, AuctionOrderConstraint::Market, 2),
+        ))
+        .unwrap();
+
+    assert!(matches!(
+        engine.submit(mass_cancel_command(4, 99, MassCancelScope::All)),
+        Err(CallAuctionEngineError::CapacityExhausted(
+            CallAuctionEngineCapacity::AdmissionCommandHistory
+        ))
+    ));
+    let report = engine
+        .submit(mass_cancel_command(5, 1, MassCancelScope::All))
+        .unwrap();
+    assert_eq!(report.events.len(), 2);
+    assert!(engine.book().order(OrderId::new(1).unwrap()).is_none());
     engine.validate().unwrap();
 }
 

@@ -373,6 +373,7 @@ impl CallAuctionRiskEngine {
             }
             CallAuctionCommand::PhaseControl(_)
             | CallAuctionCommand::Cancel(_)
+            | CallAuctionCommand::MassCancel(_)
             | CallAuctionCommand::Uncross(_) => Ok(()),
         }
     }
@@ -440,6 +441,7 @@ impl CallAuctionRiskEngine {
                     self.remove_reservation(cancellation.order_id());
                 }
                 CallAuctionEventKind::PhaseChanged { .. }
+                | CallAuctionEventKind::MassCancelCompleted { .. }
                 | CallAuctionEventKind::UncrossCompleted { .. }
                 | CallAuctionEventKind::CommandRejected(_) => {}
             }
