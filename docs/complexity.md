@@ -628,6 +628,20 @@ rejection append two existing frames; allocation failure, decline, unwind, and
 replay append zero. No command/report codec, event bound, or fixed
 authoritative state changes.
 
+`submit_cancel_order_if` composes ordinary `CancelOrder` preparation with one
+fixed-size `ActiveOrderObservation`, a predicate, and the ordinary cancellation
+commit. Let `A` be cancellation preparation cost, `V` the validated active-
+order lookup cost, `F` predicate cost, and `M` cancellation commit cost.
+Acceptance is `O(A + V + F + M)` time; decline is `O(A + V + F)` time.
+Observation and evaluator auxiliary space are `O(1)`. `V` is one expected
+`O(1)` order-index lookup plus fixed-size resting or dormant-stop validation.
+Core rejection and exact replay retain their existing preparation bound and
+skip `V` and `F`. Coupled cancellation authorization is expected `O(1)` and
+ordinary commit releases the existing reservation. Durable acceptance and
+business rejection append two existing frames; observation failure, decline,
+unwind, and replay append zero. No command/report codec, event bound, or fixed
+authoritative state changes.
+
 ## Default matching limits and memory
 
 This section states the default resource envelopes, the buffer pools, the

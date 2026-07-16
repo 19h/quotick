@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A144 are stable and are referenced from code comments and other
+identifiers A1-A145 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -5522,6 +5522,68 @@ before acceptance, reservation loss on risk rejection, interposed shard
 transition, durable protocol or recovery drift, or new wire value falsifies
 A144.
 
+## A145 — atomic conditional cancellation observation
+
+**Assumption.** One `submit_cancel_order_if` call on an `OrderBook`,
+`RiskManagedOrderBook`, `DurableOrderBook`, or `DurableRiskOrderBook` holds the
+corresponding exclusive mutable shard borrow across ordinary `CancelOrder`
+preparation, construction of one `ActiveOrderObservation`, a borrowed local
+predicate, and commit of that same preparation. It reuses the ordinary
+cancellation, coupled-risk trace, report, persistence, and recovery paths.
+
+Exact replay plus unknown-order, wrong-owner, and other core business
+rejections return a reported `ConditionalCommandOutcome` without an
+observation or predicate execution. Otherwise the observation binds instrument
+ID, immutable definition version, last visible book event sequence, queried
+order ID, and validated resting or dormant-stop state. A contradictory private
+order snapshot returns `ConditionalOrderError::Query` before the predicate.
+Predicate decline or unwind drops immutable preparation before consuming
+sequence, event, matching, risk, history, public, or WAL state. Acceptance
+commits without an intervening shard transition and returns the exact
+observation with the ordinary cancellation report. Coupled risk releases the
+target reservation exactly once on commit and retains it on every noncommit
+path.
+
+Durable acceptance and business rejection retain command-before-state-before-
+report and append two existing frames. Observation failure, decline, unwind,
+and replay append zero frames. The observation and callback decision are
+process-local, unencoded, unauthenticated, and valid only within the call.
+Existing command, report, checkpoint, market-data, and wire values are
+unchanged.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A7, A9, A10, A12, A15, A18,
+A19, A22, A37, A39, A44, A45, A47, A55, A57, A67, A72, A80, A81, A82,
+A83, A85, A103, A139, A142, A143, A144, A145] Let `A` be ordinary
+cancellation preparation cost, `V` the validated active-order lookup cost,
+`F` predicate cost, and `M` cancellation commit cost. Acceptance costs
+`O(A + V + F + M)` and decline costs `O(A + V + F)`, with `O(1)` observation
+and evaluator auxiliary space. `V` is one expected `O(1)` order-index lookup
+plus fixed-size resting or dormant-stop validation. Core rejection and replay
+pay only their existing preparation path and skip `V` and `F`. Coupled risk
+retains expected `O(1)` cancellation authorization and reservation release.
+Durable acceptance and business rejection append two existing frames;
+observation failure, decline, unwind, and replay append zero. All arithmetic is
+exact integer arithmetic; approximation error is zero.
+
+**Falsification probe.** Across all four surfaces, exercise fully displayed,
+reserve, fully hidden, and dormant stop-market/stop-limit targets on both sides
+and signed prices. Run accepting, declining, and unwinding predicates. Require
+the same instrument/version/sequence/order provenance and complete resting or
+dormant state observed immediately before accepted cancellation. Exercise
+unknown and wrong-owner targets, wrong route or version, blocked/non-open
+admission where applicable, exact retry, command-ID collision, sequence/event/
+capacity exhaustion, private-order corruption, and durable write/report
+failure.
+
+Count predicate calls; compare target snapshots and queue priority, private/
+public book, risk positions/reservations/exposures, command history, WAL frames,
+and plain/coupled-risk reopen state. Any observation or predicate on rejection
+or replay, active/dormant misclassification, accepted observation/report
+provenance drift, mutation or WAL growth before acceptance, reservation loss
+on noncommit, missing reservation release on acceptance, interposed shard
+transition, durable protocol or recovery drift, or new wire value falsifies
+A145.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -5733,6 +5795,26 @@ capability, a remaining risk, or an opportunity.
   unwind, allocation failure, and replay preserve the target and append no WAL
   frames.
 
+- **High impact:** A145 now applies the same observation-bound commit to
+  cancellation across plain, coupled-risk, durable, and durable-risk books.
+  The predicate receives exact validated resting or dormant-stop state;
+  decline, unwind, query failure, and replay preserve the target, its
+  reservation, and WAL length.
+
+- **Medium impact opportunity:** one cancellation predicate can gate on exact
+  leaves, working quantity, price, display mode, dormant trigger state, expiry,
+  and book event sequence without a separate observation borrow.
+
+- **Medium impact risk:** a cancellation predicate executes synchronously
+  while the shard is exclusively borrowed. Its latency and external blocking
+  extend local cancellation latency; no callback deadline or scheduling
+  isolation is provided.
+
+- **High impact boundary:** A145 closes observation-to-cancellation validity
+  only within one synchronous process-local call. It provides no remote or
+  asynchronous validity, callback authentication or durability, cross-shard
+  cancellation, or external cancel-on-behalf authorization.
+
 - **Medium impact opportunity:** one predicate can gate immediate slippage,
   per-price concentration, passive resting admission, reserve/hidden residual
   policy, minimum-quantity availability, a market-to-limit captured price, or
@@ -5761,9 +5843,10 @@ capability, a remaining risk, or an opportunity.
   query-rate controls remain outside the order-book API.
 
 - **High impact risk:** a standalone A124 quote or A141 curve still neither
-  reserves liquidity nor fences a later borrow. A140/A142 close canonical IOC
-  A143 closes arbitrary new-order submission, and A144 closes continuous
-  replacement only within one synchronous process-local call. Remote or
+  reserves liquidity nor fences a later borrow. A140/A142 close canonical IOC,
+  A143 closes arbitrary new-order submission, A144 closes continuous
+  replacement, and A145 closes continuous cancellation only within one
+  synchronous process-local call. Remote or
   asynchronous validity, callback authentication/durability, fees, cross-shard
   execution, and projected cancel-resting or cancel-both maker effects require
   separately specified protocols.

@@ -19,12 +19,12 @@ use crate::journal::{
     SegmentedJournalError, SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
 };
 use crate::matching::{
-    Command, CommandPreparation, ConditionalExecutionDecision, ConditionalExecutionPreflight,
-    ConditionalExecutionPreparation, ConditionalOrderOutcome, ExecutionReport,
-    ImmediateExecutionCurve, ImmediateExecutionCurveOutcome, ImmediateExecutionOutcome,
-    ImmediateExecutionQuote, ImmediateExecutionSubmission, MatchingError, NewOrder, OrderBook,
-    OrderBookQueryError, OrderExecution, PreparedCommand, ReplaceOrder,
-    evaluate_conditional_execution,
+    ActiveOrderObservation, CancelOrder, Command, CommandPreparation, ConditionalCommandOutcome,
+    ConditionalExecutionPreflight, ConditionalExecutionPreparation, ConditionalOrderOutcome,
+    ExecutionReport, ImmediateExecutionCurve, ImmediateExecutionCurveOutcome,
+    ImmediateExecutionOutcome, ImmediateExecutionQuote, ImmediateExecutionSubmission,
+    MatchingError, NewOrder, OrderBook, OrderBookQueryError, OrderExecution, PreparedCommand,
+    ReplaceOrder, evaluate_conditional_execution,
 };
 use crate::risk::{
     AccountRiskDefinition, RiskError, RiskInvariantViolation, RiskManagedCheckpoint,
@@ -898,7 +898,6 @@ impl DurableRiskOrderBook {
         accept: impl FnOnce(&OrderExecution<ImmediateExecutionQuote>) -> bool,
     ) -> Result<ConditionalOrderOutcome<ImmediateExecutionQuote>, DurableRiskError> {
         self.submit_conditional_new_order(order, |_, observation| Ok(observation), accept)
-            .map(Into::into)
     }
 
     /// Durably risk-gates, constructs an active private execution curve, and
@@ -924,7 +923,6 @@ impl DurableRiskOrderBook {
             |book, observation| Ok(book.try_order_execution_curve(observation)?),
             accept,
         )
-        .map(Into::into)
     }
 
     /// Durably risk-gates, observes, and conditionally replaces one order.
@@ -944,7 +942,6 @@ impl DurableRiskOrderBook {
         accept: impl FnOnce(&OrderExecution<ImmediateExecutionQuote>) -> bool,
     ) -> Result<ConditionalOrderOutcome<ImmediateExecutionQuote>, DurableRiskError> {
         self.submit_conditional_replace_order(replacement, |_, observation| Ok(observation), accept)
-            .map(Into::into)
     }
 
     /// Durably risk-gates, constructs an active private execution curve, and
@@ -969,7 +966,26 @@ impl DurableRiskOrderBook {
             |book, observation| Ok(book.try_order_execution_curve(observation)?),
             accept,
         )
-        .map(Into::into)
+    }
+
+    /// Durably observes and conditionally cancels one coupled active order.
+    ///
+    /// Replay and core rejection bypass `accept`. Otherwise the predicate
+    /// borrows validated, provenance-bound resting or dormant state before WAL
+    /// mutation. Decline or unwind changes neither WAL nor coupled semantic
+    /// state. Acceptance persists and commits the same preparation, releasing
+    /// its reservation exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableRiskError`] for poison, preparation, private
+    /// observation, journal, or coupled commit failure.
+    pub fn submit_cancel_order_if(
+        &mut self,
+        cancellation: CancelOrder,
+        accept: impl FnOnce(&ActiveOrderObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<ActiveOrderObservation>, DurableRiskError> {
+        self.submit_conditional_cancel_order(cancellation, |_, observation| Ok(observation), accept)
     }
 
     /// Durably risk-gates, quotes, and conditionally submits one canonical IOC order.
@@ -1029,7 +1045,7 @@ impl DurableRiskOrderBook {
         submission: ImmediateExecutionSubmission,
         observe: impl FnOnce(&OrderBook, ImmediateExecutionQuote) -> Result<T, DurableRiskError>,
         accept: impl FnOnce(&T) -> bool,
-    ) -> Result<ConditionalExecutionDecision<T>, DurableRiskError> {
+    ) -> Result<ConditionalCommandOutcome<T>, DurableRiskError> {
         if self.is_poisoned() {
             return Err(DurableRiskError::Poisoned);
         }
@@ -1047,7 +1063,7 @@ impl DurableRiskOrderBook {
             OrderExecution<ImmediateExecutionQuote>,
         ) -> Result<T, DurableRiskError>,
         accept: impl FnOnce(&T) -> bool,
-    ) -> Result<ConditionalExecutionDecision<T>, DurableRiskError> {
+    ) -> Result<ConditionalCommandOutcome<T>, DurableRiskError> {
         if self.is_poisoned() {
             return Err(DurableRiskError::Poisoned);
         }
@@ -1063,7 +1079,7 @@ impl DurableRiskOrderBook {
             OrderExecution<ImmediateExecutionQuote>,
         ) -> Result<T, DurableRiskError>,
         accept: impl FnOnce(&T) -> bool,
-    ) -> Result<ConditionalExecutionDecision<T>, DurableRiskError> {
+    ) -> Result<ConditionalCommandOutcome<T>, DurableRiskError> {
         if self.is_poisoned() {
             return Err(DurableRiskError::Poisoned);
         }
@@ -1073,12 +1089,27 @@ impl DurableRiskOrderBook {
         self.submit_conditional_execution(preflight, observe, accept)
     }
 
+    fn submit_conditional_cancel_order<T>(
+        &mut self,
+        cancellation: CancelOrder,
+        observe: impl FnOnce(&OrderBook, ActiveOrderObservation) -> Result<T, DurableRiskError>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, DurableRiskError> {
+        if self.is_poisoned() {
+            return Err(DurableRiskError::Poisoned);
+        }
+        let preflight = self
+            .managed
+            .prepare_conditional_cancel_order::<DurableRiskError>(cancellation)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
     fn submit_conditional_execution<T, U>(
         &mut self,
         preflight: ConditionalExecutionPreflight<T>,
         observe: impl FnOnce(&OrderBook, T) -> Result<U, DurableRiskError>,
         accept: impl FnOnce(&U) -> bool,
-    ) -> Result<ConditionalExecutionDecision<U>, DurableRiskError> {
+    ) -> Result<ConditionalCommandOutcome<U>, DurableRiskError> {
         match evaluate_conditional_execution(
             preflight,
             |value| observe(self.managed.book(), value),
@@ -1096,7 +1127,7 @@ impl DurableRiskOrderBook {
             } => {
                 let report = self.commit_prepared(prepared)?;
                 let retained_observation = if report.replayed { None } else { observation };
-                Ok(ConditionalExecutionDecision::Reported {
+                Ok(ConditionalCommandOutcome::Reported {
                     observation: retained_observation,
                     report,
                 })
