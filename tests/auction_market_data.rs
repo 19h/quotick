@@ -5,8 +5,8 @@ use quotick::auction_book::{
 };
 use quotick::auction_engine::{
     CallAuctionCancelOrder, CallAuctionCommand, CallAuctionEngine, CallAuctionEngineLimits,
-    CallAuctionEngineLimitsSpec, CallAuctionPhase, CallAuctionPhaseControl, CallAuctionSubmitOrder,
-    CallAuctionUncrossCommand,
+    CallAuctionEngineLimitsSpec, CallAuctionPhase, CallAuctionPhaseControl,
+    CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use quotick::auction_market_data::{
     CallAuctionMarketDataBatch, CallAuctionMarketDataError, CallAuctionMarketDataKind,
@@ -153,6 +153,40 @@ fn cancel(command_id: u64, account_id: u64, order_id: u64) -> CallAuctionCommand
         instrument_version: version(),
         account_id: AccountId::new(account_id).unwrap(),
         order_id: OrderId::new(order_id).unwrap(),
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test command factory keeps target and replacement identity explicit"
+)]
+fn replace(
+    command_id: u64,
+    auction_id: u64,
+    phase_revision: u64,
+    target_order_id: u64,
+    account_id: u64,
+    replacement_order_id: u64,
+    side: Side,
+    constraint: AuctionOrderConstraint,
+    quantity: u64,
+) -> CallAuctionCommand {
+    CallAuctionCommand::Replace(CallAuctionReplaceOrder {
+        command_id: CommandId::new(command_id).unwrap(),
+        auction_id: auction(auction_id),
+        expected_phase_revision: phase_revision,
+        account_id: AccountId::new(account_id).unwrap(),
+        target_order_id: OrderId::new(target_order_id).unwrap(),
+        replacement: CallAuctionOrder::new(
+            OrderId::new(replacement_order_id).unwrap(),
+            AccountId::new(account_id).unwrap(),
+            instrument(),
+            version(),
+            side,
+            constraint,
+            Quantity::new(quantity).unwrap(),
+        ),
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
@@ -504,6 +538,86 @@ fn rejection_user_cancel_and_live_bootstrap_preserve_public_boundaries() {
         } if quantity.lots() == 9 && level.quantity() == 0 && level.order_count() == 0
     ));
     assert_eq!(engine.book().active_order_count(), 0);
+}
+
+#[test]
+fn cancel_replace_projects_two_updates_but_one_command_boundary() {
+    let mut engine = engine();
+    let mut publisher = CallAuctionMarketDataPublisher::from_engine(&engine).unwrap();
+    let mut replica = CallAuctionMarketDataReplica::new(definition());
+    execute(
+        &mut engine,
+        &mut publisher,
+        &mut replica,
+        phase(1, 1, 0, CallAuctionPhase::Collecting),
+    );
+    execute(
+        &mut engine,
+        &mut publisher,
+        &mut replica,
+        submit(
+            2,
+            1,
+            1,
+            1,
+            7,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+            5,
+        ),
+    );
+    let pre_replace_snapshot = publisher.try_snapshot().unwrap();
+    let mut split_replica = CallAuctionMarketDataReplica::new(definition());
+    split_replica.apply_snapshot(&pre_replace_snapshot).unwrap();
+    let batch = execute(
+        &mut engine,
+        &mut publisher,
+        &mut replica,
+        replace(
+            3,
+            1,
+            1,
+            1,
+            7,
+            2,
+            Side::Sell,
+            AuctionOrderConstraint::Limit(Price::from_raw(105)),
+            3,
+        ),
+    );
+    assert_eq!(batch.updates().len(), 2);
+    assert!(matches!(
+        batch.updates()[0].kind(),
+        CallAuctionMarketDataKind::Book {
+            reason: quotick::auction_market_data::CallAuctionBookChangeReason::Replaced,
+            quantity,
+            level,
+        } if quantity.lots() == 5 && level.quantity() == 0 && level.order_count() == 0
+    ));
+    assert!(matches!(
+        batch.updates()[1].kind(),
+        CallAuctionMarketDataKind::Book {
+            reason: quotick::auction_market_data::CallAuctionBookChangeReason::Accepted,
+            quantity,
+            level,
+        } if quantity.lots() == 3 && level.quantity() == 3 && level.order_count() == 1
+    ));
+    assert_eq!(
+        split_replica.apply(batch.updates()[0]),
+        Err(CallAuctionMarketDataError::InvalidUpdate(
+            "auction replacement removal requires a complete command batch"
+        ))
+    );
+    assert_eq!(split_replica.last_sequence(), 2);
+    assert_eq!(split_replica.book_revision(), 1);
+    split_replica.validate().unwrap();
+    assert_eq!(replica.last_command_sequence(), 3);
+    assert_eq!(engine.book().best_limit_price(Side::Buy), None);
+    assert_eq!(
+        engine.book().best_limit_price(Side::Sell),
+        Some(Price::from_raw(105))
+    );
+    assert_mirrors(&engine, &replica);
 }
 
 #[test]

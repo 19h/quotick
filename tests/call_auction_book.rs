@@ -8,6 +8,7 @@ use quotick::auction_book::{
     CallAuctionAdmissionError, CallAuctionBook, CallAuctionBookLimits, CallAuctionBookLimitsError,
     CallAuctionBookLimitsSpec, CallAuctionCancelError, CallAuctionCapacity,
     CallAuctionConstructionError, CallAuctionIndicative, CallAuctionOrder, CallAuctionPlanError,
+    CallAuctionReplaceError,
 };
 use quotick::instrument::{
     AdmissionError, InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol,
@@ -470,6 +471,113 @@ fn finite_capacities_fail_before_mutation_and_are_independent_per_side() {
         ))
     );
     book.validate().unwrap();
+}
+
+#[test]
+fn cancel_replace_reuses_full_capacity_loses_priority_and_fails_atomically() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(2, 1, 3)).unwrap();
+    let first = order(
+        1,
+        7,
+        Side::Buy,
+        AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        5,
+    );
+    let second = order(
+        2,
+        8,
+        Side::Buy,
+        AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        4,
+    );
+    book.admit(first).unwrap();
+    book.admit(second).unwrap();
+    let allocation = book.resource_status();
+
+    let replacement = order(
+        3,
+        7,
+        Side::Buy,
+        AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        6,
+    );
+    let replaced = book
+        .replace(account(7), first.order_id(), replacement)
+        .unwrap();
+    assert_eq!(replaced.cancelled().order_id, first.order_id());
+    assert_eq!(replaced.accepted().order_id, replacement.order_id());
+    assert_eq!(replaced.accepted().priority_sequence, 3);
+    assert!(book.order(first.order_id()).is_none());
+    assert_eq!(book.order(second.order_id()).unwrap().priority_sequence, 2);
+    assert_eq!(
+        book.order(replacement.order_id())
+            .unwrap()
+            .priority_sequence,
+        3
+    );
+    assert_eq!(book.state_revision(), 3);
+    assert_eq!(
+        book.resource_status().allocated_active_orders,
+        allocation.allocated_active_orders
+    );
+    assert_eq!(
+        book.resource_status().allocated_accepted_order_ids,
+        allocation.allocated_accepted_order_ids
+    );
+
+    let before_second = book.order(second.order_id());
+    let before_replacement = book.order(replacement.order_id());
+    let before_depth = book.limit_depth(Side::Buy, usize::MAX);
+    assert_eq!(
+        book.replace(
+            account(8),
+            second.order_id(),
+            order(
+                4,
+                8,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(105)),
+                1,
+            ),
+        ),
+        Err(CallAuctionReplaceError::Replacement(
+            CallAuctionAdmissionError::CapacityExceeded(CallAuctionCapacity::AcceptedOrderIds)
+        ))
+    );
+    assert_eq!(book.order(second.order_id()), before_second);
+    assert_eq!(book.order(replacement.order_id()), before_replacement);
+    assert_eq!(book.limit_depth(Side::Buy, usize::MAX), before_depth);
+    assert_eq!(book.state_revision(), 3);
+    book.validate().unwrap();
+
+    let mut level_full = CallAuctionBook::try_with_limits(definition(), limits(1, 1, 2)).unwrap();
+    let old = order(
+        10,
+        9,
+        Side::Sell,
+        AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        3,
+    );
+    level_full.admit(old).unwrap();
+    level_full
+        .replace(
+            account(9),
+            old.order_id(),
+            order(
+                11,
+                9,
+                Side::Sell,
+                AuctionOrderConstraint::Limit(Price::from_raw(105)),
+                2,
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        level_full.best_limit_price(Side::Sell),
+        Some(Price::from_raw(105))
+    );
+    assert_eq!(level_full.active_order_count(), 1);
+    level_full.validate().unwrap();
 }
 
 #[test]

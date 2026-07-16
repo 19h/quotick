@@ -164,8 +164,10 @@ emitted.
 For a call-auction collection with `I` accepted identities, `O` active
 orders, and `P` occupied limit prices:
 
-- Admission is `O(log I + log O + log P)` and owner-checked cancellation is
-  `O(log O + log P)`.
+- Admission and new-identity replacement are
+  `O(log I + log O + log P)`; owner-checked cancellation is
+  `O(log O + log P)`. Replacement uses `O(1)` auxiliary space and accounts for
+  the released target slot and singleton price level during preflight.
 - Aggregate scratch construction and discovery are `O(B + A)`.
 - Canonical order scratch construction is `O(O log O + P)` because intrusive
   FIFO identities are resolved through a stable AVL; allocation then adds
@@ -189,11 +191,12 @@ may allocate after corruption is detected.
 ## Sequenced auction engine
 
 For `H` retained sequenced auction reports, phase controls, business
-rejection, and monotonic idempotency lookup are expected `O(1)`; submit and
-cancel inherit the collection-book bounds above. Uncross preparation has the
-preceding book bound plus `O(T + C)` exact report-capacity derivation, and
-commit adds `O(T + C)` event emission into the already reserved trace without
-vector growth.
+rejection, and monotonic idempotency lookup are expected `O(1)`; submit,
+replace, and cancel inherit the collection-book bounds above. An accepted
+replacement emits exactly two events in `O(1)` additional time and space.
+Uncross preparation has the preceding book bound plus `O(T + C)` exact
+report-capacity derivation, and commit adds `O(T + C)` event emission into the
+already reserved trace without vector growth.
 
 The never-evicted report cache retains insertion order, so the independent
 engine audit validates `H` commands and `E` events directly in `O(H + E)`
@@ -212,6 +215,11 @@ audit recomputes all `A` account aggregates across `O` reservations in
 expected `O(A + O)` time and `O(1)` auxiliary space; full coupled parity adds
 another expected `O(O)` pass over active book orders. Adversarial full hash
 collisions can make these passes quadratic but cannot grow storage.
+
+Replacement authorization subtracts the target reservation and checks the
+replacement in expected `O(1)` time and `O(1)` auxiliary space before the
+underlying book transition. Applying the two-event trace performs one expected
+`O(1)` removal and one expected `O(1)` insertion.
 
 ## Durable auction recovery
 
@@ -515,6 +523,8 @@ updates and `U` unique affected limit identities:
   structural AVL diagnostics are allocation-free `O(P log P)`.
 - Replica capacity simulation is expected `O(E + U)` before `O(E log P)`
   mutation.
+- An accepted replacement fixes `E = 2`; projection and replica application
+  therefore retain the ordinary bounds while advancing the book revision once.
 - Snapshot output is `O(P)`; double-buffered snapshot application is
   allocation-free after construction and `O(P log P)`.
 
@@ -537,7 +547,8 @@ The page never splits a batch. Diagnosing an evicted partial oldest batch can
 scan up to `N` slots to report the earliest later complete boundary. Applying
 each replay batch has the ordinary replica `O(E + U)` capacity-preflight and
 `O(E log P)` mutation bounds. Typed slot bytes, allocator rounding, and page
-residency are target-dependent; version-1 payload bytes are unchanged.
+residency are target-dependent; version-2 payload bytes are unchanged by the
+process-local replay ring.
 
 ## WAL and journal
 

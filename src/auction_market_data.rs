@@ -402,6 +402,8 @@ pub enum CallAuctionBookChangeReason {
     Accepted,
     /// Active interest was removed by its owner.
     UserCancelled,
+    /// Active interest was removed before accepting its new identity.
+    Replaced,
     /// Unexecuted interest was removed by the final uncross policy.
     UncrossRemainder,
 }
@@ -1458,14 +1460,19 @@ impl CallAuctionMarketDataPublisher {
                 revision,
             } => self.apply_phase(command, auction_id, previous, current, revision),
             CallAuctionEventKind::OrderAccepted(order) => self.apply_accept(command, order),
-            CallAuctionEventKind::OrderCancelled { order, reason } => {
-                if reason != crate::auction_engine::CallAuctionCancellationReason::UserRequested {
-                    return Err(CallAuctionMarketDataError::TraceMismatch(
-                        "standalone auction cancellation has a non-user reason",
-                    ));
+            CallAuctionEventKind::OrderCancelled { order, reason } => match reason {
+                crate::auction_engine::CallAuctionCancellationReason::UserRequested => {
+                    self.apply_user_cancel(command, order)
                 }
-                self.apply_user_cancel(command, order)
-            }
+                crate::auction_engine::CallAuctionCancellationReason::Replaced => {
+                    self.apply_replace_cancel(command, order)
+                }
+                crate::auction_engine::CallAuctionCancellationReason::UncrossRemainder => {
+                    Err(CallAuctionMarketDataError::TraceMismatch(
+                        "standalone auction cancellation has an uncross-remainder reason",
+                    ))
+                }
+            },
             CallAuctionEventKind::Trade(trade) => self.apply_trade(command, trade, uncross),
             CallAuctionEventKind::RemainderCancelled(cancellation) => {
                 self.apply_remainder(command, cancellation, uncross)
@@ -1548,15 +1555,35 @@ impl CallAuctionMarketDataPublisher {
         command: CallAuctionCommand,
         order: CallAuctionOrderSnapshot,
     ) -> Result<CallAuctionMarketDataKind, CallAuctionMarketDataError> {
-        let CallAuctionCommand::Submit(source) = command else {
-            return Err(CallAuctionMarketDataError::TraceMismatch(
-                "non-submit command emitted an accepted order",
-            ));
+        let (auction_id, expected_phase_revision, submitted) = match command {
+            CallAuctionCommand::Submit(source) => (
+                source.auction_id,
+                source.expected_phase_revision,
+                source.order,
+            ),
+            CallAuctionCommand::Replace(source) => {
+                if source.account_id != source.replacement.account_id()
+                    || self.orders.contains_key(&source.target_order_id)
+                {
+                    return Err(CallAuctionMarketDataError::TraceMismatch(
+                        "replacement acceptance precedes its source cancellation",
+                    ));
+                }
+                (
+                    source.auction_id,
+                    source.expected_phase_revision,
+                    source.replacement,
+                )
+            }
+            _ => {
+                return Err(CallAuctionMarketDataError::TraceMismatch(
+                    "non-submit command emitted an accepted order",
+                ));
+            }
         };
-        let submitted = source.order;
         if self.phase.phase() != CallAuctionPhase::Collecting
-            || self.phase.active_auction_id() != Some(source.auction_id)
-            || source.expected_phase_revision != self.phase.revision()
+            || self.phase.active_auction_id() != Some(auction_id)
+            || expected_phase_revision != self.phase.revision()
             || order.order_id != submitted.order_id()
             || order.account_id != submitted.account_id()
             || order.side != submitted.side()
@@ -1618,6 +1645,36 @@ impl CallAuctionMarketDataPublisher {
             .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
         Ok(CallAuctionMarketDataKind::Book {
             reason: CallAuctionBookChangeReason::UserCancelled,
+            quantity: order.quantity,
+            level,
+        })
+    }
+
+    fn apply_replace_cancel(
+        &mut self,
+        command: CallAuctionCommand,
+        order: CallAuctionOrderSnapshot,
+    ) -> Result<CallAuctionMarketDataKind, CallAuctionMarketDataError> {
+        let CallAuctionCommand::Replace(source) = command else {
+            return Err(CallAuctionMarketDataError::TraceMismatch(
+                "non-replace command emitted a replacement cancellation",
+            ));
+        };
+        let tracked = self.orders.get(&order.order_id).copied().ok_or(
+            CallAuctionMarketDataError::TraceMismatch("replaced auction order is absent"),
+        )?;
+        if source.target_order_id != order.order_id
+            || source.account_id != order.account_id
+            || source.replacement.account_id() != source.account_id
+            || TrackedOrder::from(order) != tracked
+        {
+            return Err(CallAuctionMarketDataError::TraceMismatch(
+                "replaced order contradicts its command or tracked state",
+            ));
+        }
+        let level = self.remove_order(order.order_id, order.quantity.lots())?;
+        Ok(CallAuctionMarketDataKind::Book {
+            reason: CallAuctionBookChangeReason::Replaced,
             quantity: order.quantity,
             level,
         })
@@ -2239,6 +2296,17 @@ impl CallAuctionMarketDataReplica {
         if self.poisoned {
             return Err(CallAuctionMarketDataError::Poisoned);
         }
+        if matches!(
+            update.kind,
+            CallAuctionMarketDataKind::Book {
+                reason: CallAuctionBookChangeReason::Replaced,
+                ..
+            }
+        ) {
+            return Err(CallAuctionMarketDataError::InvalidUpdate(
+                "auction replacement removal requires a complete command batch",
+            ));
+        }
         self.preflight_identity(update)?;
         let expected = self
             .last_event_sequence
@@ -2504,6 +2572,13 @@ impl CallAuctionMarketDataReplica {
                             .checked_add(1)
                             .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
                     }
+                    CallAuctionBookChangeReason::Replaced => {
+                        if self.phase.phase() != CallAuctionPhase::Collecting {
+                            return Err(CallAuctionMarketDataError::InvalidUpdate(
+                                "replacement cancellation occurred outside collection",
+                            ));
+                        }
+                    }
                     CallAuctionBookChangeReason::UncrossRemainder => {
                         if self.phase.phase() != CallAuctionPhase::Frozen {
                             return Err(CallAuctionMarketDataError::InvalidUpdate(
@@ -2670,6 +2745,7 @@ impl CallAuctionMarketDataReplica {
                     .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?,
             ),
             CallAuctionBookChangeReason::UserCancelled
+            | CallAuctionBookChangeReason::Replaced
             | CallAuctionBookChangeReason::UncrossRemainder => (
                 previous.quantity.checked_sub(changed).ok_or(
                     CallAuctionMarketDataError::InvalidUpdate(
@@ -2770,6 +2846,7 @@ impl CallAuctionMarketDataReplica {
                     .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
             }
         }
+        preflight_complete_batch_grammar(updates.clone())?;
         self.preflight_batch_level_capacity(updates.clone())?;
         for update in updates {
             if let Err(error) = self.apply_verified(update) {
@@ -2862,6 +2939,48 @@ impl CallAuctionMarketDataReplica {
         self.cycle_executed_quantity = 0;
         self.cycle_trade_price = None;
     }
+}
+
+fn preflight_complete_batch_grammar<I>(updates: I) -> Result<(), CallAuctionMarketDataError>
+where
+    I: ExactSizeIterator<Item = CallAuctionMarketDataUpdate>,
+{
+    let update_count = updates.len();
+    let mut replacement_index = None;
+    let mut first_occurred_at = None;
+    let mut accepted_index = None;
+    for (index, update) in updates.enumerate() {
+        if index == 0 {
+            first_occurred_at = Some(update.occurred_at);
+        }
+        if let CallAuctionMarketDataKind::Book { reason, .. } = update.kind {
+            match reason {
+                CallAuctionBookChangeReason::Accepted => accepted_index = Some(index),
+                CallAuctionBookChangeReason::Replaced => {
+                    if replacement_index.replace(index).is_some() {
+                        return Err(CallAuctionMarketDataError::InvalidUpdate(
+                            "auction command batch repeats a replacement removal",
+                        ));
+                    }
+                }
+                CallAuctionBookChangeReason::UserCancelled
+                | CallAuctionBookChangeReason::UncrossRemainder => {}
+            }
+        }
+        if replacement_index.is_some() && update.occurred_at != first_occurred_at.unwrap() {
+            return Err(CallAuctionMarketDataError::InvalidUpdate(
+                "auction replacement batch timestamps differ",
+            ));
+        }
+    }
+    if replacement_index.is_some()
+        && (update_count != 2 || replacement_index != Some(0) || accepted_index != Some(1))
+    {
+        return Err(CallAuctionMarketDataError::InvalidUpdate(
+            "auction replacement must be Replaced then Accepted in one two-update batch",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_update_kind(
@@ -3089,6 +3208,7 @@ fn command_instrument(command: CallAuctionCommand) -> InstrumentId {
         CallAuctionCommand::PhaseControl(value) => value.instrument_id,
         CallAuctionCommand::Submit(value) => value.order.instrument_id(),
         CallAuctionCommand::Cancel(value) => value.instrument_id,
+        CallAuctionCommand::Replace(value) => value.replacement.instrument_id(),
         CallAuctionCommand::Uncross(value) => value.instrument_id,
     }
 }
@@ -3098,6 +3218,7 @@ fn command_version(command: CallAuctionCommand) -> InstrumentVersion {
         CallAuctionCommand::PhaseControl(value) => value.instrument_version,
         CallAuctionCommand::Submit(value) => value.order.instrument_version(),
         CallAuctionCommand::Cancel(value) => value.instrument_version,
+        CallAuctionCommand::Replace(value) => value.replacement.instrument_version(),
         CallAuctionCommand::Uncross(value) => value.instrument_version,
     }
 }

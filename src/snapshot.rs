@@ -18,7 +18,7 @@ use crate::matching::OrderBookCheckpoint;
 use crate::risk::RiskManagedCheckpoint;
 
 const MAGIC: [u8; 4] = *b"QSNP";
-const VERSION: u16 = 9;
+const VERSION: u16 = 10;
 const HEADER_LENGTH: usize = 28;
 const CHECKSUM_START: usize = 16;
 const CHECKSUM_END: usize = 20;

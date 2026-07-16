@@ -5,7 +5,8 @@ use quotick::auction_book::{
 };
 use quotick::auction_engine::{
     CallAuctionCancelOrder, CallAuctionCommand, CallAuctionEngine, CallAuctionExecutionReport,
-    CallAuctionPhase, CallAuctionPhaseControl, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionPhase, CallAuctionPhaseControl, CallAuctionReplaceOrder, CallAuctionSubmitOrder,
+    CallAuctionUncrossCommand,
 };
 use quotick::codec::{BinaryCodec, CodecError};
 use quotick::instrument::{
@@ -86,6 +87,22 @@ fn cancel(command_id: u64, account_id: u64, order_id: u64) -> CallAuctionCommand
     })
 }
 
+fn replace(
+    command_id: u64,
+    target_order_id: u64,
+    replacement: CallAuctionOrder,
+) -> CallAuctionCommand {
+    CallAuctionCommand::Replace(CallAuctionReplaceOrder {
+        command_id: CommandId::new(command_id).unwrap(),
+        auction_id: auction_id(),
+        expected_phase_revision: 1,
+        account_id: replacement.account_id(),
+        target_order_id: OrderId::new(target_order_id).unwrap(),
+        replacement,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
 fn uncross(command_id: u64) -> CallAuctionCommand {
     let grid = AuctionPriceGrid::new(1).unwrap();
     CallAuctionCommand::Uncross(CallAuctionUncrossCommand {
@@ -132,7 +149,8 @@ fn every_call_auction_command_variant_round_trips() {
         phase(1, 0, CallAuctionPhase::Collecting),
         submit(2, auction_order(1, 1, Side::Buy, 5)),
         cancel(3, 1, 1),
-        uncross(4),
+        replace(4, 1, auction_order(2, 1, Side::Sell, 3)),
+        uncross(5),
     ];
     for command in commands {
         let encoded = command.encode().unwrap();
@@ -150,23 +168,26 @@ fn representative_reports() -> Vec<CallAuctionExecutionReport> {
             .submit(submit(2, auction_order(1, 1, Side::Buy, 5)))
             .unwrap(),
         engine
-            .submit(submit(3, auction_order(2, 2, Side::Sell, 3)))
+            .submit(replace(3, 1, auction_order(10, 1, Side::Buy, 5)))
             .unwrap(),
         engine
-            .submit(submit(4, auction_order(3, 3, Side::Buy, 1)))
+            .submit(submit(4, auction_order(2, 2, Side::Sell, 3)))
             .unwrap(),
-        engine.submit(cancel(5, 3, 3)).unwrap(),
         engine
-            .submit(phase(6, 1, CallAuctionPhase::Frozen))
+            .submit(submit(5, auction_order(3, 3, Side::Buy, 1)))
             .unwrap(),
-        engine.submit(uncross(7)).unwrap(),
+        engine.submit(cancel(6, 3, 3)).unwrap(),
+        engine
+            .submit(phase(7, 1, CallAuctionPhase::Frozen))
+            .unwrap(),
+        engine.submit(uncross(8)).unwrap(),
         engine
             .submit(CallAuctionCommand::Submit(CallAuctionSubmitOrder {
-                command_id: CommandId::new(8).unwrap(),
+                command_id: CommandId::new(9).unwrap(),
                 auction_id: auction_id(),
                 expected_phase_revision: 3,
                 order: auction_order(4, 4, Side::Buy, 1),
-                received_at: TimestampNs::from_unix_nanos(8),
+                received_at: TimestampNs::from_unix_nanos(9),
             }))
             .unwrap(),
     ]
@@ -175,6 +196,7 @@ fn representative_reports() -> Vec<CallAuctionExecutionReport> {
 #[test]
 fn every_call_auction_event_shape_round_trips() {
     let reports = representative_reports();
+    assert!(reports.iter().any(|report| report.events.len() == 2));
     assert!(reports.iter().any(|report| report.events.len() == 3));
     for report in reports {
         let encoded = report.encode().unwrap();
@@ -263,7 +285,7 @@ fn call_auction_codecs_reject_invalid_tags_lengths_bands_and_report_grammar() {
         ))
     );
 
-    let uncross = representative_reports().remove(6).encode().unwrap();
+    let uncross = representative_reports().remove(7).encode().unwrap();
     let mut self_pair = uncross.clone();
     self_pair[70..78].copy_from_slice(&uncross[54..62]);
     assert_eq!(

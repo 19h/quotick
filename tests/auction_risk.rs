@@ -6,7 +6,8 @@ use quotick::auction_book::{
 use quotick::auction_engine::{
     CallAuctionCommand, CallAuctionCommandOutcome, CallAuctionEngineError, CallAuctionEngineLimits,
     CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionPhase, CallAuctionPhaseControl,
-    CallAuctionRejectReason, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionRejectReason, CallAuctionReplaceOrder, CallAuctionSubmitOrder,
+    CallAuctionUncrossCommand,
 };
 use quotick::auction_risk::{
     CallAuctionRiskLimits, CallAuctionRiskLimitsSpec, CallAuctionRiskManagedEngine,
@@ -177,6 +178,22 @@ fn cancel_command(command_id: u64, owner: u64, order_id: u64) -> CallAuctionComm
         instrument_version: version(),
         account_id: account(owner),
         order_id: OrderId::new(order_id).unwrap(),
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+fn replace_command(
+    command_id: u64,
+    target_order_id: u64,
+    replacement: CallAuctionOrder,
+) -> CallAuctionCommand {
+    CallAuctionCommand::Replace(CallAuctionReplaceOrder {
+        command_id: CommandId::new(command_id).unwrap(),
+        auction_id: auction(1),
+        expected_phase_revision: 1,
+        account_id: replacement.account_id(),
+        target_order_id: OrderId::new(target_order_id).unwrap(),
+        replacement,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
@@ -363,6 +380,112 @@ fn signed_collar_valuation_is_conservative_and_owner_cancel_releases_exactly() {
         engine
             .risk()
             .reservation(OrderId::new(2).unwrap())
+            .is_none()
+    );
+    engine.validate().unwrap();
+}
+
+#[test]
+fn cancel_replace_authorizes_the_net_reservation_and_rejection_keeps_the_old_order() {
+    let mut engine = managed(1);
+    engine
+        .register_account(
+            account(1),
+            risk_profile(
+                AccountRiskState::Active,
+                0,
+                RiskLimitSpec {
+                    max_order_quantity_lots: 5,
+                    max_order_notional: 10_000,
+                    max_open_orders: 1,
+                    max_open_quantity_lots: 5,
+                    max_open_notional: 10_000,
+                    max_long_position_lots: 100,
+                    max_short_position_lots: 100,
+                },
+            ),
+        )
+        .unwrap();
+    engine
+        .submit(phase_command(1, 1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            2,
+            order(
+                1,
+                1,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                5,
+            ),
+        ))
+        .unwrap();
+
+    let accepted = engine
+        .submit(replace_command(
+            3,
+            1,
+            order(
+                2,
+                1,
+                Side::Sell,
+                AuctionOrderConstraint::Limit(Price::from_raw(50)),
+                5,
+            ),
+        ))
+        .unwrap();
+    assert_eq!(accepted.outcome, CallAuctionCommandOutcome::Accepted);
+    assert_eq!(accepted.events.len(), 2);
+    assert!(
+        engine
+            .risk()
+            .reservation(OrderId::new(1).unwrap())
+            .is_none()
+    );
+    let reservation = engine.risk().reservation(OrderId::new(2).unwrap()).unwrap();
+    assert_eq!(reservation.side(), Side::Sell);
+    assert_eq!(reservation.quantity_lots(), 5);
+    assert_eq!(engine.risk().snapshot(account(1)).unwrap().open_orders(), 1);
+
+    let rejected = engine
+        .submit(replace_command(
+            4,
+            2,
+            order(
+                3,
+                1,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                6,
+            ),
+        ))
+        .unwrap();
+    assert_rejection(&rejected, CallAuctionRejectReason::RiskOrderQuantityLimit);
+    assert!(
+        engine
+            .engine()
+            .book()
+            .order(OrderId::new(2).unwrap())
+            .is_some()
+    );
+    assert!(
+        engine
+            .engine()
+            .book()
+            .order(OrderId::new(3).unwrap())
+            .is_none()
+    );
+    assert!(
+        engine
+            .risk()
+            .reservation(OrderId::new(2).unwrap())
+            .is_some()
+    );
+    assert!(
+        engine
+            .risk()
+            .reservation(OrderId::new(3).unwrap())
             .is_none()
     );
     engine.validate().unwrap();

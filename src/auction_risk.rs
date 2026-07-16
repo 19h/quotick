@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::auction::AuctionOrderConstraint;
 use crate::auction_book::{
-    CallAuctionBookLimits, CallAuctionBookLimitsSpec, CallAuctionOrderSnapshot,
+    CallAuctionBookLimits, CallAuctionBookLimitsSpec, CallAuctionOrder, CallAuctionOrderSnapshot,
 };
 use crate::auction_engine::{
     CallAuctionCheckpoint, CallAuctionCheckpointError, CallAuctionCommand,
@@ -348,14 +348,54 @@ impl CallAuctionRiskEngine {
     }
 
     fn authorize(&self, command: CallAuctionCommand) -> Result<(), CallAuctionRejectReason> {
-        let CallAuctionCommand::Submit(submit) = command else {
-            return Ok(());
-        };
-        let order = submit.order;
+        match command {
+            CallAuctionCommand::Submit(submit) => {
+                let account = self
+                    .accounts
+                    .get(&submit.order.account_id())
+                    .ok_or(CallAuctionRejectReason::RiskProfileMissing)?;
+                self.authorize_order(submit.order, *account)
+            }
+            CallAuctionCommand::Replace(replace) => {
+                let account = self
+                    .accounts
+                    .get(&replace.account_id)
+                    .ok_or(CallAuctionRejectReason::RiskProfileMissing)?;
+                let target = self
+                    .reservations
+                    .get(&replace.target_order_id)
+                    .expect("core-approved replacement target must have a risk reservation")
+                    .snapshot;
+                assert_eq!(target.account_id, replace.account_id);
+                let baseline = exposure_without_reservation(account.exposure, target)
+                    .expect("risk exposure must contain its replacement target");
+                self.authorize_order_against(replace.replacement, account.profile, baseline)
+            }
+            CallAuctionCommand::PhaseControl(_)
+            | CallAuctionCommand::Cancel(_)
+            | CallAuctionCommand::Uncross(_) => Ok(()),
+        }
+    }
+
+    fn authorize_order(
+        &self,
+        order: CallAuctionOrder,
+        account: CallAuctionRiskAccount,
+    ) -> Result<(), CallAuctionRejectReason> {
+        self.authorize_order_against(order, account.profile, account.exposure)
+    }
+
+    fn authorize_order_against(
+        &self,
+        order: CallAuctionOrder,
+        profile: RiskProfile,
+        baseline: RiskSnapshot,
+    ) -> Result<(), CallAuctionRejectReason> {
         let account = self
             .accounts
             .get(&order.account_id())
             .ok_or(CallAuctionRejectReason::RiskProfileMissing)?;
+        debug_assert_eq!(account.profile, profile);
         let constraint = risk_constraint(order.constraint());
         let notional = conservative_order_notional(
             self.definition,
@@ -365,8 +405,8 @@ impl CallAuctionRiskEngine {
         )
         .map_err(call_auction_risk_rejection)?;
         evaluate_pretrade_order(
-            account.profile,
-            account.exposure,
+            profile,
+            baseline,
             order.side(),
             order.quantity().lots(),
             notional,
@@ -849,6 +889,30 @@ impl CallAuctionRiskEngine {
         }
         Ok(())
     }
+}
+
+fn exposure_without_reservation(
+    exposure: RiskSnapshot,
+    reservation: CallAuctionReservationSnapshot,
+) -> Option<RiskSnapshot> {
+    let quantity = u128::from(reservation.quantity_lots);
+    let (open_buy_lots, open_sell_lots) = match reservation.side {
+        Side::Buy => (
+            exposure.open_buy_lots().checked_sub(quantity)?,
+            exposure.open_sell_lots(),
+        ),
+        Side::Sell => (
+            exposure.open_buy_lots(),
+            exposure.open_sell_lots().checked_sub(quantity)?,
+        ),
+    };
+    Some(RiskSnapshot::from_parts(
+        exposure.position_lots(),
+        open_buy_lots,
+        open_sell_lots,
+        exposure.open_notional().checked_sub(reservation.notional)?,
+        exposure.open_orders().checked_sub(1)?,
+    ))
 }
 
 /// Structural inconsistency between call-auction and risk state.
@@ -1729,7 +1793,12 @@ fn checkpoint_validation_limits(
         .auction
         .history()
         .iter()
-        .filter(|entry| matches!(entry.command(), CallAuctionCommand::Submit(_)))
+        .filter(|entry| {
+            matches!(
+                entry.command(),
+                CallAuctionCommand::Submit(_) | CallAuctionCommand::Replace(_)
+            )
+        })
         .count();
     let order_bound = accepted.max(active).max(submitted).max(1);
     let book = CallAuctionBookLimits::new(CallAuctionBookLimitsSpec {

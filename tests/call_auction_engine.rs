@@ -8,7 +8,8 @@ use quotick::auction_engine::{
     CallAuctionEngine, CallAuctionEngineCapacity, CallAuctionEngineConstructionError,
     CallAuctionEngineError, CallAuctionEngineLimits, CallAuctionEngineLimitsError,
     CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionPhase, CallAuctionPhaseControl,
-    CallAuctionRejectReason, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionRejectReason, CallAuctionReplaceOrder, CallAuctionSubmitOrder,
+    CallAuctionUncrossCommand,
 };
 use quotick::instrument::{
     InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -138,6 +139,22 @@ fn cancel_command(command_id: u64, owner: u64, order_id: u64) -> CallAuctionComm
         instrument_version: version(),
         account_id: account(owner),
         order_id: OrderId::new(order_id).unwrap(),
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+fn replace_command(
+    command_id: u64,
+    target_order_id: u64,
+    replacement: CallAuctionOrder,
+) -> CallAuctionCommand {
+    CallAuctionCommand::Replace(CallAuctionReplaceOrder {
+        command_id: CommandId::new(command_id).unwrap(),
+        auction_id: auction(1),
+        expected_phase_revision: 1,
+        account_id: replacement.account_id(),
+        target_order_id: OrderId::new(target_order_id).unwrap(),
+        replacement,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
@@ -337,6 +354,76 @@ fn business_rejections_are_sequenced_and_collisions_are_operational() {
         })
     );
     assert_eq!(engine.book().active_order_count(), 0);
+    engine.validate().unwrap();
+}
+
+#[test]
+fn cancel_replace_is_one_idempotent_command_with_two_order_events() {
+    let mut engine =
+        CallAuctionEngine::try_with_limits(definition(), engine_limits(2, 4, 16)).unwrap();
+    engine
+        .submit(phase_command(1, 1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            2,
+            order(
+                1,
+                7,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                5,
+            ),
+        ))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            3,
+            order(
+                2,
+                8,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                4,
+            ),
+        ))
+        .unwrap();
+    let command = replace_command(
+        4,
+        1,
+        order(
+            3,
+            7,
+            Side::Sell,
+            AuctionOrderConstraint::Limit(Price::from_raw(105)),
+            3,
+        ),
+    );
+    let report = engine.submit(command).unwrap();
+    assert_eq!(report.command_sequence, 4);
+    assert_eq!(report.events.len(), 2);
+    assert!(matches!(
+        report.events[0].kind,
+        CallAuctionEventKind::OrderCancelled {
+            order,
+            reason: quotick::auction_engine::CallAuctionCancellationReason::Replaced,
+        } if order.order_id == OrderId::new(1).unwrap()
+    ));
+    assert!(matches!(
+        report.events[1].kind,
+        CallAuctionEventKind::OrderAccepted(order)
+            if order.order_id == OrderId::new(3).unwrap() && order.priority_sequence == 3
+    ));
+    assert_eq!(
+        (report.events[0].sequence, report.events[1].sequence),
+        (4, 5)
+    );
+    assert!(engine.book().order(OrderId::new(1).unwrap()).is_none());
+    assert!(engine.book().order(OrderId::new(3).unwrap()).is_some());
+    let replay = engine.submit(command).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.events, report.events);
+    assert_eq!(engine.next_command_sequence(), 5);
     engine.validate().unwrap();
 }
 

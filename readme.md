@@ -293,13 +293,16 @@ Run any program with `cargo run --example <name>`.
   exactly its result fill vectors.
 - A bounded `CallAuctionBook` collecting crossed market/limit interest with
   never-reusable order identities, owner-checked cancellation, revision-bound
-  indicative results, and a two-phase prepare/commit uncross over
+  indicative results, atomic new-identity cancel/replace with complete priority
+  loss and saturated active/price-level capacity reuse when accepted-ID
+  headroom remains, and a two-phase prepare/commit uncross over
   constructor-owned leased buffers with explicit remainder policies
   (`RetainAll`, `CancelMarket`, `CancelAll`); the only represented self-trade
   policy is explicit `Permit`.
 - A sequenced `CallAuctionEngine` with explicit `Closed`/`Collecting`/`Frozen`
   phases, contiguous `AuctionId` cycles, revision-checked controls, exact
-  command idempotency, and a protected terminal lane guaranteeing that
+  command idempotency, exact two-event replacement reports, and a protected
+  terminal lane guaranteeing that
   currently valid cancellation, freeze/close, and uncross commands remain
   possible for a full book even at exhausted ordinary capacity.
 
@@ -322,7 +325,8 @@ Run any program with `cargo run --example <name>`.
   cancellation, account controls, and self-trade prevention; dormant stops
   reserve against their activation constraint without appearing in depth.
   Auction uncross releases both paired reservations and nets buys against sells
-  once per account.
+  once per account. Auction replacement nets out the target reservation before
+  authorizing the replacement and preserves the target on rejection.
 - Full cross-audits between active orders, reservations, aggregates, and
   positions.
 
@@ -341,9 +345,11 @@ Run any program with `cargo run --example <name>`.
   older gaps recover by atomically swapping double-buffered, pre-reserved
   snapshot arenas.
 - Call-auction replay retains exact batch starts and ends, never splits a
-  multi-update uncross trace across pages, and advances replica event and
-  command boundaries through the same preflight/application path as live
-  batches.
+  multi-update uncross or two-update replacement trace across pages, and
+  advances replica event and command boundaries through the same
+  preflight/application path as live batches. Replacement publishes anonymized
+  `Replaced` removal then `Accepted` addition while the book revision advances
+  once.
 - Continuous publishers mirror dormant stop identities, trigger indices, and
   the committed reference privately to validate canonical activation. Stop-only
   state changes publish `NoBookChange`; triggered execution publishes ordinary
@@ -373,7 +379,7 @@ Run any program with `cargo run --example <name>`.
 
 ### Durability and recovery
 
-- Versioned CRC-32C WAL frames (format 9) with bounded payloads and
+- Versioned CRC-32C WAL frames (format 10) with bounded payloads and
   contiguous sequences, as a single-file `Journal` or a size-bounded
   `SegmentedJournal` rotating whole frames and batches under one global
   sequence.
@@ -383,7 +389,7 @@ Run any program with `cargo run --example <name>`.
   writer leases with explicit abandoned-writer recovery.
 - Strict corruption detection: only a physically incomplete final frame may be
   repaired, and closed segments are always scanned strictly.
-- Versioned, bounded `QSNP` semantic snapshots (format 9) with monotonic
+- Versioned, bounded `QSNP` semantic snapshots (format 10) with monotonic
   exact-prefix lineage and synchronized atomic replacement.
 - Durable runtimes for matching, coupled risk/matching, call auctions, and
   coupled auction/risk record every command before committing the in-memory
@@ -475,10 +481,10 @@ assumptions are documented in
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
-| [WAL format v9](docs/wal-v9.md) | Current write-ahead-log frame and record schema |
-| [Snapshot format v9](docs/snapshot-v9.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
+| [WAL format v10](docs/wal-v10.md) | Current write-ahead-log frame and record schema |
+| [Snapshot format v10](docs/snapshot-v10.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
 | [Market-data payload v3](docs/market-data-v3.md) | Current continuous market-data update/snapshot payloads |
-| [Auction market-data payload v1](docs/auction-market-data-v1.md) | Current call-auction market-data payloads |
+| [Auction market-data payload v2](docs/auction-market-data-v2.md) | Current call-auction market-data payloads |
 | [Auction-risk checkpoint payload v1](docs/auction-risk-checkpoint-v1.md) | Current coupled call-auction risk checkpoint payload |
 
 Historical formats whose envelopes the runtime rejects are retained as
@@ -488,14 +494,17 @@ byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/wal-v6.md](docs/wal-v6.md),
 [docs/wal-v7.md](docs/wal-v7.md),
 [docs/wal-v8.md](docs/wal-v8.md),
-[docs/snapshot-v2.md](docs/snapshot-v2.md), and
-[docs/snapshot-v3.md](docs/snapshot-v3.md), and
-[docs/snapshot-v4.md](docs/snapshot-v4.md), and
-[docs/snapshot-v5.md](docs/snapshot-v5.md), and
-[docs/snapshot-v6.md](docs/snapshot-v6.md), and
-[docs/snapshot-v7.md](docs/snapshot-v7.md), and
-[docs/snapshot-v8.md](docs/snapshot-v8.md), plus continuous
-[market-data v2](docs/market-data-v2.md).
+[docs/wal-v9.md](docs/wal-v9.md),
+[docs/snapshot-v2.md](docs/snapshot-v2.md),
+[docs/snapshot-v3.md](docs/snapshot-v3.md),
+[docs/snapshot-v4.md](docs/snapshot-v4.md),
+[docs/snapshot-v5.md](docs/snapshot-v5.md),
+[docs/snapshot-v6.md](docs/snapshot-v6.md),
+[docs/snapshot-v7.md](docs/snapshot-v7.md),
+[docs/snapshot-v8.md](docs/snapshot-v8.md),
+[docs/snapshot-v9.md](docs/snapshot-v9.md), continuous
+[market-data v2](docs/market-data-v2.md), and call-auction
+[market-data v1](docs/auction-market-data-v1.md).
 
 ## Build and verify
 

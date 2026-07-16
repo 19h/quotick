@@ -12,7 +12,8 @@ use quotick::auction_book::{
 use quotick::auction_engine::{
     CallAuctionCheckpoint, CallAuctionCheckpointCapture, CallAuctionCommand, CallAuctionEngine,
     CallAuctionEngineError, CallAuctionEngineLimits, CallAuctionEngineLimitsSpec, CallAuctionPhase,
-    CallAuctionPhaseControl, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionPhaseControl, CallAuctionReplaceOrder, CallAuctionSubmitOrder,
+    CallAuctionUncrossCommand,
 };
 use quotick::codec::{BinaryCodec, CodecError};
 use quotick::durable_auction::{
@@ -144,6 +145,22 @@ fn order(order_id: u64, account_id: u64, side: Side, lots: u64) -> CallAuctionOr
 
 fn submit(command_id: u64, order: CallAuctionOrder) -> CallAuctionCommand {
     submit_for(command_id, auction(), 1, order)
+}
+
+fn replace(
+    command_id: u64,
+    target_order_id: u64,
+    replacement: CallAuctionOrder,
+) -> CallAuctionCommand {
+    CallAuctionCommand::Replace(CallAuctionReplaceOrder {
+        command_id: CommandId::new(command_id).unwrap(),
+        auction_id: auction(),
+        expected_phase_revision: 1,
+        account_id: replacement.account_id(),
+        target_order_id: OrderId::new(target_order_id).unwrap(),
+        replacement,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
 }
 
 fn submit_for(
@@ -493,6 +510,65 @@ fn durable_auction_round_trip_recovers_phase_book_trades_and_exact_retry() {
 }
 
 #[test]
+fn durable_cancel_replace_recovers_new_identity_priority_and_exact_retry() {
+    let file = TestPath::file("replace");
+    let mut durable = DurableCallAuctionEngine::open(file.path(), definition(), options()).unwrap();
+    durable
+        .submit(phase(1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    durable
+        .submit(submit(2, order(1, 7, Side::Buy, 5)))
+        .unwrap();
+    let command = replace(3, 1, order(2, 7, Side::Sell, 3));
+    let report = durable.submit(command).unwrap();
+    assert_eq!(report.events.len(), 2);
+    assert!(
+        durable
+            .engine()
+            .book()
+            .order(OrderId::new(1).unwrap())
+            .is_none()
+    );
+    assert_eq!(
+        durable
+            .engine()
+            .book()
+            .order(OrderId::new(2).unwrap())
+            .unwrap()
+            .priority_sequence,
+        2
+    );
+    let frame_count = frame_kinds(file.path()).len();
+    assert!(durable.submit(command).unwrap().replayed);
+    assert_eq!(frame_kinds(file.path()).len(), frame_count);
+    durable.close().unwrap();
+
+    let mut reopened =
+        DurableCallAuctionEngine::open(file.path(), definition(), options()).unwrap();
+    assert_eq!(reopened.recovery().replayed_commands, 3);
+    assert!(
+        reopened
+            .engine()
+            .book()
+            .order(OrderId::new(1).unwrap())
+            .is_none()
+    );
+    assert_eq!(
+        reopened
+            .engine()
+            .book()
+            .order(OrderId::new(2).unwrap())
+            .unwrap()
+            .quantity
+            .lots(),
+        3
+    );
+    assert!(reopened.submit(command).unwrap().replayed);
+    reopened.engine().validate().unwrap();
+    reopened.close().unwrap();
+}
+
+#[test]
 fn durable_auction_completes_a_dangling_command_and_repairs_a_torn_report() {
     let file = TestPath::file("torn-report");
     let mut durable = DurableCallAuctionEngine::open(file.path(), definition(), options()).unwrap();
@@ -762,7 +838,7 @@ fn auction_checkpoint_has_stable_kind_codec_and_direct_restore() {
     SnapshotFile::write(&snapshot, &shared, SnapshotOptions::default()).unwrap();
     let bytes = fs::read(snapshot).unwrap();
     assert_eq!(&bytes[0..4], b"QSNP");
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 9);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 10);
     assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 4);
 }
 

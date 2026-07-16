@@ -94,6 +94,7 @@ fn encode_reason(encoder: &mut Encoder, reason: CallAuctionBookChangeReason) {
         CallAuctionBookChangeReason::Accepted => 0,
         CallAuctionBookChangeReason::UserCancelled => 1,
         CallAuctionBookChangeReason::UncrossRemainder => 2,
+        CallAuctionBookChangeReason::Replaced => 3,
     });
 }
 
@@ -102,6 +103,7 @@ fn decode_reason(decoder: &mut Decoder<'_>) -> Result<CallAuctionBookChangeReaso
         0 => Ok(CallAuctionBookChangeReason::Accepted),
         1 => Ok(CallAuctionBookChangeReason::UserCancelled),
         2 => Ok(CallAuctionBookChangeReason::UncrossRemainder),
+        3 => Ok(CallAuctionBookChangeReason::Replaced),
         tag => Err(CodecError::InvalidTag {
             type_name: "CallAuctionBookChangeReason",
             tag,

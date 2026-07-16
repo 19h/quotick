@@ -1,14 +1,18 @@
 # WAL Format Version 9
 
+The current runtime writes and accepts only [WAL version 10](wal-v10.md).
+This document remains the authoritative historical schema for version 9;
+version-9 frames are rejected before payload interpretation.
+
 This document is the authoritative byte-level schema for Quotick WAL version
 9. All multibyte integers are little-endian. Rust enum layout, padding,
 pointer identity, collection capacity, and platform ABI are never persisted.
 
-Version 9 preserves the version-8 frame, record-kind registry, instrument
+Version 9 preserved the version-8 frame, record-kind registry, instrument
 definition, and existing value bytes. Continuous stop-reference commands and
 events add durable upstream source identity, source version, and source
-sequence. The runtime accepts only version 9; versions `1` through `8` are
-expired envelopes and are rejected before payload interpretation.
+sequence. The version-9 runtime accepted only version 9; versions `1` through
+`8` were expired envelopes and rejected before payload interpretation.
 
 ## Frame
 

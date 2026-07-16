@@ -20,8 +20,8 @@ use crate::auction_book::{
     CallAuctionAdmissionError, CallAuctionBook, CallAuctionBookLimits, CallAuctionCancelError,
     CallAuctionCancellation, CallAuctionCommitError, CallAuctionConstructionError,
     CallAuctionIndicative, CallAuctionInvariantViolation, CallAuctionOrder,
-    CallAuctionOrderSnapshot, CallAuctionPrepareError, CallAuctionTrade, CallAuctionUncrossPolicy,
-    PreparedCallAuctionUncross,
+    CallAuctionOrderSnapshot, CallAuctionPrepareError, CallAuctionReplaceError, CallAuctionTrade,
+    CallAuctionUncrossPolicy, PreparedCallAuctionUncross,
 };
 use crate::bounded_hash::{BoundedHashMap, BoundedHashSet};
 use crate::instrument::{AdmissionError, InstrumentDefinition};
@@ -477,6 +477,25 @@ pub struct CallAuctionCancelOrder {
     pub received_at: TimestampNs,
 }
 
+/// Sequenced new-identity cancel/replace during active collection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionReplaceOrder {
+    /// Idempotency key.
+    pub command_id: CommandId,
+    /// Collection cycle to which the replacement belongs.
+    pub auction_id: AuctionId,
+    /// Current phase revision observed by the submitter.
+    pub expected_phase_revision: u64,
+    /// Authorizing owner account for both target and replacement.
+    pub account_id: AccountId,
+    /// Active order removed if the replacement is accepted.
+    pub target_order_id: OrderId,
+    /// New-identity order admitted at fresh time priority.
+    pub replacement: CallAuctionOrder,
+    /// Gateway receive time.
+    pub received_at: TimestampNs,
+}
+
 /// Revision-checked final uncross command for one frozen auction cycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CallAuctionUncrossCommand {
@@ -511,6 +530,8 @@ pub enum CallAuctionCommand {
     Submit(CallAuctionSubmitOrder),
     /// Cancel active owned interest.
     Cancel(CallAuctionCancelOrder),
+    /// Atomically cancel active interest and admit a new-identity replacement.
+    Replace(CallAuctionReplaceOrder),
     /// Discover, allocate, pair, and consume one frozen auction.
     Uncross(CallAuctionUncrossCommand),
 }
@@ -523,6 +544,7 @@ impl CallAuctionCommand {
             Self::PhaseControl(command) => command.command_id,
             Self::Submit(command) => command.command_id,
             Self::Cancel(command) => command.command_id,
+            Self::Replace(command) => command.command_id,
             Self::Uncross(command) => command.command_id,
         }
     }
@@ -534,6 +556,7 @@ impl CallAuctionCommand {
             Self::PhaseControl(command) => command.received_at,
             Self::Submit(command) => command.received_at,
             Self::Cancel(command) => command.received_at,
+            Self::Replace(command) => command.received_at,
             Self::Uncross(command) => command.received_at,
         }
     }
@@ -548,6 +571,8 @@ pub enum CallAuctionAction {
     Submit,
     /// Owner cancellation.
     Cancel,
+    /// New-identity cancel/replace.
+    Replace,
     /// Final uncross.
     Uncross,
 }
@@ -631,6 +656,8 @@ pub enum CallAuctionRejectReason {
 pub enum CallAuctionCancellationReason {
     /// Explicit owner cancellation command.
     UserRequested,
+    /// Target removed by an accepted atomic cancel/replace command.
+    Replaced,
     /// Unexecuted remainder selected by the uncross policy.
     UncrossRemainder,
 }
@@ -1685,6 +1712,62 @@ impl CallAuctionCheckpoint {
                                 )
                             })?;
                     }
+                    CallAuctionCommand::Replace(replace) => {
+                        let Some(CallAuctionEvent {
+                            kind:
+                                CallAuctionEventKind::OrderCancelled {
+                                    order: cancelled,
+                                    reason: CallAuctionCancellationReason::Replaced,
+                                },
+                            ..
+                        }) = entry.report.events.first()
+                        else {
+                            return Err(CallAuctionCheckpointError::new(
+                                "auction checkpoint accepted replacement trace is invalid",
+                            ));
+                        };
+                        let Some(CallAuctionEvent {
+                            kind: CallAuctionEventKind::OrderAccepted(accepted_order),
+                            ..
+                        }) = entry.report.events.get(1)
+                        else {
+                            return Err(CallAuctionCheckpointError::new(
+                                "auction checkpoint accepted replacement trace is invalid",
+                            ));
+                        };
+                        if entry.report.events.len() != 2
+                            || cancelled.order_id != replace.target_order_id
+                            || cancelled.account_id != replace.account_id
+                            || replace.replacement.account_id() != replace.account_id
+                            || projected.remove(&cancelled.order_id) != Some(*cancelled)
+                            || accepted_order.priority_sequence != expected_priority_sequence
+                            || !accepted.insert(accepted_order.order_id)
+                            || projected
+                                .insert(accepted_order.order_id, *accepted_order)
+                                .is_some()
+                        {
+                            return Err(CallAuctionCheckpointError::new(
+                                "auction checkpoint replacement contradicts projected state",
+                            ));
+                        }
+                        validate_checkpoint_auction_order(
+                            self.definition,
+                            replace.replacement,
+                            *accepted_order,
+                        )?;
+                        expected_priority_sequence =
+                            expected_priority_sequence.checked_add(1).ok_or_else(|| {
+                                CallAuctionCheckpointError::new(
+                                    "auction checkpoint priority sequence is exhausted",
+                                )
+                            })?;
+                        expected_book_revision =
+                            expected_book_revision.checked_add(1).ok_or_else(|| {
+                                CallAuctionCheckpointError::new(
+                                    "auction checkpoint book revision is exhausted",
+                                )
+                            })?;
+                    }
                     CallAuctionCommand::Cancel(_) => {
                         let Some(CallAuctionEvent {
                             kind: CallAuctionEventKind::OrderCancelled { order, .. },
@@ -2065,6 +2148,24 @@ fn decoded_accepted_event_grammar_is_valid(events: &[CallAuctionEvent]) -> bool 
                 ..
             },
         ] => true,
+        [
+            CallAuctionEvent {
+                kind:
+                    CallAuctionEventKind::OrderCancelled {
+                        order: cancelled,
+                        reason: CallAuctionCancellationReason::Replaced,
+                    },
+                ..
+            },
+            CallAuctionEvent {
+                kind: CallAuctionEventKind::OrderAccepted(accepted),
+                ..
+            },
+        ] => {
+            cancelled.order_id != accepted.order_id
+                && cancelled.account_id == accepted.account_id
+                && accepted.priority_sequence > cancelled.priority_sequence
+        }
         _ => decoded_uncross_event_grammar_is_valid(events),
     }
 }
@@ -2165,6 +2266,8 @@ pub enum CallAuctionEngineError {
     BookAdmission(CallAuctionAdmissionError),
     /// Collection cancellation encountered an operational failure.
     BookCancellation(CallAuctionCancelError),
+    /// Collection cancel/replace encountered an operational failure.
+    BookReplacement(CallAuctionReplaceError),
     /// Indicative discovery encountered invalid/arithmetic input.
     Discovery(AuctionError),
     /// Allocation/pairing preparation failed before sequencing.
@@ -2204,6 +2307,9 @@ impl fmt::Display for CallAuctionEngineError {
             Self::BookAdmission(error) => write!(formatter, "call-auction admission: {error}"),
             Self::BookCancellation(error) => {
                 write!(formatter, "call-auction cancellation: {error}")
+            }
+            Self::BookReplacement(error) => {
+                write!(formatter, "call-auction replacement: {error}")
             }
             Self::Discovery(error) => write!(formatter, "call-auction discovery: {error}"),
             Self::UncrossPreparation(error) => {
@@ -2245,6 +2351,11 @@ enum PreparedCallAuctionAction {
         account_id: AccountId,
         order_id: OrderId,
     },
+    Replace {
+        account_id: AccountId,
+        target_order_id: OrderId,
+        replacement: CallAuctionOrder,
+    },
     Uncross {
         auction_id: AuctionId,
         phase_revision: u64,
@@ -2265,6 +2376,7 @@ impl PreparedCallAuctionAction {
             | Self::PhaseTransition { .. }
             | Self::Submit(_)
             | Self::Cancel { .. } => Ok(1),
+            Self::Replace { .. } => Ok(2),
         }
     }
 
@@ -2812,8 +2924,10 @@ impl CallAuctionEngine {
             return Err(CallAuctionEngineError::InternalInvariantViolation);
         }
         if let Some(reason) = external_rejection {
-            if !matches!(command, CallAuctionCommand::Submit(_))
-                || !is_external_risk_rejection(reason)
+            if !matches!(
+                command,
+                CallAuctionCommand::Submit(_) | CallAuctionCommand::Replace(_)
+            ) || !is_external_risk_rejection(reason)
             {
                 return Err(CallAuctionEngineError::InternalInvariantViolation);
             }
@@ -2926,6 +3040,30 @@ impl CallAuctionEngine {
                 );
                 CallAuctionCommandOutcome::Accepted
             }
+            PreparedCallAuctionAction::Replace {
+                account_id,
+                target_order_id,
+                replacement,
+            } => {
+                let replaced = self
+                    .book
+                    .replace(account_id, target_order_id, replacement)
+                    .map_err(|_| CallAuctionEngineError::InternalInvariantViolation)?;
+                self.push_event(
+                    command,
+                    CallAuctionEventKind::OrderCancelled {
+                        order: replaced.cancelled(),
+                        reason: CallAuctionCancellationReason::Replaced,
+                    },
+                    events,
+                );
+                self.push_event(
+                    command,
+                    CallAuctionEventKind::OrderAccepted(replaced.accepted()),
+                    events,
+                );
+                CallAuctionCommandOutcome::Accepted
+            }
             PreparedCallAuctionAction::Uncross {
                 auction_id,
                 phase_revision,
@@ -2995,29 +3133,12 @@ impl CallAuctionEngine {
                 ) {
                     return Ok(PreparedCallAuctionAction::Rejected(reason));
                 }
-                if submit.expected_phase_revision != self.phase_revision {
-                    return Ok(PreparedCallAuctionAction::Rejected(
-                        CallAuctionRejectReason::PhaseRevisionMismatch {
-                            observed: submit.expected_phase_revision,
-                            current: self.phase_revision,
-                        },
-                    ));
-                }
-                if self.phase != CallAuctionPhase::Collecting {
-                    return Ok(PreparedCallAuctionAction::Rejected(
-                        CallAuctionRejectReason::ActionNotAllowed {
-                            action: CallAuctionAction::Submit,
-                            phase: self.phase,
-                        },
-                    ));
-                }
-                if self.active_auction_id != Some(submit.auction_id) {
-                    return Ok(PreparedCallAuctionAction::Rejected(
-                        CallAuctionRejectReason::AuctionIdMismatch {
-                            observed: submit.auction_id,
-                            current: self.active_auction_id,
-                        },
-                    ));
+                if let Some(reason) = self.collection_rejection(
+                    submit.expected_phase_revision,
+                    submit.auction_id,
+                    CallAuctionAction::Submit,
+                ) {
+                    return Ok(PreparedCallAuctionAction::Rejected(reason));
                 }
                 match self.book.preflight_admission(submit.order) {
                     Ok(()) => Ok(PreparedCallAuctionAction::Submit(submit.order)),
@@ -3034,6 +3155,7 @@ impl CallAuctionEngine {
                     Err(error) => Err(CallAuctionEngineError::BookAdmission(error)),
                 }
             }
+            CallAuctionCommand::Replace(replace) => self.prepare_replace(replace),
             CallAuctionCommand::Cancel(cancel) => {
                 if let Some(reason) =
                     self.route_rejection(cancel.instrument_id, cancel.instrument_version)
@@ -3058,6 +3180,82 @@ impl CallAuctionEngine {
                 }
             }
             CallAuctionCommand::Uncross(uncross) => self.prepare_uncross_command(uncross),
+        }
+    }
+
+    fn prepare_replace(
+        &self,
+        replace: CallAuctionReplaceOrder,
+    ) -> Result<PreparedCallAuctionAction, CallAuctionEngineError> {
+        if let Some(reason) = self.route_rejection(
+            replace.replacement.instrument_id(),
+            replace.replacement.instrument_version(),
+        ) {
+            return Ok(PreparedCallAuctionAction::Rejected(reason));
+        }
+        if let Some(reason) = self.collection_rejection(
+            replace.expected_phase_revision,
+            replace.auction_id,
+            CallAuctionAction::Replace,
+        ) {
+            return Ok(PreparedCallAuctionAction::Rejected(reason));
+        }
+        match self.book.preflight_replace(
+            replace.account_id,
+            replace.target_order_id,
+            replace.replacement,
+        ) {
+            Ok(_) => Ok(PreparedCallAuctionAction::Replace {
+                account_id: replace.account_id,
+                target_order_id: replace.target_order_id,
+                replacement: replace.replacement,
+            }),
+            Err(CallAuctionReplaceError::Target(CallAuctionCancelError::UnknownOrder)) => Ok(
+                PreparedCallAuctionAction::Rejected(CallAuctionRejectReason::UnknownOrder),
+            ),
+            Err(
+                CallAuctionReplaceError::Target(CallAuctionCancelError::AccountMismatch)
+                | CallAuctionReplaceError::ReplacementAccountMismatch,
+            ) => Ok(PreparedCallAuctionAction::Rejected(
+                CallAuctionRejectReason::NotOrderOwner,
+            )),
+            Err(CallAuctionReplaceError::Replacement(CallAuctionAdmissionError::Instrument(
+                error,
+            ))) => Ok(PreparedCallAuctionAction::Rejected(
+                CallAuctionRejectReason::Instrument(error),
+            )),
+            Err(CallAuctionReplaceError::Replacement(
+                CallAuctionAdmissionError::DuplicateOrderId,
+            )) => Ok(PreparedCallAuctionAction::Rejected(
+                CallAuctionRejectReason::DuplicateOrder,
+            )),
+            Err(error) => Err(CallAuctionEngineError::BookReplacement(error)),
+        }
+    }
+
+    fn collection_rejection(
+        &self,
+        observed_phase_revision: u64,
+        observed_auction_id: AuctionId,
+        action: CallAuctionAction,
+    ) -> Option<CallAuctionRejectReason> {
+        if observed_phase_revision != self.phase_revision {
+            Some(CallAuctionRejectReason::PhaseRevisionMismatch {
+                observed: observed_phase_revision,
+                current: self.phase_revision,
+            })
+        } else if self.phase != CallAuctionPhase::Collecting {
+            Some(CallAuctionRejectReason::ActionNotAllowed {
+                action,
+                phase: self.phase,
+            })
+        } else if self.active_auction_id != Some(observed_auction_id) {
+            Some(CallAuctionRejectReason::AuctionIdMismatch {
+                observed: observed_auction_id,
+                current: self.active_auction_id,
+            })
+        } else {
+            None
         }
     }
 
@@ -3511,6 +3709,32 @@ fn cached_report_grammar_is_valid(cached: &CachedCallAuctionReport) -> bool {
                         }) if order.order_id == cancel.order_id && order.account_id == cancel.account_id
                     )
             }
+            CallAuctionCommand::Replace(replace) => {
+                report.events.len() == 2
+                    && matches!(
+                        (report.events.first(), report.events.get(1)),
+                        (
+                            Some(CallAuctionEvent {
+                                kind: CallAuctionEventKind::OrderCancelled {
+                                    order: cancelled,
+                                    reason: CallAuctionCancellationReason::Replaced,
+                                },
+                                ..
+                            }),
+                            Some(CallAuctionEvent {
+                                kind: CallAuctionEventKind::OrderAccepted(accepted),
+                                ..
+                            }),
+                        ) if cancelled.order_id == replace.target_order_id
+                            && cancelled.account_id == replace.account_id
+                            && replace.replacement.account_id() == replace.account_id
+                            && accepted.order_id == replace.replacement.order_id()
+                            && accepted.account_id == replace.replacement.account_id()
+                            && accepted.side == replace.replacement.side()
+                            && accepted.constraint == replace.replacement.constraint()
+                            && accepted.quantity == replace.replacement.quantity()
+                    )
+            }
             CallAuctionCommand::Uncross(uncross) => {
                 cached_uncross_grammar_is_valid(report, uncross)
             }
@@ -3639,11 +3863,19 @@ impl CallAuctionPhaseAudit {
                             CallAuctionRejectReason::UnknownOrder
                                 | CallAuctionRejectReason::NotOrderOwner
                         ) | (
+                            CallAuctionCommand::Replace(_),
+                            CallAuctionRejectReason::Instrument(_)
+                                | CallAuctionRejectReason::DuplicateOrder
+                                | CallAuctionRejectReason::UnknownOrder
+                                | CallAuctionRejectReason::NotOrderOwner
+                        ) | (
                             CallAuctionCommand::Uncross(_),
                             CallAuctionRejectReason::NoExecutableInterest
                         )
-                    ) || matches!(cached.command, CallAuctionCommand::Submit(_))
-                        && is_external_risk_rejection(reason)
+                    ) || matches!(
+                        cached.command,
+                        CallAuctionCommand::Submit(_) | CallAuctionCommand::Replace(_)
+                    ) && is_external_risk_rejection(reason)
                 }
             },
             CallAuctionCommandOutcome::Accepted => {
@@ -3670,6 +3902,10 @@ impl CallAuctionPhaseAudit {
                 submit.order.instrument_version(),
             ),
             CallAuctionCommand::Cancel(cancel) => (cancel.instrument_id, cancel.instrument_version),
+            CallAuctionCommand::Replace(replace) => (
+                replace.replacement.instrument_id(),
+                replace.replacement.instrument_version(),
+            ),
             CallAuctionCommand::Uncross(uncross) => {
                 (uncross.instrument_id, uncross.instrument_version)
             }
@@ -3686,32 +3922,16 @@ impl CallAuctionPhaseAudit {
         }
         match command {
             CallAuctionCommand::PhaseControl(control) => self.preflight_control(control),
-            CallAuctionCommand::Submit(submit) => {
-                if submit.expected_phase_revision != self.revision {
-                    CallAuctionControllerPreflight::Rejected(
-                        CallAuctionRejectReason::PhaseRevisionMismatch {
-                            observed: submit.expected_phase_revision,
-                            current: self.revision,
-                        },
-                    )
-                } else if self.phase != CallAuctionPhase::Collecting {
-                    CallAuctionControllerPreflight::Rejected(
-                        CallAuctionRejectReason::ActionNotAllowed {
-                            action: CallAuctionAction::Submit,
-                            phase: self.phase,
-                        },
-                    )
-                } else if self.active_auction_id != Some(submit.auction_id) {
-                    CallAuctionControllerPreflight::Rejected(
-                        CallAuctionRejectReason::AuctionIdMismatch {
-                            observed: submit.auction_id,
-                            current: self.active_auction_id,
-                        },
-                    )
-                } else {
-                    CallAuctionControllerPreflight::Applicable
-                }
-            }
+            CallAuctionCommand::Submit(submit) => self.preflight_collection(
+                submit.expected_phase_revision,
+                submit.auction_id,
+                CallAuctionAction::Submit,
+            ),
+            CallAuctionCommand::Replace(replace) => self.preflight_collection(
+                replace.expected_phase_revision,
+                replace.auction_id,
+                CallAuctionAction::Replace,
+            ),
             CallAuctionCommand::Uncross(uncross) => {
                 if uncross.expected_phase_revision != self.revision {
                     CallAuctionControllerPreflight::Rejected(
@@ -3739,6 +3959,34 @@ impl CallAuctionPhaseAudit {
                 }
             }
             CallAuctionCommand::Cancel(_) => CallAuctionControllerPreflight::Applicable,
+        }
+    }
+
+    fn preflight_collection(
+        self,
+        observed_revision: u64,
+        observed_auction_id: AuctionId,
+        action: CallAuctionAction,
+    ) -> CallAuctionControllerPreflight {
+        if observed_revision != self.revision {
+            CallAuctionControllerPreflight::Rejected(
+                CallAuctionRejectReason::PhaseRevisionMismatch {
+                    observed: observed_revision,
+                    current: self.revision,
+                },
+            )
+        } else if self.phase != CallAuctionPhase::Collecting {
+            CallAuctionControllerPreflight::Rejected(CallAuctionRejectReason::ActionNotAllowed {
+                action,
+                phase: self.phase,
+            })
+        } else if self.active_auction_id != Some(observed_auction_id) {
+            CallAuctionControllerPreflight::Rejected(CallAuctionRejectReason::AuctionIdMismatch {
+                observed: observed_auction_id,
+                current: self.active_auction_id,
+            })
+        } else {
+            CallAuctionControllerPreflight::Applicable
         }
     }
 
@@ -3857,7 +4105,9 @@ impl CallAuctionPhaseAudit {
                 self.active_auction_id = None;
                 true
             }
-            CallAuctionCommand::Submit(_) | CallAuctionCommand::Cancel(_) => true,
+            CallAuctionCommand::Submit(_)
+            | CallAuctionCommand::Cancel(_)
+            | CallAuctionCommand::Replace(_) => true,
         }
     }
 }

@@ -485,6 +485,54 @@ impl fmt::Display for CallAuctionCancelError {
 
 impl std::error::Error for CallAuctionCancelError {}
 
+/// Atomic cancel/replace failure for one active call-auction order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallAuctionReplaceError {
+    /// The active target or its authorizing account failed cancellation checks.
+    Target(CallAuctionCancelError),
+    /// The replacement order names a different account than the authorizing owner.
+    ReplacementAccountMismatch,
+    /// The new order failed immutable admission or finite-capacity checks.
+    Replacement(CallAuctionAdmissionError),
+}
+
+impl fmt::Display for CallAuctionReplaceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Target(error) => write!(formatter, "call-auction replacement target: {error}"),
+            Self::ReplacementAccountMismatch => {
+                formatter.write_str("call-auction replacement account differs from target owner")
+            }
+            Self::Replacement(error) => {
+                write!(formatter, "call-auction replacement order: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CallAuctionReplaceError {}
+
+/// One atomically removed target and newly admitted replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionReplacement {
+    cancelled: CallAuctionOrderSnapshot,
+    accepted: CallAuctionOrderSnapshot,
+}
+
+impl CallAuctionReplacement {
+    /// Returns the complete removed target state.
+    #[must_use]
+    pub const fn cancelled(self) -> CallAuctionOrderSnapshot {
+        self.cancelled
+    }
+
+    /// Returns the complete newly admitted state with fresh time priority.
+    #[must_use]
+    pub const fn accepted(self) -> CallAuctionOrderSnapshot {
+        self.accepted
+    }
+}
+
 /// One indicative clearing result bound to an exact collection-book revision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CallAuctionIndicative {
@@ -1600,46 +1648,7 @@ impl CallAuctionBook {
             .state_revision
             .checked_add(1)
             .ok_or(CallAuctionAdmissionError::StateRevisionExhausted)?;
-        let queue = self.queue_snapshot(command.side, command.constraint);
-        let total_quantity = queue
-            .total_quantity
-            .checked_add(u128::from(command.quantity.lots()))
-            .ok_or(CallAuctionAdmissionError::AggregateQuantityOverflow(
-                command.side,
-            ))?;
-        let order_count = queue.order_count.checked_add(1).ok_or(
-            CallAuctionAdmissionError::AggregateQuantityOverflow(command.side),
-        )?;
-        let resting = RestingAuctionOrder {
-            order_id: command.order_id,
-            account_id: command.account_id,
-            side: command.side,
-            constraint: command.constraint,
-            quantity: command.quantity,
-            priority_sequence: self.next_priority_sequence,
-            previous: queue.tail,
-            next: None,
-        };
-
-        if let Some(tail) = queue.tail {
-            if let Some(previous) = self.orders.get_mut(&tail) {
-                previous.next = Some(command.order_id);
-            }
-        }
-        let updated_queue = AuctionQueue {
-            head: queue.head.or(Some(command.order_id)),
-            tail: Some(command.order_id),
-            total_quantity,
-            order_count,
-        };
-        self.replace_queue(command.side, command.constraint, updated_queue);
-        let replaced_order = self.orders.insert(command.order_id, resting);
-        let replaced_identity = self.seen_order_ids.insert(command.order_id, ());
-        debug_assert!(replaced_order.is_none());
-        debug_assert!(replaced_identity.is_none());
-        self.next_priority_sequence = next_priority_sequence;
-        self.state_revision = next_state_revision;
-        Ok(resting.into())
+        Ok(self.insert_preflighted(command, next_priority_sequence, next_state_revision))
     }
 
     pub(crate) fn preflight_admission(
@@ -1737,6 +1746,166 @@ impl CallAuctionBook {
             .checked_add(1)
             .ok_or(CallAuctionCancelError::StateRevisionExhausted)?;
         Ok(order.into())
+    }
+
+    /// Atomically cancels one owned target and admits a new-identity replacement.
+    ///
+    /// The replacement always receives a fresh strict priority sequence. The
+    /// target identity remains consumed, and the replacement identity becomes
+    /// permanently consumed. Active-order and price-level slots released by
+    /// the target may be reused by the replacement without storage growth.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionReplaceError`] before mutation for target ownership,
+    /// replacement identity/domain, capacity, sequence, revision, or aggregate
+    /// failure.
+    pub fn replace(
+        &mut self,
+        account_id: AccountId,
+        target_order_id: OrderId,
+        replacement: CallAuctionOrder,
+    ) -> Result<CallAuctionReplacement, CallAuctionReplaceError> {
+        let cancelled = self.preflight_replace(account_id, target_order_id, replacement)?;
+        let target =
+            self.orders
+                .get(&target_order_id)
+                .copied()
+                .ok_or(CallAuctionReplaceError::Target(
+                    CallAuctionCancelError::UnknownOrder,
+                ))?;
+        let next_priority_sequence = self.next_priority_sequence.checked_add(1).ok_or(
+            CallAuctionReplaceError::Replacement(
+                CallAuctionAdmissionError::PrioritySequenceExhausted,
+            ),
+        )?;
+        let next_state_revision =
+            self.state_revision
+                .checked_add(1)
+                .ok_or(CallAuctionReplaceError::Replacement(
+                    CallAuctionAdmissionError::StateRevisionExhausted,
+                ))?;
+        self.remove_active_order(target);
+        let accepted =
+            self.insert_preflighted(replacement, next_priority_sequence, next_state_revision);
+        Ok(CallAuctionReplacement {
+            cancelled,
+            accepted,
+        })
+    }
+
+    pub(crate) fn preflight_replace(
+        &self,
+        account_id: AccountId,
+        target_order_id: OrderId,
+        replacement: CallAuctionOrder,
+    ) -> Result<CallAuctionOrderSnapshot, CallAuctionReplaceError> {
+        let target =
+            self.orders
+                .get(&target_order_id)
+                .copied()
+                .ok_or(CallAuctionReplaceError::Target(
+                    CallAuctionCancelError::UnknownOrder,
+                ))?;
+        if target.account_id != account_id {
+            return Err(CallAuctionReplaceError::Target(
+                CallAuctionCancelError::AccountMismatch,
+            ));
+        }
+        if replacement.account_id != account_id {
+            return Err(CallAuctionReplaceError::ReplacementAccountMismatch);
+        }
+        self.validate_command(replacement)
+            .map_err(CallAuctionReplaceError::Replacement)?;
+        if self.seen_order_ids.get(&replacement.order_id).is_some() {
+            return Err(CallAuctionReplaceError::Replacement(
+                CallAuctionAdmissionError::DuplicateOrderId,
+            ));
+        }
+        if self.seen_order_ids.len() >= self.limits.max_accepted_order_ids() {
+            return Err(CallAuctionReplaceError::Replacement(
+                CallAuctionAdmissionError::CapacityExceeded(CallAuctionCapacity::AcceptedOrderIds),
+            ));
+        }
+        self.preflight_replacement_level(target, replacement)?;
+        self.next_priority_sequence
+            .checked_add(1)
+            .ok_or(CallAuctionReplaceError::Replacement(
+                CallAuctionAdmissionError::PrioritySequenceExhausted,
+            ))?;
+        self.state_revision
+            .checked_add(1)
+            .ok_or(CallAuctionReplaceError::Replacement(
+                CallAuctionAdmissionError::StateRevisionExhausted,
+            ))?;
+        let mut queue = self.queue_snapshot(replacement.side, replacement.constraint);
+        if target.side == replacement.side && target.constraint == replacement.constraint {
+            queue.total_quantity = queue
+                .total_quantity
+                .checked_sub(u128::from(target.quantity.lots()))
+                .ok_or(CallAuctionReplaceError::Replacement(
+                    CallAuctionAdmissionError::AggregateQuantityOverflow(replacement.side),
+                ))?;
+            queue.order_count =
+                queue
+                    .order_count
+                    .checked_sub(1)
+                    .ok_or(CallAuctionReplaceError::Replacement(
+                        CallAuctionAdmissionError::AggregateQuantityOverflow(replacement.side),
+                    ))?;
+        }
+        queue
+            .total_quantity
+            .checked_add(u128::from(replacement.quantity.lots()))
+            .ok_or(CallAuctionReplaceError::Replacement(
+                CallAuctionAdmissionError::AggregateQuantityOverflow(replacement.side),
+            ))?;
+        queue
+            .order_count
+            .checked_add(1)
+            .ok_or(CallAuctionReplaceError::Replacement(
+                CallAuctionAdmissionError::AggregateQuantityOverflow(replacement.side),
+            ))?;
+        Ok(target.into())
+    }
+
+    fn preflight_replacement_level(
+        &self,
+        target: RestingAuctionOrder,
+        replacement: CallAuctionOrder,
+    ) -> Result<(), CallAuctionReplaceError> {
+        let AuctionOrderConstraint::Limit(price) = replacement.constraint else {
+            return Ok(());
+        };
+        let levels = self.levels(replacement.side);
+        let target_level = match target.constraint {
+            AuctionOrderConstraint::Limit(target_price) if target.side == replacement.side => {
+                Some((
+                    target_price,
+                    self.queue_snapshot(target.side, target.constraint),
+                ))
+            }
+            AuctionOrderConstraint::Market | AuctionOrderConstraint::Limit(_) => None,
+        };
+        let target_removes_level = target_level.is_some_and(|(_, queue)| queue.order_count == 1);
+        let target_is_requested_level =
+            target_level.is_some_and(|(target_price, _)| target_price == price);
+        let requested_exists_after_removal =
+            levels.get(price).is_some() && !(target_is_requested_level && target_removes_level);
+        let levels_after_removal = levels
+            .len()
+            .saturating_sub(usize::from(target_removes_level));
+        if !requested_exists_after_removal
+            && levels_after_removal >= self.limits.max_price_levels_per_side()
+        {
+            return Err(CallAuctionReplaceError::Replacement(
+                CallAuctionAdmissionError::CapacityExceeded(match replacement.side {
+                    Side::Buy => CallAuctionCapacity::BidPriceLevels,
+                    Side::Sell => CallAuctionCapacity::AskPriceLevels,
+                }),
+            ));
+        }
+        Ok(())
     }
 
     /// Computes one indicative clearing result from current active interest.
@@ -2434,6 +2603,56 @@ impl CallAuctionBook {
         } else {
             debug_assert!(false, "validated partial fill order must remain indexed");
         }
+    }
+
+    fn insert_preflighted(
+        &mut self,
+        command: CallAuctionOrder,
+        next_priority_sequence: u64,
+        next_state_revision: u64,
+    ) -> CallAuctionOrderSnapshot {
+        let queue = self.queue_snapshot(command.side, command.constraint);
+        let total_quantity = queue
+            .total_quantity
+            .checked_add(u128::from(command.quantity.lots()))
+            .expect("preflighted auction aggregate must remain representable");
+        let order_count = queue
+            .order_count
+            .checked_add(1)
+            .expect("preflighted auction order count must remain representable");
+        let resting = RestingAuctionOrder {
+            order_id: command.order_id,
+            account_id: command.account_id,
+            side: command.side,
+            constraint: command.constraint,
+            quantity: command.quantity,
+            priority_sequence: self.next_priority_sequence,
+            previous: queue.tail,
+            next: None,
+        };
+        if let Some(tail) = queue.tail {
+            self.orders
+                .get_mut(&tail)
+                .expect("preflighted auction queue tail must remain active")
+                .next = Some(command.order_id);
+        }
+        self.replace_queue(
+            command.side,
+            command.constraint,
+            AuctionQueue {
+                head: queue.head.or(Some(command.order_id)),
+                tail: Some(command.order_id),
+                total_quantity,
+                order_count,
+            },
+        );
+        let replaced_order = self.orders.insert(command.order_id, resting);
+        let replaced_identity = self.seen_order_ids.insert(command.order_id, ());
+        debug_assert!(replaced_order.is_none());
+        debug_assert!(replaced_identity.is_none());
+        self.next_priority_sequence = next_priority_sequence;
+        self.state_revision = next_state_revision;
+        resting.into()
     }
 
     fn remove_active_order(&mut self, order: RestingAuctionOrder) {

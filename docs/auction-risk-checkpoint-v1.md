@@ -1,7 +1,7 @@
 # Coupled Call-Auction Risk Checkpoint Payload Version 1
 
 `CallAuctionRiskCheckpoint` is a complete-value, little-endian semantic codec
-and the payload retained by snapshot-version-9 `QSNP` kind `5`. It has no WAL
+and the payload retained by snapshot-version-10 `QSNP` kind `5`. It has no WAL
 record kind of its own. Version 1 names the current immutable payload contract;
 any incompatible change requires a new explicit format or enclosing version.
 
@@ -20,7 +20,7 @@ Each account row is:
 
 | Order | Width | Field |
 |---:|---:|---|
-| 1 | variable | account-risk-definition length `u32`, then its stable WAL-v9 kind-5 payload without a WAL header |
+| 1 | variable | account-risk-definition length `u32`, then its stable WAL-v10 kind-5 payload without a WAL header |
 | 2 | 16 B | current signed executed position lots `i128` |
 | 3 | 16 B | aggregate active buy lots `u128` |
 | 4 | 16 B | aggregate active sell lots `u128` |
@@ -78,10 +78,14 @@ Direct restoration performs all of the following:
 5. Cross-audits one-to-one book/reservation parity and every numerical bound.
 
 Checkpoint construction and decode also independently replay every retained
-command through `CallAuctionRiskManagedEngine`. Risk-rejected submit commands
-must reproduce the exact rejection from the retained profiles. Validation
-capacity includes all historical submits, not only accepted identities,
-because core preparation occurs before the external risk gate.
+command through `CallAuctionRiskManagedEngine`. Risk-rejected submit and
+replace commands must reproduce the exact rejection from the retained
+profiles. Replacement authorization first subtracts the owned target's
+reservation, then evaluates the replacement under the same immutable profile.
+An accepted two-event trace removes the target reservation before inserting
+the replacement reservation. Validation capacity includes all historical
+submits and replacements, not only accepted identities, because core
+preparation occurs before the external risk gate.
 
 ## Complexity and boundary
 
@@ -94,7 +98,7 @@ embedded indexed-book audit; independent validation re-executes the complete
 command history. Constructor-owned live profile, reservation, and account-net
 maps remain bounded by the selected `CallAuctionRiskLimits`.
 
-- `SnapshotFile` supplies version-9 framing, CRC protection, synchronized
+- `SnapshotFile` supplies version-10 framing, CRC protection, synchronized
   atomic replacement, and A/B slot publication.
 - `DurableCallAuctionRiskEngine` supplies profile-prefixed WAL
   acknowledgement, full replay, one dangling-command completion, exact prefix

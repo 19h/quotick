@@ -12,8 +12,8 @@ use crate::auction_engine::{
     CallAuctionCheckpoint, CallAuctionCommand, CallAuctionCommandOutcome,
     CallAuctionCommandReportCheckpoint, CallAuctionEvent, CallAuctionEventKind,
     CallAuctionExecutionReport, CallAuctionPhase, CallAuctionPhaseControl,
-    CallAuctionPhaseSnapshot, CallAuctionRejectReason, CallAuctionSubmitOrder,
-    CallAuctionUncrossCommand,
+    CallAuctionPhaseSnapshot, CallAuctionRejectReason, CallAuctionReplaceOrder,
+    CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use crate::instrument::{AdmissionError, InstrumentDefinition};
 use crate::{AuctionId, Price, TimestampNs};
@@ -54,6 +54,7 @@ fn encode_action(encoder: &mut Encoder, action: CallAuctionAction) {
         CallAuctionAction::Submit => 1,
         CallAuctionAction::Cancel => 2,
         CallAuctionAction::Uncross => 3,
+        CallAuctionAction::Replace => 4,
     });
 }
 
@@ -63,6 +64,7 @@ fn decode_action(decoder: &mut Decoder<'_>) -> Result<CallAuctionAction, CodecEr
         1 => Ok(CallAuctionAction::Submit),
         2 => Ok(CallAuctionAction::Cancel),
         3 => Ok(CallAuctionAction::Uncross),
+        4 => Ok(CallAuctionAction::Replace),
         tag => Err(CodecError::InvalidTag {
             type_name: "CallAuctionAction",
             tag,
@@ -400,6 +402,16 @@ fn encode_command(encoder: &mut Encoder, command: CallAuctionCommand) {
             encode_uncross_policy(encoder, value.uncross_policy);
             encoder.u64(value.received_at.as_unix_nanos());
         }
+        CallAuctionCommand::Replace(value) => {
+            encoder.u8(4);
+            encoder.u64(value.command_id.get());
+            encoder.u64(value.auction_id.get());
+            encoder.u64(value.expected_phase_revision);
+            encoder.u64(value.account_id.get());
+            encoder.u64(value.target_order_id.get());
+            encode_order(encoder, value.replacement);
+            encoder.u64(value.received_at.as_unix_nanos());
+        }
     }
 }
 
@@ -453,6 +465,15 @@ fn decode_command(decoder: &mut Decoder<'_>) -> Result<CallAuctionCommand, Codec
                 received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
             }))
         }
+        4 => Ok(CallAuctionCommand::Replace(CallAuctionReplaceOrder {
+            command_id: command_id(decoder)?,
+            auction_id: auction_id(decoder)?,
+            expected_phase_revision: decoder.u64()?,
+            account_id: account(decoder)?,
+            target_order_id: order(decoder)?,
+            replacement: decode_order(decoder)?,
+            received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
+        })),
         tag => Err(CodecError::InvalidTag {
             type_name: "CallAuctionCommand",
             tag,
@@ -556,6 +577,7 @@ fn encode_cancellation_reason(encoder: &mut Encoder, reason: CallAuctionCancella
     encoder.u8(match reason {
         CallAuctionCancellationReason::UserRequested => 0,
         CallAuctionCancellationReason::UncrossRemainder => 1,
+        CallAuctionCancellationReason::Replaced => 2,
     });
 }
 
@@ -565,6 +587,7 @@ fn decode_cancellation_reason(
     match decoder.u8()? {
         0 => Ok(CallAuctionCancellationReason::UserRequested),
         1 => Ok(CallAuctionCancellationReason::UncrossRemainder),
+        2 => Ok(CallAuctionCancellationReason::Replaced),
         tag => Err(CodecError::InvalidTag {
             type_name: "CallAuctionCancellationReason",
             tag,
