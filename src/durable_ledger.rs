@@ -651,11 +651,11 @@ impl DurableLedger {
         }
     }
 
-    /// Durably commits every DVP entry from one accepted call-auction uncross.
+    /// Durably commits every DVP and explicit fee entry from one uncross.
     ///
-    /// Multi-trade settlements use one batch WAL frame and one indivisible
-    /// ledger event. Exact retries return the original receipt without WAL
-    /// growth.
+    /// Multiple trades or any explicit fee use one batch WAL frame and one
+    /// indivisible ledger event. Exact retries return the original receipt
+    /// without WAL growth.
     ///
     /// # Errors
     ///

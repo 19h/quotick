@@ -17,7 +17,7 @@ use crate::auction_engine::{
 };
 use crate::bounded_hash::{BoundedHashError, BoundedHashMap, BoundedHashSet};
 use crate::domain::{
-    AccountId, AccountingDate, AssetId, Price, Quantity, ReconciliationId, TimestampNs,
+    AccountId, AccountingDate, AssetId, Price, Quantity, ReconciliationId, TimestampNs, TradeId,
     TransactionId,
 };
 use crate::instrument::InstrumentDefinition;
@@ -57,6 +57,8 @@ pub enum LedgerResource {
 pub enum LedgerPreparationResource {
     /// Posting vector for a generated exact reversal.
     ReversalPostings,
+    /// Two-leg posting vector for one explicit trade fee.
+    CallAuctionFeePostings,
     /// DVP entries constructed for one complete call-auction report.
     CallAuctionSettlementEntries,
     /// Identity set used to validate one batch.
@@ -120,6 +122,7 @@ impl fmt::Display for LedgerPreparationResource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::ReversalPostings => "reversal posting preparation",
+            Self::CallAuctionFeePostings => "call-auction fee-posting preparation",
             Self::CallAuctionSettlementEntries => "call-auction settlement-entry preparation",
             Self::BatchIdentitySet => "batch identity validation",
             Self::PendingTransactions => "batch pending-transaction preparation",
@@ -419,6 +422,17 @@ where
     BoundedHashSet::try_new(maximum).map_err(|_| LedgerError::PreparationAllocationFailed(resource))
 }
 
+fn reserve_ledger_preparation_vec<T>(
+    maximum: usize,
+    resource: LedgerPreparationResource,
+) -> Result<Vec<T>, LedgerError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(maximum)
+        .map_err(|_| LedgerError::PreparationAllocationFailed(resource))?;
+    Ok(values)
+}
+
 fn reserve_ledger_query_vec<T>(
     maximum: usize,
     resource: LedgerQueryResource,
@@ -503,11 +517,29 @@ pub struct LedgerBatch {
     entries: Arc<Vec<JournalEntry>>,
 }
 
+/// One explicit positive fee transfer bound to one call-auction trade.
+///
+/// The amount is denominated in the asset's smallest ledger unit. The debit
+/// account supplies the amount and the credit account receives it. Rebate
+/// semantics use the opposite account direction rather than a negative amount.
+/// Fee calculation, account selection, and asset selection are authoritative
+/// caller inputs. Authorization remains an external lifecycle responsibility.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionFee {
+    transaction_id: TransactionId,
+    trade_id: TradeId,
+    debit_account_id: AccountId,
+    credit_account_id: AccountId,
+    asset_id: AssetId,
+    amount: i128,
+}
+
 /// One complete accepted call-auction uncross mapped to one ledger event.
 ///
-/// A single counterparty pair is represented by one journal entry. Two or
-/// more pairs are represented by one atomic ordered batch, so ledger readers
-/// never observe a partially settled uncross.
+/// A single counterparty pair without fees is represented by one journal
+/// entry. Multiple DVP entries or any explicit fee transfer are represented by
+/// one atomic ordered batch, so ledger readers never observe a partially
+/// settled uncross or its fees.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CallAuctionSettlement {
     record: CallAuctionSettlementRecord,
@@ -604,6 +636,12 @@ pub enum LedgerError {
         /// Counterparty pairs declared by the uncross completion event.
         trade_count: usize,
     },
+    /// A fee transfer amount was zero or negative.
+    FeeAmountNotPositive(i128),
+    /// A fee transfer used one account as both debit and credit.
+    FeeAccountsIdentical(AccountId),
+    /// A fee did not bind to the next trade in canonical report order.
+    CallAuctionFeeTradeMismatch(TradeId),
     /// Ledger state changed after an entry was prepared and before commit.
     StalePreparation,
     /// The transaction targeted by a reversal was not present.
@@ -713,7 +751,10 @@ impl fmt::Display for LedgerError {
             | Self::SettlementInstrumentMismatch
             | Self::SettlementVersionMismatch
             | Self::CallAuctionSettlementReportInvalid
-            | Self::CallAuctionSettlementTransactionCountMismatch { .. }) => {
+            | Self::CallAuctionSettlementTransactionCountMismatch { .. }
+            | Self::FeeAmountNotPositive(_)
+            | Self::FeeAccountsIdentical(_)
+            | Self::CallAuctionFeeTradeMismatch(_)) => {
                 format_settlement_error(settlement_error, formatter)
             }
             Self::StalePreparation => formatter.write_str("prepared journal entry is stale"),
@@ -828,6 +869,17 @@ fn format_settlement_error(error: &LedgerError, formatter: &mut fmt::Formatter<'
         } => write!(
             formatter,
             "call-auction settlement supplied {transaction_count} transaction identifiers for {trade_count} trades"
+        ),
+        LedgerError::FeeAmountNotPositive(amount) => {
+            write!(formatter, "fee transfer amount {amount} is not positive")
+        }
+        LedgerError::FeeAccountsIdentical(account_id) => write!(
+            formatter,
+            "fee transfer debit and credit account {account_id} are identical"
+        ),
+        LedgerError::CallAuctionFeeTradeMismatch(trade_id) => write!(
+            formatter,
+            "call-auction fee for trade {trade_id} is absent or outside canonical report order"
         ),
         _ => unreachable!("settlement formatter received a non-settlement error"),
     }
@@ -1436,6 +1488,101 @@ impl LedgerBatch {
     }
 }
 
+impl CallAuctionFee {
+    /// Constructs one positive, single-asset fee transfer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError::FeeAmountNotPositive`] for a zero or negative
+    /// amount and [`LedgerError::FeeAccountsIdentical`] when the transfer would
+    /// debit and credit the same account.
+    pub fn new(
+        transaction_id: TransactionId,
+        trade_id: TradeId,
+        debit_account_id: AccountId,
+        credit_account_id: AccountId,
+        asset_id: AssetId,
+        amount: i128,
+    ) -> Result<Self, LedgerError> {
+        if amount <= 0 {
+            return Err(LedgerError::FeeAmountNotPositive(amount));
+        }
+        if debit_account_id == credit_account_id {
+            return Err(LedgerError::FeeAccountsIdentical(debit_account_id));
+        }
+        Ok(Self {
+            transaction_id,
+            trade_id,
+            debit_account_id,
+            credit_account_id,
+            asset_id,
+            amount,
+        })
+    }
+
+    /// Returns the globally unique transaction identity for this fee entry.
+    #[must_use]
+    pub const fn transaction_id(self) -> TransactionId {
+        self.transaction_id
+    }
+
+    /// Returns the book-local trade identity to which this fee is bound.
+    #[must_use]
+    pub const fn trade_id(self) -> TradeId {
+        self.trade_id
+    }
+
+    /// Returns the account debited by the positive fee amount.
+    #[must_use]
+    pub const fn debit_account_id(self) -> AccountId {
+        self.debit_account_id
+    }
+
+    /// Returns the account credited by the positive fee amount.
+    #[must_use]
+    pub const fn credit_account_id(self) -> AccountId {
+        self.credit_account_id
+    }
+
+    /// Returns the asset denomination of the fee amount.
+    #[must_use]
+    pub const fn asset_id(self) -> AssetId {
+        self.asset_id
+    }
+
+    /// Returns the positive amount in the asset's smallest ledger unit.
+    #[must_use]
+    pub const fn amount(self) -> i128 {
+        self.amount
+    }
+
+    fn into_entry(
+        self,
+        effective_date: AccountingDate,
+        recorded_at: TimestampNs,
+    ) -> Result<JournalEntry, LedgerError> {
+        let mut postings =
+            reserve_ledger_preparation_vec(2, LedgerPreparationResource::CallAuctionFeePostings)?;
+        postings.push(Posting {
+            account_id: self.debit_account_id,
+            asset_id: self.asset_id,
+            amount: -self.amount,
+        });
+        postings.push(Posting {
+            account_id: self.credit_account_id,
+            asset_id: self.asset_id,
+            amount: self.amount,
+        });
+        JournalEntry::new(
+            self.transaction_id,
+            self.trade_id.get(),
+            effective_date,
+            recorded_at,
+            postings,
+        )
+    }
+}
+
 impl CallAuctionSettlement {
     /// Constructs one DVP ledger event from a complete accepted uncross report.
     ///
@@ -1456,6 +1603,43 @@ impl CallAuctionSettlement {
         report: &CallAuctionExecutionReport,
         definition: InstrumentDefinition,
     ) -> Result<Self, LedgerError> {
+        Self::from_report_with_fees(
+            transaction_ids,
+            Vec::new(),
+            effective_date,
+            recorded_at,
+            report,
+            definition,
+        )
+    }
+
+    /// Constructs one atomic DVP-and-fee event from a complete accepted report.
+    ///
+    /// `transaction_ids` binds one DVP entry to every trade event in report
+    /// order. `fees` must be grouped in the same report order; every contiguous
+    /// fee group follows its referenced DVP entry in the resulting batch.
+    /// Multiple fees and fee-free trades are valid. Each fee is a separately
+    /// idempotent standard entry, while the complete DVP-and-fee set commits as
+    /// one indivisible ledger event.
+    ///
+    /// Fee calculation, payer/recipient selection, and asset denomination are
+    /// not inferred. The caller supplies those authoritative values explicitly
+    /// through [`CallAuctionFee`]; authorization remains external.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] for every ordinary report, DVP, and batch
+    /// failure; a fee outside canonical report order returns
+    /// [`LedgerError::CallAuctionFeeTradeMismatch`]. No ledger state is mutated
+    /// during construction.
+    pub fn from_report_with_fees(
+        transaction_ids: Vec<TransactionId>,
+        fees: Vec<CallAuctionFee>,
+        effective_date: AccountingDate,
+        recorded_at: TimestampNs,
+        report: &CallAuctionExecutionReport,
+        definition: InstrumentDefinition,
+    ) -> Result<Self, LedgerError> {
         let trade_count = validate_call_auction_settlement_report(report, definition)?;
         if transaction_ids.len() != trade_count {
             return Err(LedgerError::CallAuctionSettlementTransactionCountMismatch {
@@ -1464,12 +1648,14 @@ impl CallAuctionSettlement {
             });
         }
 
-        let mut entries = Vec::new();
-        entries.try_reserve_exact(trade_count).map_err(|_| {
-            LedgerError::PreparationAllocationFailed(
-                LedgerPreparationResource::CallAuctionSettlementEntries,
-            )
-        })?;
+        let entry_count = trade_count
+            .checked_add(fees.len())
+            .ok_or(LedgerError::ArithmeticOverflow)?;
+        let mut entries = reserve_ledger_preparation_vec(
+            entry_count,
+            LedgerPreparationResource::CallAuctionSettlementEntries,
+        )?;
+        let mut fees = fees.into_iter().peekable();
         for (transaction_id, event) in transaction_ids
             .into_iter()
             .zip(report.events.iter().take(trade_count))
@@ -1484,6 +1670,18 @@ impl CallAuctionSettlement {
                 trade,
                 definition,
             )?);
+            while fees
+                .peek()
+                .is_some_and(|fee| fee.trade_id == trade.trade_id())
+            {
+                let Some(fee) = fees.next() else {
+                    unreachable!("peeked call-auction fee disappeared")
+                };
+                entries.push(fee.into_entry(effective_date, recorded_at)?);
+            }
+        }
+        if let Some(fee) = fees.next() {
+            return Err(LedgerError::CallAuctionFeeTradeMismatch(fee.trade_id));
         }
         let record = if entries.len() == 1 {
             let Some(entry) = entries.pop() else {
@@ -1561,10 +1759,15 @@ fn validate_call_auction_settlement_report(
     }
 
     let mut executed_quantity = 0_u128;
+    let mut previous_trade_id = None;
     for event in report.events.iter().take(trade_count) {
         let CallAuctionEventKind::Trade(trade) = event.kind else {
             return Err(LedgerError::CallAuctionSettlementReportInvalid);
         };
+        if previous_trade_id.is_some_and(|previous| trade.trade_id() <= previous) {
+            return Err(LedgerError::CallAuctionSettlementReportInvalid);
+        }
+        previous_trade_id = Some(trade.trade_id());
         if trade.instrument_id() != definition.instrument_id() {
             return Err(LedgerError::SettlementInstrumentMismatch);
         }
@@ -1658,7 +1861,7 @@ impl CallAuctionSettlementReceipt {
         self.replayed
     }
 
-    /// Returns the number of settled counterparty pairs.
+    /// Returns the number of DVP and fee transaction entries in the event.
     #[must_use]
     pub const fn transaction_count(self) -> usize {
         self.transaction_count
@@ -2868,11 +3071,12 @@ impl Ledger {
         }
     }
 
-    /// Atomically commits every DVP entry from one accepted call-auction uncross.
+    /// Atomically commits every DVP and explicit fee entry from one uncross.
     ///
-    /// A one-trade uncross is one ordinary ledger entry. A multi-trade uncross
-    /// is one batch event, with exact-retry and collision semantics delegated
-    /// to the same canonical posting paths as direct ledger use.
+    /// A one-trade fee-free uncross is one ordinary ledger entry. Multiple
+    /// trades or any explicit fee use one batch event, with exact-retry and
+    /// collision semantics delegated to the same canonical posting paths as
+    /// direct ledger use.
     ///
     /// # Errors
     ///

@@ -21,12 +21,13 @@ use quotick::instrument::{
 };
 use quotick::journal::{Durability, JournalOptions, JournalReader, RecordKind, RecoveryMode};
 use quotick::ledger::{
-    CallAuctionSettlement, JournalEntry, Ledger, LedgerError, LedgerRecord, Posting,
+    CallAuctionFee, CallAuctionSettlement, JournalEntry, Ledger, LedgerError, LedgerLimitsSpec,
+    LedgerRecord, LedgerResource, Posting,
 };
 use quotick::snapshot::{CheckpointSlot, SnapshotFile, SnapshotOptions};
 use quotick::{
     AccountId, AccountingDate, AssetId, AuctionId, CommandId, InstrumentId, InstrumentVersion,
-    OrderId, Price, Quantity, Side, TimestampNs, TransactionId,
+    OrderId, Price, Quantity, Side, TimestampNs, TradeId, TransactionId,
 };
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
@@ -210,6 +211,72 @@ fn settlement(report: &CallAuctionExecutionReport) -> CallAuctionSettlement {
     .unwrap()
 }
 
+fn report_trade_id(report: &CallAuctionExecutionReport, index: usize) -> TradeId {
+    let CallAuctionEventKind::Trade(trade) = report.events[index].kind else {
+        panic!("requested report event must be a trade");
+    };
+    trade.trade_id()
+}
+
+fn fee(
+    transaction_id: u64,
+    trade_id: TradeId,
+    debit_account_id: u64,
+    credit_account_id: u64,
+    amount: i128,
+) -> CallAuctionFee {
+    fee_in_asset(
+        transaction_id,
+        trade_id,
+        debit_account_id,
+        credit_account_id,
+        AssetId::new(2).unwrap(),
+        amount,
+    )
+}
+
+fn fee_in_asset(
+    transaction_id: u64,
+    trade_id: TradeId,
+    debit_account_id: u64,
+    credit_account_id: u64,
+    asset_id: AssetId,
+    amount: i128,
+) -> CallAuctionFee {
+    CallAuctionFee::new(
+        transaction(transaction_id),
+        trade_id,
+        account(debit_account_id),
+        account(credit_account_id),
+        asset_id,
+        amount,
+    )
+    .unwrap()
+}
+
+fn fee_settlement(report: &CallAuctionExecutionReport) -> CallAuctionSettlement {
+    CallAuctionSettlement::from_report_with_fees(
+        vec![transaction(101), transaction(102), transaction(103)],
+        vec![
+            fee(201, report_trade_id(report, 0), 11, 90, 7),
+            fee_in_asset(
+                202,
+                report_trade_id(report, 0),
+                90,
+                11,
+                AssetId::new(3).unwrap(),
+                2,
+            ),
+            fee(203, report_trade_id(report, 2), 22, 90, 11),
+        ],
+        AccountingDate::UNIX_EPOCH,
+        TimestampNs::from_unix_nanos(100),
+        report,
+        definition(),
+    )
+    .unwrap()
+}
+
 fn options() -> JournalOptions {
     JournalOptions {
         durability: Durability::Buffered,
@@ -241,6 +308,227 @@ fn complete_uncross_settles_as_one_atomic_idempotent_ledger_event() {
     assert_eq!(ledger.balance(account(12), AssetId::new(2).unwrap()), -600);
     assert_eq!(ledger.balance(account(21), AssetId::new(2).unwrap()), 300);
     assert_eq!(ledger.balance(account(22), AssetId::new(2).unwrap()), 700);
+    ledger.validate().unwrap();
+}
+
+#[test]
+fn explicit_trade_fees_settle_in_the_same_atomic_event_as_dvp() {
+    let report = multi_trade_report();
+    let value = fee_settlement(&report);
+    assert_eq!(value.transaction_count(), 6);
+
+    let mut ledger = Ledger::new();
+    let receipt = ledger.settle_call_auction(value.clone()).unwrap();
+    assert_eq!(receipt.sequence(), 1);
+    assert_eq!(receipt.transaction_count(), 6);
+    assert!(!receipt.replayed());
+    assert!(ledger.settle_call_auction(value).unwrap().replayed());
+
+    assert_eq!(ledger.record_count(), 1);
+    assert_eq!(ledger.entry_count(), 6);
+    assert!(matches!(ledger.record(1), Some(LedgerRecord::Batch(_))));
+    assert_eq!(ledger.balance(account(11), AssetId::new(2).unwrap()), -407);
+    assert_eq!(ledger.balance(account(22), AssetId::new(2).unwrap()), 689);
+    assert_eq!(ledger.balance(account(90), AssetId::new(2).unwrap()), 18);
+    assert_eq!(ledger.balance(account(11), AssetId::new(3).unwrap()), 2);
+    assert_eq!(ledger.balance(account(90), AssetId::new(3).unwrap()), -2);
+
+    let buyer_fee = ledger.transaction(transaction(201)).unwrap();
+    assert_eq!(buyer_fee.reference(), report_trade_id(&report, 0).get());
+    assert_eq!(
+        buyer_fee.postings(),
+        [
+            Posting {
+                account_id: account(11),
+                asset_id: AssetId::new(2).unwrap(),
+                amount: -7,
+            },
+            Posting {
+                account_id: account(90),
+                asset_id: AssetId::new(2).unwrap(),
+                amount: 7,
+            },
+        ]
+    );
+    let rebate = ledger.transaction(transaction(202)).unwrap();
+    assert_eq!(rebate.reference(), report_trade_id(&report, 0).get());
+    assert!(
+        rebate
+            .postings()
+            .iter()
+            .all(|posting| posting.asset_id == AssetId::new(3).unwrap())
+    );
+    assert_eq!(rebate.postings()[0].account_id, account(11));
+    assert_eq!(rebate.postings()[0].amount, 2);
+    assert_eq!(rebate.postings()[1].account_id, account(90));
+    assert_eq!(rebate.postings()[1].amount, -2);
+    ledger.validate().unwrap();
+}
+
+#[test]
+fn fee_instructions_are_positive_distinct_and_canonically_trade_bound() {
+    let trade_id = TradeId::new(1).unwrap();
+    assert_eq!(
+        CallAuctionFee::new(
+            transaction(1),
+            trade_id,
+            account(11),
+            account(90),
+            AssetId::new(2).unwrap(),
+            0,
+        ),
+        Err(LedgerError::FeeAmountNotPositive(0))
+    );
+    assert_eq!(
+        CallAuctionFee::new(
+            transaction(1),
+            trade_id,
+            account(11),
+            account(90),
+            AssetId::new(2).unwrap(),
+            -1,
+        ),
+        Err(LedgerError::FeeAmountNotPositive(-1))
+    );
+    assert_eq!(
+        CallAuctionFee::new(
+            transaction(1),
+            trade_id,
+            account(11),
+            account(11),
+            AssetId::new(2).unwrap(),
+            1,
+        ),
+        Err(LedgerError::FeeAccountsIdentical(account(11)))
+    );
+
+    let report = multi_trade_report();
+    let unknown_trade = TradeId::new(999).unwrap();
+    assert_eq!(
+        CallAuctionSettlement::from_report_with_fees(
+            vec![transaction(101), transaction(102), transaction(103)],
+            vec![fee(201, unknown_trade, 11, 90, 1)],
+            AccountingDate::UNIX_EPOCH,
+            TimestampNs::from_unix_nanos(100),
+            &report,
+            definition(),
+        ),
+        Err(LedgerError::CallAuctionFeeTradeMismatch(unknown_trade))
+    );
+
+    let first_trade = report_trade_id(&report, 0);
+    let last_trade = report_trade_id(&report, 2);
+    assert_eq!(
+        CallAuctionSettlement::from_report_with_fees(
+            vec![transaction(101), transaction(102), transaction(103)],
+            vec![
+                fee(201, last_trade, 22, 90, 1),
+                fee(202, first_trade, 11, 90, 1),
+            ],
+            AccountingDate::UNIX_EPOCH,
+            TimestampNs::from_unix_nanos(100),
+            &report,
+            definition(),
+        ),
+        Err(LedgerError::CallAuctionFeeTradeMismatch(first_trade))
+    );
+
+    assert_eq!(
+        CallAuctionSettlement::from_report_with_fees(
+            vec![transaction(101), transaction(102), transaction(103)],
+            vec![fee(101, first_trade, 11, 90, 1)],
+            AccountingDate::UNIX_EPOCH,
+            TimestampNs::from_unix_nanos(100),
+            &report,
+            definition(),
+        ),
+        Err(LedgerError::BatchDuplicateTransaction(transaction(101)))
+    );
+    assert_eq!(
+        CallAuctionSettlement::from_report_with_fees(
+            vec![transaction(101), transaction(102), transaction(103)],
+            vec![
+                fee(201, first_trade, 11, 90, 1),
+                fee(201, first_trade, 90, 11, 1),
+            ],
+            AccountingDate::UNIX_EPOCH,
+            TimestampNs::from_unix_nanos(100),
+            &report,
+            definition(),
+        ),
+        Err(LedgerError::BatchDuplicateTransaction(transaction(201)))
+    );
+}
+
+#[test]
+fn fee_enriched_settlement_respects_atomic_record_capacity() {
+    let report = multi_trade_report();
+    let value = fee_settlement(&report);
+    let mut ledger = Ledger::try_with_limits(LedgerLimitsSpec {
+        max_balance_keys: 16,
+        max_transactions: 16,
+        max_reversals: 8,
+        max_records: 16,
+        max_postings_per_transaction: 4,
+        max_transactions_per_record: 4,
+        max_retained_postings: 64,
+    })
+    .unwrap();
+
+    assert_eq!(
+        ledger.settle_call_auction(value),
+        Err(LedgerError::CapacityExceeded {
+            resource: LedgerResource::TransactionsPerRecord,
+            maximum: 4,
+            attempted: 6,
+        })
+    );
+    assert_eq!(ledger.record_count(), 0);
+    assert_eq!(ledger.entry_count(), 0);
+    assert_eq!(ledger.nonzero_balance_count(), 0);
+    ledger.validate().unwrap();
+}
+
+#[test]
+fn separately_committed_fee_prevents_the_complete_settlement_without_a_prefix() {
+    let report = multi_trade_report();
+    let value = fee_settlement(&report);
+    let standalone_fee = JournalEntry::new(
+        transaction(201),
+        report_trade_id(&report, 0).get(),
+        AccountingDate::UNIX_EPOCH,
+        TimestampNs::from_unix_nanos(100),
+        vec![
+            Posting {
+                account_id: account(11),
+                asset_id: AssetId::new(2).unwrap(),
+                amount: -7,
+            },
+            Posting {
+                account_id: account(90),
+                asset_id: AssetId::new(2).unwrap(),
+                amount: 7,
+            },
+        ],
+    )
+    .unwrap();
+    let mut ledger = Ledger::new();
+    ledger.post(standalone_fee).unwrap();
+
+    assert_eq!(
+        ledger.settle_call_auction(value),
+        Err(LedgerError::BatchAlreadyPartiallyCommitted(transaction(
+            201
+        )))
+    );
+    assert_eq!(ledger.record_count(), 1);
+    assert_eq!(ledger.entry_count(), 1);
+    assert!(ledger.transaction(transaction(101)).is_none());
+    assert!(ledger.transaction(transaction(102)).is_none());
+    assert!(ledger.transaction(transaction(103)).is_none());
+    assert!(ledger.transaction(transaction(202)).is_none());
+    assert!(ledger.transaction(transaction(203)).is_none());
+    assert_eq!(ledger.balance(account(90), AssetId::new(2).unwrap()), 7);
     ledger.validate().unwrap();
 }
 
@@ -484,6 +772,74 @@ fn durable_uncross_settlement_is_one_frame_and_recovers_exactly() {
     assert_eq!(recovered.ledger().entry_count(), 3);
     assert!(recovered.settle_call_auction(value).unwrap().replayed());
     recovered.ledger().validate().unwrap();
+}
+
+#[test]
+fn durable_fee_enriched_settlement_is_one_frame_and_recovers_exactly() {
+    let file = TestFile::new();
+    let checkpoint_base = file.0.with_extension("qsnp");
+    let report = multi_trade_report();
+    let value = fee_settlement(&report);
+    let mut durable = DurableLedger::open(&file.0, options()).unwrap();
+    let receipt = durable.settle_call_auction(value.clone()).unwrap();
+    assert_eq!(receipt.transaction_count(), 6);
+    let length = fs::metadata(&file.0).unwrap().len();
+    assert!(
+        durable
+            .settle_call_auction(value.clone())
+            .unwrap()
+            .replayed()
+    );
+    assert_eq!(fs::metadata(&file.0).unwrap().len(), length);
+    durable.close().unwrap();
+
+    let frames = JournalReader::open(&file.0, options())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].kind(), RecordKind::LedgerBatch);
+
+    let mut recovered = DurableLedger::open(&file.0, options()).unwrap();
+    assert_eq!(recovered.ledger().record_count(), 1);
+    assert_eq!(recovered.ledger().entry_count(), 6);
+    assert_eq!(
+        recovered
+            .ledger()
+            .balance(account(90), AssetId::new(2).unwrap()),
+        18
+    );
+    assert!(recovered.settle_call_auction(value).unwrap().replayed());
+    recovered.ledger().validate().unwrap();
+    let cutover = recovered
+        .compact_to_checkpoint(&checkpoint_base, SnapshotOptions::default())
+        .unwrap();
+    assert_eq!(cutover.slot(), CheckpointSlot::A);
+    recovered.close().unwrap();
+
+    let value = fee_settlement(&report);
+    let mut checkpointed = DurableLedger::open_with_checkpoint(
+        &file.0,
+        &checkpoint_base,
+        options(),
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(checkpointed.recovery().checkpointed_records, 1);
+    assert_eq!(checkpointed.recovery().replayed_records, 0);
+    assert_eq!(
+        checkpointed
+            .ledger()
+            .balance(account(90), AssetId::new(2).unwrap()),
+        18
+    );
+    assert!(checkpointed.settle_call_auction(value).unwrap().replayed());
+    checkpointed.ledger().validate().unwrap();
+    checkpointed.close().unwrap();
+
+    for slot in [CheckpointSlot::A, CheckpointSlot::B] {
+        let _ = fs::remove_file(SnapshotFile::slot_path(&checkpoint_base, slot));
+    }
 }
 
 #[test]

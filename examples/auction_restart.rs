@@ -15,7 +15,7 @@ use quotick::auction_engine::{
 };
 use quotick::durable_auction::DurableCallAuctionEngine;
 use quotick::instrument::InstrumentDefinition;
-use quotick::ledger::{CallAuctionSettlement, Ledger};
+use quotick::ledger::{CallAuctionFee, CallAuctionSettlement, Ledger};
 use quotick::snapshot::{CheckpointSlot, SnapshotOptions};
 use quotick::{
     AccountingDate, AuctionId, CommandId, OrderId, Price, Quantity, Side, TransactionId,
@@ -84,8 +84,27 @@ fn settle_report(
         .iter()
         .filter(|event| matches!(event.kind, CallAuctionEventKind::Trade(_)))
         .count();
-    let settlement = CallAuctionSettlement::from_report(
+    let trade = report
+        .events
+        .iter()
+        .find_map(|event| match event.kind {
+            CallAuctionEventKind::Trade(trade) => Some(trade),
+            _ => None,
+        })
+        .expect("representative uncross emits one trade");
+    let settlement = CallAuctionSettlement::from_report_with_fees(
         vec![TransactionId::new(1).unwrap()],
+        vec![
+            CallAuctionFee::new(
+                TransactionId::new(2).unwrap(),
+                trade.trade_id(),
+                trade.buy_account_id(),
+                account(90),
+                definition.quote_asset_id(),
+                3,
+            )
+            .unwrap(),
+        ],
         AccountingDate::UNIX_EPOCH,
         timestamp(7),
         report,
@@ -94,7 +113,8 @@ fn settle_report(
     .unwrap();
     let mut ledger = Ledger::new();
     let receipt = ledger.settle_call_auction(settlement).unwrap();
-    assert_eq!(receipt.transaction_count(), trade_count);
+    assert_eq!(receipt.transaction_count(), trade_count + 1);
+    assert_eq!(ledger.balance(account(90), definition.quote_asset_id()), 3);
     ledger.validate().unwrap();
     (trade_count, receipt.transaction_count())
 }

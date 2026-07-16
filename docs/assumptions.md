@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A117 are stable and are referenced from code comments and other
+identifiers A1-A118 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -163,8 +163,9 @@ falsifies A10.
 **Assumption.** A continuous trade is durably settled once using a caller-
 supplied globally unique transaction ID and the definition-correlated path. A
 complete accepted call-auction uncross instead supplies exactly one such ID per
-trade in report order and settles as one entry or atomic batch under A116. The
-lower-level convention API is not an authorization boundary.
+trade in report order and, under A118, one per explicit fee transfer. It settles
+as one entry or atomic batch under A116/A118. The lower-level convention API is
+not an authorization boundary.
 
 **Dependent results.** Delivery-versus-payment balances, WAL reconstruction,
 and retry behavior.
@@ -198,8 +199,9 @@ reserves its derived session-ID index before publication.
 Successful continuous-book/risk, call-auction-book/engine/risk, and indexed-AVL
 structural audits allocate no scratch; continuous matching/risk,
 call-auction/risk, and ledger checkpoint capture/semantic/capacity resources,
-call-auction settlement-entry construction, codec collections/output, and WAL
-frame/batch/read buffers reserve fallibly with typed resource identity. Arc
+call-auction settlement-entry and per-fee posting construction, codec
+collections/output, and WAL frame/batch/read buffers reserve fallibly with
+typed resource identity. Arc
 control blocks, caller-owned command/entry
 objects, decoded/caller-built event traces and checkpoints, snapshot-file
 ownership, path/string construction, ledger diagnostic/reconciliation
@@ -3911,10 +3913,74 @@ growth, leaked partial output, unrelated-order scan in an account query,
 private identity in public depth, nondeterministic ordering, mutation, or
 untyped fallible-path failure falsifies A117.
 
+## A118 — atomic trade-bound call-auction fees
+
+**Assumption.** A fee input extends one complete A116 settlement; it is not an
+independent trade assertion. Each `CallAuctionFee` carries one globally unique
+`TransactionId`, one book-local `TradeId`, distinct debit and credit
+`AccountId` values, one explicit `AssetId`, and one positive signed-`i128`
+amount in that asset's smallest ledger unit. The debit account supplies the
+amount and the credit account receives it. A rebate reverses those accounts
+rather than using a zero or negative amount.
+
+The fee vector is grouped in the report's canonical strictly increasing trade-
+ID order. For each trade, `from_report_with_fees` constructs the A116 DVP entry
+and then every contiguous fee entry bound to that trade. Trades may have zero,
+one, or multiple fees. An unknown or reordered binding and any global
+transaction-ID duplication across DVP or fee entries fail before ledger
+mutation. Fee calculation, account-role mapping, asset selection, and tax or
+disclosure parameters are authoritative external inputs. Authorization remains
+an external lifecycle responsibility; the ledger does not infer or attest it.
+
+**Dependent results.** [A1, A7, A11, A12, A17, A29, A33, A34, A42, A43,
+A64, A65, A66, A69, A79, A89, A90, A116, A118] For `T` trades, `C`
+cancellations, `F` fees, `N = T + F` entries, `L <= 4T + 2F` non-zero posting
+legs, and `U` affected balance keys, report and fee-binding validation is
+`O(T + C + F)` time and `O(1)` auxiliary space. Construction fallibly reserves
+exactly `N` entry handles and two postings per fee and owns `O(N + L)` result
+storage. Except for `T = 1, F = 0`, A42 batch construction adds expected
+`O(N)` time and `O(N)` identity storage; A79 preparation is `O(L log L)` with
+`O(N + L + U)` auxiliary storage, and commit is expected `O(N + U)`. A full
+adversarial transaction-hash collision cluster can make identity and overlay
+work `O(N²)` without storage growth.
+
+One fee-enriched settlement occupies one ordinary kind-`7` ledger-batch frame
+and one batch checkpoint record. Standard entry/batch encoding already carries
+the postings, references, effective date, and booking timestamp, so WAL and
+snapshot version 19 do not change. DVP and fees share one event sequence, final
+balance image, capacity decision, exact-retry identity, append-before-commit
+transition, checkpoint, and recovery result. No prefix is observable after
+construction, capacity, period, timestamp, balance, WAL, or recovery failure.
+
+**Falsification probe.** Exercise zero, one, and multiple fees per trade;
+fee-free trades between fee-bearing trades; buyer, seller, and third-account
+debits; third-asset fees; reversed-account rebates; maximum positive amounts;
+and single- and multi-trade reports. Reject zero/negative amounts, identical
+fee accounts, unknown trade IDs, reordered fee groups, duplicate DVP/fee and
+fee/fee transaction IDs, nonmonotonic report trade IDs, closed dates, timestamp
+regression, final-balance overflow, every entry/posting/record capacity, and
+every fee-posting/settlement-entry reservation failure before mutation.
+
+Precommit one DVP or fee transaction separately and under another batch. For
+durable settlement, terminate at every frame-write/barrier/commit boundary,
+repair a torn tail, recover from uncut WAL and both A/B checkpoint slots, apply
+a suffix, and retry before and after reopen. Compare every balance, transaction
+reference, posting, record, sequence, checkpoint image, and WAL length. Any fee
+bound to another trade, sign/direction ambiguity, partial DVP or fee effect,
+second retry effect, frame split, recovery divergence, or inferred external fee
+policy falsifies A118.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** explicit positive fee transfers now bind to call-auction
+  trades and commit atomically with their DVP entries under A118. Multiple fees,
+  third-party collectors, reverse-direction rebates, capacity failure,
+  one-frame durability, recovery, and exact retry reuse the bounded batch path.
+  Fee schedules, calculation, authorization, account-role mapping, tax, and
+  settlement-date policy remain external lifecycle inputs.
 
 - **Medium impact:** continuous public-depth, complete private resting-order,
   and account-scoped identifier extraction now has typed fallible output under
@@ -3950,9 +4016,11 @@ capability, a remaining risk, or an opportunity.
 - **High impact:** every private call-auction trade now carries immutable
   instrument identity/version, and one complete accepted uncross report maps to
   one DVP ledger entry or atomic batch with one global transaction ID per trade.
-  Entry construction, exact retry, collision/partial-commit detection, durable
-  one-frame recovery, and ledger checkpoint cutover reuse the existing bounded
-  ledger paths. Clearing authorization, novation/allocation accounts, fees,
+  Explicit positive trade-bound fee transfers can join that same atomic event
+  with independent transaction identity. Entry construction, exact retry,
+  collision/partial-commit detection, durable one-frame recovery, and ledger
+  checkpoint cutover reuse the existing bounded ledger paths. Clearing
+  authorization, novation/allocation accounts, fee calculation/authorization,
   settlement dates, custody, external money settlement, and legal finality
   remain separate lifecycle boundaries.
 - **High impact:** call-auction collection now supports atomic new-identity
@@ -4090,7 +4158,8 @@ capability, a remaining risk, or an opportunity.
   auction display and venue-specific size-ranked, time-weighted, minimum-share,
   or hybrid allocation policies, venue-specific self-trade cancellation,
   decrement, and alternative-pairing policies, clearing-lifecycle authorization,
-  fee/allocation and settlement-date derivation, authenticated public/private
+  fee calculation/authorization, allocation, and settlement-date derivation,
+  authenticated public/private
   transport, market-on-auction and imbalance-only order types,
   authoritative external continuous stop-reference ingestion, pegged triggers,
   discretionary ranges,
@@ -4335,9 +4404,10 @@ capability, a remaining risk, or an opportunity.
   journal history provide deterministic internal reconciliation evidence and
   generation-addressed audit images. External statement/custodian anchors and
   persistent signed evidence are still required for cross-system reconciliation.
-- **Medium impact opportunity:** the generalized ledger-batch primitive can
-  carry fees, allocations, multi-leg settlement, and clearing bundles without
-  exposing partial economic state. Product-specific construction,
-  authorization, and external lifecycle evidence remain separate adapters.
+- **Medium impact opportunity:** the generalized ledger-batch primitive now
+  carries explicit trade-bound call-auction fees without exposing partial
+  economic state. Allocation, multi-leg settlement, and clearing bundles can
+  reuse the same primitive, but product-specific construction, authorization,
+  and external lifecycle evidence remain separate adapters.
 - **Low impact:** UI and visualization layers should consume immutable versioned
   traces and snapshots; they are not authoritative state owners.

@@ -815,17 +815,18 @@ and mutates only affected fixed-capacity indexes plus one pre-reserved record
 slot. Initial entry/batch construction creates one shared-owner control block
 after validation; that stable-Rust allocator boundary remains A12.
 
-For one accepted call-auction uncross with `T` trades and `C` remainder
-cancellations, report validation is `O(T + C)` time and `O(1)` auxiliary
-space. Settlement construction fallibly reserves exactly `T` entry handles,
-constructs at most `L = 4T` non-zero posting legs with checked `i128`
-arithmetic, and uses `O(T + L)` owned result storage before ledger mutation.
-The `T = 1` case uses ordinary entry preparation. For `T >= 2`, batch
-construction adds expected `O(T)` time and `O(T)` identity storage, after
-which the existing batch bounds above apply: `O(L log L)` preparation,
-`O(T + L + U)` auxiliary memory, and expected `O(T + U)` commit. Durable
-settlement adds one entry or batch frame; exact replay is resolved without
-frame growth.
+For one accepted call-auction uncross with `T` trades, `C` remainder
+cancellations, `F` explicit fee transfers, `N = T + F` entries, and
+`L <= 4T + 2F` non-zero posting legs, report and canonical fee-binding
+validation is `O(T + C + F)` time and `O(1)` auxiliary space. Settlement
+construction fallibly reserves exactly `N` entry handles and two postings per
+fee, uses checked `i128` DVP arithmetic, and owns `O(N + L)` result storage
+before ledger mutation. The `T = 1, F = 0` case uses ordinary entry
+preparation. Otherwise batch construction adds expected `O(N)` time and
+`O(N)` identity storage, after which the existing batch bounds above apply:
+`O(L log L)` preparation, `O(N + L + U)` auxiliary memory, and expected
+`O(N + U)` commit. Durable settlement adds one entry or batch frame; exact
+replay is resolved without frame growth.
 
 For `A` internal non-zero balances, `V` asset denominations, and `W` spilled
 `u64` magnitude limbs, fallible trial-balance construction reserves one flat

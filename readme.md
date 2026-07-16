@@ -71,7 +71,7 @@ verify deterministic replay during recovery.
 | `auction`, `auction_book`, `auction_engine` | Pure clearing-price and allocation kernels, bounded collection book, sequenced phase engine |
 | `risk`, `auction_risk` | Immutable account profiles, conservative reservations, coupled matching and auction shards |
 | `market_data`, `auction_market_data` | Anonymized L2 publishers and gap-detecting replicas for both trading models |
-| `ledger` | Atomic multi-asset double-entry ledger with continuous-trade and complete call-auction DVP settlement |
+| `ledger` | Atomic multi-asset double-entry ledger with continuous-trade DVP and complete call-auction DVP-plus-fee settlement |
 | `journal`, `snapshot` | CRC-32C WAL (single-file and segmented), `QSNP` semantic snapshots, A/B checkpoint-cutover primitives |
 | `durable`, `durable_risk`, `durable_auction`, `durable_ledger` | Crash-recoverable single-writer runtimes |
 | `codec` | Stable little-endian `BinaryCodec` implementations for durable records and calendar images |
@@ -404,6 +404,10 @@ Run any program with `cargo run --example <name>`.
   one atomic ledger batch for multiple pairs. Report grammar, instrument
   identity/version, clearing price, counts, and aggregate quantity are proved
   before ledger mutation.
+- Explicit positive single-asset fee transfers can bind to each report trade
+  in canonical order. Every fee has its own global transaction ID and balanced
+  debit/credit pair; DVP and fee entries commit in the same atomic batch.
+  Rebates reverse account direction rather than using negative fee amounts.
 - Entry-before-balance durability with prepared, generation-checked commits;
   exact-entry idempotency and typed transaction-ID collision detection.
 - First-class reversals with exact posting-inverse proof and append-only
@@ -505,11 +509,11 @@ calendar images and day/session-to-GTD normalization are implemented, but
 authoritative calendar ingestion, signed distribution, atomic activation,
 original-request audit durability, and sequenced session-state transitions are
 external. The auction path provides instrument-bound atomic DVP settlement for
-a complete accepted uncross report. Clearing lifecycle authorization,
-allocation/fee workflows, settlement-date derivation, reference or dynamic-
-band derivation, alternative-counterparty STP rearrangement, cancel/decrement
-STP policies, calendar-driven phase scheduling, and venue-specific uncross
-rules remain external.
+a complete accepted uncross report and explicit trade-bound fee transfers in
+the same ledger event. Fee calculation and authorization, allocation workflows,
+settlement-date derivation, reference or dynamic-band derivation, alternative-
+counterparty STP rearrangement, cancel/decrement STP policies, calendar-driven
+phase scheduling, and venue-specific uncross rules remain external.
 
 The complete boundary, the failure model, and the register of environmental
 assumptions are documented in
@@ -521,7 +525,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 117 tagged assumptions (A1–A117), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 118 tagged assumptions (A1–A118), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -611,9 +615,10 @@ includes:
   engine phase-model run. Fail-closed self-trade abort is covered across
   canonical pairing, sequencing, risk neutrality, public no-change projection,
   stable codecs, and durable exact retry. Settlement coverage proves one-entry
-  and multi-entry mappings, instrument/version mismatch, same-account
-  rejection, overflow atomicity, partial-prior-commit detection, one-frame
-  recovery, checkpoint cutover, and WAL-free exact retry.
+  and multi-entry mappings, canonical explicit fee binding, instrument/version
+  mismatch, invalid fee and same-account rejection, overflow/capacity
+  atomicity, partial-prior-commit detection, one-frame recovery, checkpoint
+  cutover, and WAL-free exact retry.
 - **Market data and accounting:** continuous and complete-batch auction depth
   reconstruction, replay-first gap repair, snapshot fallback,
   allocation-stable ring wrap, continuous and auction settlement, reversals,

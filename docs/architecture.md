@@ -1293,6 +1293,27 @@ periods, batches, and recovery.
     posting-count, and record-capacity decisions occur during preparation.
     Commit reuses fixed storage and allocates nothing.
 
+### Explicit call-auction fees
+
+39. `CallAuctionFee` is one positive transfer in one explicit asset from one
+    debit account to one distinct credit account. Its globally unique
+    `TransactionId` provides ledger idempotency and its book-local `TradeId`
+    binds the transfer to one trade in the complete settlement report. A rebate
+    reverses account direction; zero and negative amounts are rejected.
+40. `CallAuctionSettlement::from_report_with_fees` requires fee instructions in
+    canonical report-trade order. For each trade it emits the DVP entry followed
+    by every contiguous fee entry for that trade. Unknown or reordered fee
+    bindings, duplicate fee/DVP transaction IDs, and allocation failure are
+    rejected before ledger mutation. Fee calculation, account selection, and
+    asset denomination are authoritative caller inputs; authorization remains
+    external.
+41. A one-trade settlement without fees retains the ordinary entry path. Any
+    explicit fee or multiple trades use one `LedgerBatch`; DVP and fees
+    therefore share one event sequence, capacity decision, final-balance image,
+    WAL frame, checkpoint record, exact-retry identity, and all-or-nothing
+    recovery path. Standard entry/batch encoding already represents the fee
+    postings, so WAL and snapshot version 19 do not change.
+
 Signed balances are intentional accounting state. Credit limits, collateral,
 and margin are not inferred by the ledger. The implemented order risk layer
 consumes seeded positions and matching traces; it does not derive available
@@ -2009,9 +2030,11 @@ pointer identity across clones, commit, record materialization, checkpoint
 capture, and borrowed restoration while codec fixtures remain value-identical.
 
 Call-auction settlement tests prove one-entry and multi-entry report mappings,
-exact DVP balances, instrument/version/count/grammar rejection, same-account
-rejection, arithmetic-overflow atomicity, partial-prior-commit detection,
-single-frame durable recovery, checkpoint cutover, and WAL-free exact retry.
+exact DVP balances, canonical explicit fee binding and balances, invalid fee
+structure, instrument/version/count/grammar rejection, duplicate fee/DVP
+identity rejection, same-account rejection, arithmetic/capacity atomicity,
+partial-prior-commit detection, single-frame durable recovery, checkpoint
+cutover, and WAL-free exact retry.
 
 Matching checkpoint tests cover capture-time replay audit, displayed-class-
 tail reserve state, resting STP, exact retry, stable kind/codec, semantic
@@ -2229,15 +2252,15 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | Impact | Capability | Evidence required for completion |
 |---|---|---|
 | High | Durable storage completion | externally coordinated retired-generation archival/handoff; kernel inode locking or qualified alias exclusion; forced-power-loss filesystem/device evidence |
-| High | Ledger lifecycle completion | controller authorization; versioned calendar ingestion; durable external-statement evidence; externally anchored cutoff proofs; allocation/fee/settlement-date lifecycle adapters over atomic batches |
+| High | Ledger lifecycle completion | explicit trade-bound fee transfers over atomic call-auction DVP batches are implemented; remaining work is controller authorization, versioned calendar ingestion, durable external-statement evidence, externally anchored cutoff proofs, allocation adapters, fee calculation, and settlement-date lifecycle adapters |
 | High | Snapshots and compaction | single-file and segmented matching/risk/ledger/call-auction WAL cutover plus off-thread direct and WAL-synchronized plain/coupled continuous-matching and call-auction replay verification are implemented; verified matching/risk/auction handles can retire an older prefix by cursor-streaming only its synchronized suffix. Remaining evidence is bounded checkpoint memory and writer audit-copy/projection/direct-reconstruction pause, bounded suffix-copy pause, semantic generation rollover, and externally retained audit/idempotency proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
-| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, sourced explicit-reference stop-market/stop-limit activation with durable source identity/version/sequence and gap/reset validation, native reserve and fully hidden continuous queue classes, atomic minimum-quantity IOC, atomic FOK under all four continuous self-trade policies, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, authoritative typed priority classes, account/side mass cancellation, atomic new-identity replacement with full priority loss, aggregate depth queries, banded discovery, sequenced nullable indicative publication, explicit price-time and price/class-tier pro-rata-time allocation, deterministic pairing/atomic uncross with fail-closed self-trade abort, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, plain/coupled-risk full-WAL plus cutover recovery, and instrument-bound atomic DVP settlement of complete accepted uncross reports are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authenticated external stop-reference acquisition/normalization and missed-reference recovery, auction reference and dynamic-band derivation, authenticated venue-category-to-class and beneficial-owner mapping, venue-specific display/allocation policies, venue-specific call-auction self-trade cancellation/decrement and alternative-pairing policies, clearing lifecycle authorization and fee/settlement-date derivation, volatility/interruption auctions, pegged, discretionary, venue-specific in-place amendment/uncross/publication cadence/filtering semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
+| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, sourced explicit-reference stop-market/stop-limit activation with durable source identity/version/sequence and gap/reset validation, native reserve and fully hidden continuous queue classes, atomic minimum-quantity IOC, atomic FOK under all four continuous self-trade policies, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, authoritative typed priority classes, account/side mass cancellation, atomic new-identity replacement with full priority loss, aggregate depth queries, banded discovery, sequenced nullable indicative publication, explicit price-time and price/class-tier pro-rata-time allocation, deterministic pairing/atomic uncross with fail-closed self-trade abort, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, plain/coupled-risk full-WAL plus cutover recovery, instrument-bound atomic DVP settlement of complete accepted uncross reports, and explicit trade-bound fee transfers in the same atomic ledger event are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authenticated external stop-reference acquisition/normalization and missed-reference recovery, auction reference and dynamic-band derivation, authenticated venue-category-to-class and beneficial-owner mapping, venue-specific display/allocation policies, venue-specific call-auction self-trade cancellation/decrement and alternative-pairing policies, clearing lifecycle authorization, fee calculation/authorization, settlement-date derivation, volatility/interruption auctions, pegged, discretionary, venue-specific in-place amendment/uncross/publication cadence/filtering semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
 | High | Instrument lifecycle expansion | authoritative calendar ingestion/distribution/activation, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |
-| High | Clearing lifecycle | novation/allocation, fees, settlement dates, fails, corrections, busts, and reconciliation |
+| High | Clearing lifecycle | explicit positive trade-bound fee transfers are atomic with call-auction DVP; remaining work is novation/allocation, fee calculation and authorization, settlement dates, fails, trade-level corrections/busts, and externally anchored reconciliation |
 | High | Security boundary | authenticated principals, authorization policy, secret management, audit export, and abuse controls |
 | Medium | Gateways and schemas | versioned binary protocol, FIX adapter, backpressure, session recovery, and conformance fixtures |
 | Medium | Market-data distribution | constructor-reserved per-instrument short-gap replay for continuous updates and complete call-auction command batches, with typed gap/collision/eviction/boundary handling and snapshot fallback, is implemented; remaining work is authenticated transport framing, entitlement, fanout, remote retransmission sessions, bandwidth control, and conformance fixtures |
