@@ -3,9 +3,10 @@ use quotick::instrument::{
     QuantityRules, ReserveOrderRules, TradingState,
 };
 use quotick::matching::{
-    Command, CommandOutcome, MassCancelScope, MatchingHashIndex, NewOrder, OrderBook,
-    OrderBookQueryError, OrderBookQueryResource, OrderDisplay, OrderType, RejectReason,
-    SelfTradePrevention, TimeInForce,
+    Command, CommandOutcome, EventKind, ImmediateExecutionRequest, ImmediateExecutionTermination,
+    MassCancelScope, MatchingHashIndex, NewOrder, OrderBook, OrderBookQueryError,
+    OrderBookQueryResource, OrderDisplay, OrderType, RejectReason, SelfTradePrevention,
+    StopActivation, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -21,7 +22,7 @@ fn definition() -> InstrumentDefinition {
         kind: InstrumentKind::Equity,
         base_asset_id: AssetId::new(1).unwrap(),
         quote_asset_id: AssetId::new(2).unwrap(),
-        price: PriceRules::new(0, 1, Price::from_raw(1), Price::from_raw(1_000)).unwrap(),
+        price: PriceRules::new(0, 1, Price::from_raw(-1_000), Price::from_raw(1_000)).unwrap(),
         quantity: QuantityRules::new(1, 1, 1_000).unwrap(),
         reserve: ReserveOrderRules::new(32).unwrap(),
         hidden_orders_supported: true,
@@ -73,6 +74,213 @@ fn populated_book() -> OrderBook {
         book.submit(command).unwrap();
     }
     book
+}
+
+fn execution_quote_book() -> OrderBook {
+    let mut book = OrderBook::new(definition());
+    for command in [
+        order(
+            1,
+            1,
+            8,
+            Side::Sell,
+            100,
+            10,
+            OrderDisplay::Reserve {
+                peak: Quantity::new(3).unwrap(),
+            },
+        ),
+        order(2, 2, 7, Side::Sell, 100, 2, OrderDisplay::FullyDisplayed),
+        order(3, 3, 9, Side::Sell, 100, 5, OrderDisplay::Hidden),
+        order(4, 4, 10, Side::Sell, 101, 7, OrderDisplay::FullyDisplayed),
+    ] {
+        assert_eq!(
+            book.submit(command).unwrap().outcome,
+            CommandOutcome::Accepted
+        );
+    }
+    book
+}
+
+fn immediate_order(policy: SelfTradePrevention, quantity: u64) -> Command {
+    Command::New(NewOrder {
+        command_id: CommandId::new(5).unwrap(),
+        order_id: OrderId::new(100).unwrap(),
+        account_id: AccountId::new(7).unwrap(),
+        instrument_id: InstrumentId::new(1).unwrap(),
+        instrument_version: InstrumentVersion::new(1).unwrap(),
+        side: Side::Buy,
+        quantity: Quantity::new(quantity).unwrap(),
+        display: OrderDisplay::FullyDisplayed,
+        order_type: OrderType::Market,
+        time_in_force: TimeInForce::ImmediateOrCancel,
+        self_trade_prevention: policy,
+        received_at: TimestampNs::from_unix_nanos(5),
+    })
+}
+
+fn execution_totals(report: &quotick::matching::ExecutionReport) -> (u64, u64, u64, i128) {
+    let mut executed = 0_u64;
+    let mut decremented = 0_u64;
+    let mut unfilled = 0_u64;
+    let mut raw_notional = 0_i128;
+    for event in &report.events {
+        match event.kind {
+            EventKind::Trade(trade) => {
+                executed += trade.quantity.lots();
+                raw_notional += i128::from(trade.price.raw()) * i128::from(trade.quantity.lots());
+            }
+            EventKind::SelfTradePrevented {
+                quantity,
+                policy: SelfTradePrevention::DecrementAndCancel,
+                ..
+            } => decremented += quantity.lots(),
+            EventKind::OrderCancelled {
+                order_id, quantity, ..
+            } if order_id == OrderId::new(100).unwrap() => unfilled += quantity.lots(),
+            _ => {}
+        }
+    }
+    (executed, decremented, unfilled, raw_notional)
+}
+
+#[test]
+fn immediate_execution_quotes_match_reserve_hidden_and_stp_execution() {
+    for (policy, expected, termination) in [
+        (
+            SelfTradePrevention::CancelAggressor,
+            (3, 0, 12, 300),
+            ImmediateExecutionTermination::SelfTradePrevention,
+        ),
+        (
+            SelfTradePrevention::CancelResting,
+            (15, 0, 0, 1_500),
+            ImmediateExecutionTermination::Filled,
+        ),
+        (
+            SelfTradePrevention::CancelBoth,
+            (3, 0, 12, 300),
+            ImmediateExecutionTermination::SelfTradePrevention,
+        ),
+        (
+            SelfTradePrevention::DecrementAndCancel,
+            (13, 2, 0, 1_300),
+            ImmediateExecutionTermination::SelfTradePrevention,
+        ),
+    ] {
+        let mut book = execution_quote_book();
+        let before_depth = book.depth_iter(Side::Sell).collect::<Vec<_>>();
+        let before_orders = book.active_orders().unwrap();
+        let before_commands = book.retained_command_count();
+        let request = ImmediateExecutionRequest::new(
+            AccountId::new(7).unwrap(),
+            Side::Buy,
+            Quantity::new(15).unwrap(),
+            StopActivation::Market,
+            policy,
+        );
+        let quote = book.immediate_execution_quote(request);
+
+        assert_eq!(quote.instrument_id(), InstrumentId::new(1).unwrap());
+        assert_eq!(
+            quote.instrument_version(),
+            InstrumentVersion::new(1).unwrap()
+        );
+        assert_eq!(quote.book_event_sequence(), book.last_event_sequence());
+        assert_eq!(quote.request(), request);
+        assert_eq!(quote.requested_quantity(), Quantity::new(15).unwrap());
+        assert_eq!(quote.executed_quantity_lots(), expected.0);
+        assert_eq!(quote.self_trade_decrement_quantity_lots(), expected.1);
+        assert_eq!(quote.unfilled_quantity_lots(), expected.2);
+        assert_eq!(quote.raw_price_notional(), expected.3);
+        assert_eq!(quote.worst_execution_price(), Some(Price::from_raw(100)));
+        assert_eq!(quote.termination(), termination);
+        assert_eq!(
+            book.depth_iter(Side::Sell).collect::<Vec<_>>(),
+            before_depth
+        );
+        assert_eq!(book.active_orders().unwrap(), before_orders);
+        assert_eq!(book.retained_command_count(), before_commands);
+
+        let report = book.submit(immediate_order(policy, 15)).unwrap();
+        assert_eq!(execution_totals(&report), expected);
+        book.validate().unwrap();
+    }
+}
+
+#[test]
+fn immediate_execution_quotes_distinguish_limits_exhaustion_and_signed_notional() {
+    let book = execution_quote_book();
+    let limited = book.immediate_execution_quote(ImmediateExecutionRequest::new(
+        AccountId::new(99).unwrap(),
+        Side::Buy,
+        Quantity::new(20).unwrap(),
+        StopActivation::Limit(Price::from_raw(100)),
+        SelfTradePrevention::CancelAggressor,
+    ));
+    assert_eq!(limited.executed_quantity_lots(), 17);
+    assert_eq!(limited.unfilled_quantity_lots(), 3);
+    assert_eq!(limited.raw_price_notional(), 1_700);
+    assert_eq!(limited.worst_execution_price(), Some(Price::from_raw(100)));
+    assert_eq!(
+        limited.termination(),
+        ImmediateExecutionTermination::PriceLimit
+    );
+
+    let exhausted = book.immediate_execution_quote(ImmediateExecutionRequest::new(
+        AccountId::new(99).unwrap(),
+        Side::Buy,
+        Quantity::new(30).unwrap(),
+        StopActivation::Market,
+        SelfTradePrevention::CancelAggressor,
+    ));
+    assert_eq!(exhausted.executed_quantity_lots(), 24);
+    assert_eq!(exhausted.unfilled_quantity_lots(), 6);
+    assert_eq!(exhausted.raw_price_notional(), 2_407);
+    assert_eq!(
+        exhausted.worst_execution_price(),
+        Some(Price::from_raw(101))
+    );
+    assert_eq!(
+        exhausted.termination(),
+        ImmediateExecutionTermination::BookExhausted
+    );
+
+    let mut negative = OrderBook::new(definition());
+    negative
+        .submit(order(
+            1,
+            1,
+            1,
+            Side::Buy,
+            -10,
+            4,
+            OrderDisplay::FullyDisplayed,
+        ))
+        .unwrap();
+    negative
+        .submit(order(
+            2,
+            2,
+            2,
+            Side::Buy,
+            -20,
+            3,
+            OrderDisplay::FullyDisplayed,
+        ))
+        .unwrap();
+    let signed = negative.immediate_execution_quote(ImmediateExecutionRequest::new(
+        AccountId::new(99).unwrap(),
+        Side::Sell,
+        Quantity::new(5).unwrap(),
+        StopActivation::Market,
+        SelfTradePrevention::CancelAggressor,
+    ));
+    assert_eq!(signed.executed_quantity_lots(), 5);
+    assert_eq!(signed.raw_price_notional(), -60);
+    assert_eq!(signed.worst_execution_price(), Some(Price::from_raw(-20)));
+    assert_eq!(signed.termination(), ImmediateExecutionTermination::Filled);
+    negative.validate().unwrap();
 }
 
 #[test]

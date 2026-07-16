@@ -1591,6 +1591,166 @@ impl From<InvariantViolation> for OrderBookQueryError {
     }
 }
 
+/// One immutable private-book immediate-execution query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImmediateExecutionRequest {
+    account_id: AccountId,
+    side: Side,
+    quantity: Quantity,
+    constraint: StopActivation,
+    self_trade_prevention: SelfTradePrevention,
+}
+
+impl ImmediateExecutionRequest {
+    /// Constructs a typed immediate-execution query.
+    #[must_use]
+    pub const fn new(
+        account_id: AccountId,
+        side: Side,
+        quantity: Quantity,
+        constraint: StopActivation,
+        self_trade_prevention: SelfTradePrevention,
+    ) -> Self {
+        Self {
+            account_id,
+            side,
+            quantity,
+            constraint,
+            self_trade_prevention,
+        }
+    }
+
+    /// Returns the hypothetical aggressor account.
+    #[must_use]
+    pub const fn account_id(self) -> AccountId {
+        self.account_id
+    }
+
+    /// Returns the hypothetical aggressor side.
+    #[must_use]
+    pub const fn side(self) -> Side {
+        self.side
+    }
+
+    /// Returns the positive requested quantity.
+    #[must_use]
+    pub const fn quantity(self) -> Quantity {
+        self.quantity
+    }
+
+    /// Returns the market-or-limit execution constraint.
+    #[must_use]
+    pub const fn constraint(self) -> StopActivation {
+        self.constraint
+    }
+
+    /// Returns the hypothetical self-trade policy.
+    #[must_use]
+    pub const fn self_trade_prevention(self) -> SelfTradePrevention {
+        self.self_trade_prevention
+    }
+}
+
+/// Why an immutable immediate-execution quote stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImmediateExecutionTermination {
+    /// Every requested lot would trade against external resting liquidity.
+    Filled,
+    /// Self-trade prevention would stop or partly decrement the incoming order.
+    SelfTradePrevention,
+    /// The next occupied opposite price is outside the supplied limit.
+    PriceLimit,
+    /// No further opposite-side price exists.
+    BookExhausted,
+}
+
+/// Exact nonmutating economics of one immediately active order.
+///
+/// Raw price notional is the signed sum of `price.raw() * executed lots`.
+/// Together with executed quantity it preserves the exact volume-weighted
+/// price numerator and denominator without imposing a rounding policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImmediateExecutionQuote {
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    book_event_sequence: u64,
+    request: ImmediateExecutionRequest,
+    executed_quantity_lots: u64,
+    self_trade_decrement_quantity_lots: u64,
+    unfilled_quantity_lots: u64,
+    raw_price_notional: i128,
+    worst_execution_price: Option<Price>,
+    termination: ImmediateExecutionTermination,
+}
+
+impl ImmediateExecutionQuote {
+    /// Returns the quoted instrument.
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version used by the quote.
+    #[must_use]
+    pub const fn instrument_version(self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the last committed event sequence visible to the quote.
+    #[must_use]
+    pub const fn book_event_sequence(self) -> u64 {
+        self.book_event_sequence
+    }
+
+    /// Returns the complete hypothetical execution request.
+    #[must_use]
+    pub const fn request(self) -> ImmediateExecutionRequest {
+        self.request
+    }
+
+    /// Returns the positive requested quantity.
+    #[must_use]
+    pub const fn requested_quantity(self) -> Quantity {
+        self.request.quantity
+    }
+
+    /// Returns quantity that would trade against external resting orders.
+    #[must_use]
+    pub const fn executed_quantity_lots(self) -> u64 {
+        self.executed_quantity_lots
+    }
+
+    /// Returns incoming quantity consumed without trade by decrement-and-cancel.
+    #[must_use]
+    pub const fn self_trade_decrement_quantity_lots(self) -> u64 {
+        self.self_trade_decrement_quantity_lots
+    }
+
+    /// Returns incoming quantity neither traded nor self-trade decremented.
+    #[must_use]
+    pub const fn unfilled_quantity_lots(self) -> u64 {
+        self.unfilled_quantity_lots
+    }
+
+    /// Returns exact signed raw-price notional over external executions.
+    #[must_use]
+    pub const fn raw_price_notional(self) -> i128 {
+        self.raw_price_notional
+    }
+
+    /// Returns the last and therefore worst externally executed price.
+    #[must_use]
+    pub const fn worst_execution_price(self) -> Option<Price> {
+        self.worst_execution_price
+    }
+
+    /// Returns why the hypothetical immediate execution stopped.
+    #[must_use]
+    pub const fn termination(self) -> ImmediateExecutionTermination {
+        self.termination
+    }
+}
+
 fn reserve_order_book_query_vec<T>(
     maximum: usize,
     resource: OrderBookQueryResource,
@@ -4674,7 +4834,7 @@ struct ReserveRefresh {
 enum LevelLiquidity {
     Filled,
     Remaining(u64),
-    BlockedBySelfTrade,
+    BlockedBySelfTrade(u64),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4690,10 +4850,20 @@ struct MinimumScanState {
     external_required: u64,
 }
 
-impl MinimumScanState {
+trait DecrementAndCancelScanState {
+    fn incoming_remaining(&self) -> u64;
+
+    fn consume_totals(&mut self, total: u64, external: u64) -> MinimumScanProgress;
+
     fn consume_slice(&mut self, available: u64, external: bool) -> MinimumScanProgress {
-        let consumed = self.incoming_remaining.min(available);
+        let consumed = self.incoming_remaining().min(available);
         self.consume_totals(consumed, u64::from(external) * consumed)
+    }
+}
+
+impl DecrementAndCancelScanState for MinimumScanState {
+    fn incoming_remaining(&self) -> u64 {
+        self.incoming_remaining
     }
 
     fn consume_totals(&mut self, total: u64, external: u64) -> MinimumScanProgress {
@@ -4706,6 +4876,113 @@ impl MinimumScanState {
             MinimumScanProgress::IncomingExhausted
         } else {
             MinimumScanProgress::Continue
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ImmediateExecutionScanState {
+    incoming_remaining: u64,
+    external_executed: u64,
+}
+
+impl DecrementAndCancelScanState for ImmediateExecutionScanState {
+    fn incoming_remaining(&self) -> u64 {
+        self.incoming_remaining
+    }
+
+    fn consume_totals(&mut self, total: u64, external: u64) -> MinimumScanProgress {
+        debug_assert!(total <= self.incoming_remaining && external <= total);
+        self.incoming_remaining -= total;
+        self.external_executed = self
+            .external_executed
+            .checked_add(external)
+            .expect("external execution cannot exceed incoming quantity");
+        if self.incoming_remaining == 0 {
+            MinimumScanProgress::IncomingExhausted
+        } else {
+            MinimumScanProgress::Continue
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ImmediateExecutionQuoteBuilder {
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    book_event_sequence: u64,
+    request: ImmediateExecutionRequest,
+    executed_quantity_lots: u64,
+    incoming_remaining_lots: u64,
+    raw_price_notional: i128,
+    worst_execution_price: Option<Price>,
+}
+
+impl ImmediateExecutionQuoteBuilder {
+    const fn new(
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        book_event_sequence: u64,
+        request: ImmediateExecutionRequest,
+    ) -> Self {
+        Self {
+            instrument_id,
+            instrument_version,
+            book_event_sequence,
+            request,
+            executed_quantity_lots: 0,
+            incoming_remaining_lots: request.quantity.lots(),
+            raw_price_notional: 0,
+            worst_execution_price: None,
+        }
+    }
+
+    fn record_execution(&mut self, price: Price, quantity_lots: u64) {
+        if quantity_lots == 0 {
+            return;
+        }
+        self.executed_quantity_lots = self
+            .executed_quantity_lots
+            .checked_add(quantity_lots)
+            .expect("external execution cannot exceed requested quantity");
+        self.incoming_remaining_lots = self
+            .incoming_remaining_lots
+            .checked_sub(quantity_lots)
+            .expect("external execution cannot exceed incoming leaves");
+        let contribution = i128::from(price.raw()) * i128::from(quantity_lots);
+        self.raw_price_notional = self
+            .raw_price_notional
+            .checked_add(contribution)
+            .expect("bounded price times requested quantity must fit i128");
+        self.worst_execution_price = Some(price);
+    }
+
+    fn finish(
+        self,
+        self_trade_decrement_quantity_lots: u64,
+        termination: ImmediateExecutionTermination,
+    ) -> ImmediateExecutionQuote {
+        let unfilled_quantity_lots = self
+            .incoming_remaining_lots
+            .checked_sub(self_trade_decrement_quantity_lots)
+            .expect("self-trade decrement cannot exceed incoming leaves");
+        debug_assert_eq!(
+            self.request.quantity.lots(),
+            self.executed_quantity_lots
+                + self_trade_decrement_quantity_lots
+                + unfilled_quantity_lots
+        );
+        ImmediateExecutionQuote {
+            instrument_id: self.instrument_id,
+            instrument_version: self.instrument_version,
+            book_event_sequence: self.book_event_sequence,
+            request: self.request,
+            executed_quantity_lots: self.executed_quantity_lots,
+            self_trade_decrement_quantity_lots,
+            unfilled_quantity_lots,
+            raw_price_notional: self.raw_price_notional,
+            worst_execution_price: self.worst_execution_price,
+            termination,
         }
     }
 }
@@ -6256,6 +6533,151 @@ impl OrderBook {
             Side::Buy => MatchingCapacity::BidPriceLevels,
             Side::Sell => MatchingCapacity::AskPriceLevels,
         }
+    }
+
+    /// Quotes the exact external execution economics of one immediately active
+    /// order without allocating or mutating the book.
+    ///
+    /// The query walks private displayed, reserve, and hidden priority under
+    /// the selected self-trade policy. [`StopActivation`] supplies the shared
+    /// market-or-limit execution constraint; no dormant trigger is evaluated.
+    /// The result excludes admission, account controls, risk, fees, and the
+    /// resting-order cancellations caused by cancel-resting or cancel-both.
+    ///
+    /// Ordinary policies visit each inspected order once. Decrement-and-cancel
+    /// reuses the exact minimum-quantity virtual-queue scan, including its
+    /// bounded binary search over complete reserve-refresh rounds.
+    #[must_use]
+    pub fn immediate_execution_quote(
+        &self,
+        request: ImmediateExecutionRequest,
+    ) -> ImmediateExecutionQuote {
+        let incoming = IncomingPreview {
+            account_id: request.account_id,
+            side: request.side,
+            order_type: request.constraint.order_type(),
+            leaves: request.quantity.lots(),
+            self_trade_prevention: request.self_trade_prevention,
+        };
+        let quote = ImmediateExecutionQuoteBuilder::new(
+            self.definition.instrument_id(),
+            self.definition.version(),
+            self.last_event_sequence(),
+            request,
+        );
+        if request.self_trade_prevention == SelfTradePrevention::DecrementAndCancel {
+            self.quote_decrement_and_cancel(incoming, quote)
+        } else {
+            self.quote_barrier_execution(incoming, quote)
+        }
+    }
+
+    fn quote_barrier_execution(
+        &self,
+        incoming: IncomingPreview,
+        mut quote: ImmediateExecutionQuoteBuilder,
+    ) -> ImmediateExecutionQuote {
+        debug_assert_ne!(
+            incoming.self_trade_prevention,
+            SelfTradePrevention::DecrementAndCancel
+        );
+        let mut remaining = incoming.leaves;
+        let mut price = self.best_price(incoming.side.opposite());
+        loop {
+            let Some(current_price) = price else {
+                return quote.finish(0, ImmediateExecutionTermination::BookExhausted);
+            };
+            if !incoming.crosses(current_price) {
+                return quote.finish(0, ImmediateExecutionTermination::PriceLimit);
+            }
+            let level = self
+                .levels(incoming.side.opposite())
+                .get(current_price)
+                .expect("enumerated price must have a level");
+            match self.immediate_level_liquidity(incoming, level.head, remaining) {
+                LevelLiquidity::Filled => {
+                    quote.record_execution(current_price, remaining);
+                    return quote.finish(0, ImmediateExecutionTermination::Filled);
+                }
+                LevelLiquidity::Remaining(next) => {
+                    quote.record_execution(current_price, remaining - next);
+                    remaining = next;
+                }
+                LevelLiquidity::BlockedBySelfTrade(next) => {
+                    quote.record_execution(current_price, remaining - next);
+                    return quote.finish(0, ImmediateExecutionTermination::SelfTradePrevention);
+                }
+            }
+            price = self.next_worse_price(incoming.side.opposite(), current_price);
+        }
+    }
+
+    fn quote_decrement_and_cancel(
+        &self,
+        incoming: IncomingPreview,
+        mut quote: ImmediateExecutionQuoteBuilder,
+    ) -> ImmediateExecutionQuote {
+        let mut scan = ImmediateExecutionScanState {
+            incoming_remaining: incoming.leaves,
+            external_executed: 0,
+        };
+        let mut price = self.best_price(incoming.side.opposite());
+        loop {
+            let Some(current_price) = price else {
+                return Self::finish_decrement_and_cancel_quote(
+                    quote,
+                    scan,
+                    ImmediateExecutionTermination::BookExhausted,
+                );
+            };
+            if !incoming.crosses(current_price) {
+                return Self::finish_decrement_and_cancel_quote(
+                    quote,
+                    scan,
+                    ImmediateExecutionTermination::PriceLimit,
+                );
+            }
+            let level = self
+                .levels(incoming.side.opposite())
+                .get(current_price)
+                .expect("enumerated price must have a level");
+            let external_before = scan.external_executed;
+            let progress =
+                self.scan_decrement_and_cancel_level(level, incoming.account_id, &mut scan);
+            quote.record_execution(current_price, scan.external_executed - external_before);
+            match progress {
+                MinimumScanProgress::Continue => {}
+                MinimumScanProgress::IncomingExhausted => {
+                    let termination = if scan.external_executed == incoming.leaves {
+                        ImmediateExecutionTermination::Filled
+                    } else {
+                        ImmediateExecutionTermination::SelfTradePrevention
+                    };
+                    return Self::finish_decrement_and_cancel_quote(quote, scan, termination);
+                }
+                MinimumScanProgress::Satisfied => {
+                    unreachable!("execution quotes carry no minimum-quantity threshold")
+                }
+            }
+            price = self.next_worse_price(incoming.side.opposite(), current_price);
+        }
+    }
+
+    fn finish_decrement_and_cancel_quote(
+        quote: ImmediateExecutionQuoteBuilder,
+        scan: ImmediateExecutionScanState,
+        termination: ImmediateExecutionTermination,
+    ) -> ImmediateExecutionQuote {
+        let consumed = quote
+            .request
+            .quantity
+            .lots()
+            .checked_sub(scan.incoming_remaining)
+            .expect("scan remaining cannot exceed requested quantity");
+        let self_trade_decrement_quantity_lots = consumed
+            .checked_sub(scan.external_executed)
+            .expect("external execution cannot exceed consumed quantity");
+        quote.finish(self_trade_decrement_quantity_lots, termination)
     }
 
     /// Returns the current best bid.
@@ -8713,7 +9135,7 @@ impl OrderBook {
                 }
             };
             match liquidity {
-                LevelLiquidity::Filled | LevelLiquidity::BlockedBySelfTrade => return None,
+                LevelLiquidity::Filled | LevelLiquidity::BlockedBySelfTrade(_) => return None,
                 LevelLiquidity::Remaining(next) => {
                     remaining = next;
                     removed_orders = removed_orders
@@ -8825,11 +9247,7 @@ impl OrderBook {
                 .levels(incoming.side.opposite())
                 .get(current_price)
                 .expect("enumerated price must have a level");
-            match self.scan_decrement_and_cancel_minimum_level(
-                level,
-                incoming.account_id,
-                &mut state,
-            ) {
+            match self.scan_decrement_and_cancel_level(level, incoming.account_id, &mut state) {
                 MinimumScanProgress::Continue => {}
                 MinimumScanProgress::Satisfied => return true,
                 MinimumScanProgress::IncomingExhausted => return false,
@@ -8839,11 +9257,11 @@ impl OrderBook {
         false
     }
 
-    fn scan_decrement_and_cancel_minimum_level(
+    fn scan_decrement_and_cancel_level<S: DecrementAndCancelScanState>(
         &self,
         level: &PriceLevel,
         incoming_account_id: AccountId,
-        state: &mut MinimumScanState,
+        state: &mut S,
     ) -> MinimumScanProgress {
         let mut hidden_head = Some(level.head);
         let mut maximum_reserve_rounds = 0_u64;
@@ -8873,7 +9291,7 @@ impl OrderBook {
                 }
                 current = order.next;
             }
-            let progress = self.scan_minimum_reserve_rounds(
+            let progress = self.scan_decrement_and_cancel_reserve_rounds(
                 level.head,
                 displayed_tail,
                 maximum_reserve_rounds,
@@ -8902,13 +9320,13 @@ impl OrderBook {
         MinimumScanProgress::Continue
     }
 
-    fn scan_minimum_reserve_rounds(
+    fn scan_decrement_and_cancel_reserve_rounds<S: DecrementAndCancelScanState>(
         &self,
         head: OrderId,
         displayed_tail: OrderId,
         maximum_rounds: u64,
         incoming_account_id: AccountId,
-        state: &mut MinimumScanState,
+        state: &mut S,
     ) -> MinimumScanProgress {
         let mut completed_rounds = 0_u64;
         let mut upper = maximum_rounds;
@@ -8916,7 +9334,7 @@ impl OrderBook {
             let candidate = completed_rounds + (upper - completed_rounds).div_ceil(2);
             let (total, _) =
                 self.reserve_round_totals(head, displayed_tail, candidate, incoming_account_id);
-            if total <= u128::from(state.incoming_remaining) {
+            if total <= u128::from(state.incoming_remaining()) {
                 completed_rounds = candidate;
             } else {
                 upper = candidate - 1;
@@ -9017,7 +9435,7 @@ impl OrderBook {
             match self.immediate_level_liquidity(incoming, level.head, remaining) {
                 LevelLiquidity::Filled => return true,
                 LevelLiquidity::Remaining(next) => remaining = next,
-                LevelLiquidity::BlockedBySelfTrade => return false,
+                LevelLiquidity::BlockedBySelfTrade(_) => return false,
             }
             price = self.next_worse_price(incoming.side.opposite(), current_price);
         }
@@ -9095,7 +9513,12 @@ impl OrderBook {
                 if order.display.is_hidden() && total_path_remaining == 0 {
                     return LevelLiquidity::Filled;
                 }
-                return LevelLiquidity::BlockedBySelfTrade;
+                let remaining = if order.display.is_hidden() {
+                    total_path_remaining
+                } else {
+                    pre_barrier_remaining
+                };
+                return LevelLiquidity::BlockedBySelfTrade(remaining);
             }
             total_path_remaining = total_path_remaining.saturating_sub(order.leaves);
             pre_barrier_remaining = pre_barrier_remaining.saturating_sub(order.displayed);
@@ -9743,10 +10166,11 @@ mod price_level_index_tests {
     use super::{
         AccountAdmissionState, AccountControl, AccountControlAction, AccountControlSnapshot,
         BuyStopKey, Command, CommandOutcome, CommandPreparation, EventTraceBuilder,
+        ImmediateExecutionQuote, ImmediateExecutionRequest, ImmediateExecutionTermination,
         IncomingPreview, InvariantViolation, MassCancel, MassCancelScope, MatchingCapacity,
         MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsSpec,
         OrderBookQueryError, OrderDisplay, OrderSelectionPool, OrderType, PriceLevel, PriceLevels,
-        RejectReason, ReplaceOrder, RestingOrder, SelfTradePrevention, TimeInForce,
+        RejectReason, ReplaceOrder, RestingOrder, SelfTradePrevention, StopActivation, TimeInForce,
         try_event_arena,
     };
     use crate::instrument::{
@@ -9855,6 +10279,45 @@ mod price_level_index_tests {
         assert!(book.checkpoint_state(1, 5).is_err());
     }
 
+    struct ReferenceLevelQueue {
+        displayed: std::collections::VecDeque<RestingOrder>,
+        hidden: std::collections::VecDeque<RestingOrder>,
+    }
+
+    impl ReferenceLevelQueue {
+        fn from_level(book: &OrderBook, level: &PriceLevel) -> Self {
+            let mut queue = Self {
+                displayed: std::collections::VecDeque::new(),
+                hidden: std::collections::VecDeque::new(),
+            };
+            let mut order_id = Some(level.head);
+            while let Some(current_id) = order_id {
+                let order = *book.orders.get(&current_id).unwrap();
+                order_id = order.next;
+                if order.display.is_hidden() {
+                    queue.hidden.push_back(order);
+                } else {
+                    queue.displayed.push_back(order);
+                }
+            }
+            queue
+        }
+
+        fn pop_front(&mut self) -> Option<RestingOrder> {
+            self.displayed
+                .pop_front()
+                .or_else(|| self.hidden.pop_front())
+        }
+
+        fn push_refreshed(&mut self, order: RestingOrder) {
+            if order.display.is_hidden() {
+                self.hidden.push_back(order);
+            } else {
+                self.displayed.push_back(order);
+            }
+        }
+    }
+
     fn reference_can_fill(book: &OrderBook, incoming: &NewOrder) -> bool {
         let mut remaining = incoming.quantity.lots();
         let mut price = book.best_price(incoming.side.opposite());
@@ -9874,13 +10337,7 @@ mod price_level_index_tests {
                 .levels(incoming.side.opposite())
                 .get(current_price)
                 .unwrap();
-            let mut queue = std::collections::VecDeque::new();
-            let mut order_id = Some(level.head);
-            while let Some(current_id) = order_id {
-                let order = *book.orders.get(&current_id).unwrap();
-                order_id = order.next;
-                queue.push_back(order);
-            }
+            let mut queue = ReferenceLevelQueue::from_level(book, level);
             while let Some(mut order) = queue.pop_front() {
                 if order.account_id == incoming.account_id {
                     match incoming.self_trade_prevention {
@@ -9900,7 +10357,7 @@ mod price_level_index_tests {
                     order.displayed = order.display.working_lots(order.leaves);
                     order.previous = None;
                     order.next = None;
-                    queue.push_back(order);
+                    queue.push_refreshed(order);
                 }
             }
             price = book.next_worse_price(incoming.side.opposite(), current_price);
@@ -9924,13 +10381,7 @@ mod price_level_index_tests {
                 .levels(incoming.side.opposite())
                 .get(current_price)
                 .unwrap();
-            let mut queue = std::collections::VecDeque::new();
-            let mut order_id = Some(level.head);
-            while let Some(current_id) = order_id {
-                let order = *book.orders.get(&current_id).unwrap();
-                order_id = order.next;
-                queue.push_back(order);
-            }
+            let mut queue = ReferenceLevelQueue::from_level(book, level);
             while let Some(mut order) = queue.pop_front() {
                 let consumed = incoming_remaining.min(order.displayed);
                 incoming_remaining -= consumed;
@@ -9948,12 +10399,100 @@ mod price_level_index_tests {
                     order.displayed = order.display.working_lots(order.leaves);
                     order.previous = None;
                     order.next = None;
-                    queue.push_back(order);
+                    queue.push_refreshed(order);
                 }
             }
             price = book.next_worse_price(incoming.side.opposite(), current_price);
         }
         false
+    }
+
+    fn reference_immediate_execution_quote(
+        book: &OrderBook,
+        incoming: &NewOrder,
+    ) -> ImmediateExecutionQuote {
+        let requested = incoming.quantity.lots();
+        let mut remaining = requested;
+        let mut executed = 0_u64;
+        let mut self_decrement = 0_u64;
+        let mut raw_price_notional = 0_i128;
+        let mut worst_execution_price = None;
+        let mut price = book.best_price(incoming.side.opposite());
+        let termination = 'book: loop {
+            let Some(current_price) = price else {
+                break 'book ImmediateExecutionTermination::BookExhausted;
+            };
+            if !IncomingPreview::from(*incoming).crosses(current_price) {
+                break 'book ImmediateExecutionTermination::PriceLimit;
+            }
+            let level = book
+                .levels(incoming.side.opposite())
+                .get(current_price)
+                .unwrap();
+            let mut queue = ReferenceLevelQueue::from_level(book, level);
+            while let Some(mut order) = queue.pop_front() {
+                let consumed = remaining.min(order.displayed);
+                if order.account_id == incoming.account_id {
+                    match incoming.self_trade_prevention {
+                        SelfTradePrevention::CancelAggressor | SelfTradePrevention::CancelBoth => {
+                            break 'book ImmediateExecutionTermination::SelfTradePrevention;
+                        }
+                        SelfTradePrevention::CancelResting => continue,
+                        SelfTradePrevention::DecrementAndCancel => {
+                            remaining -= consumed;
+                            self_decrement += consumed;
+                            if remaining == 0 {
+                                break 'book ImmediateExecutionTermination::SelfTradePrevention;
+                            }
+                        }
+                    }
+                } else {
+                    remaining -= consumed;
+                    executed += consumed;
+                    raw_price_notional += i128::from(current_price.raw()) * i128::from(consumed);
+                    worst_execution_price = Some(current_price);
+                    if remaining == 0 {
+                        break 'book if self_decrement == 0 {
+                            ImmediateExecutionTermination::Filled
+                        } else {
+                            ImmediateExecutionTermination::SelfTradePrevention
+                        };
+                    }
+                }
+                order.leaves -= consumed;
+                if order.leaves > 0 {
+                    order.displayed = order.display.working_lots(order.leaves);
+                    order.previous = None;
+                    order.next = None;
+                    queue.push_refreshed(order);
+                }
+            }
+            price = book.next_worse_price(incoming.side.opposite(), current_price);
+        };
+        ImmediateExecutionQuote {
+            instrument_id: book.definition.instrument_id(),
+            instrument_version: book.definition.version(),
+            book_event_sequence: book.last_event_sequence(),
+            request: ImmediateExecutionRequest::new(
+                incoming.account_id,
+                incoming.side,
+                incoming.quantity,
+                match incoming.order_type {
+                    OrderType::Market => StopActivation::Market,
+                    OrderType::Limit(price) => StopActivation::Limit(price),
+                    OrderType::Stop { .. } => {
+                        unreachable!("generated order is immediately active")
+                    }
+                },
+                incoming.self_trade_prevention,
+            ),
+            executed_quantity_lots: executed,
+            self_trade_decrement_quantity_lots: self_decrement,
+            unfilled_quantity_lots: remaining,
+            raw_price_notional,
+            worst_execution_price,
+            termination,
+        }
     }
 
     fn generated_book_and_fok(generator: &mut Generator) -> (OrderBook, NewOrder) {
@@ -9983,17 +10522,19 @@ mod price_level_index_tests {
             let order_count = generator.bounded(5) + 1;
             for _ in 0..order_count {
                 let leaves = generator.bounded(20) + 1;
-                let (display, displayed) = if generator.bounded(2) == 0 {
-                    (OrderDisplay::FullyDisplayed, leaves)
-                } else {
-                    let peak = generator.bounded(5) + 1;
-                    let displayed = generator.bounded(leaves.min(peak)) + 1;
-                    (
-                        OrderDisplay::Reserve {
-                            peak: Quantity::new(peak).unwrap(),
-                        },
-                        displayed,
-                    )
+                let (display, displayed) = match generator.bounded(3) {
+                    0 => (OrderDisplay::FullyDisplayed, leaves),
+                    1 => (OrderDisplay::Hidden, leaves),
+                    _ => {
+                        let peak = generator.bounded(5) + 1;
+                        let displayed = generator.bounded(leaves.min(peak)) + 1;
+                        (
+                            OrderDisplay::Reserve {
+                                peak: Quantity::new(peak).unwrap(),
+                            },
+                            displayed,
+                        )
+                    }
                 };
                 let account_id = if generator.bounded(4) == 0 {
                     AccountId::new(1).unwrap()
@@ -10654,6 +11195,70 @@ mod price_level_index_tests {
                 reference_can_execute_decrement_and_cancel_minimum(&book, &incoming, required),
                 "minimum-quantity model divergence in generated case {case}"
             );
+        }
+    }
+
+    #[test]
+    fn immediate_execution_quote_matches_literal_slice_queue_reference() {
+        let mut generator = Generator(0xe4b7_83d1_20ca_596f);
+        for case in 0..20_000 {
+            let (book, incoming) = generated_book_and_fok(&mut generator);
+            let constraint = match incoming.order_type {
+                OrderType::Market => StopActivation::Market,
+                OrderType::Limit(price) => StopActivation::Limit(price),
+                OrderType::Stop { .. } => unreachable!("generated order is immediately active"),
+            };
+            let actual = book.immediate_execution_quote(ImmediateExecutionRequest::new(
+                incoming.account_id,
+                incoming.side,
+                incoming.quantity,
+                constraint,
+                incoming.self_trade_prevention,
+            ));
+            let reference = reference_immediate_execution_quote(&book, &incoming);
+            assert_eq!(
+                actual, reference,
+                "immediate-execution quote diverged in generated case {case}; \
+                 incoming={incoming:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn immediate_execution_quote_notional_covers_signed_domain_extremes() {
+        for raw_price in [i64::MIN, i64::MAX] {
+            let mut book = OrderBook::new(reserve_definition());
+            let order_id = OrderId::new(1).unwrap();
+            book.append_order(RestingOrder {
+                order_id,
+                account_id: AccountId::new(2).unwrap(),
+                side: Side::Buy,
+                price: Price::from_raw(raw_price),
+                leaves: u64::MAX,
+                displayed: u64::MAX,
+                display: OrderDisplay::FullyDisplayed,
+                self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                expires_at: None,
+                stop: None,
+                previous: None,
+                next: None,
+                account_previous: None,
+                account_next: None,
+            });
+            book.seen_order_ids.insert(order_id);
+            let quote = book.immediate_execution_quote(ImmediateExecutionRequest::new(
+                AccountId::new(1).unwrap(),
+                Side::Sell,
+                Quantity::new(u64::MAX).unwrap(),
+                StopActivation::Market,
+                SelfTradePrevention::CancelAggressor,
+            ));
+            assert_eq!(quote.executed_quantity_lots(), u64::MAX);
+            assert_eq!(
+                quote.raw_price_notional(),
+                i128::from(raw_price) * i128::from(u64::MAX)
+            );
+            assert_eq!(quote.termination(), ImmediateExecutionTermination::Filled);
         }
     }
 

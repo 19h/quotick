@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A123 are stable and are referenced from code comments and other
+identifiers A1-A124 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -217,11 +217,13 @@ depth, continuous and call-auction account-order-ID output, plus continuous and
 call-auction market-data batch/snapshot/depth outputs have explicit fallible
 APIs. Continuous and call-auction authoritative books also expose
 allocation-free market-priority depth iterators, as do continuous and
-call-auction public replicas. Borrowed ledger-record lookup, history iteration,
-per-record transaction iteration, and point-in-time balance reconstruction
-allocate no output and return typed journal/index or reconstruction
-contradictions. Convenience wrappers can still panic on allocation failure;
-the account-order-ID wrappers can also panic if private topology is corrupt.
+call-auction public replicas. Continuous private immediate-execution quotes
+return fixed-size values without allocation. Borrowed ledger-record lookup,
+history iteration, per-record transaction iteration, and point-in-time balance
+reconstruction allocate no output and return typed journal/index or
+reconstruction contradictions. Convenience wrappers can still panic on
+allocation failure; the account-order-ID wrappers can also panic if private
+topology is corrupt.
 
 **Dependent results.** Typed failure exists at the enumerated boundaries; no
 end-to-end allocation-failure continuation claim follows. Authoritative bounded
@@ -4277,6 +4279,59 @@ out-of-band row, missed inclusive endpoint, duplicate, non-market ordering,
 outside-band linear scan, output/traversal allocation, partial failure output,
 state mutation, or model divergence falsifies A123.
 
+## A124 — exact immediate-execution economics
+
+**Assumption.** One `ImmediateExecutionRequest` binds a hypothetical
+aggressor's `AccountId`, side, positive lot quantity, shared market-or-limit
+`StopActivation` constraint, and one of the four continuous self-trade
+prevention policies. One immutable `OrderBook` borrow remains stable for the
+complete query. The scan follows the exact private execution topology:
+displayed and reserve orders precede fully hidden orders at one price, FIFO
+holds within each class, and each reserve refresh rejoins the displayed-class
+tail before hidden liquidity. Cancel-resting logically removes self orders
+from the hypothetical path; cancel-aggressor and cancel-both stop at the first
+reachable self order; decrement-and-cancel consumes the lesser of incoming
+leaves and each self maker's current executable slice without trade.
+
+The result binds the instrument ID, immutable definition version, last visible
+book event sequence, and complete request. Requested lots equal external
+executed lots plus decrement-and-cancel self-trade-consumed lots plus unfilled
+lots. Raw-price notional is the exact signed `i128` sum of
+`price.raw() × executed lots`; the final external execution price is the worst
+price. Termination distinguishes a complete external fill, self-trade
+prevention, the supplied price limit, and book exhaustion. The quote is an
+immutable observation, not admission, an account-control or risk decision, a
+fee calculation, a liquidity reservation, a command commitment, or a report
+of the resting-order cancellations that live cancel-resting or cancel-both
+would emit.
+
+**Dependent results.** [A1, A2, A3, A4, A7, A12, A19, A22, A44, A45, A47,
+A55, A72, A83, A103, A115, A124] Ordinary policies inspect `O_c` orders over
+`P_c` crossed prices in `O(O_c + P_c log(P + 1))` time, `O(1)` auxiliary
+space, and zero allocations. For decrement-and-cancel, with `D_p` displayed
+orders and at most `R_p` remaining reserve rounds at price `p`, exact work is
+`O(O_c + P_c log(P + 1) + sum_p D_p log(R_p + 1))`; A115's binary search
+performs at most 32 aggregate passes because admission bounds `R_p` by `u32`.
+Output is one fixed-size value. Since total executed quantity is at most
+`u64::MAX` lots and `|price.raw()| <= 2^63`, the absolute accumulated notional
+is less than `2^127` and is representable by `i128`. The query changes no
+matching, risk, reservation, sequence, WAL, snapshot, or public state and
+requires no wire-version change.
+
+**Falsification probe.** For both sides, market and limit constraints, signed
+prices, every termination, and all four self-trade policies, compare the quote
+with a committed immediate-order trace from the identical state. Exercise
+displayed, reserve, and hidden self/external orders, partial initial slices,
+multiple refresh rounds, price-limit boundaries, exhausted books, and
+`i64::MIN`, `i64::MAX`, and `u64::MAX` arithmetic. Differentially compare at
+least 20,000 generated multi-price books with an independent literal two-class
+slice/requeue model. Require exact quantity partitioning, signed notional,
+worst price, request/provenance binding, unchanged private/public/history state,
+and zero query allocations. Any priority or STP divergence, self quantity
+credited as execution, incorrect termination or notional, overflow, mutation,
+allocation, stale provenance at the observed boundary, or implied execution
+commitment falsifies A124.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -4312,6 +4367,27 @@ capability, a remaining risk, or an opportunity.
   owned results. Target-hardware narrow-band latency, allocator latency for
   materialized results, resident memory, and sustained 250,000-order snapshot
   cadence remain unknown until measured.
+
+- **High impact:** continuous matching now exposes exact fixed-size private
+  immediate-execution economics under all four STP policies. The result binds
+  its request and instrument/version/event-sequence provenance, partitions
+  execution, self-trade decrement, and unfilled lots, and reports signed raw-
+  price notional, worst price, and exact termination under A124. Reserve and
+  hidden priority share the execution preflight scanners and are covered by a
+  20,000-case literal two-class queue differential.
+
+- **High impact risk:** an immediate-execution quote neither reserves liquidity
+  nor fences a later command. Another committed command can invalidate the
+  economics after the reported event sequence; admission, account controls,
+  risk, fees, and the resting-order cancellation effects of cancel-resting or
+  cancel-both are also excluded. Atomic quote-to-command commitment or remote
+  quote validity therefore requires a separately sequenced protocol.
+
+- **Medium impact opportunity:** the exact quantity partition, signed
+  notional, worst price, and termination can drive deterministic slippage,
+  collar, minimum-quantity, and venue-routing analysis without materializing
+  private depth. Cross-venue comparison still requires synchronized provenance,
+  normalized units, fee/risk inputs, and independently specified queue rules.
 
 - **Medium impact:** continuous and call-auction live command/report history
   now supports expected constant-time exact lookup and zero-copy chronological

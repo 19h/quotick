@@ -394,6 +394,23 @@ binary search requires at most 32 aggregate passes. The scan allocates no
 queue and does not mutate matching, risk, reservation, sequence, or public
 state.
 
+`OrderBook::immediate_execution_quote` returns exact private-book execution
+economics for one hypothetical immediately active market-or-limit order. Under
+permit, cancel-aggressor, cancel-resting, or cancel-both, it has the same
+one-visit bound:
+
+```text
+O(O_c + P_c log(P + 1)) time
+O(1) auxiliary space
+```
+
+Under decrement-and-cancel it composes the exact reserve-round scanner and has
+the same `O(O_c + P_c log(P + 1) + sum_p D_p log(R_p + 1))` time bound stated
+above. Each crossed price contributes one constant-time signed `i128` notional
+update, and output is one fixed-size value containing provenance, the exact
+quantity partition, worst execution price, and termination. Both paths
+allocate nothing and do not mutate or reserve book state.
+
 ## Default matching limits and memory
 
 This section states the default resource envelopes, the buffer pools, the
