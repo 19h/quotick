@@ -7,8 +7,9 @@ use quotick::auction_book::{
 };
 use quotick::auction_engine::{
     CallAuctionAmendOrder, CallAuctionCancelOrder, CallAuctionCommand, CallAuctionEngine,
-    CallAuctionExecutionReport, CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl,
-    CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionExecutionReport, CallAuctionIndicativeCommand, CallAuctionMassCancel,
+    CallAuctionPhase, CallAuctionPhaseControl, CallAuctionReplaceOrder, CallAuctionSubmitOrder,
+    CallAuctionUncrossCommand,
 };
 use quotick::codec::{BinaryCodec, CodecError};
 use quotick::instrument::{
@@ -146,6 +147,26 @@ fn uncross(command_id: u64) -> CallAuctionCommand {
     uncross_with_allocation(command_id, AuctionAllocationPolicy::PriceTime)
 }
 
+fn indicative(command_id: u64, phase_revision: u64) -> CallAuctionCommand {
+    let grid = AuctionPriceGrid::new(1).unwrap();
+    CallAuctionCommand::Indicative(CallAuctionIndicativeCommand {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: InstrumentId::new(7).unwrap(),
+        instrument_version: InstrumentVersion::new(2).unwrap(),
+        auction_id: auction_id(),
+        expected_phase_revision: phase_revision,
+        price_band: quotick::auction::AuctionPriceBand::new(
+            grid,
+            Price::from_raw(0),
+            Price::from_raw(1_000),
+        )
+        .unwrap(),
+        reference_price: Price::from_raw(100),
+        price_policy: AuctionPricePolicy::PRESSURE_THEN_REFERENCE_HIGHER,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
 fn uncross_with_allocation(
     command_id: u64,
     allocation: AuctionAllocationPolicy,
@@ -201,11 +222,68 @@ fn every_call_auction_command_variant_round_trips() {
         uncross_with_allocation(8, AuctionAllocationPolicy::ProRataTime),
         mass_cancel(6, 1, MassCancelScope::Side(Side::Buy)),
         amend(7, 1, 1, 4),
+        indicative(9, 1),
     ];
     for command in commands {
         let encoded = command.encode().unwrap();
         assert_eq!(CallAuctionCommand::decode(&encoded).unwrap(), command);
     }
+}
+
+#[test]
+fn call_auction_indicative_command_and_nullable_event_have_stable_layouts() {
+    let command = indicative(2, 1);
+    let encoded_command = command.encode().unwrap();
+    assert_eq!(encoded_command.len(), 75);
+    assert_eq!(encoded_command[0], 7);
+    assert_eq!(&encoded_command[1..9], &2_u64.to_le_bytes());
+    assert_eq!(&encoded_command[41..49], &0_i64.to_le_bytes());
+    assert_eq!(&encoded_command[49..57], &1_000_i64.to_le_bytes());
+    assert_eq!(&encoded_command[57..65], &100_i64.to_le_bytes());
+    assert_eq!(encoded_command[65..67], [1, 1]);
+    assert_eq!(
+        CallAuctionCommand::decode(&encoded_command).unwrap(),
+        command
+    );
+
+    let mut engine = CallAuctionEngine::try_new(definition()).unwrap();
+    engine
+        .submit(phase(1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    let report = engine.submit(command).unwrap();
+    let encoded_report = report.encode().unwrap();
+    assert_eq!(encoded_report.len(), 98);
+    assert_eq!(encoded_report[45], 9);
+    assert_eq!(encoded_report[96], 0); // No executable clearing.
+    assert_eq!(
+        CallAuctionExecutionReport::decode(&encoded_report).unwrap(),
+        report
+    );
+
+    let mut zero_phase_revision = encoded_report;
+    zero_phase_revision[54..62].fill(0);
+    assert_eq!(
+        CallAuctionExecutionReport::decode(&zero_phase_revision),
+        Err(CodecError::InvalidValue(
+            "call-auction indicative state is structurally invalid"
+        ))
+    );
+
+    engine
+        .submit(submit(3, auction_order(1, 1, Side::Buy, 3)))
+        .unwrap();
+    engine
+        .submit(submit(4, auction_order(2, 2, Side::Sell, 3)))
+        .unwrap();
+    let crossed_report = engine.submit(indicative(5, 1)).unwrap();
+    let crossed_bytes = crossed_report.encode().unwrap();
+    assert_eq!(crossed_bytes.len(), 138);
+    assert_eq!(crossed_bytes[45], 9);
+    assert_eq!(crossed_bytes[96], 1);
+    assert_eq!(
+        CallAuctionExecutionReport::decode(&crossed_bytes).unwrap(),
+        crossed_report
+    );
 }
 
 #[test]

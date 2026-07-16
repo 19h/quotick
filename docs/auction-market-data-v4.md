@@ -1,4 +1,7 @@
-# Call-auction Market-data Payload Format Version 4
+# Expired Call-auction Market-data Payload Format Version 4
+
+Version 4 is expired. New producers and consumers use
+[call-auction market-data payload format version 5](auction-market-data-v5.md).
 
 This document defines the complete-value little-endian binary payloads
 implemented by `BinaryCodec` for `CallAuctionMarketDataUpdate` and

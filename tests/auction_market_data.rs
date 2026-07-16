@@ -5,9 +5,9 @@ use quotick::auction_book::{
 };
 use quotick::auction_engine::{
     CallAuctionAmendOrder, CallAuctionCancelOrder, CallAuctionCommand, CallAuctionEngine,
-    CallAuctionEngineLimits, CallAuctionEngineLimitsSpec, CallAuctionMassCancel, CallAuctionPhase,
-    CallAuctionPhaseControl, CallAuctionReplaceOrder, CallAuctionSubmitOrder,
-    CallAuctionUncrossCommand,
+    CallAuctionEngineLimits, CallAuctionEngineLimitsSpec, CallAuctionIndicativeCommand,
+    CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl, CallAuctionReplaceOrder,
+    CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use quotick::auction_market_data::{
     CallAuctionBookChangeReason, CallAuctionMarketDataBatch, CallAuctionMarketDataError,
@@ -170,6 +170,25 @@ fn uncross(
     )
 }
 
+fn indicative(
+    engine: &CallAuctionEngine,
+    command_id: u64,
+    auction_id: u64,
+    phase_revision: u64,
+) -> CallAuctionCommand {
+    CallAuctionCommand::Indicative(CallAuctionIndicativeCommand {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        auction_id: auction(auction_id),
+        expected_phase_revision: phase_revision,
+        price_band: engine.book().instrument_price_band(),
+        reference_price: Price::from_raw(100),
+        price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
 fn uncross_with_allocation(
     engine: &CallAuctionEngine,
     command_id: u64,
@@ -277,6 +296,7 @@ fn replace(
 fn assert_mirrors(engine: &CallAuctionEngine, replica: &CallAuctionMarketDataReplica) {
     assert_eq!(engine.phase_snapshot(), replica.phase());
     assert_eq!(engine.book().state_revision(), replica.book_revision());
+    assert_eq!(engine.last_indicative(), replica.indicative());
     assert_eq!(
         engine.book().market_quantity(Side::Buy),
         replica.market_quantity(Side::Buy)
@@ -301,6 +321,114 @@ fn assert_mirrors(engine: &CallAuctionEngine, replica: &CallAuctionMarketDataRep
         engine.book().limit_depth(Side::Sell, usize::MAX),
         replica.limit_depth(Side::Sell, usize::MAX)
     );
+}
+
+#[test]
+fn indicative_updates_round_trip_replay_snapshot_and_invalidate_on_book_change() {
+    let mut engine = engine();
+    let mut publisher = CallAuctionMarketDataPublisher::from_engine(&engine).unwrap();
+    let mut replica = CallAuctionMarketDataReplica::new(definition());
+    let genesis = publisher.snapshot();
+    replica.apply_snapshot(&genesis).unwrap();
+
+    let phase_batch = execute(
+        &mut engine,
+        &mut publisher,
+        &mut replica,
+        phase(1, 1, 0, CallAuctionPhase::Collecting),
+    );
+    let empty_command = indicative(&engine, 2, 1, 1);
+    let empty = execute(&mut engine, &mut publisher, &mut replica, empty_command);
+    let CallAuctionMarketDataKind::Indicative(empty_state) = empty.updates()[0].kind() else {
+        panic!("indicative command must publish one indicative update");
+    };
+    assert_eq!(empty_state.clearing(), None);
+    assert_eq!(replica.indicative(), Some(empty_state));
+
+    let encoded = empty.updates()[0].encode().unwrap();
+    assert_eq!(encoded.len(), 84);
+    assert_eq!(encoded[32], 6);
+    assert_eq!(
+        CallAuctionMarketDataUpdate::decode(&encoded).unwrap(),
+        empty.updates()[0]
+    );
+
+    let retry = engine.submit(empty_command).unwrap();
+    let retry_batch = publisher.publish(empty_command, &retry, &engine).unwrap();
+    assert!(retry_batch.replayed());
+    assert!(retry_batch.updates().is_empty());
+    assert_eq!(replica.indicative(), Some(empty_state));
+
+    execute(
+        &mut engine,
+        &mut publisher,
+        &mut replica,
+        submit(
+            3,
+            1,
+            1,
+            1,
+            7,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+            5,
+        ),
+    );
+    assert_eq!(engine.last_indicative(), None);
+    assert_eq!(replica.indicative(), None);
+
+    let current_command = indicative(&engine, 4, 1, 1);
+    let current = execute(&mut engine, &mut publisher, &mut replica, current_command);
+    let CallAuctionMarketDataKind::Indicative(current_state) = current.updates()[0].kind() else {
+        panic!("indicative command must publish one indicative update");
+    };
+    assert_eq!(current_state.clearing(), None);
+
+    execute(
+        &mut engine,
+        &mut publisher,
+        &mut replica,
+        submit(
+            5,
+            1,
+            1,
+            2,
+            8,
+            Side::Sell,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+            3,
+        ),
+    );
+    assert_eq!(engine.last_indicative(), None);
+    assert_eq!(replica.indicative(), None);
+
+    let crossed_command = indicative(&engine, 6, 1, 1);
+    let crossed = execute(&mut engine, &mut publisher, &mut replica, crossed_command);
+    let CallAuctionMarketDataKind::Indicative(crossed_state) = crossed.updates()[0].kind() else {
+        panic!("crossed book must publish one indicative update");
+    };
+    assert_eq!(crossed_state.clearing().unwrap().executable_quantity(), 3);
+    let crossed_bytes = crossed.updates()[0].encode().unwrap();
+    assert_eq!(crossed_bytes.len(), 124);
+    assert_eq!(
+        CallAuctionMarketDataUpdate::decode(&crossed_bytes).unwrap(),
+        crossed.updates()[0]
+    );
+
+    let snapshot = publisher.snapshot();
+    assert_eq!(snapshot.indicative(), Some(crossed_state));
+    let snapshot_bytes = snapshot.encode().unwrap();
+    let decoded = CallAuctionMarketDataSnapshot::decode(&snapshot_bytes).unwrap();
+    assert_eq!(decoded, snapshot);
+    let mut repaired = CallAuctionMarketDataReplica::new(definition());
+    repaired.apply_snapshot(&decoded).unwrap();
+    assert_eq!(repaired.indicative(), Some(crossed_state));
+
+    let mut replayed = CallAuctionMarketDataReplica::new(definition());
+    replayed.apply_snapshot(&genesis).unwrap();
+    replayed.apply_batch(&phase_batch).unwrap();
+    replayed.apply_batch(&empty).unwrap();
+    assert_eq!(replayed.indicative(), Some(empty_state));
 }
 
 fn execute(
@@ -1019,6 +1147,7 @@ fn phase_update_and_genesis_snapshot_have_stable_little_endian_layouts() {
     expected_genesis.push(0); // No active auction.
     expected_genesis.push(0); // No last auction.
     expected_genesis.extend_from_slice(&0_u64.to_le_bytes());
+    expected_genesis.push(0); // No indicative state.
     expected_genesis.push(0); // No last trade.
     expected_genesis.push(0); // Buy side.
     expected_genesis.push(0); // Market constraint.
@@ -1031,7 +1160,7 @@ fn phase_update_and_genesis_snapshot_have_stable_little_endian_layouts() {
     expected_genesis.extend_from_slice(&0_u32.to_le_bytes());
     expected_genesis.extend_from_slice(&0_u32.to_le_bytes());
     assert_eq!(genesis, expected_genesis);
-    assert_eq!(genesis.len(), 112);
+    assert_eq!(genesis.len(), 113);
 
     let command = phase(1, 1, 0, CallAuctionPhase::Collecting);
     let report = engine.submit(command).unwrap();

@@ -569,6 +569,129 @@ pub struct CallAuctionUncrossCommand {
     pub received_at: TimestampNs,
 }
 
+/// Sequenced publication request for one revision-bound indicative state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionIndicativeCommand {
+    /// Idempotency key.
+    pub command_id: CommandId,
+    /// Routed instrument.
+    pub instrument_id: InstrumentId,
+    /// Immutable instrument version.
+    pub instrument_version: InstrumentVersion,
+    /// Active collection cycle being observed.
+    pub auction_id: AuctionId,
+    /// Current phase revision observed by the controller.
+    pub expected_phase_revision: u64,
+    /// Authoritative aligned candidate-price band.
+    pub price_band: AuctionPriceBand,
+    /// Authoritative aligned reference price.
+    pub reference_price: Price,
+    /// Explicit price-ranking policy.
+    pub price_policy: AuctionPricePolicy,
+    /// Gateway/controller receive time.
+    pub received_at: TimestampNs,
+}
+
+/// Publicly safe, reproducible indicative state at one exact auction revision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionIndicativeState {
+    auction_id: AuctionId,
+    phase_revision: u64,
+    book_revision: u64,
+    price_band: AuctionPriceBand,
+    reference_price: Price,
+    price_policy: AuctionPricePolicy,
+    clearing: Option<AuctionClearing>,
+}
+
+impl CallAuctionIndicativeState {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the state binds every independently authoritative discovery coordinate"
+    )]
+    pub(crate) const fn from_parts(
+        auction_id: AuctionId,
+        phase_revision: u64,
+        book_revision: u64,
+        price_band: AuctionPriceBand,
+        reference_price: Price,
+        price_policy: AuctionPricePolicy,
+        clearing: Option<AuctionClearing>,
+    ) -> Self {
+        Self {
+            auction_id,
+            phase_revision,
+            book_revision,
+            price_band,
+            reference_price,
+            price_policy,
+            clearing,
+        }
+    }
+
+    /// Returns the observed auction cycle.
+    #[must_use]
+    pub const fn auction_id(self) -> AuctionId {
+        self.auction_id
+    }
+
+    /// Returns the exact phase revision used by discovery.
+    #[must_use]
+    pub const fn phase_revision(self) -> u64 {
+        self.phase_revision
+    }
+
+    /// Returns the exact collection-book revision used by discovery.
+    #[must_use]
+    pub const fn book_revision(self) -> u64 {
+        self.book_revision
+    }
+
+    /// Returns the authoritative candidate-price band.
+    #[must_use]
+    pub const fn price_band(self) -> AuctionPriceBand {
+        self.price_band
+    }
+
+    /// Returns the authoritative reference price.
+    #[must_use]
+    pub const fn reference_price(self) -> Price {
+        self.reference_price
+    }
+
+    /// Returns the explicit deterministic price-ranking policy.
+    #[must_use]
+    pub const fn price_policy(self) -> AuctionPricePolicy {
+        self.price_policy
+    }
+
+    /// Returns clearing state, or `None` when current interest cannot execute.
+    #[must_use]
+    pub const fn clearing(self) -> Option<AuctionClearing> {
+        self.clearing
+    }
+
+    pub(crate) fn is_structurally_valid(self) -> bool {
+        self.phase_revision != 0
+            && self.clearing.is_none_or(|clearing| {
+                clearing.executable_quantity() != 0
+                    && clearing.price().raw() >= self.price_band.minimum().raw()
+                    && clearing.price().raw() <= self.price_band.maximum().raw()
+            })
+    }
+
+    fn is_valid_for(self, definition: InstrumentDefinition) -> bool {
+        let price_rules = definition.price_rules();
+        self.is_structurally_valid()
+            && price_rules.validate(self.price_band.minimum()).is_ok()
+            && price_rules.validate(self.price_band.maximum()).is_ok()
+            && price_rules.validate(self.reference_price).is_ok()
+            && self
+                .clearing
+                .is_none_or(|clearing| price_rules.validate(clearing.price()).is_ok())
+    }
+}
+
 /// One state-changing sequenced call-auction command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CallAuctionCommand {
@@ -584,6 +707,8 @@ pub enum CallAuctionCommand {
     Amend(CallAuctionAmendOrder),
     /// Atomically cancel active interest and admit a new-identity replacement.
     Replace(CallAuctionReplaceOrder),
+    /// Publish an indicative clearing state without mutating collection interest.
+    Indicative(CallAuctionIndicativeCommand),
     /// Discover, allocate, pair, and consume one frozen auction.
     Uncross(CallAuctionUncrossCommand),
 }
@@ -599,6 +724,7 @@ impl CallAuctionCommand {
             Self::MassCancel(command) => command.command_id,
             Self::Amend(command) => command.command_id,
             Self::Replace(command) => command.command_id,
+            Self::Indicative(command) => command.command_id,
             Self::Uncross(command) => command.command_id,
         }
     }
@@ -613,6 +739,7 @@ impl CallAuctionCommand {
             Self::MassCancel(command) => command.received_at,
             Self::Amend(command) => command.received_at,
             Self::Replace(command) => command.received_at,
+            Self::Indicative(command) => command.received_at,
             Self::Uncross(command) => command.received_at,
         }
     }
@@ -633,6 +760,8 @@ pub enum CallAuctionAction {
     Amend,
     /// New-identity cancel/replace.
     Replace,
+    /// Revision-bound indicative-state publication.
+    Indicative,
     /// Final uncross.
     Uncross,
 }
@@ -792,6 +921,8 @@ pub enum CallAuctionEventKind {
         /// Newly committed phase revision.
         phase_revision: u64,
     },
+    /// One revision-bound indicative state was calculated and published.
+    IndicativePublished(CallAuctionIndicativeState),
     /// Command failed deterministic business validation.
     CommandRejected(CallAuctionRejectReason),
 }
@@ -1719,11 +1850,7 @@ impl CallAuctionCheckpoint {
                 report: entry.report.clone(),
             };
             if !cached_report_grammar_is_valid(&cached)
-                || !phase_audit.observe(
-                    &cached,
-                    self.definition.instrument_id(),
-                    self.definition.version(),
-                )
+                || !phase_audit.observe(&cached, self.definition)
             {
                 return Err(CallAuctionCheckpointError::new(
                     "auction checkpoint command/report grammar is invalid",
@@ -1903,6 +2030,30 @@ impl CallAuctionCheckpoint {
                                     "auction checkpoint book revision is exhausted",
                                 )
                             })?;
+                    }
+                    CallAuctionCommand::Indicative(indicative) => {
+                        let Some(CallAuctionEvent {
+                            kind: CallAuctionEventKind::IndicativePublished(state),
+                            ..
+                        }) = entry.report.events.first()
+                        else {
+                            return Err(CallAuctionCheckpointError::new(
+                                "auction checkpoint indicative publication is absent",
+                            ));
+                        };
+                        if entry.report.events.len() != 1
+                            || state.auction_id() != indicative.auction_id
+                            || state.phase_revision() != indicative.expected_phase_revision
+                            || state.book_revision() != expected_book_revision
+                            || state.price_band() != indicative.price_band
+                            || state.reference_price() != indicative.reference_price
+                            || state.price_policy() != indicative.price_policy
+                            || !state.is_valid_for(self.definition)
+                        {
+                            return Err(CallAuctionCheckpointError::new(
+                                "auction checkpoint indicative publication contradicts projected state",
+                            ));
+                        }
                     }
                     CallAuctionCommand::Cancel(_) => {
                         let Some(CallAuctionEvent {
@@ -2348,6 +2499,12 @@ fn decoded_accepted_event_grammar_is_valid(events: &[CallAuctionEvent]) -> bool 
         ] => previous_quantity.lots() > order.quantity.lots() && *book_revision != 0,
         [
             CallAuctionEvent {
+                kind: CallAuctionEventKind::IndicativePublished(state),
+                ..
+            },
+        ] => state.is_structurally_valid(),
+        [
+            CallAuctionEvent {
                 kind:
                     CallAuctionEventKind::OrderCancelled {
                         order: cancelled,
@@ -2574,6 +2731,7 @@ enum PreparedCallAuctionAction {
         target_order_id: OrderId,
         replacement: CallAuctionOrder,
     },
+    Indicative(CallAuctionIndicativeState),
     Uncross {
         auction_id: AuctionId,
         phase_revision: u64,
@@ -2600,7 +2758,8 @@ impl PreparedCallAuctionAction {
             | Self::PhaseTransition { .. }
             | Self::Submit(_)
             | Self::Cancel { .. }
-            | Self::Amend { .. } => Ok(1),
+            | Self::Amend { .. }
+            | Self::Indicative(_) => Ok(1),
             Self::Replace { .. } => Ok(2),
         }
     }
@@ -2732,6 +2891,7 @@ pub struct CallAuctionEngine {
     phase_revision: u64,
     active_auction_id: Option<AuctionId>,
     last_auction_id: Option<AuctionId>,
+    last_indicative: Option<CallAuctionIndicativeState>,
     next_command_sequence: u64,
     next_event_sequence: u64,
     reports: BoundedHashMap<CommandId, CachedCallAuctionReport>,
@@ -2780,6 +2940,7 @@ impl CallAuctionEngine {
             phase_revision: 0,
             active_auction_id: None,
             last_auction_id: None,
+            last_indicative: None,
             next_command_sequence: 1,
             next_event_sequence: 1,
             reports,
@@ -2810,6 +2971,12 @@ impl CallAuctionEngine {
             active_auction_id: self.active_auction_id,
             last_auction_id: self.last_auction_id,
         }
+    }
+
+    /// Returns the latest still-current sequenced indicative state.
+    #[must_use]
+    pub const fn last_indicative(&self) -> Option<CallAuctionIndicativeState> {
+        self.last_indicative
     }
 
     /// Returns the next committed-command sequence.
@@ -2986,7 +3153,17 @@ impl CallAuctionEngine {
                     CallAuctionCheckpointError::new("auction event sequence is exhausted")
                 })
             })?;
+        let mut phase_audit = CallAuctionPhaseAudit::default();
         for source in checkpoint.history.iter() {
+            let source_cached = CachedCallAuctionReport {
+                command: source.command,
+                report: source.report.clone(),
+            };
+            if !phase_audit.observe(&source_cached, checkpoint.definition) {
+                return Err(CallAuctionCheckpointError::new(
+                    "auction checkpoint history failed restore audit",
+                ));
+            }
             let mut entry = source.clone();
             let event_start = engine.retained_event_count;
             for event in entry.report.events.iter().copied() {
@@ -3013,6 +3190,7 @@ impl CallAuctionEngine {
                 },
             );
         }
+        engine.last_indicative = phase_audit.last_indicative;
         engine
             .validate()
             .map_err(|error| CallAuctionCheckpointError::new(error.detail()))?;
@@ -3217,7 +3395,11 @@ impl CallAuctionEngine {
         action: PreparedCallAuctionAction,
         events: &mut CallAuctionEventTraceBuilder,
     ) -> Result<CallAuctionCommandOutcome, CallAuctionEngineError> {
-        Ok(match action {
+        let invalidates_indicative = !matches!(
+            &action,
+            PreparedCallAuctionAction::Rejected(_) | PreparedCallAuctionAction::Indicative(_)
+        );
+        let outcome = match action {
             PreparedCallAuctionAction::Rejected(reason) => {
                 self.push_event(
                     command,
@@ -3295,6 +3477,9 @@ impl CallAuctionEngine {
                 target_order_id,
                 replacement,
             } => self.apply_replace(command, account_id, target_order_id, replacement, events)?,
+            PreparedCallAuctionAction::Indicative(indicative) => {
+                self.apply_indicative(command, indicative, events)
+            }
             PreparedCallAuctionAction::Uncross {
                 auction_id,
                 phase_revision,
@@ -3302,7 +3487,26 @@ impl CallAuctionEngine {
             } => {
                 self.apply_prepared_uncross(command, auction_id, phase_revision, prepared, events)?
             }
-        })
+        };
+        if invalidates_indicative {
+            self.last_indicative = None;
+        }
+        Ok(outcome)
+    }
+
+    fn apply_indicative(
+        &mut self,
+        command: CallAuctionCommand,
+        indicative: CallAuctionIndicativeState,
+        events: &mut CallAuctionEventTraceBuilder,
+    ) -> CallAuctionCommandOutcome {
+        self.last_indicative = Some(indicative);
+        self.push_event(
+            command,
+            CallAuctionEventKind::IndicativePublished(indicative),
+            events,
+        );
+        CallAuctionCommandOutcome::Accepted
     }
 
     fn apply_amend(
@@ -3527,8 +3731,78 @@ impl CallAuctionEngine {
                 })
             }
             CallAuctionCommand::Amend(amend) => self.prepare_amend(amend),
+            CallAuctionCommand::Indicative(indicative) => {
+                self.prepare_indicative_command(indicative)
+            }
             CallAuctionCommand::Uncross(uncross) => self.prepare_uncross_command(uncross),
         }
+    }
+
+    fn prepare_indicative_command(
+        &mut self,
+        command: CallAuctionIndicativeCommand,
+    ) -> Result<PreparedCallAuctionAction, CallAuctionEngineError> {
+        if let Some(reason) =
+            self.route_rejection(command.instrument_id, command.instrument_version)
+        {
+            return Ok(PreparedCallAuctionAction::Rejected(reason));
+        }
+        if command.expected_phase_revision != self.phase_revision {
+            return Ok(PreparedCallAuctionAction::Rejected(
+                CallAuctionRejectReason::PhaseRevisionMismatch {
+                    observed: command.expected_phase_revision,
+                    current: self.phase_revision,
+                },
+            ));
+        }
+        if self.phase == CallAuctionPhase::Closed {
+            return Ok(PreparedCallAuctionAction::Rejected(
+                CallAuctionRejectReason::ActionNotAllowed {
+                    action: CallAuctionAction::Indicative,
+                    phase: self.phase,
+                },
+            ));
+        }
+        if self.active_auction_id != Some(command.auction_id) {
+            return Ok(PreparedCallAuctionAction::Rejected(
+                CallAuctionRejectReason::AuctionIdMismatch {
+                    observed: command.auction_id,
+                    current: self.active_auction_id,
+                },
+            ));
+        }
+        let price_rules = self.book.definition().price_rules();
+        for price in [
+            command.price_band.minimum(),
+            command.price_band.maximum(),
+            command.reference_price,
+        ] {
+            if let Err(error) = price_rules.validate(price) {
+                return Ok(PreparedCallAuctionAction::Rejected(
+                    CallAuctionRejectReason::Instrument(error),
+                ));
+            }
+        }
+        let clearing = self
+            .book
+            .indicative_clearing(
+                command.price_band,
+                command.reference_price,
+                command.price_policy,
+            )
+            .map_err(CallAuctionEngineError::Discovery)?
+            .map(CallAuctionIndicative::clearing);
+        Ok(PreparedCallAuctionAction::Indicative(
+            CallAuctionIndicativeState::from_parts(
+                command.auction_id,
+                self.phase_revision,
+                self.book.state_revision(),
+                command.price_band,
+                command.reference_price,
+                command.price_policy,
+                clearing,
+            ),
+        ))
     }
 
     fn prepare_amend(
@@ -3985,7 +4259,9 @@ impl CallAuctionEngine {
                     "auction cache key, command, and report identity disagree",
                 ));
             }
-            if !cached_report_grammar_is_valid(cached) {
+            if !cached_report_grammar_is_valid(cached)
+                || !cached_indicative_prices_are_valid(cached, self.book.definition())
+            {
                 return Err(CallAuctionEngineInvariantViolation::new(
                     "auction cached report violates command/event grammar",
                 ));
@@ -4003,11 +4279,7 @@ impl CallAuctionEngine {
                 ));
             }
             let received_at = cached.command.received_at();
-            if !phase_audit.observe(
-                cached,
-                self.book.definition().instrument_id(),
-                self.book.definition().version(),
-            ) {
+            if !phase_audit.observe(cached, self.book.definition()) {
                 return Err(CallAuctionEngineInvariantViolation::new(
                     "auction history contradicts controller phase semantics",
                 ));
@@ -4038,9 +4310,10 @@ impl CallAuctionEngine {
             || phase_audit.revision != self.phase_revision
             || phase_audit.active_auction_id != self.active_auction_id
             || phase_audit.last_auction_id != self.last_auction_id
+            || phase_audit.last_indicative != self.last_indicative
         {
             return Err(CallAuctionEngineInvariantViolation::new(
-                "auction replayed phase state disagrees with live state",
+                "auction replayed controller state disagrees with live state",
             ));
         }
         Ok(())
@@ -4136,10 +4409,48 @@ fn cached_report_grammar_is_valid(cached: &CachedCallAuctionReport) -> bool {
                             && accepted.quantity == replace.replacement.quantity()
                     )
             }
+            CallAuctionCommand::Indicative(indicative) => {
+                cached_indicative_grammar_is_valid(report, indicative)
+            }
             CallAuctionCommand::Uncross(uncross) => {
                 cached_uncross_grammar_is_valid(report, uncross)
             }
         },
+    }
+}
+
+fn cached_indicative_grammar_is_valid(
+    report: &CallAuctionExecutionReport,
+    indicative: CallAuctionIndicativeCommand,
+) -> bool {
+    report.events.len() == 1
+        && matches!(
+            report.events.first(),
+            Some(CallAuctionEvent {
+                kind: CallAuctionEventKind::IndicativePublished(state),
+                ..
+            }) if state.auction_id() == indicative.auction_id
+                && state.phase_revision() == indicative.expected_phase_revision
+                && state.price_band() == indicative.price_band
+                && state.reference_price() == indicative.reference_price
+                && state.price_policy() == indicative.price_policy
+                && state.is_structurally_valid()
+        )
+}
+
+fn cached_indicative_prices_are_valid(
+    cached: &CachedCallAuctionReport,
+    definition: InstrumentDefinition,
+) -> bool {
+    match (cached.report.outcome, cached.report.events.first()) {
+        (
+            CallAuctionCommandOutcome::Accepted,
+            Some(CallAuctionEvent {
+                kind: CallAuctionEventKind::IndicativePublished(state),
+                ..
+            }),
+        ) => state.is_valid_for(definition),
+        _ => true,
     }
 }
 
@@ -4315,16 +4626,16 @@ struct CallAuctionPhaseAudit {
     revision: u64,
     active_auction_id: Option<AuctionId>,
     last_auction_id: Option<AuctionId>,
+    last_indicative: Option<CallAuctionIndicativeState>,
 }
 
 impl CallAuctionPhaseAudit {
     fn observe(
         &mut self,
         cached: &CachedCallAuctionReport,
-        instrument_id: InstrumentId,
-        instrument_version: InstrumentVersion,
+        definition: InstrumentDefinition,
     ) -> bool {
-        let preflight = self.preflight(cached.command, instrument_id, instrument_version);
+        let preflight = self.preflight(cached.command, definition);
         match cached.report.outcome {
             CallAuctionCommandOutcome::Rejected(reason) => match preflight {
                 CallAuctionControllerPreflight::Rejected(expected) => reason == expected,
@@ -4374,8 +4685,7 @@ impl CallAuctionPhaseAudit {
     fn preflight(
         self,
         command: CallAuctionCommand,
-        instrument_id: InstrumentId,
-        instrument_version: InstrumentVersion,
+        definition: InstrumentDefinition,
     ) -> CallAuctionControllerPreflight {
         let (observed_instrument, observed_version) = match command {
             CallAuctionCommand::PhaseControl(control) => {
@@ -4394,16 +4704,19 @@ impl CallAuctionPhaseAudit {
                 replace.replacement.instrument_id(),
                 replace.replacement.instrument_version(),
             ),
+            CallAuctionCommand::Indicative(indicative) => {
+                (indicative.instrument_id, indicative.instrument_version)
+            }
             CallAuctionCommand::Uncross(uncross) => {
                 (uncross.instrument_id, uncross.instrument_version)
             }
         };
-        if observed_instrument != instrument_id {
+        if observed_instrument != definition.instrument_id() {
             return CallAuctionControllerPreflight::Rejected(
                 CallAuctionRejectReason::WrongInstrument,
             );
         }
-        if observed_version != instrument_version {
+        if observed_version != definition.version() {
             return CallAuctionControllerPreflight::Rejected(
                 CallAuctionRejectReason::WrongInstrumentVersion,
             );
@@ -4425,6 +4738,9 @@ impl CallAuctionPhaseAudit {
                 replace.auction_id,
                 CallAuctionAction::Replace,
             ),
+            CallAuctionCommand::Indicative(indicative) => {
+                self.preflight_indicative(indicative, definition)
+            }
             CallAuctionCommand::Uncross(uncross) => {
                 if uncross.expected_phase_revision != self.revision {
                     CallAuctionControllerPreflight::Rejected(
@@ -4454,6 +4770,45 @@ impl CallAuctionPhaseAudit {
             CallAuctionCommand::Cancel(_) | CallAuctionCommand::MassCancel(_) => {
                 CallAuctionControllerPreflight::Applicable
             }
+        }
+    }
+
+    fn preflight_indicative(
+        self,
+        indicative: CallAuctionIndicativeCommand,
+        definition: InstrumentDefinition,
+    ) -> CallAuctionControllerPreflight {
+        if indicative.expected_phase_revision != self.revision {
+            CallAuctionControllerPreflight::Rejected(
+                CallAuctionRejectReason::PhaseRevisionMismatch {
+                    observed: indicative.expected_phase_revision,
+                    current: self.revision,
+                },
+            )
+        } else if self.phase == CallAuctionPhase::Closed {
+            CallAuctionControllerPreflight::Rejected(CallAuctionRejectReason::ActionNotAllowed {
+                action: CallAuctionAction::Indicative,
+                phase: self.phase,
+            })
+        } else if self.active_auction_id != Some(indicative.auction_id) {
+            CallAuctionControllerPreflight::Rejected(CallAuctionRejectReason::AuctionIdMismatch {
+                observed: indicative.auction_id,
+                current: self.active_auction_id,
+            })
+        } else {
+            let price_rules = definition.price_rules();
+            for price in [
+                indicative.price_band.minimum(),
+                indicative.price_band.maximum(),
+                indicative.reference_price,
+            ] {
+                if let Err(error) = price_rules.validate(price) {
+                    return CallAuctionControllerPreflight::Rejected(
+                        CallAuctionRejectReason::Instrument(error),
+                    );
+                }
+            }
+            CallAuctionControllerPreflight::Applicable
         }
     }
 
@@ -4540,6 +4895,9 @@ impl CallAuctionPhaseAudit {
     }
 
     fn apply_accepted(&mut self, cached: &CachedCallAuctionReport) -> bool {
+        if !matches!(cached.command, CallAuctionCommand::Indicative(_)) {
+            self.last_indicative = None;
+        }
         match cached.command {
             CallAuctionCommand::PhaseControl(control) => {
                 let Some(CallAuctionEvent {
@@ -4598,6 +4956,20 @@ impl CallAuctionPhaseAudit {
                 self.phase = CallAuctionPhase::Closed;
                 self.revision = next_revision;
                 self.active_auction_id = None;
+                true
+            }
+            CallAuctionCommand::Indicative(_) => {
+                let Some(CallAuctionEvent {
+                    kind: CallAuctionEventKind::IndicativePublished(state),
+                    ..
+                }) = cached.report.events.first()
+                else {
+                    return false;
+                };
+                if cached.report.events.len() != 1 || !state.is_structurally_valid() {
+                    return false;
+                }
+                self.last_indicative = Some(*state);
                 true
             }
             CallAuctionCommand::Submit(_)

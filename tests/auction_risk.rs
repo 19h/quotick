@@ -6,8 +6,9 @@ use quotick::auction_book::{
 use quotick::auction_engine::{
     CallAuctionAmendOrder, CallAuctionCommand, CallAuctionCommandOutcome, CallAuctionEngineError,
     CallAuctionEngineLimits, CallAuctionEngineLimitsSpec, CallAuctionEventKind,
-    CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl, CallAuctionRejectReason,
-    CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionIndicativeCommand, CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl,
+    CallAuctionRejectReason, CallAuctionReplaceOrder, CallAuctionSubmitOrder,
+    CallAuctionUncrossCommand,
 };
 use quotick::auction_risk::{
     CallAuctionRiskLimits, CallAuctionRiskLimitsSpec, CallAuctionRiskManagedEngine,
@@ -249,6 +250,23 @@ fn uncross_command(
     )
 }
 
+fn indicative_command(
+    engine: &CallAuctionRiskManagedEngine,
+    command_id: u64,
+) -> CallAuctionCommand {
+    CallAuctionCommand::Indicative(CallAuctionIndicativeCommand {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        auction_id: auction(1),
+        expected_phase_revision: 1,
+        price_band: engine.engine().book().instrument_price_band(),
+        reference_price: Price::from_raw(100),
+        price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
 fn uncross_command_with_allocation(
     engine: &CallAuctionRiskManagedEngine,
     command_id: u64,
@@ -286,6 +304,27 @@ fn assert_rejection(
         report.events[0].kind,
         CallAuctionEventKind::CommandRejected(expected)
     );
+}
+
+#[test]
+fn indicative_publication_is_risk_neutral_and_requires_no_account_profile() {
+    let mut engine = managed(1);
+    engine
+        .submit(phase_command(1, 1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    let command = indicative_command(&engine, 2);
+    let report = engine.submit(command).unwrap();
+    assert_eq!(report.outcome, CallAuctionCommandOutcome::Accepted);
+    assert!(matches!(
+        report.events[0].kind,
+        CallAuctionEventKind::IndicativePublished(_)
+    ));
+    assert_eq!(engine.risk().reservation_count(), 0);
+
+    let retry = engine.submit(command).unwrap();
+    assert!(retry.replayed);
+    assert_eq!(engine.risk().reservation_count(), 0);
+    engine.validate().unwrap();
 }
 
 #[test]

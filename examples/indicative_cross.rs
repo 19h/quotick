@@ -9,8 +9,9 @@ use quotick::auction_book::{
 };
 use quotick::auction_engine::{
     CallAuctionCommand, CallAuctionCommandOutcome, CallAuctionEventKind,
-    CallAuctionExecutionReport, CallAuctionPhase, CallAuctionPhaseControl, CallAuctionRejectReason,
-    CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionExecutionReport, CallAuctionIndicativeCommand, CallAuctionPhase,
+    CallAuctionPhaseControl, CallAuctionRejectReason, CallAuctionSubmitOrder,
+    CallAuctionUncrossCommand,
 };
 use quotick::auction_market_data::{
     CallAuctionMarketDataBatch, CallAuctionMarketDataLimits, CallAuctionMarketDataPublisher,
@@ -71,6 +72,26 @@ fn order(
     })
 }
 
+fn indicative(
+    definition: quotick::instrument::InstrumentDefinition,
+    command_id: u64,
+    auction_id: AuctionId,
+    expected_revision: u64,
+    price_band: quotick::auction::AuctionPriceBand,
+) -> CallAuctionCommand {
+    CallAuctionCommand::Indicative(CallAuctionIndicativeCommand {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: definition.instrument_id(),
+        instrument_version: definition.version(),
+        auction_id,
+        expected_phase_revision: expected_revision,
+        price_band,
+        reference_price: Price::from_raw(10_100),
+        price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
+        received_at: timestamp(command_id),
+    })
+}
+
 fn execute(
     managed: &mut CallAuctionRiskManagedEngine,
     publisher: &mut CallAuctionMarketDataPublisher,
@@ -118,6 +139,7 @@ fn main() {
         replica_limits.max_batch_updates,
     )
     .unwrap();
+    let price_band = managed.engine().book().instrument_price_band();
 
     execute(
         &mut managed,
@@ -177,6 +199,24 @@ fn main() {
         );
     }
 
+    let (indicative_report, _) = execute(
+        &mut managed,
+        &mut publisher,
+        &mut replica,
+        &mut replay,
+        indicative(definition, 6, auction_id, 1, price_band),
+    );
+    let CallAuctionEventKind::IndicativePublished(indicative_state) =
+        indicative_report.events[0].kind
+    else {
+        panic!("indicative command must publish one indicative state");
+    };
+    let indicative_clearing = indicative_state.clearing().unwrap();
+    assert_eq!(indicative_clearing.price(), Price::from_raw(10_100));
+    assert_eq!(indicative_clearing.executable_quantity(), 6);
+    assert_eq!(managed.engine().last_indicative(), Some(indicative_state));
+    assert_eq!(replica.indicative(), Some(indicative_state));
+
     let (risk_rejection, _) = execute(
         &mut managed,
         &mut publisher,
@@ -184,7 +224,7 @@ fn main() {
         &mut replay,
         order(
             definition,
-            6,
+            7,
             auction_id,
             5,
             99,
@@ -197,21 +237,48 @@ fn main() {
         risk_rejection.outcome,
         CallAuctionCommandOutcome::Rejected(CallAuctionRejectReason::RiskOrderQuantityLimit)
     );
+    assert_eq!(managed.engine().last_indicative(), Some(indicative_state));
+    assert_eq!(replica.indicative(), Some(indicative_state));
 
     execute(
         &mut managed,
         &mut publisher,
         &mut replica,
         &mut replay,
-        phase(definition, 7, auction_id, 1, CallAuctionPhase::Frozen),
+        phase(definition, 8, auction_id, 1, CallAuctionPhase::Frozen),
     );
+    assert_eq!(managed.engine().last_indicative(), None);
+    assert_eq!(replica.indicative(), None);
+
+    let (frozen_indicative_report, _) = execute(
+        &mut managed,
+        &mut publisher,
+        &mut replica,
+        &mut replay,
+        indicative(definition, 9, auction_id, 2, price_band),
+    );
+    let CallAuctionEventKind::IndicativePublished(frozen_indicative_state) =
+        frozen_indicative_report.events[0].kind
+    else {
+        panic!("frozen indicative command must publish one indicative state");
+    };
+    assert_eq!(
+        frozen_indicative_state.clearing(),
+        indicative_state.clearing()
+    );
+    assert_eq!(
+        managed.engine().last_indicative(),
+        Some(frozen_indicative_state)
+    );
+    assert_eq!(replica.indicative(), Some(frozen_indicative_state));
+
     let uncross = CallAuctionCommand::Uncross(CallAuctionUncrossCommand {
-        command_id: CommandId::new(8).unwrap(),
+        command_id: CommandId::new(10).unwrap(),
         instrument_id: definition.instrument_id(),
         instrument_version: definition.version(),
         auction_id,
         expected_phase_revision: 2,
-        price_band: managed.engine().book().instrument_price_band(),
+        price_band,
         reference_price: Price::from_raw(10_100),
         price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
         uncross_policy: CallAuctionUncrossPolicy::new(
@@ -219,7 +286,7 @@ fn main() {
             CallAuctionRemainderPolicy::RetainAll,
             CallAuctionSelfTradePolicy::Permit,
         ),
-        received_at: timestamp(8),
+        received_at: timestamp(10),
     });
     let (report, _) = execute(
         &mut managed,
@@ -293,6 +360,8 @@ fn main() {
         managed.engine().phase_snapshot().phase(),
         CallAuctionPhase::Closed
     );
+    assert_eq!(managed.engine().last_indicative(), None);
+    assert_eq!(replica.indicative(), None);
     assert_eq!(replica.phase(), managed.engine().phase_snapshot());
     assert_eq!(
         replica.limit_depth(Side::Buy, usize::MAX),

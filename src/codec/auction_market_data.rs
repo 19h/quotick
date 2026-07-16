@@ -1,4 +1,4 @@
-use crate::auction::{AuctionClearing, AuctionOrderConstraint};
+use crate::auction::AuctionOrderConstraint;
 use crate::auction_engine::{CallAuctionPhase, CallAuctionPhaseSnapshot};
 use crate::auction_market_data::{
     CallAuctionBookChangeReason, CallAuctionMarketDataKind, CallAuctionMarketDataLevel,
@@ -6,6 +6,7 @@ use crate::auction_market_data::{
 };
 use crate::{AuctionId, Price, TimestampNs};
 
+use super::auction::{decode_indicative_state, encode_indicative_state};
 use super::{
     BinaryCodec, CodecError, Decoder, Encoder, decode_side, encode_side, instrument,
     instrument_version, quantity, reserve_decoded_vec, trade_id,
@@ -131,20 +132,6 @@ fn decode_print(decoder: &mut Decoder<'_>) -> Result<CallAuctionTradePrint, Code
     ))
 }
 
-fn encode_clearing(encoder: &mut Encoder, clearing: AuctionClearing) {
-    encoder.i64(clearing.price().raw());
-    encoder.u128(clearing.buy_quantity());
-    encoder.u128(clearing.sell_quantity());
-}
-
-fn decode_clearing(decoder: &mut Decoder<'_>) -> Result<AuctionClearing, CodecError> {
-    Ok(AuctionClearing::from_quantities(
-        Price::from_raw(decoder.i64()?),
-        decoder.u128()?,
-        decoder.u128()?,
-    ))
-}
-
 impl BinaryCodec for CallAuctionMarketDataUpdate {
     fn encode(&self) -> Result<Vec<u8>, CodecError> {
         let mut encoder = Encoder::default();
@@ -192,7 +179,7 @@ impl BinaryCodec for CallAuctionMarketDataUpdate {
             } => {
                 encoder.u8(4);
                 encoder.u64(auction_id.get());
-                encode_clearing(&mut encoder, clearing);
+                super::auction::encode_clearing(&mut encoder, clearing);
                 encoder.u64(trade_count);
                 encoder.u64(cancellation_count);
                 encoder.u64(book_revision);
@@ -207,6 +194,10 @@ impl BinaryCodec for CallAuctionMarketDataUpdate {
                 encoder.u64(cancelled_order_count);
                 encoder.u128(cancelled_quantity_lots);
                 encoder.u64(book_revision);
+            }
+            CallAuctionMarketDataKind::Indicative(indicative) => {
+                encoder.u8(6);
+                encode_indicative_state(&mut encoder, indicative);
             }
         }
         encoder.finish()
@@ -238,7 +229,7 @@ impl BinaryCodec for CallAuctionMarketDataUpdate {
             },
             4 => CallAuctionMarketDataKind::UncrossCompleted {
                 auction_id: auction_id(&mut decoder)?,
-                clearing: decode_clearing(&mut decoder)?,
+                clearing: super::auction::decode_clearing(&mut decoder)?,
                 trade_count: decoder.u64()?,
                 cancellation_count: decoder.u64()?,
                 book_revision: decoder.u64()?,
@@ -249,6 +240,7 @@ impl BinaryCodec for CallAuctionMarketDataUpdate {
                 cancelled_quantity_lots: decoder.u128()?,
                 book_revision: decoder.u64()?,
             },
+            6 => CallAuctionMarketDataKind::Indicative(decode_indicative_state(&mut decoder)?),
             tag => {
                 return Err(CodecError::InvalidTag {
                     type_name: "CallAuctionMarketDataKind",
@@ -280,6 +272,10 @@ impl BinaryCodec for CallAuctionMarketDataSnapshot {
         encode_optional_auction_id(&mut encoder, phase.active_auction_id());
         encode_optional_auction_id(&mut encoder, phase.last_auction_id());
         encoder.u64(self.book_revision());
+        encoder.bool(self.indicative().is_some());
+        if let Some(indicative) = self.indicative() {
+            encode_indicative_state(&mut encoder, indicative);
+        }
         encoder.bool(self.last_trade_id().is_some());
         if let Some(trade_id) = self.last_trade_id() {
             encoder.u64(trade_id.get());
@@ -308,6 +304,11 @@ impl BinaryCodec for CallAuctionMarketDataSnapshot {
         let active_auction_id = decode_optional_auction_id(&mut decoder)?;
         let last_auction_id = decode_optional_auction_id(&mut decoder)?;
         let book_revision = decoder.u64()?;
+        let indicative = if decoder.bool()? {
+            Some(decode_indicative_state(&mut decoder)?)
+        } else {
+            None
+        };
         let last_trade_id = if decoder.bool()? {
             Some(trade_id(&mut decoder)?)
         } else {
@@ -338,6 +339,7 @@ impl BinaryCodec for CallAuctionMarketDataSnapshot {
                 last_auction_id,
             ),
             book_revision,
+            indicative,
             last_trade_id,
             market_buy,
             market_sell,

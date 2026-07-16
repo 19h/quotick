@@ -20,8 +20,8 @@ use crate::auction_book::{
 };
 use crate::auction_engine::{
     CallAuctionCommand, CallAuctionCommandOutcome, CallAuctionEngine, CallAuctionEngineLimits,
-    CallAuctionEvent, CallAuctionEventKind, CallAuctionExecutionReport, CallAuctionPhase,
-    CallAuctionPhaseSnapshot,
+    CallAuctionEvent, CallAuctionEventKind, CallAuctionExecutionReport, CallAuctionIndicativeState,
+    CallAuctionPhase, CallAuctionPhaseSnapshot,
 };
 use crate::bounded_hash::{BoundedHashError, BoundedHashMap};
 use crate::domain::{
@@ -496,6 +496,8 @@ pub enum CallAuctionMarketDataKind {
         /// Newly committed phase revision.
         revision: u64,
     },
+    /// Revision-bound indicative clearing state for the active cycle.
+    Indicative(CallAuctionIndicativeState),
     /// One final uncross closed its cycle.
     UncrossCompleted {
         /// Closed cycle.
@@ -729,6 +731,7 @@ pub struct CallAuctionMarketDataSnapshot {
     command_sequence: u64,
     phase: CallAuctionPhaseSnapshot,
     book_revision: u64,
+    indicative: Option<CallAuctionIndicativeState>,
     last_trade_id: Option<TradeId>,
     market_buy: CallAuctionMarketDataLevel,
     market_sell: CallAuctionMarketDataLevel,
@@ -748,6 +751,7 @@ impl CallAuctionMarketDataSnapshot {
         command_sequence: u64,
         phase: CallAuctionPhaseSnapshot,
         book_revision: u64,
+        indicative: Option<CallAuctionIndicativeState>,
         last_trade_id: Option<TradeId>,
         market_buy: CallAuctionMarketDataLevel,
         market_sell: CallAuctionMarketDataLevel,
@@ -761,6 +765,7 @@ impl CallAuctionMarketDataSnapshot {
             command_sequence,
             phase,
             book_revision,
+            indicative,
             last_trade_id,
             market_buy,
             market_sell,
@@ -807,6 +812,12 @@ impl CallAuctionMarketDataSnapshot {
         self.book_revision
     }
 
+    /// Returns the latest valid indication, if one remains current.
+    #[must_use]
+    pub const fn indicative(&self) -> Option<CallAuctionIndicativeState> {
+        self.indicative
+    }
+
     /// Returns the final trade identifier reflected by this image.
     #[must_use]
     pub const fn last_trade_id(&self) -> Option<TradeId> {
@@ -843,6 +854,17 @@ impl CallAuctionMarketDataSnapshot {
         {
             return Err(CallAuctionMarketDataError::InvalidSnapshot(
                 "auction snapshot event, command, and book revisions are inconsistent",
+            ));
+        }
+        if self.indicative.is_some_and(|indicative| {
+            !indicative.is_structurally_valid()
+                || self.phase.phase() == CallAuctionPhase::Closed
+                || self.phase.active_auction_id() != Some(indicative.auction_id())
+                || self.phase.revision() != indicative.phase_revision()
+                || self.book_revision != indicative.book_revision()
+        }) {
+            return Err(CallAuctionMarketDataError::InvalidSnapshot(
+                "auction snapshot indication contradicts phase or book state",
             ));
         }
         if self
@@ -1014,6 +1036,7 @@ pub struct CallAuctionMarketDataPublisher {
     instrument_version: InstrumentVersion,
     phase: CallAuctionPhaseSnapshot,
     book_revision: u64,
+    indicative: Option<CallAuctionIndicativeState>,
     market_buy: Aggregate,
     market_sell: Aggregate,
     bids: AuctionDepthMap,
@@ -1069,6 +1092,7 @@ impl CallAuctionMarketDataPublisher {
             instrument_version: definition.version(),
             phase: engine.phase_snapshot(),
             book_revision: engine.book().state_revision(),
+            indicative: engine.last_indicative(),
             market_buy: aggregate_market(engine, Side::Buy),
             market_sell: aggregate_market(engine, Side::Sell),
             bids: try_depth_map(
@@ -1216,6 +1240,7 @@ impl CallAuctionMarketDataPublisher {
             command_sequence: self.last_command_sequence,
             phase: self.phase,
             book_revision: self.book_revision,
+            indicative: self.indicative,
             last_trade_id: self.last_trade_id,
             market_buy: self.market_level(Side::Buy),
             market_sell: self.market_level(Side::Sell),
@@ -1400,12 +1425,13 @@ impl CallAuctionMarketDataPublisher {
         )?;
         if self.phase != engine.phase_snapshot()
             || self.book_revision != engine.book().state_revision()
+            || self.indicative != engine.last_indicative()
             || self.last_command_sequence != engine_command_sequence
             || self.last_event_sequence != engine_event_sequence
             || self.last_trade_id != previous_trade_id(engine.book().next_trade_id())?
         {
             return Err(CallAuctionMarketDataError::SourceDivergence(
-                "publisher sequence, phase, book revision, or trade state differs from the engine",
+                "publisher sequence, phase, indication, book revision, or trade state differs from the engine",
             ));
         }
         let active = engine.book().active_order_states();
@@ -1485,6 +1511,12 @@ impl CallAuctionMarketDataPublisher {
         uncross: &mut UncrossProgress,
         mass_cancel: &mut MassCancelProgress,
     ) -> Result<CallAuctionMarketDataKind, CallAuctionMarketDataError> {
+        if !matches!(
+            event.kind,
+            CallAuctionEventKind::CommandRejected(_) | CallAuctionEventKind::IndicativePublished(_)
+        ) {
+            self.indicative = None;
+        }
         match event.kind {
             CallAuctionEventKind::PhaseChanged {
                 auction_id,
@@ -1562,10 +1594,42 @@ impl CallAuctionMarketDataPublisher {
                 previous_quantity,
                 book_revision,
             } => self.apply_amend(command, order, previous_quantity, book_revision),
+            CallAuctionEventKind::IndicativePublished(state) => {
+                self.apply_indicative(command, state)
+            }
             CallAuctionEventKind::CommandRejected(_) => {
                 Ok(CallAuctionMarketDataKind::NoPublicChange)
             }
         }
+    }
+
+    fn apply_indicative(
+        &mut self,
+        command: CallAuctionCommand,
+        state: CallAuctionIndicativeState,
+    ) -> Result<CallAuctionMarketDataKind, CallAuctionMarketDataError> {
+        let CallAuctionCommand::Indicative(source) = command else {
+            return Err(CallAuctionMarketDataError::TraceMismatch(
+                "non-indicative command emitted an indication",
+            ));
+        };
+        if state.auction_id() != source.auction_id
+            || state.phase_revision() != source.expected_phase_revision
+            || state.phase_revision() != self.phase.revision()
+            || self.phase.phase() == CallAuctionPhase::Closed
+            || self.phase.active_auction_id() != Some(state.auction_id())
+            || state.book_revision() != self.book_revision
+            || state.price_band() != source.price_band
+            || state.reference_price() != source.reference_price
+            || state.price_policy() != source.price_policy
+            || !state.is_structurally_valid()
+        {
+            return Err(CallAuctionMarketDataError::TraceMismatch(
+                "indicative publication contradicts its command or publisher state",
+            ));
+        }
+        self.indicative = Some(state);
+        Ok(CallAuctionMarketDataKind::Indicative(state))
     }
 
     fn apply_phase(
@@ -2259,6 +2323,7 @@ pub struct CallAuctionMarketDataReplica {
     definition: InstrumentDefinition,
     phase: CallAuctionPhaseSnapshot,
     book_revision: u64,
+    indicative: Option<CallAuctionIndicativeState>,
     market_buy: Aggregate,
     market_sell: Aggregate,
     bids: AuctionDepthMap,
@@ -2306,6 +2371,7 @@ impl CallAuctionMarketDataReplica {
             definition,
             phase: CallAuctionPhaseSnapshot::default(),
             book_revision: 0,
+            indicative: None,
             market_buy: Aggregate::default(),
             market_sell: Aggregate::default(),
             bids: try_depth_map(
@@ -2419,6 +2485,7 @@ impl CallAuctionMarketDataReplica {
         std::mem::swap(&mut self.asks, &mut self.standby_asks);
         self.phase = snapshot.phase;
         self.book_revision = snapshot.book_revision;
+        self.indicative = snapshot.indicative;
         self.market_buy = aggregate_from_level(snapshot.market_buy);
         self.market_sell = aggregate_from_level(snapshot.market_sell);
         self.last_command_sequence = snapshot.command_sequence;
@@ -2644,6 +2711,12 @@ impl CallAuctionMarketDataReplica {
         self.book_revision
     }
 
+    /// Returns the latest valid indication, if one remains current.
+    #[must_use]
+    pub const fn indicative(&self) -> Option<CallAuctionIndicativeState> {
+        self.indicative
+    }
+
     /// Returns whether a new snapshot is required after invalid incremental state.
     #[must_use]
     pub const fn is_poisoned(&self) -> bool {
@@ -2719,6 +2792,12 @@ impl CallAuctionMarketDataReplica {
                 .last_trade_id
                 .is_some_and(|trade_id| trade_id.get() > self.last_event_sequence)
             || validate_phase_snapshot(self.phase, self.last_event_sequence).is_err()
+            || self.indicative.is_some_and(|indicative| {
+                self.validate_indicative(indicative).is_err()
+                    || self.phase.active_auction_id() != Some(indicative.auction_id())
+                    || self.phase.revision() != indicative.phase_revision()
+                    || self.book_revision != indicative.book_revision()
+            })
         {
             return Err(CallAuctionMarketDataError::SourceDivergence(
                 "auction replica scalar state is internally inconsistent",
@@ -2749,6 +2828,12 @@ impl CallAuctionMarketDataReplica {
         update: CallAuctionMarketDataUpdate,
     ) -> Result<(), CallAuctionMarketDataError> {
         validate_update_kind(update.sequence, update.kind)?;
+        if !matches!(
+            update.kind,
+            CallAuctionMarketDataKind::NoPublicChange | CallAuctionMarketDataKind::Indicative(_)
+        ) {
+            self.indicative = None;
+        }
         match update.kind {
             CallAuctionMarketDataKind::NoPublicChange => {}
             CallAuctionMarketDataKind::Book {
@@ -2865,6 +2950,19 @@ impl CallAuctionMarketDataReplica {
                 if current == CallAuctionPhase::Collecting {
                     self.reset_cycle_trace();
                 }
+            }
+            CallAuctionMarketDataKind::Indicative(indicative) => {
+                self.validate_indicative(indicative)?;
+                if self.phase.phase() == CallAuctionPhase::Closed
+                    || self.phase.active_auction_id() != Some(indicative.auction_id())
+                    || self.phase.revision() != indicative.phase_revision()
+                    || self.book_revision != indicative.book_revision()
+                {
+                    return Err(CallAuctionMarketDataError::InvalidUpdate(
+                        "auction indication contradicts replica phase or book state",
+                    ));
+                }
+                self.indicative = Some(indicative);
             }
             CallAuctionMarketDataKind::UncrossCompleted {
                 auction_id,
@@ -3154,6 +3252,47 @@ impl CallAuctionMarketDataReplica {
                 })?;
             }
         }
+        if let Some(indicative) = snapshot.indicative {
+            self.validate_indicative(indicative).map_err(|_| {
+                CallAuctionMarketDataError::InvalidSnapshot(
+                    "auction snapshot indication contains an invalid price",
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn validate_indicative(
+        &self,
+        indicative: CallAuctionIndicativeState,
+    ) -> Result<(), CallAuctionMarketDataError> {
+        if !indicative.is_structurally_valid()
+            || self
+                .definition
+                .price_rules()
+                .validate(indicative.price_band().minimum())
+                .is_err()
+            || self
+                .definition
+                .price_rules()
+                .validate(indicative.price_band().maximum())
+                .is_err()
+            || self
+                .definition
+                .price_rules()
+                .validate(indicative.reference_price())
+                .is_err()
+            || indicative.clearing().is_some_and(|clearing| {
+                self.definition
+                    .price_rules()
+                    .validate(clearing.price())
+                    .is_err()
+            })
+        {
+            return Err(CallAuctionMarketDataError::InvalidUpdate(
+                "auction indication contains an invalid price or clearing",
+            ));
+        }
         Ok(())
     }
 
@@ -3306,6 +3445,17 @@ fn validate_update_kind(
             if previous == current || revision == 0 || revision > sequence {
                 return Err(CallAuctionMarketDataError::InvalidUpdate(
                     "auction phase update is unchanged or has an infeasible revision",
+                ));
+            }
+            Ok(())
+        }
+        CallAuctionMarketDataKind::Indicative(indicative) => {
+            if !indicative.is_structurally_valid()
+                || indicative.phase_revision() > sequence
+                || indicative.book_revision() > sequence
+            {
+                return Err(CallAuctionMarketDataError::InvalidUpdate(
+                    "auction indication contains an infeasible revision or clearing",
                 ));
             }
             Ok(())
@@ -3522,6 +3672,7 @@ fn command_instrument(command: CallAuctionCommand) -> InstrumentId {
         CallAuctionCommand::MassCancel(value) => value.instrument_id,
         CallAuctionCommand::Amend(value) => value.instrument_id,
         CallAuctionCommand::Replace(value) => value.replacement.instrument_id(),
+        CallAuctionCommand::Indicative(value) => value.instrument_id,
         CallAuctionCommand::Uncross(value) => value.instrument_id,
     }
 }
@@ -3534,6 +3685,7 @@ fn command_version(command: CallAuctionCommand) -> InstrumentVersion {
         CallAuctionCommand::MassCancel(value) => value.instrument_version,
         CallAuctionCommand::Amend(value) => value.instrument_version,
         CallAuctionCommand::Replace(value) => value.replacement.instrument_version(),
+        CallAuctionCommand::Indicative(value) => value.instrument_version,
         CallAuctionCommand::Uncross(value) => value.instrument_version,
     }
 }
@@ -3673,6 +3825,7 @@ const fn update_levels(
         CallAuctionMarketDataKind::Trade { buy, sell, .. } => [Some(buy), Some(sell)],
         CallAuctionMarketDataKind::NoPublicChange
         | CallAuctionMarketDataKind::PhaseChanged { .. }
+        | CallAuctionMarketDataKind::Indicative(_)
         | CallAuctionMarketDataKind::UncrossCompleted { .. }
         | CallAuctionMarketDataKind::MassCancelCompleted { .. } => [None, None],
     }

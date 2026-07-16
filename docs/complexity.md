@@ -214,6 +214,12 @@ preparation has the preceding book bound plus `O(T + C)` exact report-capacity
 derivation, and commit adds `O(T + C)` event emission into the already reserved
 trace without vector growth.
 
+One sequenced indicative publication reconstructs the canonical bid and ask
+aggregates and applies the shared discovery kernel in `O(B + A)` time with
+`O(1)` auxiliary space. It emits exactly one fixed-size event whether clearing
+is present or absent. Retaining or invalidating the latest revision-bound
+state is `O(1)` time and space; an exact retry and a rejection preserve it.
+
 Mass-cancel preflight inherits the expected `O(1)` account lookup. Commit adds
 the collection-book `O(K(log K + log O + log P))` work plus `O(K)` event
 emission. It emits `K` removals and one completion; `K = 0` emits only the
@@ -252,6 +258,8 @@ cardinality.
 
 An accepted mass cancel applies `K` ordinary reservation removals in expected
 `O(K)` risk time. Its aggregate completion has no second risk-state effect.
+Indicative publication requires no account lookup or reservation mutation and
+adds `O(1)` risk authorization and trace-application work.
 
 ## Durable auction recovery
 
@@ -566,6 +574,9 @@ updates and `U` unique affected limit identities:
 - A mass cancel with `K` selected orders fixes `E = K + 1`. Publisher and
   replica work is expected `O(E + U log P)` for `U` affected limit identities;
   the complete batch advances book revision once exactly when `K > 0`.
+- An indicative publication fixes `E = 1`. Discovery is already charged to the
+  engine as `O(B + A)`; publisher and replica retention, validation, and
+  invalidation of its fixed-size optional state are `O(1)`.
 - Snapshot output is `O(P)`; double-buffered snapshot application is
   allocation-free after construction and `O(P log P)`.
 
@@ -588,8 +599,9 @@ The page never splits a batch. Diagnosing an evicted partial oldest batch can
 scan up to `N` slots to report the earliest later complete boundary. Applying
 each replay batch has the ordinary replica `O(E + U)` capacity-preflight and
 `O(E log P)` mutation bounds. Typed slot bytes, allocator rounding, and page
-residency are target-dependent; version-4 payload bytes are unchanged by the
-process-local replay ring.
+residency are target-dependent; version-5 payload bytes are unchanged by the
+process-local replay ring. Indicative updates are 84 B without executable
+interest and 124 B with clearing; an empty closed snapshot is 113 B.
 
 ## WAL and journal
 
@@ -691,8 +703,10 @@ For `C` retained call-auction commands containing `E` events, `O` active
 orders, `I` accepted identities, and `A` coupled accounts, plain capture
 audits the live engine/book/event arena, exactly captures the three canonical
 row images, and projects phase/cycle, revision, order, identity, priority,
-trade, and event lineage without executing commands. Coupled capture
-additionally sorts `A` account rows in `O(A log A)`, reconstructs
+trade, indicative-state, and event lineage without executing commands. The
+optional current indication is derived from accepted history rather than
+duplicated in a direct row. Coupled capture additionally sorts `A` account
+rows in `O(A log A)`, reconstructs
 positions/reservations/exposures directly, and proves exact live equality.
 Complete plain or coupled replay occurs once in a consuming off-thread
 verifier; prior nested replay in the coupled path is eliminated.

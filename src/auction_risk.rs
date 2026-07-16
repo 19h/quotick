@@ -375,6 +375,7 @@ impl CallAuctionRiskEngine {
             | CallAuctionCommand::Cancel(_)
             | CallAuctionCommand::MassCancel(_)
             | CallAuctionCommand::Amend(_)
+            | CallAuctionCommand::Indicative(_)
             | CallAuctionCommand::Uncross(_) => Ok(()),
         }
     }
@@ -455,6 +456,7 @@ impl CallAuctionRiskEngine {
                 CallAuctionEventKind::PhaseChanged { .. }
                 | CallAuctionEventKind::MassCancelCompleted { .. }
                 | CallAuctionEventKind::UncrossCompleted { .. }
+                | CallAuctionEventKind::IndicativePublished(_)
                 | CallAuctionEventKind::CommandRejected(_) => {}
             }
         }

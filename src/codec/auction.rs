@@ -11,9 +11,10 @@ use crate::auction_engine::{
     CallAuctionAction, CallAuctionAmendOrder, CallAuctionCancelOrder,
     CallAuctionCancellationReason, CallAuctionCheckpoint, CallAuctionCommand,
     CallAuctionCommandOutcome, CallAuctionCommandReportCheckpoint, CallAuctionEvent,
-    CallAuctionEventKind, CallAuctionExecutionReport, CallAuctionMassCancel, CallAuctionPhase,
-    CallAuctionPhaseControl, CallAuctionPhaseSnapshot, CallAuctionRejectReason,
-    CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionEventKind, CallAuctionExecutionReport, CallAuctionIndicativeCommand,
+    CallAuctionIndicativeState, CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl,
+    CallAuctionPhaseSnapshot, CallAuctionRejectReason, CallAuctionReplaceOrder,
+    CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use crate::instrument::{AdmissionError, InstrumentDefinition};
 use crate::{AuctionId, Price, TimestampNs};
@@ -57,6 +58,7 @@ fn encode_action(encoder: &mut Encoder, action: CallAuctionAction) {
         CallAuctionAction::Replace => 4,
         CallAuctionAction::MassCancel => 5,
         CallAuctionAction::Amend => 6,
+        CallAuctionAction::Indicative => 7,
     });
 }
 
@@ -69,6 +71,7 @@ fn decode_action(decoder: &mut Decoder<'_>) -> Result<CallAuctionAction, CodecEr
         4 => Ok(CallAuctionAction::Replace),
         5 => Ok(CallAuctionAction::MassCancel),
         6 => Ok(CallAuctionAction::Amend),
+        7 => Ok(CallAuctionAction::Indicative),
         tag => Err(CodecError::InvalidTag {
             type_name: "CallAuctionAction",
             tag,
@@ -99,7 +102,7 @@ fn decode_constraint(decoder: &mut Decoder<'_>) -> Result<AuctionOrderConstraint
     }
 }
 
-fn encode_price_policy(encoder: &mut Encoder, policy: AuctionPricePolicy) {
+pub(super) fn encode_price_policy(encoder: &mut Encoder, policy: AuctionPricePolicy) {
     encoder.u8(match policy.pressure_rule() {
         AuctionPressureRule::Ignore => 0,
         AuctionPressureRule::FavorImbalance => 1,
@@ -110,7 +113,9 @@ fn encode_price_policy(encoder: &mut Encoder, policy: AuctionPricePolicy) {
     });
 }
 
-fn decode_price_policy(decoder: &mut Decoder<'_>) -> Result<AuctionPricePolicy, CodecError> {
+pub(super) fn decode_price_policy(
+    decoder: &mut Decoder<'_>,
+) -> Result<AuctionPricePolicy, CodecError> {
     let pressure = match decoder.u8()? {
         0 => AuctionPressureRule::Ignore,
         1 => AuctionPressureRule::FavorImbalance,
@@ -459,7 +464,46 @@ fn encode_command(encoder: &mut Encoder, command: CallAuctionCommand) {
             encoder.u64(value.new_quantity.lots());
             encoder.u64(value.received_at.as_unix_nanos());
         }
+        CallAuctionCommand::Indicative(value) => {
+            encoder.u8(7);
+            encoder.u64(value.command_id.get());
+            encoder.u64(value.instrument_id.get());
+            encoder.u64(value.instrument_version.get());
+            encoder.u64(value.auction_id.get());
+            encoder.u64(value.expected_phase_revision);
+            encoder.i64(value.price_band.minimum().raw());
+            encoder.i64(value.price_band.maximum().raw());
+            encoder.i64(value.reference_price.raw());
+            encode_price_policy(encoder, value.price_policy);
+            encoder.u64(value.received_at.as_unix_nanos());
+        }
     }
+}
+
+fn decode_indicative_command(
+    decoder: &mut Decoder<'_>,
+) -> Result<CallAuctionIndicativeCommand, CodecError> {
+    let command_id = command_id(decoder)?;
+    let instrument_id = instrument(decoder)?;
+    let instrument_version = instrument_version(decoder)?;
+    let auction_id = auction_id(decoder)?;
+    let expected_phase_revision = decoder.u64()?;
+    let minimum = Price::from_raw(decoder.i64()?);
+    let maximum = Price::from_raw(decoder.i64()?);
+    let price_band = AuctionPriceBand::from_ordered_prices(minimum, maximum).ok_or(
+        CodecError::InvalidValue("call-auction indicative price band is inverted"),
+    )?;
+    Ok(CallAuctionIndicativeCommand {
+        command_id,
+        instrument_id,
+        instrument_version,
+        auction_id,
+        expected_phase_revision,
+        price_band,
+        reference_price: Price::from_raw(decoder.i64()?),
+        price_policy: decode_price_policy(decoder)?,
+        received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
+    })
 }
 
 fn decode_command(decoder: &mut Decoder<'_>) -> Result<CallAuctionCommand, CodecError> {
@@ -540,6 +584,9 @@ fn decode_command(decoder: &mut Decoder<'_>) -> Result<CallAuctionCommand, Codec
             new_quantity: quantity(decoder)?,
             received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
         })),
+        7 => Ok(CallAuctionCommand::Indicative(decode_indicative_command(
+            decoder,
+        )?)),
         tag => Err(CodecError::InvalidTag {
             type_name: "CallAuctionCommand",
             tag,
@@ -619,13 +666,13 @@ fn decode_cancellation(decoder: &mut Decoder<'_>) -> Result<CallAuctionCancellat
     ))
 }
 
-fn encode_clearing(encoder: &mut Encoder, clearing: AuctionClearing) {
+pub(super) fn encode_clearing(encoder: &mut Encoder, clearing: AuctionClearing) {
     encoder.i64(clearing.price().raw());
     encoder.u128(clearing.buy_quantity());
     encoder.u128(clearing.sell_quantity());
 }
 
-fn decode_clearing(decoder: &mut Decoder<'_>) -> Result<AuctionClearing, CodecError> {
+pub(super) fn decode_clearing(decoder: &mut Decoder<'_>) -> Result<AuctionClearing, CodecError> {
     let clearing = AuctionClearing::from_quantities(
         Price::from_raw(decoder.i64()?),
         decoder.u128()?,
@@ -637,6 +684,52 @@ fn decode_clearing(decoder: &mut Decoder<'_>) -> Result<AuctionClearing, CodecEr
         ));
     }
     Ok(clearing)
+}
+
+pub(super) fn encode_indicative_state(encoder: &mut Encoder, state: CallAuctionIndicativeState) {
+    encoder.u64(state.auction_id().get());
+    encoder.u64(state.phase_revision());
+    encoder.u64(state.book_revision());
+    encoder.i64(state.price_band().minimum().raw());
+    encoder.i64(state.price_band().maximum().raw());
+    encoder.i64(state.reference_price().raw());
+    encode_price_policy(encoder, state.price_policy());
+    encoder.bool(state.clearing().is_some());
+    if let Some(clearing) = state.clearing() {
+        encode_clearing(encoder, clearing);
+    }
+}
+
+pub(super) fn decode_indicative_state(
+    decoder: &mut Decoder<'_>,
+) -> Result<CallAuctionIndicativeState, CodecError> {
+    let auction_id = auction_id(decoder)?;
+    let phase_revision = decoder.u64()?;
+    let book_revision = decoder.u64()?;
+    let minimum = Price::from_raw(decoder.i64()?);
+    let maximum = Price::from_raw(decoder.i64()?);
+    let price_band = AuctionPriceBand::from_ordered_prices(minimum, maximum).ok_or(
+        CodecError::InvalidValue("call-auction indicative price band is inverted"),
+    )?;
+    let state = CallAuctionIndicativeState::from_parts(
+        auction_id,
+        phase_revision,
+        book_revision,
+        price_band,
+        Price::from_raw(decoder.i64()?),
+        decode_price_policy(decoder)?,
+        if decoder.bool()? {
+            Some(decode_clearing(decoder)?)
+        } else {
+            None
+        },
+    );
+    if !state.is_structurally_valid() {
+        return Err(CodecError::InvalidValue(
+            "call-auction indicative state is structurally invalid",
+        ));
+    }
+    Ok(state)
 }
 
 fn encode_cancellation_reason(encoder: &mut Encoder, reason: CallAuctionCancellationReason) {
@@ -740,6 +833,10 @@ fn encode_event_kind(encoder: &mut Encoder, kind: CallAuctionEventKind) {
             encoder.u64(previous_quantity.lots());
             encoder.u64(book_revision);
         }
+        CallAuctionEventKind::IndicativePublished(state) => {
+            encoder.u8(9);
+            encode_indicative_state(encoder, state);
+        }
     }
 }
 
@@ -786,6 +883,9 @@ fn decode_event_kind(decoder: &mut Decoder<'_>) -> Result<CallAuctionEventKind, 
             previous_quantity: quantity(decoder)?,
             book_revision: decoder.u64()?,
         }),
+        9 => Ok(CallAuctionEventKind::IndicativePublished(
+            decode_indicative_state(decoder)?,
+        )),
         tag => Err(CodecError::InvalidTag {
             type_name: "CallAuctionEventKind",
             tag,

@@ -14,8 +14,8 @@ use quotick::auction_engine::{
     CallAuctionAmendOrder, CallAuctionCheckpoint, CallAuctionCheckpointCapture, CallAuctionCommand,
     CallAuctionEngine, CallAuctionEngineError, CallAuctionEngineLimits,
     CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionExecutionReport,
-    CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl, CallAuctionReplaceOrder,
-    CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionIndicativeCommand, CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl,
+    CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use quotick::codec::{BinaryCodec, CodecError};
 use quotick::durable_auction::{
@@ -226,6 +226,25 @@ fn uncross(command_id: u64) -> CallAuctionCommand {
     )
 }
 
+fn indicative(command_id: u64, revision: u64) -> CallAuctionCommand {
+    CallAuctionCommand::Indicative(CallAuctionIndicativeCommand {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: InstrumentId::new(71).unwrap(),
+        instrument_version: InstrumentVersion::new(1).unwrap(),
+        auction_id: auction(),
+        expected_phase_revision: revision,
+        price_band: AuctionPriceBand::new(
+            AuctionPriceGrid::new(1).unwrap(),
+            Price::from_raw(0),
+            Price::from_raw(1_000),
+        )
+        .unwrap(),
+        reference_price: Price::from_raw(100),
+        price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
 fn uncross_for(
     command_id: u64,
     auction_id: AuctionId,
@@ -337,6 +356,59 @@ fn staged_auction_capture_is_shared_and_survives_source_suffix_growth() {
     let restored = CallAuctionEngine::from_checkpoint(&verified).unwrap();
     assert_eq!(restored.phase_snapshot(), verified.phase());
     assert_eq!(restored.book().active_order_count(), 1);
+}
+
+#[test]
+fn indicative_state_survives_wal_and_snapshot_then_suffix_invalidation() {
+    let area = TestPath::directory("indicative-recovery");
+    fs::create_dir_all(area.path()).unwrap();
+    let wal = area.join("auction.wal");
+    let snapshot = area.join("auction.qsnp");
+    let mut durable = DurableCallAuctionEngine::open(&wal, definition(), options()).unwrap();
+    for command in [
+        phase(1, 0, CallAuctionPhase::Collecting),
+        submit(2, order(1, 1, Side::Buy, 7)),
+        submit(3, order(2, 2, Side::Sell, 5)),
+    ] {
+        durable.submit(command).unwrap();
+    }
+    let indication_command = indicative(4, 1);
+    let indication_report = durable.submit(indication_command).unwrap();
+    let CallAuctionEventKind::IndicativePublished(indication) = indication_report.events[0].kind
+    else {
+        panic!("indicative command must publish one indication");
+    };
+    assert_eq!(indication.clearing().unwrap().executable_quantity(), 5);
+    assert_eq!(durable.engine().last_indicative(), Some(indication));
+    durable
+        .write_checkpoint(&snapshot, SnapshotOptions::default())
+        .unwrap();
+
+    let checkpoint =
+        SnapshotFile::read::<CallAuctionCheckpoint>(&snapshot, SnapshotOptions::default()).unwrap();
+    let restored = CallAuctionEngine::from_checkpoint(&checkpoint).unwrap();
+    assert_eq!(restored.last_indicative(), Some(indication));
+    assert!(durable.submit(indication_command).unwrap().replayed);
+
+    durable
+        .submit(phase(5, 1, CallAuctionPhase::Frozen))
+        .unwrap();
+    assert_eq!(durable.engine().last_indicative(), None);
+    durable.close().unwrap();
+
+    let recovered = DurableCallAuctionEngine::open_with_checkpoint(
+        &wal,
+        &snapshot,
+        definition(),
+        options(),
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().checkpointed_commands, 4);
+    assert_eq!(recovered.recovery().replayed_commands, 1);
+    assert_eq!(recovered.engine().last_indicative(), None);
+    recovered.engine().validate().unwrap();
+    recovered.close().unwrap();
 }
 
 #[test]
@@ -1071,7 +1143,7 @@ fn auction_checkpoint_has_stable_kind_codec_and_direct_restore() {
     SnapshotFile::write(&snapshot, &shared, SnapshotOptions::default()).unwrap();
     let bytes = fs::read(snapshot).unwrap();
     assert_eq!(&bytes[0..4], b"QSNP");
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 14);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 15);
     assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 4);
 }
 

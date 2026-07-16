@@ -1,4 +1,7 @@
-use quotick::auction::{AuctionAllocationPolicy, AuctionOrderConstraint, AuctionPricePolicy};
+use quotick::auction::{
+    AuctionAllocationPolicy, AuctionOrderConstraint, AuctionPriceBand, AuctionPriceGrid,
+    AuctionPricePolicy,
+};
 use quotick::auction_book::{
     CallAuctionBookLimits, CallAuctionBookLimitsSpec, CallAuctionOrder, CallAuctionPrepareError,
     CallAuctionRemainderPolicy, CallAuctionSelfTradePolicy, CallAuctionUncrossPolicy,
@@ -8,12 +11,13 @@ use quotick::auction_engine::{
     CallAuctionCommandOutcome, CallAuctionEngine, CallAuctionEngineCapacity,
     CallAuctionEngineConstructionError, CallAuctionEngineError, CallAuctionEngineLimits,
     CallAuctionEngineLimitsError, CallAuctionEngineLimitsSpec, CallAuctionEventKind,
-    CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl, CallAuctionRejectReason,
-    CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionIndicativeCommand, CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl,
+    CallAuctionRejectReason, CallAuctionReplaceOrder, CallAuctionSubmitOrder,
+    CallAuctionUncrossCommand,
 };
 use quotick::instrument::{
-    InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
-    QuantityRules, ReserveOrderRules, TradingState,
+    AdmissionError, InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol,
+    PriceRules, QuantityRules, ReserveOrderRules, TradingState,
 };
 use quotick::matching::MassCancelScope;
 use quotick::{
@@ -234,6 +238,145 @@ fn uncross_command_with_allocation(
         ),
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
+}
+
+fn indicative_command(
+    engine: &CallAuctionEngine,
+    command_id: u64,
+    expected_revision: u64,
+) -> CallAuctionCommand {
+    CallAuctionCommand::Indicative(CallAuctionIndicativeCommand {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        auction_id: auction(1),
+        expected_phase_revision: expected_revision,
+        price_band: engine.book().instrument_price_band(),
+        reference_price: Price::from_raw(100),
+        price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+fn outside_collar_indicative_command(
+    command_id: u64,
+    expected_revision: u64,
+) -> CallAuctionCommand {
+    CallAuctionCommand::Indicative(CallAuctionIndicativeCommand {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        auction_id: auction(1),
+        expected_phase_revision: expected_revision,
+        price_band: AuctionPriceBand::new(
+            AuctionPriceGrid::new(5).unwrap(),
+            Price::from_raw(-105),
+            Price::from_raw(200),
+        )
+        .unwrap(),
+        reference_price: Price::from_raw(100),
+        price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+#[test]
+fn indicative_publication_is_sequenced_revision_bound_nullable_and_idempotent() {
+    let mut engine =
+        CallAuctionEngine::try_with_limits(definition(), engine_limits(8, 16, 32)).unwrap();
+    engine
+        .submit(phase_command(1, 1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+
+    let empty_command = indicative_command(&engine, 2, 1);
+    let empty = engine.submit(empty_command).unwrap();
+    let CallAuctionEventKind::IndicativePublished(empty_state) = empty.events[0].kind else {
+        panic!("expected an indicative publication");
+    };
+    assert_eq!(empty_state.auction_id(), auction(1));
+    assert_eq!(empty_state.phase_revision(), 1);
+    assert_eq!(empty_state.book_revision(), 0);
+    assert_eq!(empty_state.clearing(), None);
+    assert_eq!(engine.last_indicative(), Some(empty_state));
+
+    engine
+        .submit(submit_command(
+            3,
+            order(
+                10,
+                1,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                10,
+            ),
+        ))
+        .unwrap();
+    assert_eq!(engine.last_indicative(), None);
+    engine
+        .submit(submit_command(
+            4,
+            order(
+                20,
+                2,
+                Side::Sell,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                6,
+            ),
+        ))
+        .unwrap();
+
+    let crossed_command = indicative_command(&engine, 5, 1);
+    let crossed = engine.submit(crossed_command).unwrap();
+    let CallAuctionEventKind::IndicativePublished(crossed_state) = crossed.events[0].kind else {
+        panic!("expected an indicative publication");
+    };
+    let clearing = crossed_state.clearing().unwrap();
+    assert_eq!(clearing.price(), Price::from_raw(100));
+    assert_eq!(clearing.executable_quantity(), 6);
+    assert_eq!(clearing.buy_quantity(), 10);
+    assert_eq!(clearing.sell_quantity(), 6);
+    assert_eq!(clearing.imbalance_side(), Some(Side::Buy));
+    assert_eq!(crossed_state.book_revision(), 2);
+    assert_eq!(engine.last_indicative(), Some(crossed_state));
+
+    let retry = engine.submit(crossed_command).unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.events, crossed.events);
+    assert_eq!(engine.last_indicative(), Some(crossed_state));
+
+    engine
+        .submit(phase_command(6, 1, 1, CallAuctionPhase::Frozen))
+        .unwrap();
+    assert_eq!(engine.last_indicative(), None);
+    let frozen_command = indicative_command(&engine, 7, 2);
+    let frozen = engine.submit(frozen_command).unwrap();
+    let CallAuctionEventKind::IndicativePublished(frozen_state) = frozen.events[0].kind else {
+        panic!("expected an indicative publication");
+    };
+    assert_eq!(frozen_state.phase_revision(), 2);
+    assert_eq!(frozen_state.clearing(), Some(clearing));
+    assert_eq!(engine.last_indicative(), Some(frozen_state));
+
+    let stale = engine.submit(indicative_command(&engine, 8, 1)).unwrap();
+    assert_eq!(
+        stale.outcome,
+        CallAuctionCommandOutcome::Rejected(CallAuctionRejectReason::PhaseRevisionMismatch {
+            observed: 1,
+            current: 2,
+        })
+    );
+    assert_eq!(engine.last_indicative(), Some(frozen_state));
+
+    let outside_collar = outside_collar_indicative_command(9, 2);
+    let rejected = engine.submit(outside_collar).unwrap();
+    assert_eq!(
+        rejected.outcome,
+        CallAuctionCommandOutcome::Rejected(CallAuctionRejectReason::Instrument(
+            AdmissionError::PriceOutsideCollar,
+        ))
+    );
+    assert_eq!(engine.last_indicative(), Some(frozen_state));
+    engine.validate().unwrap();
 }
 
 #[test]
