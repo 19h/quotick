@@ -222,6 +222,30 @@ fn uncross_command_with_allocation(
     allocation: AuctionAllocationPolicy,
     remainder: CallAuctionRemainderPolicy,
 ) -> CallAuctionCommand {
+    uncross_command_with_policy(
+        engine,
+        command_id,
+        auction_id,
+        expected_revision,
+        allocation,
+        remainder,
+        CallAuctionSelfTradePolicy::Permit,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test command factory keeps every uncross policy dimension explicit"
+)]
+fn uncross_command_with_policy(
+    engine: &CallAuctionEngine,
+    command_id: u64,
+    auction_id: u64,
+    expected_revision: u64,
+    allocation: AuctionAllocationPolicy,
+    remainder: CallAuctionRemainderPolicy,
+    self_trade: CallAuctionSelfTradePolicy,
+) -> CallAuctionCommand {
     CallAuctionCommand::Uncross(CallAuctionUncrossCommand {
         command_id: CommandId::new(command_id).unwrap(),
         instrument_id: instrument(),
@@ -231,11 +255,7 @@ fn uncross_command_with_allocation(
         price_band: engine.book().instrument_price_band(),
         reference_price: Price::from_raw(100),
         price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
-        uncross_policy: CallAuctionUncrossPolicy::new(
-            allocation,
-            remainder,
-            CallAuctionSelfTradePolicy::Permit,
-        ),
+        uncross_policy: CallAuctionUncrossPolicy::new(allocation, remainder, self_trade),
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
@@ -465,6 +485,90 @@ fn lifecycle_sequences_collection_freeze_uncross_and_exact_replay() {
     assert!(replay.events.shares_storage_with(&report.events));
     assert_eq!(engine.next_command_sequence(), 7);
     assert_eq!(engine.next_event_sequence(), 8);
+    engine.validate().unwrap();
+}
+
+#[test]
+fn abort_self_trade_is_a_replayable_frozen_rejection_and_permit_can_continue() {
+    let mut engine =
+        CallAuctionEngine::try_with_limits(definition(), engine_limits(4, 8, 16)).unwrap();
+    for command in [
+        phase_command(1, 1, 0, CallAuctionPhase::Collecting),
+        submit_command(
+            2,
+            order(
+                1,
+                7,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                5,
+            ),
+        ),
+        submit_command(
+            3,
+            order(
+                2,
+                7,
+                Side::Sell,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                5,
+            ),
+        ),
+        phase_command(4, 1, 1, CallAuctionPhase::Frozen),
+    ] {
+        engine.submit(command).unwrap();
+    }
+    let indication_report = engine.submit(indicative_command(&engine, 5, 2)).unwrap();
+    let CallAuctionEventKind::IndicativePublished(indication) = indication_report.events[0].kind
+    else {
+        panic!("expected crossed indicative publication");
+    };
+    let command = uncross_command_with_policy(
+        &engine,
+        6,
+        1,
+        2,
+        AuctionAllocationPolicy::PriceTime,
+        CallAuctionRemainderPolicy::RetainAll,
+        CallAuctionSelfTradePolicy::Abort,
+    );
+    let rejected = engine.submit(command).unwrap();
+
+    assert_eq!(
+        rejected.outcome,
+        CallAuctionCommandOutcome::Rejected(CallAuctionRejectReason::SelfTradeWouldOccur)
+    );
+    assert_eq!(rejected.events.len(), 1);
+    assert_eq!(
+        rejected.events[0].kind,
+        CallAuctionEventKind::CommandRejected(CallAuctionRejectReason::SelfTradeWouldOccur)
+    );
+    assert_eq!(engine.phase_snapshot().phase(), CallAuctionPhase::Frozen);
+    assert_eq!(engine.phase_snapshot().revision(), 2);
+    assert_eq!(engine.book().state_revision(), 2);
+    assert_eq!(engine.book().next_trade_id(), 1);
+    assert_eq!(engine.book().active_order_count(), 2);
+    assert_eq!(engine.last_indicative(), Some(indication));
+    let next_command_sequence = engine.next_command_sequence();
+    let next_event_sequence = engine.next_event_sequence();
+
+    let retry = engine.submit(command).unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.command_sequence, rejected.command_sequence);
+    assert!(retry.events.shares_storage_with(&rejected.events));
+    assert_eq!(engine.next_command_sequence(), next_command_sequence);
+    assert_eq!(engine.next_event_sequence(), next_event_sequence);
+    assert_eq!(engine.last_indicative(), Some(indication));
+    engine.validate().unwrap();
+
+    let permitted = uncross_command(&engine, 7, 1, 2, CallAuctionRemainderPolicy::RetainAll);
+    assert_eq!(
+        engine.submit(permitted).unwrap().outcome,
+        CallAuctionCommandOutcome::Accepted
+    );
+    assert_eq!(engine.phase_snapshot().phase(), CallAuctionPhase::Closed);
+    assert_eq!(engine.book().active_order_count(), 0);
+    assert_eq!(engine.book().next_trade_id(), 2);
     engine.validate().unwrap();
 }
 

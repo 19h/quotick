@@ -770,6 +770,8 @@ impl CallAuctionRemainderPolicy {
 pub enum CallAuctionSelfTradePolicy {
     /// Permit a pair whose buy and sell accounts are identical.
     Permit,
+    /// Abort the complete uncross at the first canonical same-account pair.
+    Abort,
 }
 
 /// Explicit policy applied by one atomic call-auction uncross.
@@ -974,6 +976,17 @@ pub enum CallAuctionPrepareError {
         /// Configured simultaneous lease maximum.
         maximum: usize,
     },
+    /// Canonical pairing reached equal buyer and seller account identities.
+    SelfTradeWouldOccur {
+        /// Account present on both sides of the pair.
+        account_id: AccountId,
+        /// Canonically selected buy order.
+        buy_order_id: OrderId,
+        /// Canonically selected sell order.
+        sell_order_id: OrderId,
+        /// Positive quantity the pair would execute.
+        quantity: Quantity,
+    },
     /// Private collection state contradicted its validated analytical plan.
     InternalInvariantViolation,
 }
@@ -991,6 +1004,16 @@ impl fmt::Display for CallAuctionPrepareError {
             Self::PreparationCapacityExhausted { maximum } => write!(
                 formatter,
                 "call-auction prepared-uncross capacity {maximum} is exhausted"
+            ),
+            Self::SelfTradeWouldOccur {
+                account_id,
+                buy_order_id,
+                sell_order_id,
+                quantity,
+            } => write!(
+                formatter,
+                "call-auction canonical pair buy {buy_order_id} and sell {sell_order_id} would self-trade account {account_id} for {} lots",
+                quantity.lots()
             ),
             Self::InternalInvariantViolation => {
                 formatter.write_str("call-auction private state contradicts prepared uncross")
@@ -2510,8 +2533,10 @@ impl CallAuctionBook {
     /// Fully prepares deterministic pairing and remainder treatment without
     /// mutating active orders, trade identity, or collection revision.
     ///
-    /// The supplied policy explicitly selects allocation and permits self-trade;
-    /// neither behavior is inferred. One constructor-owned lease supplies both
+    /// The supplied policy explicitly selects allocation and either permits or
+    /// aborts at the first canonical self-trade pair; neither behavior is
+    /// inferred and abort does not search for an alternative pairing. One
+    /// constructor-owned lease supplies both
     /// side-fill vectors, the counterparty-pair vector, and the cancellation
     /// vector. Dropping the preparation or committed result returns that isolated
     /// storage to the pool.
@@ -2573,7 +2598,7 @@ impl CallAuctionBook {
             cancellations,
             ..
         } = buffers;
-        let next_trade_id = self.prepare_trade_pairs(plan, trades)?;
+        let next_trade_id = self.prepare_trade_pairs(plan, policy.self_trade, trades)?;
         self.prepare_remainder_cancellations(plan, policy.remainder, cancellations)?;
         Ok(PreparedCallAuctionUncross {
             book_instance_id: self.instance_id,
@@ -2874,6 +2899,7 @@ impl CallAuctionBook {
     fn prepare_trade_pairs(
         &self,
         plan: &AuctionAllocationPlan,
+        self_trade: CallAuctionSelfTradePolicy,
         trades: &mut Vec<CallAuctionTrade>,
     ) -> Result<u64, CallAuctionPrepareError> {
         let pair_count = required_pair_count(plan.buy_fills(), plan.sell_fills())
@@ -2911,6 +2937,18 @@ impl CallAuctionBook {
             if buy_order.side != Side::Buy || sell_order.side != Side::Sell || quantity_lots == 0 {
                 return Err(CallAuctionPrepareError::InternalInvariantViolation);
             }
+            let quantity = Quantity::new(quantity_lots)
+                .map_err(|_| CallAuctionPrepareError::InternalInvariantViolation)?;
+            if self_trade == CallAuctionSelfTradePolicy::Abort
+                && buy_order.account_id == sell_order.account_id
+            {
+                return Err(CallAuctionPrepareError::SelfTradeWouldOccur {
+                    account_id: buy_order.account_id,
+                    buy_order_id: buy_fill.order_id(),
+                    sell_order_id: sell_fill.order_id(),
+                    quantity,
+                });
+            }
             let offset = u64::try_from(trades.len())
                 .map_err(|_| CallAuctionPrepareError::TradeIdentifierExhausted)?;
             let raw_trade_id = self
@@ -2918,8 +2956,6 @@ impl CallAuctionBook {
                 .checked_add(offset)
                 .ok_or(CallAuctionPrepareError::TradeIdentifierExhausted)?;
             let trade_id = TradeId::new(raw_trade_id)
-                .map_err(|_| CallAuctionPrepareError::InternalInvariantViolation)?;
-            let quantity = Quantity::new(quantity_lots)
                 .map_err(|_| CallAuctionPrepareError::InternalInvariantViolation)?;
             trades.push(CallAuctionTrade {
                 trade_id,

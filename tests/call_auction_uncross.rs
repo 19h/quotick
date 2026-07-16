@@ -90,7 +90,15 @@ fn allocation_policy(
     allocation: AuctionAllocationPolicy,
     remainder: CallAuctionRemainderPolicy,
 ) -> CallAuctionUncrossPolicy {
-    CallAuctionUncrossPolicy::new(allocation, remainder, CallAuctionSelfTradePolicy::Permit)
+    allocation_policy_with_self_trade(allocation, remainder, CallAuctionSelfTradePolicy::Permit)
+}
+
+fn allocation_policy_with_self_trade(
+    allocation: AuctionAllocationPolicy,
+    remainder: CallAuctionRemainderPolicy,
+    self_trade: CallAuctionSelfTradePolicy,
+) -> CallAuctionUncrossPolicy {
+    CallAuctionUncrossPolicy::new(allocation, remainder, self_trade)
 }
 
 fn indicative(
@@ -163,6 +171,112 @@ fn prepare_pairs_priority_fills_and_commit_removes_every_filled_order_atomically
     assert_eq!(book.active_order_count(), 0);
     assert_eq!(book.accepted_order_id_count(), 4);
     assert_eq!(book.next_trade_id(), 4);
+    book.validate().unwrap();
+}
+
+#[test]
+fn abort_self_trade_rejects_first_canonical_pair_without_mutating_or_leaking_buffers() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(4, 8)).unwrap();
+    book.admit(order(
+        1,
+        7,
+        Side::Buy,
+        AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        5,
+    ))
+    .unwrap();
+    book.admit(order(
+        2,
+        7,
+        Side::Sell,
+        AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        3,
+    ))
+    .unwrap();
+
+    let clearing = indicative(&mut book, 100);
+    let before = book.resource_status();
+    let error = book
+        .prepare_uncross(
+            clearing,
+            allocation_policy_with_self_trade(
+                AuctionAllocationPolicy::PriceTime,
+                CallAuctionRemainderPolicy::RetainAll,
+                CallAuctionSelfTradePolicy::Abort,
+            ),
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        CallAuctionPrepareError::SelfTradeWouldOccur {
+            account_id: account(7),
+            buy_order_id: OrderId::new(1).unwrap(),
+            sell_order_id: OrderId::new(2).unwrap(),
+            quantity: Quantity::new(3).unwrap(),
+        }
+    );
+    assert_eq!(book.resource_status(), before);
+    assert_eq!(book.active_order_count(), 2);
+    assert_eq!(book.state_revision(), 2);
+    assert_eq!(book.next_trade_id(), 1);
+    assert_eq!(
+        book.order(OrderId::new(1).unwrap())
+            .unwrap()
+            .quantity
+            .lots(),
+        5
+    );
+    assert_eq!(
+        book.order(OrderId::new(2).unwrap())
+            .unwrap()
+            .quantity
+            .lots(),
+        3
+    );
+
+    let permitted = book
+        .prepare_uncross(clearing, policy(CallAuctionRemainderPolicy::RetainAll))
+        .unwrap();
+    assert_eq!(permitted.trades().len(), 1);
+    assert_eq!(permitted.trades()[0].quantity().lots(), 3);
+    drop(permitted);
+    book.validate().unwrap();
+}
+
+#[test]
+fn abort_self_trade_policy_commits_when_every_canonical_pair_is_external() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(4, 8)).unwrap();
+    book.admit(order(1, 1, Side::Buy, AuctionOrderConstraint::Market, 4))
+        .unwrap();
+    book.admit(order(2, 2, Side::Sell, AuctionOrderConstraint::Market, 4))
+        .unwrap();
+
+    let clearing = indicative(&mut book, 100);
+    let prepared = book
+        .prepare_uncross(
+            clearing,
+            allocation_policy_with_self_trade(
+                AuctionAllocationPolicy::PriceTime,
+                CallAuctionRemainderPolicy::RetainAll,
+                CallAuctionSelfTradePolicy::Abort,
+            ),
+        )
+        .unwrap();
+    assert!(
+        prepared
+            .trades()
+            .iter()
+            .all(|trade| trade.buy_account_id() != trade.sell_account_id())
+    );
+    let result = book.commit_uncross(prepared).unwrap();
+
+    assert_eq!(
+        result.policy().self_trade(),
+        CallAuctionSelfTradePolicy::Abort
+    );
+    assert_eq!(book.active_order_count(), 0);
+    assert_eq!(book.next_trade_id(), 2);
     book.validate().unwrap();
 }
 

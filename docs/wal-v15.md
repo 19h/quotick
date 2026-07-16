@@ -1,4 +1,7 @@
-# WAL Format Version 15
+# Expired WAL Format Version 15
+
+Version 15 is expired. The runtime accepts only
+[WAL format version 16](wal-v16.md).
 
 This document is the authoritative byte-level schema for Quotick WAL version
 15. All multibyte integers are little-endian. Rust enum layout, padding,

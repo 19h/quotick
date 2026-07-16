@@ -303,7 +303,9 @@ Run any program with `cargo run --example <name>`.
   reduction with exact aggregate reconciliation, and a two-phase prepare/commit
   uncross over constructor-owned leased buffers with explicit allocation and
   remainder policies (`RetainAll`, `CancelMarket`, `CancelAll`); the only
-  represented self-trade policy is explicit `Permit`.
+  represented self-trade policies are explicit `Permit` and fail-closed
+  `Abort`, which rejects the first canonical same-account pair without
+  re-pairing or mutation.
 - A sequenced `CallAuctionEngine` with explicit `Closed`/`Collecting`/`Frozen`
   phases, contiguous `AuctionId` cycles, revision-checked controls, exact
   command idempotency, exact one-event amendment and two-event replacement
@@ -337,6 +339,8 @@ Run any program with `cargo run --example <name>`.
   once per account. Auction replacement nets out the target reservation before
   authorizing the replacement and preserves the target on rejection. Auction
   amendment releases the exact quantity/notional delta without a new risk gate.
+  An aborted self-trade uncross leaves reservations, exposures, and positions
+  unchanged.
 - Full cross-audits between active orders, reservations, aggregates, and
   positions.
 
@@ -396,7 +400,7 @@ Run any program with `cargo run --example <name>`.
 
 ### Durability and recovery
 
-- Versioned CRC-32C WAL frames (format 15) with bounded payloads and
+- Versioned CRC-32C WAL frames (format 16) with bounded payloads and
   contiguous sequences, as a single-file `Journal` or a size-bounded
   `SegmentedJournal` rotating whole frames and batches under one global
   sequence.
@@ -406,7 +410,7 @@ Run any program with `cargo run --example <name>`.
   writer leases with explicit abandoned-writer recovery.
 - Strict corruption detection: only a physically incomplete final frame may be
   repaired, and closed segments are always scanned strictly.
-- Versioned, bounded `QSNP` semantic snapshots (format 15) with monotonic
+- Versioned, bounded `QSNP` semantic snapshots (format 16) with monotonic
   exact-prefix lineage and synchronized atomic replacement.
 - Durable runtimes for matching, coupled risk/matching, call auctions, and
   coupled auction/risk record every command before committing the in-memory
@@ -483,8 +487,9 @@ calendar images and day/session-to-GTD normalization are implemented, but
 authoritative calendar ingestion, signed distribution, atomic activation,
 original-request audit durability, and sequenced session-state transitions are
 external. The auction path additionally provides no ledger effects, reference
-or dynamic-band derivation, preventive self-trade policies, calendar-driven
-phase scheduling, or venue-specific uncross rules.
+or dynamic-band derivation, alternative-counterparty STP rearrangement,
+cancel/decrement STP policies, calendar-driven phase scheduling, or
+venue-specific uncross rules.
 
 The complete boundary, the failure model, and the register of environmental
 assumptions are documented in
@@ -496,12 +501,12 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 112 tagged assumptions (A1–A112), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 113 tagged assumptions (A1–A113), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
-| [WAL format v15](docs/wal-v15.md) | Current write-ahead-log frame and record schema |
-| [Snapshot format v15](docs/snapshot-v15.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
+| [WAL format v16](docs/wal-v16.md) | Current write-ahead-log frame and record schema |
+| [Snapshot format v16](docs/snapshot-v16.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
 | [Market-data payload v3](docs/market-data-v3.md) | Current continuous market-data update/snapshot payloads |
 | [Auction market-data payload v5](docs/auction-market-data-v5.md) | Current call-auction market-data payloads |
 | [Auction-risk checkpoint payload v1](docs/auction-risk-checkpoint-v1.md) | Current coupled call-auction risk checkpoint payload |
@@ -519,6 +524,7 @@ byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/wal-v12.md](docs/wal-v12.md),
 [docs/wal-v13.md](docs/wal-v13.md),
 [docs/wal-v14.md](docs/wal-v14.md),
+[docs/wal-v15.md](docs/wal-v15.md),
 [docs/snapshot-v2.md](docs/snapshot-v2.md),
 [docs/snapshot-v3.md](docs/snapshot-v3.md),
 [docs/snapshot-v4.md](docs/snapshot-v4.md),
@@ -531,7 +537,8 @@ byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/snapshot-v11.md](docs/snapshot-v11.md),
 [docs/snapshot-v12.md](docs/snapshot-v12.md),
 [docs/snapshot-v13.md](docs/snapshot-v13.md),
-[docs/snapshot-v14.md](docs/snapshot-v14.md), continuous
+[docs/snapshot-v14.md](docs/snapshot-v14.md),
+[docs/snapshot-v15.md](docs/snapshot-v15.md), continuous
 [market-data v2](docs/market-data-v2.md), and call-auction
 [market-data v1](docs/auction-market-data-v1.md) and
 [market-data v2](docs/auction-market-data-v2.md) and
@@ -572,8 +579,10 @@ includes:
   models, canonical account/side mass cancellation across book, engine, risk,
   public-feed, checkpoint, and WAL recovery, retained-priority amendment across
   the same paths, nullable indicative publication/invalidation across engine,
-  risk, public-feed, replay, snapshot, and WAL recovery, and a 10,000-command engine phase-
-  model run.
+  risk, public-feed, replay, snapshot, and WAL recovery, and a 10,000-command
+  engine phase-model run. Fail-closed self-trade abort is covered across
+  canonical pairing, sequencing, risk neutrality, public no-change projection,
+  stable codecs, and durable exact retry.
 - **Market data and accounting:** continuous and complete-batch auction depth
   reconstruction, replay-first gap repair, snapshot fallback,
   allocation-stable ring wrap, settlement, reversals, corrections, batches,

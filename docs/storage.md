@@ -233,7 +233,7 @@ semantic generation plus exact history lineage. It decides as follows:
   size exceeds the caller's configured limit is preserved.
 
 The complete wire and decision contract is
-[Semantic snapshot format version 15](snapshot-v15.md).
+[Semantic snapshot format version 16](snapshot-v16.md).
 
 Direct users must dedicate the target and its two sidecars to snapshots.
 `DurableOrderBook`, `DurableRiskOrderBook`, `DurableLedger`, and
@@ -437,8 +437,10 @@ and how reopen interprets the resulting bytes.
   phase/book/counter/cache restoration, multi-cycle retained remainders,
   retained-priority active-quantity amendment, account/side mass-cancel
   recovery and exact retry suppression, revision-bound nullable indicative
-  state, its suffix invalidation, uncut prefix forks/ahead state, corrupt/wrong
-  A/B slots, and dangling suffix completion after an anchor.
+  state, fail-closed self-trade rejection with unchanged frozen/risk state,
+  exact retry suppression, its suffix invalidation, uncut prefix forks/ahead
+  state, corrupt/wrong A/B slots, and dangling suffix completion after an
+  anchor.
 - **Cutover tests** additionally cover repeated A/B replacement, non-genesis
   physical sequences, anchor/snapshot divergence, missing checkpoint context,
   suffix continuation, occupied and abandoned staging paths, path aliasing,

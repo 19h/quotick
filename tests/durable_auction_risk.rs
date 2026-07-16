@@ -174,6 +174,14 @@ fn submit(command_id: u64, order: CallAuctionOrder) -> CallAuctionCommand {
 }
 
 fn uncross(command_id: u64, remainder: CallAuctionRemainderPolicy) -> CallAuctionCommand {
+    uncross_with_self_trade(command_id, remainder, CallAuctionSelfTradePolicy::Permit)
+}
+
+fn uncross_with_self_trade(
+    command_id: u64,
+    remainder: CallAuctionRemainderPolicy,
+    self_trade: CallAuctionSelfTradePolicy,
+) -> CallAuctionCommand {
     CallAuctionCommand::Uncross(CallAuctionUncrossCommand {
         command_id: CommandId::new(command_id).unwrap(),
         instrument_id: instrument(),
@@ -191,7 +199,7 @@ fn uncross(command_id: u64, remainder: CallAuctionRemainderPolicy) -> CallAuctio
         uncross_policy: CallAuctionUncrossPolicy::new(
             AuctionAllocationPolicy::PriceTime,
             remainder,
-            CallAuctionSelfTradePolicy::Permit,
+            self_trade,
         ),
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
@@ -355,6 +363,89 @@ fn single_file_recovery_reproduces_risk_rejections_positions_and_reservations() 
 }
 
 #[test]
+fn coupled_checkpoint_recovers_abort_self_trade_with_unchanged_risk_state() {
+    let area = TestArea::new("abort-self-trade");
+    let wal = area.join("auction-risk.wal");
+    let snapshot = area.join("auction-risk.qsnp");
+    let profile_values = profiles();
+    let mut durable =
+        DurableCallAuctionRiskEngine::open(&wal, definition(), &profile_values, options()).unwrap();
+    for command in [
+        phase(1, 0, CallAuctionPhase::Collecting),
+        submit(
+            2,
+            order(
+                1,
+                1,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                5,
+            ),
+        ),
+        submit(
+            3,
+            order(
+                2,
+                1,
+                Side::Sell,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                5,
+            ),
+        ),
+        phase(4, 1, CallAuctionPhase::Frozen),
+    ] {
+        durable.submit(command).unwrap();
+    }
+    let before = durable.managed().risk().snapshot(account(1)).unwrap();
+    let command = uncross_with_self_trade(
+        5,
+        CallAuctionRemainderPolicy::RetainAll,
+        CallAuctionSelfTradePolicy::Abort,
+    );
+    let rejected = durable.submit(command).unwrap();
+    assert_eq!(
+        rejected.outcome,
+        CallAuctionCommandOutcome::Rejected(CallAuctionRejectReason::SelfTradeWouldOccur)
+    );
+    assert_eq!(
+        durable.managed().risk().snapshot(account(1)).unwrap(),
+        before
+    );
+    assert_eq!(durable.managed().risk().reservation_count(), 2);
+    durable
+        .write_checkpoint(&snapshot, SnapshotOptions::default())
+        .unwrap();
+    durable.close().unwrap();
+
+    let mut recovered = DurableCallAuctionRiskEngine::open_with_checkpoint(
+        &wal,
+        &snapshot,
+        definition(),
+        &profile_values,
+        options(),
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().checkpointed_commands, 5);
+    assert_eq!(recovered.recovery().replayed_commands, 0);
+    assert_eq!(
+        recovered.managed().risk().snapshot(account(1)).unwrap(),
+        before
+    );
+    assert_eq!(recovered.managed().risk().reservation_count(), 2);
+    assert_eq!(
+        recovered.managed().engine().phase_snapshot().phase(),
+        CallAuctionPhase::Frozen
+    );
+    assert_eq!(recovered.managed().engine().book().next_trade_id(), 1);
+    let frames = frame_count(&wal);
+    assert!(recovered.submit(command).unwrap().replayed);
+    assert_eq!(frame_count(&wal), frames);
+    recovered.managed().validate().unwrap();
+    recovered.close().unwrap();
+}
+
+#[test]
 fn checkpoint_is_snapshot_kind_five_and_replays_only_the_suffix() {
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -396,7 +487,7 @@ fn checkpoint_is_snapshot_kind_five_and_replays_only_the_suffix() {
     durable.close().unwrap();
 
     let bytes = fs::read(&snapshot).unwrap();
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 15);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 16);
     assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 5);
     let mut recovered = DurableCallAuctionRiskEngine::open_with_checkpoint(
         &wal,

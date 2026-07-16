@@ -21,8 +21,9 @@ use crate::auction_book::{
     CallAuctionCancelError, CallAuctionCancellation, CallAuctionCommitError,
     CallAuctionConstructionError, CallAuctionIndicative, CallAuctionInvariantViolation,
     CallAuctionMassCancelError, CallAuctionMassCancelResult, CallAuctionOrder,
-    CallAuctionOrderSnapshot, CallAuctionPrepareError, CallAuctionReplaceError, CallAuctionTrade,
-    CallAuctionUncrossPolicy, PreparedCallAuctionUncross,
+    CallAuctionOrderSnapshot, CallAuctionPrepareError, CallAuctionReplaceError,
+    CallAuctionSelfTradePolicy, CallAuctionTrade, CallAuctionUncrossPolicy,
+    PreparedCallAuctionUncross,
 };
 use crate::bounded_hash::{BoundedHashMap, BoundedHashSet};
 use crate::instrument::{AdmissionError, InstrumentDefinition};
@@ -820,6 +821,8 @@ pub enum CallAuctionRejectReason {
     AmendQuantityNotReduced,
     /// Frozen interest had no executable clearing state.
     NoExecutableInterest,
+    /// The explicit uncross policy aborted at a canonical same-account pair.
+    SelfTradeWouldOccur,
     /// Submitted account has no immutable risk profile.
     RiskProfileMissing,
     /// Submitted account is blocked by its risk profile.
@@ -2547,6 +2550,7 @@ fn decoded_uncross_event_grammar_is_valid(events: &[CallAuctionEvent]) -> bool {
         kind:
             CallAuctionEventKind::UncrossCompleted {
                 clearing,
+                policy,
                 trade_count,
                 cancellation_count,
                 book_revision,
@@ -2579,6 +2583,8 @@ fn decoded_uncross_event_grammar_is_valid(events: &[CallAuctionEvent]) -> bool {
             return false;
         };
         if trade.price() != clearing.price()
+            || (policy.self_trade() == CallAuctionSelfTradePolicy::Abort
+                && trade.buy_account_id() == trade.sell_account_id())
             || previous_trade_id
                 .is_some_and(|previous| previous.checked_add(1) != Some(trade.trade_id().get()))
         {
@@ -4050,10 +4056,18 @@ impl CallAuctionEngine {
             .phase_revision
             .checked_add(1)
             .ok_or(CallAuctionEngineError::PhaseRevisionExhausted)?;
-        let prepared = self
+        let prepared = match self
             .book
             .prepare_uncross(indicative, uncross.uncross_policy)
-            .map_err(CallAuctionEngineError::UncrossPreparation)?;
+        {
+            Ok(prepared) => prepared,
+            Err(CallAuctionPrepareError::SelfTradeWouldOccur { .. }) => {
+                return Ok(PreparedCallAuctionAction::Rejected(
+                    CallAuctionRejectReason::SelfTradeWouldOccur,
+                ));
+            }
+            Err(error) => return Err(CallAuctionEngineError::UncrossPreparation(error)),
+        };
         Ok(PreparedCallAuctionAction::Uncross {
             auction_id: uncross.auction_id,
             phase_revision,
@@ -4667,6 +4681,15 @@ impl CallAuctionPhaseAudit {
                             CallAuctionCommand::Uncross(_),
                             CallAuctionRejectReason::NoExecutableInterest
                         )
+                    ) || matches!(
+                        (cached.command, reason),
+                        (
+                            CallAuctionCommand::Uncross(CallAuctionUncrossCommand {
+                                uncross_policy,
+                                ..
+                            }),
+                            CallAuctionRejectReason::SelfTradeWouldOccur
+                        ) if uncross_policy.self_trade() == CallAuctionSelfTradePolicy::Abort
                     ) || matches!(
                         cached.command,
                         CallAuctionCommand::Submit(_) | CallAuctionCommand::Replace(_)

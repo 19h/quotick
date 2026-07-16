@@ -151,6 +151,7 @@ fn encode_uncross_policy(encoder: &mut Encoder, policy: CallAuctionUncrossPolicy
     });
     encoder.u8(match policy.self_trade() {
         CallAuctionSelfTradePolicy::Permit => 0,
+        CallAuctionSelfTradePolicy::Abort => 1,
     });
 }
 
@@ -180,6 +181,7 @@ fn decode_uncross_policy(
     };
     let self_trade = match decoder.u8()? {
         0 => CallAuctionSelfTradePolicy::Permit,
+        1 => CallAuctionSelfTradePolicy::Abort,
         tag => {
             return Err(CodecError::InvalidTag {
                 type_name: "CallAuctionSelfTradePolicy",
@@ -333,6 +335,7 @@ fn encode_reject_reason(encoder: &mut Encoder, reason: CallAuctionRejectReason) 
         CallAuctionRejectReason::RiskPositionLimit => encoder.u8(20),
         CallAuctionRejectReason::RiskArithmeticOverflow => encoder.u8(21),
         CallAuctionRejectReason::AmendQuantityNotReduced => encoder.u8(22),
+        CallAuctionRejectReason::SelfTradeWouldOccur => encoder.u8(23),
     }
 }
 
@@ -383,6 +386,7 @@ fn decode_reject_reason(decoder: &mut Decoder<'_>) -> Result<CallAuctionRejectRe
         20 => Ok(CallAuctionRejectReason::RiskPositionLimit),
         21 => Ok(CallAuctionRejectReason::RiskArithmeticOverflow),
         22 => Ok(CallAuctionRejectReason::AmendQuantityNotReduced),
+        23 => Ok(CallAuctionRejectReason::SelfTradeWouldOccur),
         tag => Err(CodecError::InvalidTag {
             type_name: "CallAuctionRejectReason",
             tag,

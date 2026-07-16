@@ -1,4 +1,7 @@
-# Semantic Snapshot Format Version 15
+# Expired Semantic Snapshot Format Version 15
+
+Version 15 is expired. The runtime accepts only
+[semantic snapshot format version 16](snapshot-v16.md).
 
 `SnapshotFile` stores one complete typed semantic value in a bounded,
 versioned CRC-32C envelope. Version 15 preserves the version-14 kind registry

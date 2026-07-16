@@ -194,6 +194,11 @@ For `T` buyer/seller trade pairs, `C` remainder cancellations, and `M <= O`
 affected orders, uncross preparation is `O(O log O + P + F_b + F_a + T)` time
 with `O(F_b + F_a + T + C)` fallibly reserved result memory. The two-pointer
 pairing bound is `T <= F_b + F_a - 1` when both fill vectors are non-empty.
+`Abort` self-trade policy adds one constant-time account comparison per
+candidate pair. A conflict can occur after a strict prefix has been written to
+the leased trade buffer; returning the preparation clears no capacity, drops
+the lease, and leaves authoritative state unchanged. No alternative-pair
+search or additional storage is performed.
 Commit is `O(M(log O + log P))` and performs no heap allocation.
 
 A successful complete collection-book audit uses `O(1)` auxiliary space and
@@ -213,6 +218,10 @@ exactly one event. Both add `O(1)` event-construction time and space. Uncross
 preparation has the preceding book bound plus `O(T + C)` exact report-capacity
 derivation, and commit adds `O(T + C)` event emission into the already reserved
 trace without vector growth.
+An aborted self-trade uncross performs ordinary discovery/allocation and scans
+only through the first conflicting canonical pair, then emits one fixed-size
+business-rejection event. It performs no commit work or terminal-lane
+admission.
 
 One sequenced indicative publication reconstructs the canonical bid and ask
 aggregates and applies the shared discovery kernel in `O(B + A)` time with
@@ -260,6 +269,8 @@ An accepted mass cancel applies `K` ordinary reservation removals in expected
 `O(K)` risk time. Its aggregate completion has no second risk-state effect.
 Indicative publication requires no account lookup or reservation mutation and
 adds `O(1)` risk authorization and trace-application work.
+An aborted self-trade rejection likewise adds `O(1)` risk work and changes no
+reservation, exposure, position, or netting scratch.
 
 ## Durable auction recovery
 
@@ -577,6 +588,8 @@ updates and `U` unique affected limit identities:
 - An indicative publication fixes `E = 1`. Discovery is already charged to the
   engine as `O(B + A)`; publisher and replica retention, validation, and
   invalidation of its fixed-size optional state are `O(1)`.
+- An aborted self-trade rejection fixes `E = 1` and projects one
+  `NoPublicChange` in `O(1)`; its exact retry fixes `E = 0`.
 - Snapshot output is `O(P)`; double-buffered snapshot application is
   allocation-free after construction and `O(P log P)`.
 

@@ -273,6 +273,22 @@ fn uncross_command_with_allocation(
     allocation: AuctionAllocationPolicy,
     remainder: CallAuctionRemainderPolicy,
 ) -> CallAuctionCommand {
+    uncross_command_with_policy(
+        engine,
+        command_id,
+        allocation,
+        remainder,
+        CallAuctionSelfTradePolicy::Permit,
+    )
+}
+
+fn uncross_command_with_policy(
+    engine: &CallAuctionRiskManagedEngine,
+    command_id: u64,
+    allocation: AuctionAllocationPolicy,
+    remainder: CallAuctionRemainderPolicy,
+    self_trade: CallAuctionSelfTradePolicy,
+) -> CallAuctionCommand {
     CallAuctionCommand::Uncross(CallAuctionUncrossCommand {
         command_id: CommandId::new(command_id).unwrap(),
         instrument_id: instrument(),
@@ -282,11 +298,7 @@ fn uncross_command_with_allocation(
         price_band: engine.engine().book().instrument_price_band(),
         reference_price: Price::from_raw(100),
         price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
-        uncross_policy: CallAuctionUncrossPolicy::new(
-            allocation,
-            remainder,
-            CallAuctionSelfTradePolicy::Permit,
-        ),
+        uncross_policy: CallAuctionUncrossPolicy::new(allocation, remainder, self_trade),
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
@@ -776,6 +788,66 @@ fn uncross_updates_positions_and_retains_only_exact_partial_reservations() {
         0
     );
     assert_eq!(engine.risk().reservation_count(), 0);
+    engine.validate().unwrap();
+}
+
+#[test]
+fn aborted_self_trade_uncross_is_risk_neutral_and_exactly_replayable() {
+    let mut engine = managed(2);
+    engine
+        .register_account(account(1), broad_profile(AccountRiskState::Active, 0))
+        .unwrap();
+    for command in [
+        phase_command(1, 1, 0, CallAuctionPhase::Collecting),
+        submit_command(
+            2,
+            order(
+                1,
+                1,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                5,
+            ),
+        ),
+        submit_command(
+            3,
+            order(
+                2,
+                1,
+                Side::Sell,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                5,
+            ),
+        ),
+        phase_command(4, 1, 1, CallAuctionPhase::Frozen),
+    ] {
+        engine.submit(command).unwrap();
+    }
+    let before = engine.risk().snapshot(account(1)).unwrap();
+    let command = uncross_command_with_policy(
+        &engine,
+        5,
+        AuctionAllocationPolicy::PriceTime,
+        CallAuctionRemainderPolicy::RetainAll,
+        CallAuctionSelfTradePolicy::Abort,
+    );
+    let rejected = engine.submit(command).unwrap();
+
+    assert_rejection(&rejected, CallAuctionRejectReason::SelfTradeWouldOccur);
+    assert_eq!(engine.risk().snapshot(account(1)).unwrap(), before);
+    assert_eq!(engine.risk().reservation_count(), 2);
+    assert_eq!(engine.engine().book().active_order_count(), 2);
+    assert_eq!(engine.engine().book().next_trade_id(), 1);
+    assert_eq!(
+        engine.engine().phase_snapshot().phase(),
+        CallAuctionPhase::Frozen
+    );
+
+    let retry = engine.submit(command).unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.command_sequence, rejected.command_sequence);
+    assert_eq!(engine.risk().snapshot(account(1)).unwrap(), before);
+    assert_eq!(engine.risk().reservation_count(), 2);
     engine.validate().unwrap();
 }
 

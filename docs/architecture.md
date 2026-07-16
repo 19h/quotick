@@ -678,8 +678,12 @@ interest for discovery, allocation, and uncross preparation.
 9. Counterparty pairing preserves each side's allocation order and repeatedly
    transfers the smaller remaining side fill. If `F_b` and `F_a` are positive
    fill counts, pair count `T <= F_b + F_a - 1`; all paired quantities sum in
-   `u128` to `E(p)`. The only represented self-trade policy is explicit
-   `Permit`; preventive/cancel/decrement policies are not inferred.
+   `u128` to `E(p)`. Self-trade policy is explicit: `Permit` retains a
+   same-account pair, while `Abort` rejects the complete preparation at the
+   first canonical same-account pair. `Abort` reports the account, buy order,
+   sell order, and prevented quantity through the direct book error; it does
+   not re-pair, alter allocation, cancel/decrement interest, assign
+   aggressor/resting roles, or mutate trade/book state.
 10. Remainder policy is explicit: `RetainAll`, `CancelMarket`, or `CancelAll`.
     Preparation performs a linear merge of source-indexed fills with canonical
     orders, computes every positive post-fill remainder, proves the existing
@@ -703,12 +707,13 @@ interest for discovery, allocation, and uncross preparation.
       preparation, stale commit, or committed result returns that set.
     - The book primitive itself has no command sequence, phase, idempotency,
       or durability semantics. `CallAuctionEngine` supplies the first three,
-      and the version-15 durable wrapper supplies stable wire encoding,
-      full-WAL recovery, and snapshot-version-15 checkpoint/cutover recovery.
+      and the version-16 durable wrapper supplies stable wire encoding,
+      full-WAL recovery, and snapshot-version-16 checkpoint/cutover recovery.
     - The separate `CallAuctionRiskManagedEngine` supplies optional profile
       admission, reservations, positions, and independently replayed coupled
-      checkpoints; settlement, public/private auction transport, preventive
-      self-trade policies, and venue conformance remain absent.
+      checkpoints; settlement, public/private auction transport, venue-specific
+      self-trade cancellation/decrement or alternative-pairing policies, and
+      venue conformance remain absent.
 
 ## Sequenced call-auction engine invariants
 
@@ -893,7 +898,7 @@ admission and tracks reservations and positions.
    risk-rejected submits and replacements because they still require core
    preparation.
 8. The coupled checkpoint has a stable complete-value little-endian codec and
-   direct restore under default or explicit limits. Snapshot version 15 assigns
+   direct restore under default or explicit limits. Snapshot version 16 assigns
    it `QSNP` kind `5`. `DurableCallAuctionRiskEngine` binds a canonical
    definition/profile prefix, persists command/report pairs, completes at most
    one dangling non-retry command, verifies risk-aware replay, and supports
@@ -905,7 +910,7 @@ admission and tracks reservations and positions.
 This section defines WAL persistence, recovery, and checkpoint rules for the
 call-auction engine.
 
-1. WAL version 15 retains stable record-kind tags `9` and `10` for one
+1. WAL version 16 retains stable record-kind tags `9` and `10` for one
    call-auction command and its complete execution report. All multibyte fields
    are little-endian, enum tags are explicit, and decoding reconstructs and
    validates domain values, contiguous event sequencing, report outcome/event
@@ -915,11 +920,14 @@ call-auction engine.
    and authoritative `u16` order priority classes across commands, snapshots,
    amendments, and recovery. Indicative command tag `7`, action tag `7`, and
    event-kind tag `9` bind auction, phase revision, book revision, band,
-   reference, policy, and optional clearing. Uncross commands and completion events
-   carry the same explicit price-time or pro-rata-time allocation-policy tag.
+   reference, policy, and optional clearing. Uncross commands and completion
+   events carry the same explicit price-time or pro-rata-time allocation-policy
+   tag and self-trade policy tags `0` `Permit` or `1` `Abort`. Rejection tag
+   `23` records an aborted canonical same-account pair without publishing its
+   private identities.
 2. An uncut auction journal contains one immutable instrument definition
    followed by strict command/report pairs. A compacted journal instead begins
-   with one kind-`8` anchor bound to snapshot-version-15 call-auction kind `4`,
+   with one kind-`8` anchor bound to snapshot-version-16 call-auction kind `4`,
    followed by the same suffix grammar. A report without a command, consecutive
    commands, a second definition, an interior anchor, a
    continuous-matching/risk/ledger record, or any other kind fails recovery. At
@@ -1645,7 +1653,7 @@ storage, and recovery grammar.
     generation and first-retained-sequence selector after the new generation is
     synchronized.
 22. Matching, coupled risk, ledger, and call-auction cutover publishes an
-    inactive A/B checkpoint slot before publishing a synchronized version-15
+    inactive A/B checkpoint slot before publishing a synchronized version-16
     anchor and any
     retained suffix. Single-file storage atomically renames the complete
     anchor-plus-suffix file over the WAL. Segmented storage synchronizes every
@@ -1666,7 +1674,7 @@ storage, and recovery grammar.
 This section defines the semantic snapshot file format and the checkpoint
 capture, verification, and cutover rules.
 
-1. A version-15 `QSNP` file carries a fixed 28 B header with magic, typed
+1. A version-16 `QSNP` file carries a fixed 28 B header with magic, typed
    payload kind (`1` ledger, `2` matching, `3` coupled risk/matching, `4` call
    auction,
    `5` coupled call-auction risk),
@@ -1693,7 +1701,7 @@ capture, verification, and cutover rules.
 9. Ledger, matching, coupled risk, and call-auction checkpoints retain complete
    semantic history. Uncut recovery scans the complete WAL to prove the prefix.
    Cutover in either physical layout replaces that prefix with an anchor bound
-   to one version-15 A/B snapshot slot, so reopen scans only the
+   to one version-16 A/B snapshot slot, so reopen scans only the
    anchor and suffix. This does not bound checkpoint memory, capture pause,
    retained idempotency/audit history, or semantic shard-generation lifetime.
 10. Matching candidate capture requires exact live topology and command-derived
@@ -1748,8 +1756,8 @@ capture, verification, and cutover rules.
       namespace mutation.
 
 The authoritative persisted framing and payload schemas are
-[WAL format version 15](wal-v15.md) and
-[Semantic snapshot format version 15](snapshot-v15.md). Filesystem and device
+[WAL format version 16](wal-v16.md) and
+[Semantic snapshot format version 16](snapshot-v16.md). Filesystem and device
 assumptions are bounded by the [Local storage contract](storage.md).
 
 ## Failure model
@@ -2117,6 +2125,12 @@ There is no additional claim that semantic checkpoint history is size bounded.
   Quotick's ingress-supplied numeric class, exact priority-class tiers,
   quantity-increment floor, and FIFO residual are internal deterministic rules
   and do not claim compatibility with any venue category or protocol.
+- CME describes self-match prevention using one common identifier and
+  instruction-dependent cancellation behavior in its
+  [Globex Self-Match Prevention FAQ](https://www.cmegroup.com/solutions/market-access/globex/trade-on-globex/faq-self-match.html).
+  Quotick instead compares already-routed `AccountId` values and supports
+  fail-closed complete-uncross `Abort`; it does not claim venue-protocol
+  compatibility.
 - Gregorian calendar strings used at service boundaries follow
   [ISO 8601-1:2019](https://www.iso.org/standard/70907.html). The internal
   `AccountingDate` wire scalar is signed days relative to 1970-01-01 and does
@@ -2135,7 +2149,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Snapshots and compaction | single-file and segmented matching/risk/ledger/call-auction WAL cutover plus off-thread direct and WAL-synchronized plain/coupled continuous-matching and call-auction replay verification are implemented; verified matching/risk/auction handles can retire an older prefix by cursor-streaming only its synchronized suffix. Remaining evidence is bounded checkpoint memory and writer audit-copy/projection/direct-reconstruction pause, bounded suffix-copy pause, semantic generation rollover, and externally retained audit/idempotency proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
-| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, sourced explicit-reference stop-market/stop-limit activation with durable source identity/version/sequence and gap/reset validation, native reserve and fully hidden continuous queue classes, atomic minimum-quantity IOC, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, authoritative typed priority classes, account/side mass cancellation, atomic new-identity replacement with full priority loss, aggregate depth queries, banded discovery, sequenced nullable indicative publication, explicit price-time and price/class-tier pro-rata-time allocation, deterministic pairing/atomic uncross, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, and plain/coupled-risk full-WAL plus cutover recovery are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authenticated external stop-reference acquisition/normalization and missed-reference recovery, auction reference and dynamic-band derivation, authenticated venue-category-to-class mapping, venue-specific display/allocation policies, preventive self-trade policies, ledger integration, volatility/interruption auctions, pegged, discretionary, venue-specific in-place amendment/uncross/publication cadence/filtering semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
+| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, sourced explicit-reference stop-market/stop-limit activation with durable source identity/version/sequence and gap/reset validation, native reserve and fully hidden continuous queue classes, atomic minimum-quantity IOC, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, authoritative typed priority classes, account/side mass cancellation, atomic new-identity replacement with full priority loss, aggregate depth queries, banded discovery, sequenced nullable indicative publication, explicit price-time and price/class-tier pro-rata-time allocation, deterministic pairing/atomic uncross with fail-closed self-trade abort, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, and plain/coupled-risk full-WAL plus cutover recovery are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authenticated external stop-reference acquisition/normalization and missed-reference recovery, auction reference and dynamic-band derivation, authenticated venue-category-to-class and beneficial-owner mapping, venue-specific display/allocation policies, venue-specific self-trade cancellation/decrement and alternative-pairing policies, ledger integration, volatility/interruption auctions, pegged, discretionary, venue-specific in-place amendment/uncross/publication cadence/filtering semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
 | High | Instrument lifecycle expansion | authoritative calendar ingestion/distribution/activation, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |

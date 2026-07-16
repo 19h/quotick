@@ -171,6 +171,14 @@ fn uncross_with_allocation(
     command_id: u64,
     allocation: AuctionAllocationPolicy,
 ) -> CallAuctionCommand {
+    uncross_with_policy(command_id, allocation, CallAuctionSelfTradePolicy::Permit)
+}
+
+fn uncross_with_policy(
+    command_id: u64,
+    allocation: AuctionAllocationPolicy,
+    self_trade: CallAuctionSelfTradePolicy,
+) -> CallAuctionCommand {
     let grid = AuctionPriceGrid::new(1).unwrap();
     CallAuctionCommand::Uncross(CallAuctionUncrossCommand {
         command_id: CommandId::new(command_id).unwrap(),
@@ -189,7 +197,7 @@ fn uncross_with_allocation(
         uncross_policy: CallAuctionUncrossPolicy::new(
             allocation,
             CallAuctionRemainderPolicy::CancelAll,
-            CallAuctionSelfTradePolicy::Permit,
+            self_trade,
         ),
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
@@ -331,6 +339,60 @@ fn call_auction_uncross_policy_has_stable_explicit_allocation_tags() {
     assert_eq!(
         CallAuctionCommand::decode(&pro_rata).unwrap(),
         uncross_with_allocation(5, AuctionAllocationPolicy::ProRataTime)
+    );
+}
+
+#[test]
+fn call_auction_abort_self_trade_policy_and_rejection_have_stable_tags() {
+    let command = uncross_with_policy(
+        5,
+        AuctionAllocationPolicy::PriceTime,
+        CallAuctionSelfTradePolicy::Abort,
+    );
+    let encoded_command = command.encode().unwrap();
+    assert_eq!(encoded_command.len(), 78);
+    assert_eq!(encoded_command[65..70], [1, 1, 0, 2, 1]);
+    assert_eq!(
+        CallAuctionCommand::decode(&encoded_command).unwrap(),
+        command
+    );
+
+    let mut engine = CallAuctionEngine::try_new(definition()).unwrap();
+    for value in [
+        phase(1, 0, CallAuctionPhase::Collecting),
+        submit(2, auction_order(1, 7, Side::Buy, 5)),
+        submit(3, auction_order(2, 7, Side::Sell, 5)),
+        phase(4, 1, CallAuctionPhase::Frozen),
+    ] {
+        engine.submit(value).unwrap();
+    }
+    let report = engine.submit(command).unwrap();
+    let encoded_report = report.encode().unwrap();
+    assert_eq!(encoded_report.len(), 49);
+    assert_eq!(encoded_report[17], 23);
+    assert_eq!(encoded_report[46..48], [6, 23]);
+    assert_eq!(
+        CallAuctionExecutionReport::decode(&encoded_report).unwrap(),
+        report
+    );
+
+    let mut permitted = CallAuctionEngine::try_new(definition()).unwrap();
+    for value in [
+        phase(1, 0, CallAuctionPhase::Collecting),
+        submit(2, auction_order(1, 7, Side::Buy, 5)),
+        submit(3, auction_order(2, 7, Side::Sell, 5)),
+        phase(4, 1, CallAuctionPhase::Frozen),
+    ] {
+        permitted.submit(value).unwrap();
+    }
+    let mut invalid_completion = permitted.submit(uncross(5)).unwrap().encode().unwrap();
+    let completion_start = invalid_completion.len() - 1 - 108;
+    invalid_completion[completion_start + 75] = 1;
+    assert_eq!(
+        CallAuctionExecutionReport::decode(&invalid_completion),
+        Err(CodecError::InvalidValue(
+            "call-auction accepted report grammar is inconsistent"
+        ))
     );
 }
 
@@ -497,6 +559,16 @@ fn call_auction_codecs_reject_invalid_tags_lengths_bands_and_report_grammar() {
         CallAuctionCommand::decode(&invalid_allocation),
         Err(CodecError::InvalidTag {
             type_name: "AuctionAllocationPolicy",
+            tag: 255,
+        })
+    );
+
+    let mut invalid_self_trade = uncross(1).encode().unwrap();
+    invalid_self_trade[69] = 255;
+    assert_eq!(
+        CallAuctionCommand::decode(&invalid_self_trade),
+        Err(CodecError::InvalidTag {
+            type_name: "CallAuctionSelfTradePolicy",
             tag: 255,
         })
     );

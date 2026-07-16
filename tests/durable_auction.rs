@@ -12,10 +12,11 @@ use quotick::auction_book::{
 };
 use quotick::auction_engine::{
     CallAuctionAmendOrder, CallAuctionCheckpoint, CallAuctionCheckpointCapture, CallAuctionCommand,
-    CallAuctionEngine, CallAuctionEngineError, CallAuctionEngineLimits,
+    CallAuctionCommandOutcome, CallAuctionEngine, CallAuctionEngineError, CallAuctionEngineLimits,
     CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionExecutionReport,
     CallAuctionIndicativeCommand, CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl,
-    CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionRejectReason, CallAuctionReplaceOrder, CallAuctionSubmitOrder,
+    CallAuctionUncrossCommand,
 };
 use quotick::codec::{BinaryCodec, CodecError};
 use quotick::durable_auction::{
@@ -267,6 +268,24 @@ fn uncross_for_allocation(
     allocation: AuctionAllocationPolicy,
     remainder: CallAuctionRemainderPolicy,
 ) -> CallAuctionCommand {
+    uncross_for_policy(
+        command_id,
+        auction_id,
+        revision,
+        allocation,
+        remainder,
+        CallAuctionSelfTradePolicy::Permit,
+    )
+}
+
+fn uncross_for_policy(
+    command_id: u64,
+    auction_id: AuctionId,
+    revision: u64,
+    allocation: AuctionAllocationPolicy,
+    remainder: CallAuctionRemainderPolicy,
+    self_trade: CallAuctionSelfTradePolicy,
+) -> CallAuctionCommand {
     CallAuctionCommand::Uncross(CallAuctionUncrossCommand {
         command_id: CommandId::new(command_id).unwrap(),
         instrument_id: InstrumentId::new(71).unwrap(),
@@ -281,11 +300,7 @@ fn uncross_for_allocation(
         .unwrap(),
         reference_price: Price::from_raw(100),
         price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
-        uncross_policy: CallAuctionUncrossPolicy::new(
-            allocation,
-            remainder,
-            CallAuctionSelfTradePolicy::Permit,
-        ),
+        uncross_policy: CallAuctionUncrossPolicy::new(allocation, remainder, self_trade),
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
@@ -753,6 +768,82 @@ fn durable_auction_round_trip_recovers_phase_book_trades_and_exact_retry() {
 }
 
 #[test]
+fn durable_abort_self_trade_rejection_recovers_frozen_and_suppresses_retry_writes() {
+    let area = TestPath::directory("abort-self-trade");
+    fs::create_dir_all(area.path()).unwrap();
+    let wal = area.join("auction.wal");
+    let snapshot = area.join("auction.qsnp");
+    let mut durable = DurableCallAuctionEngine::open(&wal, definition(), options()).unwrap();
+    for command in [
+        phase(1, 0, CallAuctionPhase::Collecting),
+        submit(2, order(1, 7, Side::Buy, 5)),
+        submit(3, order(2, 7, Side::Sell, 5)),
+        phase(4, 1, CallAuctionPhase::Frozen),
+    ] {
+        durable.submit(command).unwrap();
+    }
+    let command = uncross_for_policy(
+        5,
+        auction(),
+        2,
+        AuctionAllocationPolicy::PriceTime,
+        CallAuctionRemainderPolicy::RetainAll,
+        CallAuctionSelfTradePolicy::Abort,
+    );
+    let rejected = durable.submit(command).unwrap();
+    assert_eq!(
+        rejected.outcome,
+        CallAuctionCommandOutcome::Rejected(CallAuctionRejectReason::SelfTradeWouldOccur)
+    );
+    assert_eq!(durable.engine().book().next_trade_id(), 1);
+    assert_eq!(durable.engine().book().active_order_count(), 2);
+    assert_eq!(
+        durable.engine().phase_snapshot().phase(),
+        CallAuctionPhase::Frozen
+    );
+    durable
+        .write_checkpoint(&snapshot, SnapshotOptions::default())
+        .unwrap();
+    durable.close().unwrap();
+
+    let mut recovered = DurableCallAuctionEngine::open(&wal, definition(), options()).unwrap();
+    assert_eq!(recovered.recovery().replayed_commands, 5);
+    assert_eq!(recovered.engine().book().next_trade_id(), 1);
+    assert_eq!(recovered.engine().book().active_order_count(), 2);
+    assert_eq!(
+        recovered.engine().phase_snapshot().phase(),
+        CallAuctionPhase::Frozen
+    );
+    let frames = frame_kinds(&wal);
+    let retry = recovered.submit(command).unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.command_sequence, rejected.command_sequence);
+    assert_eq!(frame_kinds(&wal), frames);
+    recovered.engine().validate().unwrap();
+    recovered.close().unwrap();
+
+    let mut checkpointed = DurableCallAuctionEngine::open_with_checkpoint(
+        &wal,
+        &snapshot,
+        definition(),
+        options(),
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(checkpointed.recovery().checkpointed_commands, 5);
+    assert_eq!(checkpointed.recovery().replayed_commands, 0);
+    assert_eq!(checkpointed.engine().book().next_trade_id(), 1);
+    assert_eq!(checkpointed.engine().book().active_order_count(), 2);
+    assert_eq!(
+        checkpointed.engine().phase_snapshot().phase(),
+        CallAuctionPhase::Frozen
+    );
+    assert!(checkpointed.submit(command).unwrap().replayed);
+    checkpointed.engine().validate().unwrap();
+    checkpointed.close().unwrap();
+}
+
+#[test]
 fn pro_rata_uncross_recovers_identically_from_wal_and_snapshot_history() {
     let area = TestPath::directory("pro-rata-recovery");
     fs::create_dir_all(area.path()).unwrap();
@@ -1143,7 +1234,7 @@ fn auction_checkpoint_has_stable_kind_codec_and_direct_restore() {
     SnapshotFile::write(&snapshot, &shared, SnapshotOptions::default()).unwrap();
     let bytes = fs::read(snapshot).unwrap();
     assert_eq!(&bytes[0..4], b"QSNP");
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 15);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 16);
     assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 4);
 }
 
