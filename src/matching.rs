@@ -1772,6 +1772,245 @@ impl DepthSummary {
     }
 }
 
+/// One immutable public-depth liquidity request.
+///
+/// The side is the hypothetical aggressor. The quote therefore consumes
+/// displayed aggregate liquidity on the opposite side in market priority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DisplayedLiquidityRequest {
+    side: Side,
+    quantity: Quantity,
+    constraint: StopActivation,
+}
+
+impl DisplayedLiquidityRequest {
+    /// Constructs a public displayed-liquidity request.
+    #[must_use]
+    pub const fn new(side: Side, quantity: Quantity, constraint: StopActivation) -> Self {
+        Self {
+            side,
+            quantity,
+            constraint,
+        }
+    }
+
+    /// Returns the hypothetical aggressor side.
+    #[must_use]
+    pub const fn side(self) -> Side {
+        self.side
+    }
+
+    /// Returns the positive requested quantity.
+    #[must_use]
+    pub const fn quantity(self) -> Quantity {
+        self.quantity
+    }
+
+    /// Returns the market-or-limit price constraint.
+    #[must_use]
+    pub const fn constraint(self) -> StopActivation {
+        self.constraint
+    }
+
+    const fn crosses(self, price: Price) -> bool {
+        execution_constraint_crosses(self.side, self.constraint, price)
+    }
+}
+
+const fn execution_constraint_crosses(
+    side: Side,
+    constraint: StopActivation,
+    price: Price,
+) -> bool {
+    match (side, constraint) {
+        (_, StopActivation::Market) => true,
+        (Side::Buy, StopActivation::Limit(limit)) => limit.raw() >= price.raw(),
+        (Side::Sell, StopActivation::Limit(limit)) => limit.raw() <= price.raw(),
+    }
+}
+
+/// Why a displayed-liquidity quote stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisplayedLiquidityTermination {
+    /// Every requested lot is represented by displayed public depth.
+    Filled,
+    /// The next displayed opposite price is outside the supplied limit.
+    PriceLimit,
+    /// No further displayed opposite-side price exists.
+    BookExhausted,
+}
+
+/// Exact nonmutating economics of consuming current displayed public depth.
+///
+/// The quote excludes fully hidden leaves and undisplayed reserve leaves. Raw
+/// price notional is the signed sum of `price.raw() * quoted lots`; it and the
+/// quoted quantity preserve an exact volume-weighted-price fraction without a
+/// rounding policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DisplayedLiquidityQuote {
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    book_event_sequence: u64,
+    request: DisplayedLiquidityRequest,
+    quoted_quantity_lots: u64,
+    unquoted_quantity_lots: u64,
+    raw_price_notional: i128,
+    worst_quoted_price: Option<Price>,
+    contributing_level_count: usize,
+    termination: DisplayedLiquidityTermination,
+}
+
+impl DisplayedLiquidityQuote {
+    pub(crate) fn try_from_depth<I>(
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        book_event_sequence: u64,
+        request: DisplayedLiquidityRequest,
+        depth: I,
+    ) -> Result<Self, InvariantViolation>
+    where
+        I: IntoIterator<Item = LevelSnapshot>,
+    {
+        let mut totals = ExecutionQuoteTotals::new(request.quantity.lots());
+        let mut contributing_level_count = 0_usize;
+        for level in depth {
+            if level.quantity == 0 || level.order_count == 0 {
+                return Err(InvariantViolation::new(format!(
+                    "public depth level at {} has a zero aggregate or order count",
+                    level.price.raw()
+                )));
+            }
+            if !request.crosses(level.price) {
+                return Ok(Self::from_totals(
+                    instrument_id,
+                    instrument_version,
+                    book_event_sequence,
+                    request,
+                    totals,
+                    contributing_level_count,
+                    DisplayedLiquidityTermination::PriceLimit,
+                ));
+            }
+            let quantity_lots = u64::try_from(level.quantity.min(u128::from(totals.remaining())))
+                .expect("selected public quantity cannot exceed requested u64 quantity");
+            totals.record_execution(level.price, quantity_lots);
+            contributing_level_count =
+                contributing_level_count.checked_add(1).ok_or_else(|| {
+                    InvariantViolation::new("public depth contributing-level count is exhausted")
+                })?;
+            if totals.remaining() == 0 {
+                return Ok(Self::from_totals(
+                    instrument_id,
+                    instrument_version,
+                    book_event_sequence,
+                    request,
+                    totals,
+                    contributing_level_count,
+                    DisplayedLiquidityTermination::Filled,
+                ));
+            }
+        }
+        Ok(Self::from_totals(
+            instrument_id,
+            instrument_version,
+            book_event_sequence,
+            request,
+            totals,
+            contributing_level_count,
+            DisplayedLiquidityTermination::BookExhausted,
+        ))
+    }
+
+    const fn from_totals(
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        book_event_sequence: u64,
+        request: DisplayedLiquidityRequest,
+        totals: ExecutionQuoteTotals,
+        contributing_level_count: usize,
+        termination: DisplayedLiquidityTermination,
+    ) -> Self {
+        Self {
+            instrument_id,
+            instrument_version,
+            book_event_sequence,
+            request,
+            quoted_quantity_lots: totals.executed_quantity_lots,
+            unquoted_quantity_lots: totals.incoming_remaining_lots,
+            raw_price_notional: totals.raw_price_notional,
+            worst_quoted_price: totals.worst_execution_price,
+            contributing_level_count,
+            termination,
+        }
+    }
+
+    /// Returns the quoted instrument.
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version used by the quote.
+    #[must_use]
+    pub const fn instrument_version(self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the final source event sequence visible to the quote.
+    #[must_use]
+    pub const fn book_event_sequence(self) -> u64 {
+        self.book_event_sequence
+    }
+
+    /// Returns the complete displayed-liquidity request.
+    #[must_use]
+    pub const fn request(self) -> DisplayedLiquidityRequest {
+        self.request
+    }
+
+    /// Returns the positive requested quantity.
+    #[must_use]
+    pub const fn requested_quantity(self) -> Quantity {
+        self.request.quantity
+    }
+
+    /// Returns lots represented by displayed public depth.
+    #[must_use]
+    pub const fn quoted_quantity_lots(self) -> u64 {
+        self.quoted_quantity_lots
+    }
+
+    /// Returns requested lots not represented by the selected public depth.
+    #[must_use]
+    pub const fn unquoted_quantity_lots(self) -> u64 {
+        self.unquoted_quantity_lots
+    }
+
+    /// Returns exact signed raw-price notional over quoted public depth.
+    #[must_use]
+    pub const fn raw_price_notional(self) -> i128 {
+        self.raw_price_notional
+    }
+
+    /// Returns the last and therefore worst price contributing to the quote.
+    #[must_use]
+    pub const fn worst_quoted_price(self) -> Option<Price> {
+        self.worst_quoted_price
+    }
+
+    /// Returns the number of distinct prices contributing non-zero quantity.
+    #[must_use]
+    pub const fn contributing_level_count(self) -> usize {
+        self.contributing_level_count
+    }
+
+    /// Returns why displayed-depth consumption stopped.
+    #[must_use]
+    pub const fn termination(self) -> DisplayedLiquidityTermination {
+        self.termination
+    }
+}
+
 /// Caller-owned output allocated by a read-only order-book query.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OrderBookQueryResource {
@@ -5295,14 +5534,14 @@ impl From<NewOrder> for IncomingPreview {
 
 impl IncomingPreview {
     fn crosses(self, price: Price) -> bool {
-        match (self.side, self.order_type) {
-            (_, OrderType::Market) => true,
-            (Side::Buy, OrderType::Limit(limit)) => limit >= price,
-            (Side::Sell, OrderType::Limit(limit)) => limit <= price,
-            (_, OrderType::Stop { .. }) => {
+        let constraint = match self.order_type {
+            OrderType::Market => StopActivation::Market,
+            OrderType::Limit(limit) => StopActivation::Limit(limit),
+            OrderType::Stop { .. } => {
                 unreachable!("dormant stop constraint cannot enter liquidity inspection")
             }
-        }
+        };
+        execution_constraint_crosses(self.side, constraint, price)
     }
 }
 
@@ -5391,34 +5630,25 @@ impl DecrementAndCancelScanState for ImmediateExecutionScanState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ImmediateExecutionQuoteBuilder {
-    instrument_id: InstrumentId,
-    instrument_version: InstrumentVersion,
-    book_event_sequence: u64,
-    request: ImmediateExecutionRequest,
+struct ExecutionQuoteTotals {
     executed_quantity_lots: u64,
     incoming_remaining_lots: u64,
     raw_price_notional: i128,
     worst_execution_price: Option<Price>,
 }
 
-impl ImmediateExecutionQuoteBuilder {
-    const fn new(
-        instrument_id: InstrumentId,
-        instrument_version: InstrumentVersion,
-        book_event_sequence: u64,
-        request: ImmediateExecutionRequest,
-    ) -> Self {
+impl ExecutionQuoteTotals {
+    const fn new(requested_quantity_lots: u64) -> Self {
         Self {
-            instrument_id,
-            instrument_version,
-            book_event_sequence,
-            request,
             executed_quantity_lots: 0,
-            incoming_remaining_lots: request.quantity.lots(),
+            incoming_remaining_lots: requested_quantity_lots,
             raw_price_notional: 0,
             worst_execution_price: None,
         }
+    }
+
+    const fn remaining(self) -> u64 {
+        self.incoming_remaining_lots
     }
 
     fn record_execution(&mut self, price: Price, quantity_lots: u64) {
@@ -5440,6 +5670,36 @@ impl ImmediateExecutionQuoteBuilder {
             .expect("bounded price times requested quantity must fit i128");
         self.worst_execution_price = Some(price);
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ImmediateExecutionQuoteBuilder {
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    book_event_sequence: u64,
+    request: ImmediateExecutionRequest,
+    totals: ExecutionQuoteTotals,
+}
+
+impl ImmediateExecutionQuoteBuilder {
+    const fn new(
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        book_event_sequence: u64,
+        request: ImmediateExecutionRequest,
+    ) -> Self {
+        Self {
+            instrument_id,
+            instrument_version,
+            book_event_sequence,
+            request,
+            totals: ExecutionQuoteTotals::new(request.quantity.lots()),
+        }
+    }
+
+    fn record_execution(&mut self, price: Price, quantity_lots: u64) {
+        self.totals.record_execution(price, quantity_lots);
+    }
 
     fn finish(
         self,
@@ -5447,12 +5707,13 @@ impl ImmediateExecutionQuoteBuilder {
         termination: ImmediateExecutionTermination,
     ) -> ImmediateExecutionQuote {
         let unfilled_quantity_lots = self
+            .totals
             .incoming_remaining_lots
             .checked_sub(self_trade_decrement_quantity_lots)
             .expect("self-trade decrement cannot exceed incoming leaves");
         debug_assert_eq!(
             self.request.quantity.lots(),
-            self.executed_quantity_lots
+            self.totals.executed_quantity_lots
                 + self_trade_decrement_quantity_lots
                 + unfilled_quantity_lots
         );
@@ -5461,11 +5722,11 @@ impl ImmediateExecutionQuoteBuilder {
             instrument_version: self.instrument_version,
             book_event_sequence: self.book_event_sequence,
             request: self.request,
-            executed_quantity_lots: self.executed_quantity_lots,
+            executed_quantity_lots: self.totals.executed_quantity_lots,
             self_trade_decrement_quantity_lots,
             unfilled_quantity_lots,
-            raw_price_notional: self.raw_price_notional,
-            worst_execution_price: self.worst_execution_price,
+            raw_price_notional: self.totals.raw_price_notional,
+            worst_execution_price: self.totals.worst_execution_price,
             termination,
         }
     }
@@ -7019,6 +7280,32 @@ impl OrderBook {
         }
     }
 
+    /// Quotes current displayed public liquidity without successful-path
+    /// allocation or mutation.
+    ///
+    /// The query consumes opposite-side aggregate depth in market priority
+    /// under the supplied market-or-limit constraint. Fully hidden liquidity
+    /// and undisplayed reserve leaves are excluded. The result is bound to the
+    /// instrument, definition version, and last committed event sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] if an inspected public level has a zero
+    /// aggregate or displayed-order count, or its contributing-level count is
+    /// not representable.
+    pub fn try_displayed_liquidity_quote(
+        &self,
+        request: DisplayedLiquidityRequest,
+    ) -> Result<DisplayedLiquidityQuote, InvariantViolation> {
+        DisplayedLiquidityQuote::try_from_depth(
+            self.definition.instrument_id(),
+            self.definition.version(),
+            self.last_event_sequence(),
+            request,
+            self.public_depth_candidates(request.side.opposite()),
+        )
+    }
+
     /// Quotes the exact external execution economics of one immediately active
     /// order without allocating or mutating the book.
     ///
@@ -7452,6 +7739,15 @@ impl OrderBook {
         self.levels(side)
             .iter()
             .filter(|(_, level)| level.total_quantity != 0)
+            .map(|(&price, level)| Self::level_snapshot(price, level))
+    }
+
+    fn public_depth_candidates(
+        &self,
+        side: Side,
+    ) -> impl DoubleEndedIterator<Item = LevelSnapshot> + '_ {
+        DirectionalIter::new(self.levels(side).iter(), side == Side::Buy)
+            .filter(|(_, level)| level.total_quantity != 0 || level.visible_order_count != 0)
             .map(|(&price, level)| Self::level_snapshot(price, level))
     }
 
@@ -9915,16 +10211,7 @@ impl OrderBook {
                     .orders
                     .get(&order_id)
                     .expect("account index order must exist");
-                if order.side != incoming.side.opposite()
-                    || !match (incoming.side, incoming.order_type) {
-                        (_, OrderType::Market) => true,
-                        (Side::Buy, OrderType::Limit(limit)) => limit >= order.price,
-                        (Side::Sell, OrderType::Limit(limit)) => limit <= order.price,
-                        (_, OrderType::Stop { .. }) => {
-                            unreachable!("dormant stop constraint cannot enter account preview")
-                        }
-                    }
-                {
+                if order.side != incoming.side.opposite() || !incoming.crosses(order.price) {
                     return false;
                 }
                 current = order.account_next;
@@ -10901,7 +11188,8 @@ mod price_level_index_tests {
 
     use super::{
         AccountAdmissionState, AccountControl, AccountControlAction, AccountControlSnapshot,
-        BuyStopKey, Command, CommandOutcome, CommandPreparation, EventTraceBuilder,
+        BuyStopKey, Command, CommandOutcome, CommandPreparation, DisplayedLiquidityQuote,
+        DisplayedLiquidityRequest, DisplayedLiquidityTermination, EventTraceBuilder,
         ImmediateExecutionQuote, ImmediateExecutionRequest, ImmediateExecutionTermination,
         IncomingPreview, InvariantViolation, MassCancel, MassCancelScope, MatchingCapacity,
         MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsSpec,
@@ -11241,6 +11529,53 @@ mod price_level_index_tests {
         }
     }
 
+    fn reference_displayed_liquidity_quote(
+        book: &OrderBook,
+        request: DisplayedLiquidityRequest,
+    ) -> DisplayedLiquidityQuote {
+        let mut remaining = request.quantity.lots();
+        let mut quoted_quantity_lots = 0_u64;
+        let mut raw_price_notional = 0_i128;
+        let mut worst_quoted_price = None;
+        let mut contributing_level_count = 0_usize;
+        let termination = 'book: {
+            for level in book.depth_iter(request.side.opposite()) {
+                let crosses = match (request.side, request.constraint) {
+                    (_, StopActivation::Market) => true,
+                    (Side::Buy, StopActivation::Limit(limit)) => limit >= level.price,
+                    (Side::Sell, StopActivation::Limit(limit)) => limit <= level.price,
+                };
+                if !crosses {
+                    break 'book DisplayedLiquidityTermination::PriceLimit;
+                }
+                let consumed = u64::try_from(level.quantity.min(u128::from(remaining))).unwrap();
+                remaining = remaining.checked_sub(consumed).unwrap();
+                quoted_quantity_lots = quoted_quantity_lots.checked_add(consumed).unwrap();
+                raw_price_notional = raw_price_notional
+                    .checked_add(i128::from(level.price.raw()) * i128::from(consumed))
+                    .unwrap();
+                worst_quoted_price = Some(level.price);
+                contributing_level_count += 1;
+                if remaining == 0 {
+                    break 'book DisplayedLiquidityTermination::Filled;
+                }
+            }
+            DisplayedLiquidityTermination::BookExhausted
+        };
+        DisplayedLiquidityQuote {
+            instrument_id: book.definition.instrument_id(),
+            instrument_version: book.definition.version(),
+            book_event_sequence: book.last_event_sequence(),
+            request,
+            quoted_quantity_lots,
+            unquoted_quantity_lots: remaining,
+            raw_price_notional,
+            worst_quoted_price,
+            contributing_level_count,
+            termination,
+        }
+    }
+
     fn reference_order_queue_position(
         book: &OrderBook,
         order_id: OrderId,
@@ -11555,6 +11890,34 @@ mod price_level_index_tests {
                 .detail()
                 .contains("public depth quantity exceeds u128")
         );
+    }
+
+    #[test]
+    fn displayed_liquidity_quote_rejects_invalid_public_aggregates() {
+        let mut book = OrderBook::new(reserve_definition());
+        book.bids.insert(Price::from_raw(100), level(1));
+        let request = DisplayedLiquidityRequest::new(
+            Side::Sell,
+            Quantity::new(1).unwrap(),
+            StopActivation::Market,
+        );
+
+        book.bids
+            .update(Price::from_raw(100), |level| {
+                level.total_quantity = 0;
+            })
+            .unwrap();
+        let error = book.try_displayed_liquidity_quote(request).unwrap_err();
+        assert!(error.detail().contains("zero aggregate or order count"));
+
+        book.bids
+            .update(Price::from_raw(100), |level| {
+                level.total_quantity = 1;
+                level.visible_order_count = 0;
+            })
+            .unwrap();
+        let error = book.try_displayed_liquidity_quote(request).unwrap_err();
+        assert!(error.detail().contains("zero aggregate or order count"));
     }
 
     #[test]
@@ -12070,6 +12433,40 @@ mod price_level_index_tests {
     }
 
     #[test]
+    fn displayed_liquidity_quote_matches_literal_public_depth_fold() {
+        let mut generator = Generator(0x172b_c6a0_9d4f_83e5);
+        for case in 0..20_000 {
+            let (book, incoming) = generated_book_and_fok(&mut generator);
+            let best_opposite = book.best_price(incoming.side.opposite()).unwrap();
+            let constraint = match generator.bounded(3) {
+                0 => StopActivation::Market,
+                1 => match incoming.order_type {
+                    OrderType::Limit(price) => StopActivation::Limit(price),
+                    OrderType::Market | OrderType::Stop { .. } => {
+                        unreachable!("generated order is a limit")
+                    }
+                },
+                _ => {
+                    let offset = i64::try_from(generator.bounded(4)).unwrap();
+                    StopActivation::Limit(Price::from_raw(match incoming.side {
+                        Side::Buy => best_opposite.raw() + offset,
+                        Side::Sell => best_opposite.raw() - offset,
+                    }))
+                }
+            };
+            let request =
+                DisplayedLiquidityRequest::new(incoming.side, incoming.quantity, constraint);
+            let actual = book.try_displayed_liquidity_quote(request).unwrap();
+            let reference = reference_displayed_liquidity_quote(&book, request);
+            assert_eq!(
+                actual, reference,
+                "displayed-liquidity quote diverged in generated case {case}; \
+                 incoming={incoming:?}"
+            );
+        }
+    }
+
+    #[test]
     fn immediate_execution_quote_notional_covers_signed_domain_extremes() {
         for raw_price in [i64::MIN, i64::MAX] {
             let mut book = OrderBook::new(reserve_definition());
@@ -12104,6 +12501,23 @@ mod price_level_index_tests {
                 i128::from(raw_price) * i128::from(u64::MAX)
             );
             assert_eq!(quote.termination(), ImmediateExecutionTermination::Filled);
+
+            let displayed = book
+                .try_displayed_liquidity_quote(DisplayedLiquidityRequest::new(
+                    Side::Sell,
+                    Quantity::new(u64::MAX).unwrap(),
+                    StopActivation::Market,
+                ))
+                .unwrap();
+            assert_eq!(displayed.quoted_quantity_lots(), u64::MAX);
+            assert_eq!(
+                displayed.raw_price_notional(),
+                i128::from(raw_price) * i128::from(u64::MAX)
+            );
+            assert_eq!(
+                displayed.termination(),
+                DisplayedLiquidityTermination::Filled
+            );
         }
     }
 

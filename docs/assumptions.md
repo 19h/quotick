@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A125 are stable and are referenced from code comments and other
+identifiers A1-A131 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -217,9 +217,10 @@ depth, continuous and call-auction account-order-ID output, plus continuous and
 call-auction market-data batch/snapshot/depth outputs have explicit fallible
 APIs. Continuous and call-auction authoritative books also expose
 allocation-free market-priority depth iterators, as do continuous and
-call-auction public replicas. Continuous private immediate-execution quotes and
-resting-order queue-position queries return fixed-size values without
-successful-path allocation. Borrowed ledger-record lookup, history iteration,
+call-auction public replicas. Continuous private immediate-execution quotes,
+authoritative and replica displayed-liquidity quotes, and resting-order queue-
+position queries return fixed-size values without successful-path allocation.
+Borrowed ledger-record lookup, history iteration,
 per-record transaction iteration, and point-in-time balance reconstruction
 allocate no output and return typed journal/index or reconstruction
 contradictions. Convenience wrappers can still panic on allocation failure;
@@ -4638,6 +4639,67 @@ output while poisoned, provenance mismatch, parity divergence, unchecked wrap,
 allocation, mutation, invented definition bounds, or consolidated/executable
 interpretation falsifies A130.
 
+## A131 — exact displayed-liquidity sweep quotes
+
+**Assumption.** One `DisplayedLiquidityRequest` binds a hypothetical aggressor
+side, positive lot quantity, and shared market-or-limit `StopActivation`
+constraint. One immutable continuous `OrderBook` or healthy
+`MarketDataReplica` borrow remains stable for the complete query. The quote
+walks opposite-side public aggregate depth in market priority: offers ascend
+for a buy request and bids descend for a sell request. A limit includes only
+prices at or better than its exact endpoint.
+
+Only current displayed quantity enters the calculation. A reserve order
+contributes its current working slice; its undisplayed leaves and every fully
+hidden order are absent. Each inspected candidate must have positive public
+quantity and displayed-order count. The authoritative book returns a typed
+`InvariantViolation` for a contradiction. A replica rejects poison before
+traversal and maps the same fold failure to
+`MarketDataError::SourceDivergence` without returning a partial value.
+
+`DisplayedLiquidityQuote` binds the complete request to instrument identity,
+immutable definition version, and final observed source event sequence.
+Requested lots equal quoted plus unquoted lots. Raw-price notional is the exact
+signed `i128` sum of `price.raw() × quoted lots`; the last contributing price
+is the worst quoted price, and the distinct contributing price count is exact.
+Termination distinguishes complete displayed fill, the next public price
+outside the limit, and exhaustion of public depth.
+
+The authoritative and replica queries use one shared checked depth fold. Its
+notional arithmetic composes the same `ExecutionQuoteTotals` accumulator used
+by the private A124 quote, and market/limit crossing is one shared predicate
+used by matching preview. The successful query path allocates nothing, reserves
+no liquidity, and changes no book, replica, sequence, poison, risk, WAL,
+snapshot, or replay state. Human-readable authoritative invariant detail may
+allocate only after corruption is detected and is discarded by replica error
+mapping. It is neither an A124 private execution prediction nor a commitment:
+hidden execution prices, reserve refresh, STP, later commands, admission,
+account controls, risk, and fees can make a committed result differ.
+
+**Dependent results.** [A1, A2, A3, A7, A10, A12, A22, A44, A55, A70, A72,
+A83, A103, A123, A124, A128, A130, A131] For `K` occupied execution prices
+inspected through termination among `P` authoritative prices, work is
+`O(log(P + 1) + K)` time with `O(1)` fixed output/state. Hidden-only prices can
+contribute to `K` but not the quote. Replica work has the same bound over
+public prices. Since quoted quantity is at most `u64::MAX` lots and
+`|price.raw()| <= 2^63`, the absolute accumulated notional is less than
+`2^127` and fits `i128`. No output allocation or wire-version change follows.
+
+**Falsification probe.** Exercise both aggressor directions, market and exact
+limit boundaries, empty and one-/multi-level books, filled, price-limit, and
+book-exhausted outcomes, partial terminal levels, signed and zero-adjacent
+prices, current reserve slices, fully hidden prices, and `i64::MIN`,
+`i64::MAX`, and `u64::MAX` arithmetic. Compare with a literal checked fold over
+public depth and require exact quantity partition, signed notional, worst
+price, contributing count, request/provenance, nonmutation, and zero allocation.
+Compare caught-up source and replica results after incremental commands, exact
+retry, snapshot repair, and durable bootstrap. Poison a replica and corrupt
+source/replica levels to zero quantity/count; require the specified typed
+failure without partial output. Any hidden or reserve-hidden disclosure,
+wrong crossing direction, arithmetic wrap, provenance/parity divergence,
+mutation, allocation, stale poisoned output, or implied executable commitment
+falsifies A131.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -4745,6 +4807,25 @@ capability, a remaining risk, or an opportunity.
   summary method because its constructor owns instrument identity/version but
   not versioned price-rule endpoints. Callers requiring full-definition labels
   must supply the corresponding definition and request that explicit band.
+
+- **Medium impact:** authoritative books and healthy replicas now expose one
+  exact fixed-size displayed-liquidity sweep quote under A131. Market and limit
+  requests return provenance, quoted/unquoted lots, signed raw notional, worst
+  price, contributing price count, and exact termination without materializing
+  depth. Incremental, snapshot-repair, and durable-bootstrap tests require
+  source/replica parity.
+
+- **Medium impact risk:** displayed-liquidity quotes intentionally omit fully
+  hidden orders and future reserve refreshes and reserve no public quantity.
+  They therefore cannot substitute for A124 private execution economics or an
+  atomic quote-to-command protocol; later commands, STP, risk, and fees remain
+  outside the result.
+
+- **Medium impact opportunity:** the exact public quantity/notional fraction
+  and worst price can drive local slippage, market-impact, routing, and depth-
+  exhaustion features without caller-owned vectors. Cross-venue analysis still
+  requires synchronized source identity, normalized units, fees, entitlements,
+  and explicit staleness policy.
 
 - **Medium impact risk:** queue position is a state observation, not a fill-
   probability or latency estimate. Subsequent execution, cancellation,

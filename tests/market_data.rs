@@ -13,9 +13,9 @@ use quotick::market_data::{
 };
 use quotick::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
-    Command, CommandOutcome, EventKind, ExecutionReport, ExpirySweep, NewOrder, OrderBook,
-    OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, StopActivation, StopReference,
-    StopReferenceCursor, StopTriggerSweep, TimeInForce,
+    Command, CommandOutcome, DisplayedLiquidityRequest, EventKind, ExecutionReport, ExpirySweep,
+    NewOrder, OrderBook, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention,
+    StopActivation, StopReference, StopReferenceCursor, StopTriggerSweep, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -226,6 +226,19 @@ fn assert_mirrors(book: &OrderBook, replica: &MarketDataReplica) {
                 .unwrap(),
             book.try_depth_range_summary(side, range).unwrap()
         );
+        let exact_best = match side {
+            Side::Buy => book.best_ask(),
+            Side::Sell => book.best_bid(),
+        }
+        .map_or(Price::from_raw(0), |level| level.price);
+        for constraint in [StopActivation::Market, StopActivation::Limit(exact_best)] {
+            let request =
+                DisplayedLiquidityRequest::new(side, Quantity::new(17).unwrap(), constraint);
+            assert_eq!(
+                replica.try_displayed_liquidity_quote(request).unwrap(),
+                book.try_displayed_liquidity_quote(request).unwrap()
+            );
+        }
     }
 }
 

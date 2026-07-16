@@ -196,6 +196,18 @@ across the complete signed `i64` price domain; exact midpoint numerator
 perform the same bounded work. Human-readable invariant detail may allocate
 only after a zero aggregate/count or locked/crossed pair is detected.
 
+For a displayed-liquidity request, let `K` be the occupied opposite-side
+execution prices inspected through filled, price-limit, or public-book-
+exhausted termination among `P` occupied prices. Hidden-only prices can be
+inspected but do not enter the quote. `try_displayed_liquidity_quote` costs
+`O(log(P + 1) + K)` time and `O(1)` fixed output/state, allocates no output,
+and performs no mutation. Each contributing public price adds one constant-time
+checked quantity/notional update; at most one level is partial. Quoted quantity
+is bounded by the requested `u64`, so the exact signed `i128` notional covers
+the full `i64` price domain. The shared accumulator is also used by the private
+immediate-execution quote. Human-readable invariant detail can allocate only
+after corrupt public aggregates are detected.
+
 For `C` retained commands, `retained_command_report` performs one expected
 `O(1)` bounded-hash lookup and returns one borrowed command/report view.
 `retained_history` has `O(1)` setup and exact-size iterator state; consuming
@@ -449,9 +461,10 @@ O(1) auxiliary space
 Under decrement-and-cancel it composes the exact reserve-round scanner and has
 the same `O(O_c + P_c log(P + 1) + sum_p D_p log(R_p + 1))` time bound stated
 above. Each crossed price contributes one constant-time signed `i128` notional
-update, and output is one fixed-size value containing provenance, the exact
-quantity partition, worst execution price, and termination. Both paths
-allocate nothing and do not mutate or reserve book state.
+update through the accumulator shared with displayed-liquidity quoting, and
+output is one fixed-size value containing provenance, the exact quantity
+partition, worst execution price, and termination. Both paths allocate nothing
+and do not mutate or reserve book state.
 
 ## Default matching limits and memory
 
@@ -716,6 +729,15 @@ selected public levels. Neither query allocates output. Poison rejection is
 detail may allocate only after corruption and is then discarded. No error path
 returns a partial summary. The replica exposes no definition-wide summary
 because it retains no price-rule endpoints.
+
+`try_displayed_liquidity_quote` performs one market-priority fold over the
+opposite replica side. For `K` public prices inspected through termination
+among `P` occupied prices, it is `O(log(P + 1) + K)` time and `O(1)` fixed
+output/state with no successful-path allocation or mutation. It reuses the
+authoritative checked fold and signed-notional accumulator. Poison rejection is
+`O(1)` before traversal; invalid aggregate/count failure discards the shared
+human-readable detail and returns a static source-divergence category without
+partial output.
 
 For replay capacity `N`, one `MarketDataReplayBuffer` initializes `N` optional
 typed slots in `O(N)` time and retains `O(N)` state. An `E`-update admission

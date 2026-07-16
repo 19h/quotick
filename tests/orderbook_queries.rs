@@ -3,7 +3,8 @@ use quotick::instrument::{
     QuantityRules, ReserveOrderRules, TradingState,
 };
 use quotick::matching::{
-    BestBidOffer, Command, CommandOutcome, DepthSummary, EventKind, ImmediateExecutionRequest,
+    BestBidOffer, Command, CommandOutcome, DepthSummary, DisplayedLiquidityRequest,
+    DisplayedLiquidityTermination, EventKind, ImmediateExecutionRequest,
     ImmediateExecutionTermination, MassCancelScope, MatchingHashIndex, NewOrder, OrderBook,
     OrderBookQueryError, OrderBookQueryResource, OrderDisplay, OrderQueueClass, OrderType,
     PriceLevelOrders, RejectReason, SelfTradePrevention, StopActivation, TimeInForce,
@@ -344,6 +345,169 @@ fn immediate_execution_quotes_distinguish_limits_exhaustion_and_signed_notional(
     assert_eq!(signed.worst_execution_price(), Some(Price::from_raw(-20)));
     assert_eq!(signed.termination(), ImmediateExecutionTermination::Filled);
     negative.validate().unwrap();
+}
+
+#[test]
+fn displayed_liquidity_quotes_exact_public_market_limit_and_exhaustion_economics() {
+    let book = execution_quote_book();
+    let before_depth = book.depth_iter(Side::Sell).collect::<Vec<_>>();
+    let before_orders = book.active_orders().unwrap();
+
+    let request = DisplayedLiquidityRequest::new(
+        Side::Buy,
+        Quantity::new(8).unwrap(),
+        StopActivation::Market,
+    );
+    let filled = book.try_displayed_liquidity_quote(request).unwrap();
+    assert_eq!(filled.instrument_id(), InstrumentId::new(1).unwrap());
+    assert_eq!(
+        filled.instrument_version(),
+        InstrumentVersion::new(1).unwrap()
+    );
+    assert_eq!(filled.book_event_sequence(), book.last_event_sequence());
+    assert_eq!(filled.request(), request);
+    assert_eq!(filled.requested_quantity(), Quantity::new(8).unwrap());
+    assert_eq!(filled.quoted_quantity_lots(), 8);
+    assert_eq!(filled.unquoted_quantity_lots(), 0);
+    assert_eq!(filled.raw_price_notional(), 803);
+    assert_eq!(filled.worst_quoted_price(), Some(Price::from_raw(101)));
+    assert_eq!(filled.contributing_level_count(), 2);
+    assert_eq!(filled.termination(), DisplayedLiquidityTermination::Filled);
+
+    let limited = book
+        .try_displayed_liquidity_quote(DisplayedLiquidityRequest::new(
+            Side::Buy,
+            Quantity::new(10).unwrap(),
+            StopActivation::Limit(Price::from_raw(100)),
+        ))
+        .unwrap();
+    assert_eq!(limited.quoted_quantity_lots(), 5);
+    assert_eq!(limited.unquoted_quantity_lots(), 5);
+    assert_eq!(limited.raw_price_notional(), 500);
+    assert_eq!(limited.worst_quoted_price(), Some(Price::from_raw(100)));
+    assert_eq!(limited.contributing_level_count(), 1);
+    assert_eq!(
+        limited.termination(),
+        DisplayedLiquidityTermination::PriceLimit
+    );
+
+    let exhausted = book
+        .try_displayed_liquidity_quote(DisplayedLiquidityRequest::new(
+            Side::Buy,
+            Quantity::new(20).unwrap(),
+            StopActivation::Market,
+        ))
+        .unwrap();
+    assert_eq!(exhausted.quoted_quantity_lots(), 12);
+    assert_eq!(exhausted.unquoted_quantity_lots(), 8);
+    assert_eq!(exhausted.raw_price_notional(), 1_207);
+    assert_eq!(exhausted.worst_quoted_price(), Some(Price::from_raw(101)));
+    assert_eq!(exhausted.contributing_level_count(), 2);
+    assert_eq!(
+        exhausted.termination(),
+        DisplayedLiquidityTermination::BookExhausted
+    );
+
+    assert_eq!(
+        book.depth_iter(Side::Sell).collect::<Vec<_>>(),
+        before_depth
+    );
+    assert_eq!(book.active_orders().unwrap(), before_orders);
+}
+
+#[test]
+fn displayed_liquidity_quote_handles_empty_and_zero_adjacent_prices() {
+    let mut book = OrderBook::new(definition());
+    let request = DisplayedLiquidityRequest::new(
+        Side::Buy,
+        Quantity::new(2).unwrap(),
+        StopActivation::Market,
+    );
+    let empty = book.try_displayed_liquidity_quote(request).unwrap();
+    assert_eq!(empty.quoted_quantity_lots(), 0);
+    assert_eq!(empty.unquoted_quantity_lots(), 2);
+    assert_eq!(empty.raw_price_notional(), 0);
+    assert_eq!(empty.worst_quoted_price(), None);
+    assert_eq!(empty.contributing_level_count(), 0);
+    assert_eq!(
+        empty.termination(),
+        DisplayedLiquidityTermination::BookExhausted
+    );
+
+    for command in [
+        order(1, 1, 1, Side::Sell, -1, 1, OrderDisplay::FullyDisplayed),
+        order(2, 2, 2, Side::Sell, 0, 1, OrderDisplay::FullyDisplayed),
+    ] {
+        book.submit(command).unwrap();
+    }
+    let market = book.try_displayed_liquidity_quote(request).unwrap();
+    assert_eq!(market.quoted_quantity_lots(), 2);
+    assert_eq!(market.unquoted_quantity_lots(), 0);
+    assert_eq!(market.raw_price_notional(), -1);
+    assert_eq!(market.worst_quoted_price(), Some(Price::from_raw(0)));
+    assert_eq!(market.contributing_level_count(), 2);
+    assert_eq!(market.termination(), DisplayedLiquidityTermination::Filled);
+
+    let limited = book
+        .try_displayed_liquidity_quote(DisplayedLiquidityRequest::new(
+            Side::Buy,
+            Quantity::new(2).unwrap(),
+            StopActivation::Limit(Price::from_raw(-1)),
+        ))
+        .unwrap();
+    assert_eq!(limited.quoted_quantity_lots(), 1);
+    assert_eq!(limited.unquoted_quantity_lots(), 1);
+    assert_eq!(limited.raw_price_notional(), -1);
+    assert_eq!(limited.worst_quoted_price(), Some(Price::from_raw(-1)));
+    assert_eq!(limited.contributing_level_count(), 1);
+    assert_eq!(
+        limited.termination(),
+        DisplayedLiquidityTermination::PriceLimit
+    );
+    book.validate().unwrap();
+}
+
+#[test]
+fn displayed_liquidity_quote_preserves_signed_price_notional() {
+    let mut book = OrderBook::new(definition());
+    for command in [
+        order(1, 1, 1, Side::Buy, -10, 4, OrderDisplay::FullyDisplayed),
+        order(2, 2, 2, Side::Buy, -20, 3, OrderDisplay::FullyDisplayed),
+    ] {
+        book.submit(command).unwrap();
+    }
+
+    let quote = book
+        .try_displayed_liquidity_quote(DisplayedLiquidityRequest::new(
+            Side::Sell,
+            Quantity::new(5).unwrap(),
+            StopActivation::Market,
+        ))
+        .unwrap();
+    assert_eq!(quote.quoted_quantity_lots(), 5);
+    assert_eq!(quote.unquoted_quantity_lots(), 0);
+    assert_eq!(quote.raw_price_notional(), -60);
+    assert_eq!(quote.worst_quoted_price(), Some(Price::from_raw(-20)));
+    assert_eq!(quote.contributing_level_count(), 2);
+    assert_eq!(quote.termination(), DisplayedLiquidityTermination::Filled);
+
+    let limited = book
+        .try_displayed_liquidity_quote(DisplayedLiquidityRequest::new(
+            Side::Sell,
+            Quantity::new(5).unwrap(),
+            StopActivation::Limit(Price::from_raw(-10)),
+        ))
+        .unwrap();
+    assert_eq!(limited.quoted_quantity_lots(), 4);
+    assert_eq!(limited.unquoted_quantity_lots(), 1);
+    assert_eq!(limited.raw_price_notional(), -40);
+    assert_eq!(limited.worst_quoted_price(), Some(Price::from_raw(-10)));
+    assert_eq!(limited.contributing_level_count(), 1);
+    assert_eq!(
+        limited.termination(),
+        DisplayedLiquidityTermination::PriceLimit
+    );
+    book.validate().unwrap();
 }
 
 #[test]

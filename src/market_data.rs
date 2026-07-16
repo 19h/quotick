@@ -25,10 +25,10 @@ use crate::indexed_avl::{DirectionalIter, IndexedAvlMap};
 use crate::instrument::TradingState;
 use crate::matching::{
     AccountAdmissionState, AccountControlAction, AccountControlSnapshot, BestBidOffer,
-    CancelReason, Command, CommandOutcome, DepthSummary, Event, EventKind, ExecutionReport,
-    LevelSnapshot, MassCancelScope, OrderBook, OrderBookLimits, OrderDisplay, OrderType,
-    SelfTradePrevention, StopActivation, StopReference, TimeInForce, Trade,
-    TradingStateControlAction, TradingStateSnapshot,
+    CancelReason, Command, CommandOutcome, DepthSummary, DisplayedLiquidityQuote,
+    DisplayedLiquidityRequest, Event, EventKind, ExecutionReport, LevelSnapshot, MassCancelScope,
+    OrderBook, OrderBookLimits, OrderDisplay, OrderType, SelfTradePrevention, StopActivation,
+    StopReference, TimeInForce, Trade, TradingStateControlAction, TradingStateSnapshot,
 };
 
 mod replay;
@@ -3344,6 +3344,39 @@ impl MarketDataReplica {
         .map_err(|_| MarketDataError::SourceDivergence("replica best bid and offer are invalid"))
     }
 
+    /// Quotes current displayed public liquidity without successful-path
+    /// allocation or mutation.
+    ///
+    /// The query consumes opposite-side aggregate depth in market priority
+    /// under the supplied market-or-limit constraint. The fixed-size result
+    /// carries replica instrument/version/final-source-sequence provenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketDataError::Poisoned`] while snapshot repair is required,
+    /// or [`MarketDataError::SourceDivergence`] if an inspected aggregate or
+    /// contributing-level count is invalid.
+    pub fn try_displayed_liquidity_quote(
+        &self,
+        request: DisplayedLiquidityRequest,
+    ) -> Result<DisplayedLiquidityQuote, MarketDataError> {
+        if self.poisoned {
+            return Err(MarketDataError::Poisoned);
+        }
+        DisplayedLiquidityQuote::try_from_depth(
+            self.instrument_id,
+            self.instrument_version,
+            self.last_sequence,
+            request,
+            self.depth_iter(request.side().opposite()),
+        )
+        .map_err(|_| {
+            MarketDataError::SourceDivergence(
+                "replica displayed-liquidity quote encountered invalid aggregates",
+            )
+        })
+    }
+
     /// Summarizes replica depth inside one inclusive price range.
     ///
     /// The allocation-free result retains the exact endpoints, side,
@@ -4216,6 +4249,11 @@ mod resource_limit_tests {
     #[test]
     fn replica_fixed_queries_fail_closed_on_poison_and_invalid_aggregates() {
         let full_range = Price::from_raw(i64::MIN)..=Price::from_raw(i64::MAX);
+        let bid_sweep = DisplayedLiquidityRequest::new(
+            Side::Sell,
+            Quantity::new(1).unwrap(),
+            StopActivation::Market,
+        );
 
         let mut poisoned = replica();
         poisoned.poisoned = true;
@@ -4225,6 +4263,10 @@ mod resource_limit_tests {
         );
         assert_eq!(
             poisoned.try_depth_range_summary(Side::Buy, full_range.clone()),
+            Err(MarketDataError::Poisoned)
+        );
+        assert_eq!(
+            poisoned.try_displayed_liquidity_quote(bid_sweep),
             Err(MarketDataError::Poisoned)
         );
 
@@ -4246,6 +4288,12 @@ mod resource_limit_tests {
             invalid.try_depth_range_summary(Side::Buy, full_range.clone()),
             Err(MarketDataError::SourceDivergence(
                 "replica depth summary encountered invalid aggregates"
+            ))
+        );
+        assert_eq!(
+            invalid.try_displayed_liquidity_quote(bid_sweep),
+            Err(MarketDataError::SourceDivergence(
+                "replica displayed-liquidity quote encountered invalid aggregates"
             ))
         );
 
