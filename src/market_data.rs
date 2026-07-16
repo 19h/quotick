@@ -3331,6 +3331,10 @@ impl MarketDataReplica {
     /// or [`MarketDataError::SourceDivergence`] if the cached extrema have a
     /// zero aggregate/count or are locked/crossed.
     pub fn try_best_bid_offer(&self) -> Result<BestBidOffer, MarketDataError> {
+        self.try_observation_state()
+    }
+
+    fn try_observation_state(&self) -> Result<BestBidOffer, MarketDataError> {
         if self.poisoned {
             return Err(MarketDataError::Poisoned);
         }
@@ -3338,8 +3342,8 @@ impl MarketDataReplica {
             self.instrument_id,
             self.instrument_version,
             self.last_sequence,
-            self.best_bid(),
-            self.best_ask(),
+            self.raw_best_bid(),
+            self.raw_best_ask(),
         )
         .map_err(|_| MarketDataError::SourceDivergence("replica best bid and offer are invalid"))
     }
@@ -3360,15 +3364,13 @@ impl MarketDataReplica {
         &self,
         request: DisplayedLiquidityRequest,
     ) -> Result<DisplayedLiquidityQuote, MarketDataError> {
-        if self.poisoned {
-            return Err(MarketDataError::Poisoned);
-        }
+        self.try_observation_state()?;
         DisplayedLiquidityQuote::try_from_depth(
             self.instrument_id,
             self.instrument_version,
             self.last_sequence,
             request,
-            self.depth_iter(request.side().opposite()),
+            self.raw_depth_iter(request.side().opposite()),
         )
         .map_err(|_| {
             MarketDataError::SourceDivergence(
@@ -3393,9 +3395,7 @@ impl MarketDataReplica {
         side: Side,
         range: RangeInclusive<Price>,
     ) -> Result<DepthSummary, MarketDataError> {
-        if self.poisoned {
-            return Err(MarketDataError::Poisoned);
-        }
+        self.try_observation_state()?;
         let range_start = *range.start();
         let range_end = *range.end();
         let mut summary = DepthSummary::empty(
@@ -3406,7 +3406,7 @@ impl MarketDataReplica {
             range_start,
             range_end,
         );
-        for level in self.depth_range_iter(side, range) {
+        for level in self.raw_depth_range_iter(side, range) {
             summary.try_include(level).map_err(|_| {
                 MarketDataError::SourceDivergence(
                     "replica depth summary encountered invalid aggregates",
@@ -3420,16 +3420,22 @@ impl MarketDataReplica {
     ///
     /// # Errors
     ///
-    /// Returns [`MarketDataError::PreparationAllocationFailed`] without partial
-    /// output if the caller-owned result vector cannot be reserved.
+    /// Returns [`MarketDataError::Poisoned`] while snapshot repair is required,
+    /// [`MarketDataError::SourceDivergence`] for incoherent extrema or a
+    /// selected invalid aggregate, or
+    /// [`MarketDataError::PreparationAllocationFailed`] if the complete output
+    /// vector cannot be reserved. No error returns partial output.
     pub fn try_depth(
         &self,
         side: Side,
         limit: usize,
     ) -> Result<Vec<LevelSnapshot>, MarketDataError> {
-        let output_len = self.levels(side).len().min(limit);
+        let depth = self.try_depth_iter(side)?;
+        let output_len = depth.len().min(limit);
         let mut output = reserve_replica_depth_output(output_len, side)?;
-        output.extend(self.depth_iter(side).take(limit));
+        for level in depth.take(limit) {
+            output.push(level?);
+        }
         Ok(output)
     }
 
@@ -3442,20 +3448,26 @@ impl MarketDataReplica {
     ///
     /// # Errors
     ///
-    /// Returns [`MarketDataError::PreparationAllocationFailed`] without partial
-    /// output if the caller-owned result vector cannot be reserved.
+    /// Returns [`MarketDataError::Poisoned`] while snapshot repair is required,
+    /// [`MarketDataError::SourceDivergence`] for incoherent extrema or a
+    /// selected invalid aggregate, or
+    /// [`MarketDataError::PreparationAllocationFailed`] if the complete output
+    /// vector cannot be reserved. No error returns partial output.
     pub fn try_depth_range(
         &self,
         side: Side,
         range: RangeInclusive<Price>,
         limit: usize,
     ) -> Result<Vec<LevelSnapshot>, MarketDataError> {
-        let output_len = self
-            .depth_range_iter(side, range.clone())
-            .take(limit)
-            .count();
+        let mut output_len = 0_usize;
+        for level in self.try_depth_range_iter(side, range.clone())?.take(limit) {
+            level?;
+            output_len += 1;
+        }
         let mut output = reserve_replica_depth_output(output_len, side)?;
-        output.extend(self.depth_range_iter(side, range).take(limit));
+        for level in self.try_depth_range_iter(side, range)?.take(limit) {
+            output.push(level?);
+        }
         Ok(output)
     }
 
@@ -3463,8 +3475,9 @@ impl MarketDataReplica {
     ///
     /// # Panics
     ///
-    /// Panics only if result-vector allocation fails. Use [`Self::try_depth`]
-    /// when allocation failure must remain typed.
+    /// Panics if the replica requires snapshot repair, contains invalid public
+    /// state, or result-vector allocation fails. Use [`Self::try_depth`] when
+    /// failure must remain typed.
     #[must_use]
     pub fn depth(&self, side: Side, limit: usize) -> Vec<LevelSnapshot> {
         self.try_depth(side, limit)
@@ -3476,8 +3489,9 @@ impl MarketDataReplica {
     ///
     /// # Panics
     ///
-    /// Panics only if result-vector allocation fails. Use
-    /// [`Self::try_depth_range`] when allocation failure must remain typed.
+    /// Panics if the replica requires snapshot repair, contains invalid public
+    /// state, or result-vector allocation fails. Use [`Self::try_depth_range`]
+    /// when failure must remain typed.
     #[must_use]
     pub fn depth_range(
         &self,
@@ -3489,30 +3503,101 @@ impl MarketDataReplica {
             .expect("market-data price-range depth output allocation failed")
     }
 
-    /// Iterates public aggregate levels in market-priority order without
-    /// allocating.
+    /// Fallibly iterates public aggregate levels in market-priority order.
     ///
-    /// Bids are descending and asks are ascending. The iterator is
-    /// double-ended and exact-sized. Creating it is `O(log(P + 1))`; consuming
-    /// it is `O(P)` time for `P` occupied public prices and `O(1)` auxiliary
-    /// space.
+    /// Bids are descending and asks are ascending. The outer result rejects
+    /// poisoned or incoherent top-of-book state before an iterator is exposed.
+    /// Each streamed item rejects a zero aggregate/count at its exact price.
+    /// The iterator is double-ended and exact-sized. Creation is
+    /// `O(log(P + 1))`; consuming `P` public prices is `O(P)` time with `O(1)`
+    /// iterator state and no allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketDataError::Poisoned`] while snapshot repair is required,
+    /// or [`MarketDataError::SourceDivergence`] for incoherent extrema or an
+    /// invalid streamed aggregate.
+    pub fn try_depth_iter(
+        &self,
+        side: Side,
+    ) -> Result<
+        impl DoubleEndedIterator<Item = Result<LevelSnapshot, MarketDataError>> + ExactSizeIterator + '_,
+        MarketDataError,
+    > {
+        self.try_observation_state()?;
+        Ok(self.raw_depth_iter(side).map(Self::validate_depth_level))
+    }
+
+    /// Iterates public aggregate levels using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica requires snapshot repair or contains invalid
+    /// public state. Use [`Self::try_depth_iter`] when failure must remain typed.
     #[must_use]
     pub fn depth_iter(
+        &self,
+        side: Side,
+    ) -> impl DoubleEndedIterator<Item = LevelSnapshot> + ExactSizeIterator + '_ {
+        self.try_depth_iter(side)
+            .expect("market-data replica depth is not queryable")
+            .map(|level| level.expect("market-data replica depth level is invalid"))
+    }
+
+    /// Fallibly iterates public aggregates inside an inclusive price range.
+    ///
+    /// Bids are descending and asks are ascending. An inverted range is empty.
+    /// The outer result rejects poisoned or incoherent top-of-book state before
+    /// an iterator is exposed. Each streamed item rejects a zero aggregate or
+    /// count at its exact selected price. Creating and consuming `K` selected
+    /// prices among `P` public prices is `O(log(P + 1) + K)` time with `O(1)`
+    /// iterator state and no allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketDataError::Poisoned`] while snapshot repair is required,
+    /// or [`MarketDataError::SourceDivergence`] for incoherent extrema or an
+    /// invalid streamed aggregate.
+    pub fn try_depth_range_iter(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+    ) -> Result<
+        impl DoubleEndedIterator<Item = Result<LevelSnapshot, MarketDataError>> + '_,
+        MarketDataError,
+    > {
+        self.try_observation_state()?;
+        Ok(self
+            .raw_depth_range_iter(side, range)
+            .map(Self::validate_depth_level))
+    }
+
+    /// Iterates one inclusive range using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica requires snapshot repair or contains invalid
+    /// public state. Use [`Self::try_depth_range_iter`] when failure must remain
+    /// typed.
+    #[must_use]
+    pub fn depth_range_iter(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+    ) -> impl DoubleEndedIterator<Item = LevelSnapshot> + '_ {
+        self.try_depth_range_iter(side, range)
+            .expect("market-data replica depth range is not queryable")
+            .map(|level| level.expect("market-data replica depth level is invalid"))
+    }
+
+    fn raw_depth_iter(
         &self,
         side: Side,
     ) -> impl DoubleEndedIterator<Item = LevelSnapshot> + ExactSizeIterator + '_ {
         DirectionalIter::new(self.depth_levels(side), side == Side::Buy)
     }
 
-    /// Iterates public aggregate levels inside an inclusive price range without
-    /// allocating.
-    ///
-    /// Bids are descending and asks are ascending. An inverted range is empty.
-    /// Creating the iterator and consuming `K` selected levels takes
-    /// `O(log(P + 1) + K)` total time for `P` occupied public prices, with
-    /// `O(1)` auxiliary space.
-    #[must_use]
-    pub fn depth_range_iter(
+    fn raw_depth_range_iter(
         &self,
         side: Side,
         range: RangeInclusive<Price>,
@@ -3545,6 +3630,15 @@ impl MarketDataReplica {
             quantity: level.quantity,
             order_count: level.order_count,
         }
+    }
+
+    fn validate_depth_level(level: LevelSnapshot) -> Result<LevelSnapshot, MarketDataError> {
+        if level.quantity == 0 || level.order_count == 0 {
+            return Err(MarketDataError::SourceDivergence(
+                "replica depth contains invalid aggregates",
+            ));
+        }
+        Ok(level)
     }
 
     /// Applies one decoded incremental update.
@@ -3584,9 +3678,7 @@ impl MarketDataReplica {
         Ok(())
     }
 
-    /// Returns the current best bid.
-    #[must_use]
-    pub fn best_bid(&self) -> Option<LevelSnapshot> {
+    fn raw_best_bid(&self) -> Option<LevelSnapshot> {
         self.bids
             .last_key_value()
             .map(|(&price, level)| LevelSnapshot {
@@ -3596,9 +3688,7 @@ impl MarketDataReplica {
             })
     }
 
-    /// Returns the current best ask.
-    #[must_use]
-    pub fn best_ask(&self) -> Option<LevelSnapshot> {
+    fn raw_best_ask(&self) -> Option<LevelSnapshot> {
         self.asks
             .first_key_value()
             .map(|(&price, level)| LevelSnapshot {
@@ -3608,16 +3698,82 @@ impl MarketDataReplica {
             })
     }
 
+    /// Fallibly returns the current coherent best bid.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketDataError::Poisoned`] while snapshot repair is required,
+    /// or [`MarketDataError::SourceDivergence`] if public extrema are invalid
+    /// or locked/crossed. The query is `O(log(P + 1))` time and `O(1)` space.
+    pub fn try_best_bid(&self) -> Result<Option<LevelSnapshot>, MarketDataError> {
+        Ok(self.try_observation_state()?.bid())
+    }
+
+    /// Returns the current best bid using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica requires snapshot repair or public extrema are
+    /// invalid. Use [`Self::try_best_bid`] when failure must remain typed.
+    #[must_use]
+    pub fn best_bid(&self) -> Option<LevelSnapshot> {
+        self.try_best_bid()
+            .expect("market-data replica best bid is not queryable")
+    }
+
+    /// Fallibly returns the current coherent best ask.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketDataError::Poisoned`] while snapshot repair is required,
+    /// or [`MarketDataError::SourceDivergence`] if public extrema are invalid
+    /// or locked/crossed. The query is `O(log(P + 1))` time and `O(1)` space.
+    pub fn try_best_ask(&self) -> Result<Option<LevelSnapshot>, MarketDataError> {
+        Ok(self.try_observation_state()?.offer())
+    }
+
+    /// Returns the current best ask using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica requires snapshot repair or public extrema are
+    /// invalid. Use [`Self::try_best_ask`] when failure must remain typed.
+    #[must_use]
+    pub fn best_ask(&self) -> Option<LevelSnapshot> {
+        self.try_best_ask()
+            .expect("market-data replica best ask is not queryable")
+    }
+
     /// Returns the final applied source sequence.
     #[must_use]
     pub const fn last_sequence(&self) -> u64 {
         self.last_sequence
     }
 
-    /// Returns the current effective trading state and accepted revision.
+    /// Fallibly returns the current effective trading state and revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketDataError::Poisoned`] while snapshot repair is required,
+    /// or [`MarketDataError::SourceDivergence`] if the public observation state
+    /// is internally incoherent. The coherent observation gate costs
+    /// `O(log(P + 1))` time and `O(1)` space.
+    pub fn try_trading_state(&self) -> Result<TradingStateSnapshot, MarketDataError> {
+        self.try_observation_state()?;
+        Ok(self.trading_state)
+    }
+
+    /// Returns effective trading state using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica requires snapshot repair or public observation
+    /// state is internally incoherent. Use [`Self::try_trading_state`] when
+    /// failure must remain typed.
     #[must_use]
-    pub const fn trading_state(&self) -> TradingStateSnapshot {
-        self.trading_state
+    pub fn trading_state(&self) -> TradingStateSnapshot {
+        self.try_trading_state()
+            .expect("market-data replica trading state is not queryable")
     }
 
     /// Returns whether invalid incremental state requires a new snapshot.
@@ -4247,7 +4403,7 @@ mod resource_limit_tests {
     }
 
     #[test]
-    fn replica_fixed_queries_fail_closed_on_poison_and_invalid_aggregates() {
+    fn replica_fixed_queries_reject_poison() {
         let full_range = Price::from_raw(i64::MIN)..=Price::from_raw(i64::MAX);
         let bid_sweep = DisplayedLiquidityRequest::new(
             Side::Sell,
@@ -4269,6 +4425,35 @@ mod resource_limit_tests {
             poisoned.try_displayed_liquidity_quote(bid_sweep),
             Err(MarketDataError::Poisoned)
         );
+        assert_eq!(
+            poisoned.try_depth(Side::Buy, usize::MAX),
+            Err(MarketDataError::Poisoned)
+        );
+        assert_eq!(
+            poisoned.try_depth_range(Side::Buy, full_range.clone(), usize::MAX),
+            Err(MarketDataError::Poisoned)
+        );
+        assert!(matches!(
+            poisoned.try_depth_iter(Side::Buy),
+            Err(MarketDataError::Poisoned)
+        ));
+        assert!(matches!(
+            poisoned.try_depth_range_iter(Side::Buy, full_range.clone()),
+            Err(MarketDataError::Poisoned)
+        ));
+        assert_eq!(poisoned.try_best_bid(), Err(MarketDataError::Poisoned));
+        assert_eq!(poisoned.try_best_ask(), Err(MarketDataError::Poisoned));
+        assert_eq!(poisoned.try_trading_state(), Err(MarketDataError::Poisoned));
+    }
+
+    #[test]
+    fn replica_fixed_queries_reject_invalid_extrema() {
+        let full_range = Price::from_raw(i64::MIN)..=Price::from_raw(i64::MAX);
+        let bid_sweep = DisplayedLiquidityRequest::new(
+            Side::Sell,
+            Quantity::new(1).unwrap(),
+            StopActivation::Market,
+        );
 
         let mut invalid = replica();
         invalid.bids.insert(
@@ -4287,13 +4472,31 @@ mod resource_limit_tests {
         assert_eq!(
             invalid.try_depth_range_summary(Side::Buy, full_range.clone()),
             Err(MarketDataError::SourceDivergence(
-                "replica depth summary encountered invalid aggregates"
+                "replica best bid and offer are invalid"
             ))
         );
         assert_eq!(
             invalid.try_displayed_liquidity_quote(bid_sweep),
             Err(MarketDataError::SourceDivergence(
-                "replica displayed-liquidity quote encountered invalid aggregates"
+                "replica best bid and offer are invalid"
+            ))
+        );
+        assert_eq!(
+            invalid.try_depth(Side::Buy, usize::MAX),
+            Err(MarketDataError::SourceDivergence(
+                "replica best bid and offer are invalid"
+            ))
+        );
+        assert!(matches!(
+            invalid.try_depth_iter(Side::Buy),
+            Err(MarketDataError::SourceDivergence(
+                "replica best bid and offer are invalid"
+            ))
+        ));
+        assert_eq!(
+            invalid.try_best_bid(),
+            Err(MarketDataError::SourceDivergence(
+                "replica best bid and offer are invalid"
             ))
         );
 
@@ -4316,6 +4519,100 @@ mod resource_limit_tests {
             Err(MarketDataError::SourceDivergence(
                 "replica best bid and offer are invalid"
             ))
+        );
+        assert!(matches!(
+            crossed.try_depth_iter(Side::Buy),
+            Err(MarketDataError::SourceDivergence(
+                "replica best bid and offer are invalid"
+            ))
+        ));
+        assert_eq!(
+            crossed.try_trading_state(),
+            Err(MarketDataError::SourceDivergence(
+                "replica best bid and offer are invalid"
+            ))
+        );
+    }
+
+    #[test]
+    fn replica_depth_streams_reject_invalid_selected_rows() {
+        let full_range = Price::from_raw(i64::MIN)..=Price::from_raw(i64::MAX);
+
+        let mut invalid_non_best = replica();
+        for (price, quantity) in [(100, 1), (90, 0)] {
+            invalid_non_best.bids.insert(
+                Price::from_raw(price),
+                Aggregate {
+                    quantity,
+                    order_count: 1,
+                },
+            );
+        }
+        let mut full_depth = invalid_non_best.try_depth_iter(Side::Buy).unwrap();
+        assert_eq!(
+            full_depth.next(),
+            Some(Ok(LevelSnapshot {
+                price: Price::from_raw(100),
+                quantity: 1,
+                order_count: 1,
+            }))
+        );
+        assert_eq!(
+            full_depth.next(),
+            Some(Err(MarketDataError::SourceDivergence(
+                "replica depth contains invalid aggregates"
+            )))
+        );
+        let mut reverse_depth = invalid_non_best.try_depth_iter(Side::Buy).unwrap();
+        assert_eq!(
+            reverse_depth.next_back(),
+            Some(Err(MarketDataError::SourceDivergence(
+                "replica depth contains invalid aggregates"
+            )))
+        );
+        assert_eq!(
+            invalid_non_best.try_depth(Side::Buy, 1).unwrap(),
+            [LevelSnapshot {
+                price: Price::from_raw(100),
+                quantity: 1,
+                order_count: 1,
+            }]
+        );
+        assert_eq!(
+            invalid_non_best.try_depth(Side::Buy, 2),
+            Err(MarketDataError::SourceDivergence(
+                "replica depth contains invalid aggregates"
+            ))
+        );
+        assert_eq!(
+            invalid_non_best
+                .try_depth_range(Side::Buy, Price::from_raw(100)..=Price::from_raw(100), 2)
+                .unwrap(),
+            [LevelSnapshot {
+                price: Price::from_raw(100),
+                quantity: 1,
+                order_count: 1,
+            }]
+        );
+        assert_eq!(
+            invalid_non_best.try_depth_range(
+                Side::Buy,
+                Price::from_raw(90)..=Price::from_raw(100),
+                2,
+            ),
+            Err(MarketDataError::SourceDivergence(
+                "replica depth contains invalid aggregates"
+            ))
+        );
+        let mut ranged = invalid_non_best
+            .try_depth_range_iter(Side::Buy, Price::from_raw(90)..=Price::from_raw(100))
+            .unwrap();
+        assert!(matches!(ranged.next(), Some(Ok(_))));
+        assert_eq!(
+            ranged.next(),
+            Some(Err(MarketDataError::SourceDivergence(
+                "replica depth contains invalid aggregates"
+            )))
         );
 
         let mut overflowing = replica();

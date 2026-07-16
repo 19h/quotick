@@ -1731,6 +1731,10 @@ market-data stream and its replicas.
     replica state; a fresh authoritative bootstrap/snapshot is required.
     Batch-size, level-cardinality, and snapshot-cardinality failures are
     preflighted before authoritative mutation and do not poison the replica.
+    Every public replica economic observation uses one coherent query gate that
+    rejects poison before inspecting depth and rejects invalid or locked/crossed
+    public extrema before exposing a value or iterator. Sequence, poison, limit,
+    and allocation telemetry remain available as repair diagnostics.
 15. The stable complete-value schema is
     [Market-data payload format version 3](market-data-v3.md). The process-local
     replay ring retains those exact values and changes no payload bytes. Network
@@ -1761,12 +1765,18 @@ market-data stream and its replicas.
 20. Snapshot application validates identity, staleness, grammar, and both side
     cardinalities before clearing standby arenas. It fills already-owned
     standby slots, swaps both sides atomically, and retains the prior active
-    image as the next reusable standby allocation. `depth_iter` exposes
+    image as the next reusable standby allocation. `try_depth_iter` exposes a
     double-ended, exact-size market-priority replica traversal without output
-    allocation. `depth_range_iter` restricts that traversal to inclusive
-    endpoints, treats an inverted range as empty, and visits only in-band
-    occupied public prices. `try_depth_range` counts selected rows without
-    allocation and reserves exactly that cardinality before copying.
+    allocation. Its outer result applies the coherent observation gate; each
+    streamed item rejects a zero aggregate/count at the exact row encountered.
+    `try_depth_range_iter` applies the same contract to inclusive endpoints,
+    treats an inverted range as empty, and visits only in-band occupied public
+    prices. The legacy iterator wrappers compose these fallible paths and panic
+    rather than silently expose invalid or poisoned state.
+    `try_depth_range` first validates and counts every selected row, reserves
+    exactly that cardinality, and then copies through a second immutable pass.
+    `try_depth` validates only its selected market-priority prefix. Neither
+    materializer returns a partial owned vector.
     `try_best_bid_offer` and `try_depth_range_summary` reuse the authoritative
     fixed-size value validation and checked accumulator with replica instrument/
     version/final-source-sequence provenance. They refuse poisoned state;
@@ -1777,6 +1787,10 @@ market-data stream and its replicas.
     depth fold with the same provenance. It refuses poison before traversal and
     maps an invalid inspected aggregate to typed source divergence. The healthy
     caught-up result equals the authoritative quote exactly.
+    `try_best_bid`, `try_best_ask`, and `try_trading_state` use the same gate.
+    Their convenience wrappers also panic on an unhealthy replica instead of
+    returning partially advanced state. Applying a valid non-stale source
+    snapshot repairs poison and re-enables all observations at one new boundary.
     `try_snapshot`, `try_depth`, and `try_depth_range` keep caller-owned output
     allocation failure typed; the wire payload contains no process-local limit
     or allocation metadata.
@@ -2311,10 +2325,14 @@ discard active-arena and batch-scratch reservations and require the invariant
 auditor to reject both layouts.
 Replica depth-query tests additionally cover allocation-free best-first full
 and inclusive-band traversal, reverse traversal, limits, inverted bands, and
-authoritative-book parity on both sides. Shared BBO and band-summary assertions
-extend that parity across incremental command classes, retry, snapshot repair,
-and durable publisher bootstrap. Unit corruption tests require poison refusal,
-zero aggregate/count, locked/crossed, and cumulative-overflow failure.
+authoritative-book parity on both sides. Shared BBO, best-side, trading-state,
+band-summary, and fallible-stream assertions extend that parity across
+incremental command classes, retry, snapshot repair, and durable publisher
+bootstrap. An actual partially applied trade failure must poison every economic
+query; a current valid publisher snapshot must restore complete parity. Unit
+corruption tests require poison refusal, zero best and non-best aggregates,
+forward/reverse per-item failure, selected-prefix locality, bulk no-partial
+failure, locked/crossed extrema, and cumulative-overflow failure.
 Continuous replay tests reject zero/unrepresentable capacities, identity/version drift,
 gaps, collisions, evicted overlap, future/zero-limit queries, and oversized
 batches without mutation; prove exact retry, recovered boundaries, pagination,

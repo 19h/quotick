@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A131 are stable and are referenced from code comments and other
+identifiers A1-A132 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -4700,10 +4700,89 @@ wrong crossing direction, arithmetic wrap, provenance/parity divergence,
 mutation, allocation, stale poisoned output, or implied executable commitment
 falsifies A131.
 
+## A132 — fail-closed continuous-replica observation boundary
+
+**Assumption.** One public observation holds one immutable
+`MarketDataReplica` borrow. Every economic fallible query first composes one
+shared coherent-state gate. The gate rejects `poisoned = true` before depth
+inspection, then reads both public AVL extrema, requires every present extremum
+to have positive quantity and order count, and requires a present bid to be
+strictly below a present offer. Failure is `MarketDataError::Poisoned` or the
+static `MarketDataError::SourceDivergence` category before an output or
+iterator is exposed.
+
+The boundary includes BBO, separate best bid/ask, trading state, explicit-band
+summary, displayed-liquidity quote, full/range depth materialization, and
+fallible full/range depth iterators. Each iterator item independently requires
+positive quantity and order count at the exact row encountered. A stream may
+therefore yield a valid selected row before a later corrupt non-extremum row
+returns `SourceDivergence`; it never skips that row. `try_depth` validates only
+the requested market-priority prefix. `try_depth_range` first validates and
+counts the exact selected range/limit, reserves that complete cardinality, and
+copies through a second identical pass while the same immutable borrow prevents
+drift. Neither materializer returns a partial owned vector.
+
+The convenience depth, range, iterator, best-side, and trading-state methods
+delegate to the fallible boundary and panic on typed failure rather than return
+partially advanced state. `last_sequence`, `is_poisoned`, resource limits, and
+arena/index telemetry remain readable because they diagnose and size repair;
+they are not economic observations. Applying one valid non-stale authoritative
+snapshot atomically replaces the depth/state boundary and clears poison under
+A23/A70. No query mutates state, allocates successful iterator output, or
+changes payload, snapshot, WAL, or checkpoint bytes.
+
+**Dependent results.** [A1, A3, A10, A12, A23, A44, A55, A70, A72, A83,
+A103, A123, A128, A129, A130, A131, A132] Poison rejection is `O(1)` before
+tree access. The complete coherent-state gate is `O(log(P + 1))` time and
+`O(1)` space for `P` occupied public prices because it descends at most two AVL
+extremum paths. Full and range fallible iterators retain their existing
+`O(log(P + 1))` setup, `O(P)` or `O(K)` traversal, `O(1)` iterator-state, and
+zero output-allocation bounds; each item adds `O(1)` validation. A full depth
+prefix of `S = min(P, L)` rows is `O(log(P + 1) + S)` time and `O(S)` owned
+output. For `S = min(K, L)` rows selected by one band containing `K` prices and
+limit `L`, range materialization makes two `O(log(P + 1) + S)` prefix passes
+and owns `O(S)` output after exact reservation. Best-side and trading-state
+queries share the gate's `O(log(P + 1))` bound. Healthy caught-up replicas
+retain exact authoritative parity.
+
+**Falsification probe.** Cause an actual incremental trade-reconciliation
+failure after at least one replica mutation and require poison from every
+fallible economic observation. Apply the current valid publisher snapshot and
+require exact depth, iterator, best-side, BBO, trading-state, summary, and quote
+parity. In white-box state, inject zero quantity/count at an extremum and at a
+deeper row, locked/crossed extrema, and invalid rows reached first from either
+iterator end and inside an inclusive range. Require outer-gate failure for
+poison/extremum corruption, exact per-item failure for deeper corruption,
+success when the invalid deeper row is outside the selected limit/range, and a
+typed bulk failure without partial ownership when it is selected. Exercise
+empty, one-sided, both-sided, inverted-range, incremental, exact-retry,
+snapshot-repair, and durable-bootstrap states. Any economic output while
+poisoned, iterator exposed through incoherent extrema, invalid selected row
+omitted, partial bulk result, diagnostic read treated as economic state,
+mutation, allocation on successful streaming, recovery/parity difference, or
+wire-byte change falsifies A132.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** every continuous public-replica economic observation now
+  shares the A132 poison/coherent-extrema gate. Typed full/range iterators add
+  per-row validation, bulk depth returns no partial vector, and a valid current
+  snapshot restores the complete observation boundary after an actual
+  partially applied incremental failure.
+
+- **Medium impact risk:** legacy infallible depth, iterator, best-side, and
+  trading-state convenience methods now panic when the replica is poisoned or
+  internally incoherent. Consumers handling untrusted delivery or recovery
+  state must use the typed fallible methods. Streaming fallible iterators can
+  emit valid earlier rows before a later non-extremum corruption is detected.
+
+- **Low impact boundary:** source sequence, poison status, resource limits, and
+  allocation telemetry remain available while economic observation is fenced
+  because repair orchestration requires them. Transport freshness, source
+  authentication, entitlement, and cross-venue time alignment remain external.
 
 - **High impact:** full call-auction settlement busts now reverse every DVP and
   fee entry in canonical order, and replacement corrections append one complete

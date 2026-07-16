@@ -214,10 +214,13 @@ fn assert_mirrors(book: &OrderBook, replica: &MarketDataReplica) {
         book.depth(Side::Sell, usize::MAX)
     );
     assert_eq!(replica.last_sequence(), book.last_event_sequence());
+    assert_eq!(replica.try_trading_state().unwrap(), book.trading_state());
     assert_eq!(
         replica.try_best_bid_offer().unwrap(),
         book.try_best_bid_offer().unwrap()
     );
+    assert_eq!(replica.try_best_bid().unwrap(), book.best_bid());
+    assert_eq!(replica.try_best_ask().unwrap(), book.best_ask());
     for side in [Side::Buy, Side::Sell] {
         let range = Price::from_raw(-1_000)..=Price::from_raw(1_000);
         assert_eq!(
@@ -225,6 +228,14 @@ fn assert_mirrors(book: &OrderBook, replica: &MarketDataReplica) {
                 .try_depth_range_summary(side, range.clone())
                 .unwrap(),
             book.try_depth_range_summary(side, range).unwrap()
+        );
+        assert_eq!(
+            replica
+                .try_depth_iter(side)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            book.depth_iter(side).collect::<Vec<_>>()
         );
         let exact_best = match side {
             Side::Buy => book.best_ask(),
@@ -1185,6 +1196,21 @@ fn replica_rejects_a_trade_that_does_not_reconcile_to_the_maker_level() {
         ))
     ));
     assert!(replica.is_poisoned());
+    assert_eq!(
+        replica.try_depth(Side::Sell, usize::MAX),
+        Err(MarketDataError::Poisoned)
+    );
+    assert!(matches!(
+        replica.try_depth_iter(Side::Sell),
+        Err(MarketDataError::Poisoned)
+    ));
+    assert_eq!(replica.try_best_ask(), Err(MarketDataError::Poisoned));
+    assert_eq!(replica.try_trading_state(), Err(MarketDataError::Poisoned));
+
+    replica
+        .apply_snapshot(&publisher.snapshot())
+        .expect("verified snapshot repairs poisoned observation state");
+    assert_mirrors(&book, &replica);
 }
 
 #[test]

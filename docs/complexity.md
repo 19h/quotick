@@ -709,18 +709,34 @@ private dormant-stop map and two trigger arenas, and
 `O(P_max + E_max)` for one replica, with the replica reserving four per-side
 depth arenas in total (active and standby for bids and asks).
 
-For `P` occupied public prices on one replica side and requested limit `L`,
-`depth_iter` has `O(log(P + 1))` setup, `O(P)` complete traversal, and `O(1)`
-auxiliary space; `try_depth` owns `O(min(P, L))` output. For an inclusive band
-containing `K` occupied prices, `depth_range_iter` costs
-`O(log(P + 1) + K)` total time and `O(1)` auxiliary space. For
-`S = min(K, L)` selected rows, `try_depth_range` counts and copies in two
-passes, exactly reserves `S` rows, and owns `O(S)` output. An inverted band is
-empty. Both iterator types are double-ended; the full iterator is exact-size.
+Every continuous-replica economic query first rejects poison in `O(1)`, then
+applies one coherent-state gate that descends at most two public AVL extremum
+paths. The complete gate is `O(log(P + 1))` time and `O(1)` space for `P`
+occupied public prices; it rejects zero extremum aggregates/counts and a
+locked/crossed pair before exposing output. Diagnostic sequence, poison,
+limits, and allocation telemetry bypass this economic-observation gate.
 
-On a healthy continuous replica, `try_best_bid_offer` descends at most two AVL
-extremum paths and validates one fixed-size shared value in
-`O(log(P + 1))` time and `O(1)` space.
+For `P` occupied public prices on one replica side and requested limit `L`,
+`try_depth_iter` has `O(log(P + 1))` gated setup, `O(P)` complete traversal,
+and `O(1)` auxiliary space. Each streamed row adds `O(1)` aggregate validation
+and can return a typed item error after earlier valid rows. For
+`S = min(P, L)`, `try_depth` costs `O(log(P + 1) + S)` time, reserves before
+copying, owns `O(S)` output, and never returns a partial vector. An invalid
+non-extremum row after the selected prefix is not inspected.
+
+For an inclusive band containing `K` occupied prices and requested limit `L`,
+let `S = min(K, L)`. `try_depth_range_iter` costs
+`O(log(P + 1) + K)` for complete gated traversal and uses `O(1)` iterator
+state. `try_depth_range` validates/counts and copies the selected `S` rows in
+two immutable traversals, so it costs `O(log(P + 1) + S)` time with a doubled
+constant, exactly reserves `S` rows, and owns `O(S)` output. An inverted band
+is empty. Both iterator types are double-ended; the full iterator is exact-
+size. The infallible compatibility iterators compose these paths and panic on
+typed failure rather than return poisoned or invalid state.
+
+On a healthy continuous replica, `try_best_bid_offer`, `try_best_bid`,
+`try_best_ask`, and `try_trading_state` compose the shared coherent-state gate
+in `O(log(P + 1))` time and `O(1)` space.
 `try_depth_range_summary` performs one checked fold over the existing band
 iterator in `O(log(P + 1) + K)` time and `O(1)` fixed result/state for `K`
 selected public levels. Neither query allocates output. Poison rejection is
@@ -738,6 +754,10 @@ authoritative checked fold and signed-notional accumulator. Poison rejection is
 `O(1)` before traversal; invalid aggregate/count failure discards the shared
 human-readable detail and returns a static source-divergence category without
 partial output.
+
+Applying one valid non-stale snapshot retains the existing `O(P log P)`
+standby-fill and constant-time active/standby swap bound, clears poison, and
+re-enables the complete observation boundary at the snapshot sequence.
 
 For replay capacity `N`, one `MarketDataReplayBuffer` initializes `N` optional
 typed slots in `O(N)` time and retains `O(N)` state. An `E`-update admission
