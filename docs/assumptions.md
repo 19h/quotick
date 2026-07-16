@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A121 are stable and are referenced from code comments and other
+identifiers A1-A122 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -217,10 +217,11 @@ depth, continuous and call-auction account-order-ID output, plus continuous and
 call-auction market-data batch/snapshot/depth outputs have explicit fallible
 APIs. Continuous and call-auction authoritative books also expose
 allocation-free market-priority depth iterators. Borrowed ledger-record lookup,
-history iteration, and per-record transaction iteration allocate no output and
-return typed journal/index contradictions. Convenience wrappers can still
-panic on allocation failure; the account-order-ID wrappers can also panic if
-private topology is corrupt.
+history iteration, per-record transaction iteration, and point-in-time balance
+reconstruction allocate no output and return typed journal/index or
+reconstruction contradictions. Convenience wrappers can still panic on
+allocation failure; the account-order-ID wrappers can also panic if private
+topology is corrupt.
 
 **Dependent results.** Typed failure exists at the enumerated boundaries; no
 end-to-end allocation-failure continuation claim follows. Authoritative bounded
@@ -4149,6 +4150,48 @@ absence for a retained contradiction, partial history collection, mutation,
 recovery difference, divergent checkpoint resolution, or borrowed view
 surviving a mutable ledger transition falsifies A121.
 
+## A122 — exact point-in-time ledger balances
+
+**Assumption.** A point-in-time balance generation denotes one exact completed
+ledger-record boundary. Generation zero is the empty ledger; a generation
+beyond the current journal head is a typed nonmutating failure. The query
+observes one immutable ledger borrow and composes A121's fail-closed journal/
+transaction-index resolution. Entry, correction, and ordered-batch records are
+indivisible; no correction or batch member is a queryable boundary.
+
+For the selected `(AccountId, AssetId)` key, reconstruction scans each
+record's transaction entries in event-declared order. While both term signs
+remain, it consumes a term opposite to the current accumulated sign. Once one
+sign remains, the accumulated value moves monotonically toward the record's
+atomic final value. A current-generation query additionally requires the
+reconstructed value to equal the authoritative balance index. The query owns
+no output, allocates no auxiliary storage, and changes no balance, index,
+journal, capacity, WAL, snapshot, or checkpoint state.
+
+**Dependent results.** [A6, A11, A12, A29, A31, A36, A42, A69, A79, A89,
+A90, A121, A122] Generation zero and absent keys return zero. Corrections and
+batches expose only their atomic final effects, including cancelling signed
+extremes whose member order would overflow. For `E` inspected transaction
+entries and `L` inspected posting legs, the query performs expected `O(E + L)`
+time and `O(1)` auxiliary space; the two sign passes are a constant factor. A
+full adversarial transaction-index collision cluster can increase index
+resolution to `O(E^2)` without storage growth. Direct checkpoint, full-WAL,
+and checkpoint-prefix/WAL-suffix recovery reproduce the same generation and
+balance without a wire-version change.
+
+**Falsification probe.** Query empty, first, intermediate, current, and future
+generations; known and absent keys; positive, negative, and zero crossings;
+corrections; batches; and cancelling `i128` extremes. Differentially compare
+at least 1,024 generated record boundaries with balances captured immediately
+after commit. Remove or alter indexed history, force an unrepresentable atomic
+result in the reconstruction kernel, corrupt the current balance index, and
+require exact typed failures. Repeat after direct checkpoint, full-WAL, and
+checkpoint-prefix/WAL-suffix restoration while checking journal/index
+capacity, generation, balance, and WAL length before and after each query.
+Any observable member boundary, false transaction-order overflow, silent
+history contradiction, current-index divergence, allocation, mutation, or
+recovery difference falsifies A122.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -4193,6 +4236,13 @@ capability, a remaining risk, or an opportunity.
   correction, and batch grouping and event-declared transaction order survive
   direct checkpoint and checkpoint-plus-suffix recovery. Target-hardware cache
   behavior for maximum-history scans remains unknown until measured.
+
+- **Medium impact:** exact point-in-time ledger balances now reconstruct one
+  account/asset value at any completed record boundary under A122 without
+  output or auxiliary allocation. Atomic correction/batch grouping and
+  fail-closed history validation survive direct, full-WAL, and checkpoint-
+  prefix/WAL-suffix recovery. Target-hardware latency and cache behavior for
+  maximum-history scans remain unknown until measured.
 
 - **High impact risk:** the local history views expose complete private
   command/report and ledger-event content to their in-process caller.

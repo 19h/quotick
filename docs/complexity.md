@@ -28,6 +28,7 @@ Contents:
 - [Ledger checkpoints](#ledger-checkpoints)
 - [Ledger operations](#ledger-operations)
 - [Borrowed ledger history](#borrowed-ledger-history)
+- [Point-in-time ledger balances](#point-in-time-ledger-balances)
 
 ## Instrument catalog
 
@@ -843,6 +844,22 @@ output, clone no entry or batch, and mutate no ledger or durable state. A full
 adversarial transaction-hash collision cluster can increase complete traversal
 to `O(T^2)` without storage growth. The compatibility `record` method adds one
 immutable outer-handle clone after the same resolver succeeds.
+
+### Point-in-time ledger balances
+
+For a requested prefix containing `R` records, `E` transaction entries, and
+`L` posting legs, `try_balance_at` performs expected `O(E + L)` time with
+`O(1)` auxiliary space. The selected key is scanned through two sign-filtered
+passes per record; this is a constant factor, and each pass visits every entry
+and posting leg at most once. Generation zero and future-generation rejection
+are `O(1)`. A current-generation query adds one expected `O(1)` balance-index
+lookup and equality check.
+
+The query returns one `i128`, allocates no output or auxiliary storage, and
+mutates no ledger or durable state. Entry, correction, and batch records are
+applied only at their final atomic boundary. A full adversarial transaction-
+index collision cluster can increase the history-resolution component to
+`O(E^2)` without storage growth.
 
 Reversal validation is `O(L)` for the target entry's posting legs plus
 expected `O(1)` transaction/reversal-index access. Correction balance

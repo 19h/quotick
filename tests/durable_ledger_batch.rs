@@ -104,6 +104,20 @@ fn durable_batch_is_one_frame_one_event_and_exact_retry_adds_no_frame() {
     assert_eq!(recovered.ledger().record_count(), 1);
     assert_eq!(recovered.ledger().entry_count(), 2);
     assert_eq!(recovered.ledger().balance(account(1), asset()), 70);
+    assert_eq!(
+        recovered
+            .ledger()
+            .try_balance_at(0, account(1), asset())
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        recovered
+            .ledger()
+            .try_balance_at(1, account(1), asset())
+            .unwrap(),
+        70
+    );
     let history = recovered
         .ledger()
         .retained_history()
@@ -202,6 +216,20 @@ fn batch_grouping_survives_checkpoint_prefix_and_wal_suffix_recovery() {
     assert_eq!(recovered.ledger().record_count(), 2);
     assert_eq!(recovered.ledger().entry_count(), 3);
     assert_eq!(recovered.ledger().balance(account(1), asset()), 75);
+    assert_eq!(
+        recovered
+            .ledger()
+            .try_balance_at(1, account(1), asset())
+            .unwrap(),
+        70
+    );
+    assert_eq!(
+        recovered
+            .ledger()
+            .try_balance_at(2, account(1), asset())
+            .unwrap(),
+        75
+    );
     let history = recovered
         .ledger()
         .retained_history()

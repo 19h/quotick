@@ -1403,6 +1403,30 @@ periods, batches, and recovery.
       compose the same resolver. They clone only immutable entry or batch
       handles after typed journal/index consistency has been established.
 
+### Point-in-time balance reconstruction
+
+47. `Ledger::try_balance_at` reconstructs one signed `(account, asset)`
+    balance after an exact completed ledger-record boundary. Generation zero is
+    the empty ledger; a generation beyond the current journal head is a typed
+    `LedgerAsOfError::GenerationOutOfRange`.
+    - Reconstruction composes the invariant-46 retained-history resolver, so a
+      journal/index contradiction fails closed. An entry, correction, or batch
+      contributes only its indivisible final record effect; no correction or
+      batch member boundary is observable.
+    - Within one record, terms for the selected key are consumed opposite to
+      the current balance sign while both signs remain. The invariant-28
+      monotonicity proof therefore makes checked overflow mean that the atomic
+      record result is not representable as `i128`, rather than an artifact of
+      transaction order.
+    - A query at the current generation also requires equality with the
+      authoritative balance index. The operation allocates no output or
+      auxiliary storage and performs no ledger, WAL, snapshot, or checkpoint
+      mutation.
+    - For `E` inspected transaction entries and `L` inspected posting legs,
+      reconstruction is expected `O(E + L)` time with `O(1)` auxiliary space.
+      A full adversarial transaction-index collision cluster can increase the
+      index-resolution component to `O(E^2)` without storage growth.
+
 Signed balances are intentional accounting state. Credit limits, collateral,
 and margin are not inferred by the ledger. The implemented order risk layer
 consumes seeded positions and matching traces; it does not derive available
@@ -2137,6 +2161,11 @@ batch grouping, chronological and reverse traversal, transaction-order
 iteration, shared-storage identity, nonmutation, typed missing/mismatched-index
 failure, direct checkpoint restoration, and checkpoint-prefix/WAL-suffix
 recovery.
+Point-in-time ledger-balance tests cover the empty, first, current, and future
+generation boundaries; absent keys; atomic corrections and extreme cancelling
+batches; 1,024 generated record boundaries; typed history, overflow, and
+current-index contradictions; nonmutation; direct checkpoint restoration; full
+WAL recovery; and checkpoint-prefix/WAL-suffix recovery.
 
 Call-auction settlement tests prove one-entry and multi-entry report mappings,
 exact DVP balances, canonical explicit fee binding and balances, invalid fee
@@ -2377,7 +2406,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Security boundary | authenticated principals, authorization policy, secret management, audit export, and abuse controls |
 | Medium | Gateways and schemas | versioned binary protocol, FIX adapter, backpressure, session recovery, and conformance fixtures |
 | Medium | Market-data distribution | constructor-reserved per-instrument short-gap replay for continuous updates and complete call-auction command batches, with typed gap/collision/eviction/boundary handling and snapshot fallback, is implemented; remaining work is authenticated transport framing, entitlement, fanout, remote retransmission sessions, bandwidth control, and conformance fixtures |
-| Medium | Order-management and ledger history | bounded zero-copy live lookup and chronological iteration over continuous/call-auction command/report history and typed fail-closed ledger record history are implemented and survive WAL/checkpoint recovery; remaining work is authenticated account-scoped authorization, filtering, remote pagination/transport, audit export, and fenced history-generation rollover |
+| Medium | Order-management and ledger history | bounded zero-copy live lookup and chronological iteration over continuous/call-auction command/report history, typed fail-closed ledger record history, and allocation-free exact point-in-time ledger balance reconstruction are implemented and survive WAL/checkpoint recovery; remaining work is authenticated account-scoped authorization, filtering, remote pagination/transport, audit export, and fenced history-generation rollover |
 | Medium | Operations | metrics, traces, structured logs, health, capacity limits, alert rules, and runbooks |
 | Medium | Performance evidence | pinned-hardware benchmarks, allocation counts, tail latency, saturation, and regression thresholds |
 | Medium | Verification expansion | model-based/property tests, fuzzing, crash simulation, concurrency model checking, and long soak tests |

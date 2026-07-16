@@ -173,6 +173,86 @@ impl fmt::Display for LedgerHistoryError {
 
 impl std::error::Error for LedgerHistoryError {}
 
+/// Failure while reconstructing one balance at a committed ledger generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LedgerAsOfError {
+    /// The requested record boundary has not been committed.
+    GenerationOutOfRange {
+        /// Requested ledger generation.
+        requested: u64,
+        /// Current committed ledger generation.
+        current: u64,
+    },
+    /// Retained journal and transaction-index state contradict one another.
+    History(LedgerHistoryError),
+    /// One record's atomic balance effect cannot be represented as `i128`.
+    BalanceOverflow {
+        /// One-based ledger-event sequence.
+        sequence: u64,
+        /// Account whose reconstructed balance overflowed.
+        account_id: AccountId,
+        /// Asset whose reconstructed balance overflowed.
+        asset_id: AssetId,
+    },
+    /// Full-history reconstruction disagrees with the current balance index.
+    CurrentBalanceMismatch {
+        /// Account whose balance differs.
+        account_id: AccountId,
+        /// Asset whose balance differs.
+        asset_id: AssetId,
+        /// Balance reconstructed from complete retained history.
+        reconstructed: i128,
+        /// Balance stored in the current balance index.
+        indexed: i128,
+    },
+}
+
+impl fmt::Display for LedgerAsOfError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GenerationOutOfRange { requested, current } => write!(
+                formatter,
+                "ledger generation {requested} is beyond current generation {current}"
+            ),
+            Self::History(error) => error.fmt(formatter),
+            Self::BalanceOverflow {
+                sequence,
+                account_id,
+                asset_id,
+            } => write!(
+                formatter,
+                "ledger record {sequence} overflows balance for account {account_id} asset {asset_id}"
+            ),
+            Self::CurrentBalanceMismatch {
+                account_id,
+                asset_id,
+                reconstructed,
+                indexed,
+            } => write!(
+                formatter,
+                "ledger reconstructed balance {reconstructed} for account {account_id} asset {asset_id} differs from indexed balance {indexed}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LedgerAsOfError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::History(error) => Some(error),
+            Self::GenerationOutOfRange { .. }
+            | Self::BalanceOverflow { .. }
+            | Self::CurrentBalanceMismatch { .. } => None,
+        }
+    }
+}
+
+impl From<LedgerHistoryError> for LedgerAsOfError {
+    fn from(error: LedgerHistoryError) -> Self {
+        Self::History(error)
+    }
+}
+
 impl fmt::Display for LedgerPreparationResource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -4296,6 +4376,132 @@ impl Ledger {
             .map(move |(index, record)| self.resolve_retained_record(index, record))
     }
 
+    /// Reconstructs one signed balance after an exact committed record boundary.
+    ///
+    /// Generation zero denotes the empty ledger. Corrections and batches are
+    /// applied as indivisible records, so no intermediate member balance is
+    /// observable. The query allocates no output or auxiliary storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerAsOfError`] for a future generation, retained-history
+    /// contradiction, unrepresentable atomic result, or disagreement between
+    /// complete reconstruction and the current balance index.
+    pub fn try_balance_at(
+        &self,
+        generation: u64,
+        account_id: AccountId,
+        asset_id: AssetId,
+    ) -> Result<i128, LedgerAsOfError> {
+        let current_generation = u64::try_from(self.journal.len()).map_err(|_| {
+            LedgerHistoryError::SequenceOverflow {
+                index: self.journal.len().saturating_sub(1),
+            }
+        })?;
+        if generation > current_generation {
+            return Err(LedgerAsOfError::GenerationOutOfRange {
+                requested: generation,
+                current: current_generation,
+            });
+        }
+        let record_limit =
+            usize::try_from(generation).map_err(|_| LedgerHistoryError::SequenceOverflow {
+                index: self.journal.len(),
+            })?;
+        let mut reconstructed = 0_i128;
+        for retained in self.retained_history().take(record_limit) {
+            let retained = retained?;
+            reconstructed = Self::apply_record_balance(
+                retained.record,
+                retained.sequence,
+                account_id,
+                asset_id,
+                reconstructed,
+            )?;
+        }
+        if generation == current_generation {
+            let indexed = self.balance(account_id, asset_id);
+            if reconstructed != indexed {
+                return Err(LedgerAsOfError::CurrentBalanceMismatch {
+                    account_id,
+                    asset_id,
+                    reconstructed,
+                    indexed,
+                });
+            }
+        }
+        Ok(reconstructed)
+    }
+
+    fn apply_record_balance(
+        record: LedgerRecordView<'_>,
+        sequence: u64,
+        account_id: AccountId,
+        asset_id: AssetId,
+        mut balance: i128,
+    ) -> Result<i128, LedgerAsOfError> {
+        let mut negative_index = 0_usize;
+        let mut positive_index = 0_usize;
+        loop {
+            let amount = if balance >= 0 {
+                Self::next_record_amount(record, &mut negative_index, account_id, asset_id, false)
+                    .or_else(|| {
+                        Self::next_record_amount(
+                            record,
+                            &mut positive_index,
+                            account_id,
+                            asset_id,
+                            true,
+                        )
+                    })
+            } else {
+                Self::next_record_amount(record, &mut positive_index, account_id, asset_id, true)
+                    .or_else(|| {
+                        Self::next_record_amount(
+                            record,
+                            &mut negative_index,
+                            account_id,
+                            asset_id,
+                            false,
+                        )
+                    })
+            };
+            let Some(amount) = amount else {
+                return Ok(balance);
+            };
+            balance = balance
+                .checked_add(amount)
+                .ok_or(LedgerAsOfError::BalanceOverflow {
+                    sequence,
+                    account_id,
+                    asset_id,
+                })?;
+        }
+    }
+
+    fn next_record_amount(
+        record: LedgerRecordView<'_>,
+        transaction_index: &mut usize,
+        account_id: AccountId,
+        asset_id: AssetId,
+        positive: bool,
+    ) -> Option<i128> {
+        while *transaction_index < record.transaction_count() {
+            let index = *transaction_index;
+            *transaction_index += 1;
+            let entry = record.transaction(index)?;
+            if let Some(posting) = entry
+                .postings()
+                .iter()
+                .find(|posting| posting.account_id == account_id && posting.asset_id == asset_id)
+                && posting.amount.is_positive() == positive
+            {
+                return Some(posting.amount);
+            }
+        }
+        None
+    }
+
     /// Returns a cloned canonical event at a one-based ledger sequence.
     ///
     /// The clone shares immutable batch/entry/posting storage and allocates no
@@ -5380,6 +5586,14 @@ mod resource_limit_tests {
         );
         assert!(std::error::Error::source(&error).is_none());
         assert_eq!(missing.retained_history().next(), Some(Err(error)));
+        let as_of_error = missing
+            .try_balance_at(1, AccountId::new(1).unwrap(), AssetId::new(1).unwrap())
+            .unwrap_err();
+        assert_eq!(as_of_error, LedgerAsOfError::History(error));
+        assert_eq!(
+            std::error::Error::source(&as_of_error).unwrap().to_string(),
+            error.to_string()
+        );
 
         let mut mismatched = Ledger::try_with_limits(limits()).unwrap();
         mismatched.post(entry()).unwrap();
@@ -5395,6 +5609,46 @@ mod resource_limit_tests {
                 transaction_id,
             })
         );
+    }
+
+    #[test]
+    fn point_in_time_balance_reports_overflow_and_current_index_divergence() {
+        let account_id = AccountId::new(1).unwrap();
+        let asset_id = AssetId::new(1).unwrap();
+        let value = entry();
+        assert_eq!(
+            Ledger::apply_record_balance(
+                LedgerRecordView::Entry(&value),
+                1,
+                account_id,
+                asset_id,
+                i128::MAX,
+            ),
+            Err(LedgerAsOfError::BalanceOverflow {
+                sequence: 1,
+                account_id,
+                asset_id,
+            })
+        );
+
+        let mut ledger = Ledger::try_with_limits(limits()).unwrap();
+        ledger.post(value).unwrap();
+        *ledger.balances.get_mut(&(account_id, asset_id)).unwrap() = 2;
+        let error = ledger.try_balance_at(1, account_id, asset_id).unwrap_err();
+        assert_eq!(
+            error,
+            LedgerAsOfError::CurrentBalanceMismatch {
+                account_id,
+                asset_id,
+                reconstructed: 1,
+                indexed: 2,
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "ledger reconstructed balance 1 for account 1 asset 1 differs from indexed balance 2"
+        );
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]
