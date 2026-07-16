@@ -21,8 +21,10 @@ use crate::journal::{
     SegmentedJournalError, SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
 };
 use crate::matching::{
-    Command, CommandPreparation, ExecutionReport, InvariantViolation, MatchingError, OrderBook,
-    OrderBookCheckpoint, OrderBookCheckpointCapture, OrderBookCheckpointError, OrderBookLimits,
+    Command, CommandPreparation, ExecutionReport, ImmediateExecutionOutcome,
+    ImmediateExecutionQuote, ImmediateExecutionSubmission, InvariantViolation, MatchingError,
+    OrderBook, OrderBookCheckpoint, OrderBookCheckpointCapture, OrderBookCheckpointError,
+    OrderBookLimits, PreparedCommand,
 };
 use crate::snapshot::{
     CheckpointAnchor, CheckpointCutoverReceipt, CheckpointSlot, SnapshotError, SnapshotFile,
@@ -729,6 +731,58 @@ impl DurableOrderBook {
             }
             CommandPreparation::Ready(prepared) => prepared,
         };
+        self.commit_prepared(prepared)
+    }
+
+    /// Durably and atomically quotes and conditionally submits one canonical IOC order.
+    ///
+    /// Replay and core rejection bypass `accept`. A declined quote is returned
+    /// before any WAL append or semantic mutation. Acceptance appends the
+    /// canonical command, commits the exact preparation evaluated by the
+    /// predicate, then appends its report under the ordinary poison protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] for poison, matching preparation, journal, or
+    /// commit failure. A failure after command acknowledgement poisons the
+    /// instance for deterministic reopen recovery.
+    pub fn submit_immediate_execution_if(
+        &mut self,
+        submission: ImmediateExecutionSubmission,
+        accept: impl FnOnce(ImmediateExecutionQuote) -> bool,
+    ) -> Result<ImmediateExecutionOutcome, DurableError> {
+        if self.is_poisoned() {
+            return Err(DurableError::Poisoned);
+        }
+        let preflight = self
+            .book
+            .prepare_conditional_immediate_execution(submission)?;
+        let (prepared, quote) = match preflight.preparation {
+            CommandPreparation::Replay(report) => {
+                if self.is_poisoned() {
+                    return Err(DurableError::Poisoned);
+                }
+                return Ok(ImmediateExecutionOutcome::reported(None, report));
+            }
+            CommandPreparation::Ready(prepared) => (prepared, preflight.quote),
+        };
+        if let Some(value) = quote
+            && !accept(value)
+        {
+            if self.is_poisoned() {
+                return Err(DurableError::Poisoned);
+            }
+            return Ok(ImmediateExecutionOutcome::Declined(value));
+        }
+        let report = self.commit_prepared(prepared)?;
+        let retained_quote = if report.replayed { None } else { quote };
+        Ok(ImmediateExecutionOutcome::reported(retained_quote, report))
+    }
+
+    fn commit_prepared(
+        &mut self,
+        prepared: PreparedCommand,
+    ) -> Result<ExecutionReport, DurableError> {
         if self.is_poisoned() {
             return Err(DurableError::Poisoned);
         }

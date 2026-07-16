@@ -2776,6 +2776,99 @@ impl ImmediateExecutionRequest {
     }
 }
 
+/// Canonical fully displayed IOC command bound to one execution request.
+///
+/// The request supplies account, side, quantity, market-or-limit constraint,
+/// and self-trade policy. The remaining fields supply command identity,
+/// instrument provenance, and intake time. [`Self::command`] is the only
+/// command represented by this value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImmediateExecutionSubmission {
+    command_id: CommandId,
+    order_id: OrderId,
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    received_at: TimestampNs,
+    request: ImmediateExecutionRequest,
+}
+
+impl ImmediateExecutionSubmission {
+    /// Binds command metadata to one exact immediate-execution request.
+    #[must_use]
+    pub const fn new(
+        command_id: CommandId,
+        order_id: OrderId,
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        received_at: TimestampNs,
+        request: ImmediateExecutionRequest,
+    ) -> Self {
+        Self {
+            command_id,
+            order_id,
+            instrument_id,
+            instrument_version,
+            received_at,
+            request,
+        }
+    }
+
+    /// Returns the command idempotency key.
+    #[must_use]
+    pub const fn command_id(self) -> CommandId {
+        self.command_id
+    }
+
+    /// Returns the never-reusable order identity.
+    #[must_use]
+    pub const fn order_id(self) -> OrderId {
+        self.order_id
+    }
+
+    /// Returns the routed instrument identity.
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version.
+    #[must_use]
+    pub const fn instrument_version(self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the intake timestamp copied to the command and its events.
+    #[must_use]
+    pub const fn received_at(self) -> TimestampNs {
+        self.received_at
+    }
+
+    /// Returns the exact execution request evaluated by the acceptance predicate.
+    #[must_use]
+    pub const fn request(self) -> ImmediateExecutionRequest {
+        self.request
+    }
+
+    /// Constructs the canonical fully displayed IOC command.
+    #[must_use]
+    pub const fn command(self) -> Command {
+        Command::New(NewOrder {
+            command_id: self.command_id,
+            order_id: self.order_id,
+            account_id: self.request.account_id,
+            instrument_id: self.instrument_id,
+            instrument_version: self.instrument_version,
+            side: self.request.side,
+            quantity: self.request.quantity,
+            display: OrderDisplay::FullyDisplayed,
+            order_type: self.request.constraint.order_type(),
+            time_in_force: TimeInForce::ImmediateOrCancel,
+            self_trade_prevention: self.request.self_trade_prevention,
+            received_at: self.received_at,
+        })
+    }
+}
+
 /// Why an immutable immediate-execution quote stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImmediateExecutionTermination {
@@ -2874,6 +2967,65 @@ impl ImmediateExecutionQuote {
     pub const fn termination(self) -> ImmediateExecutionTermination {
         self.termination
     }
+}
+
+/// Result of atomically evaluating an immediate-execution acceptance predicate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ImmediateExecutionOutcome {
+    /// The predicate declined the quote; no command, event, identity, or WAL
+    /// state was consumed.
+    Declined(ImmediateExecutionQuote),
+    /// Matching produced a report. A quote is present only when a newly
+    /// accepted command passed the predicate; replay and business/risk
+    /// rejection bypass the predicate and carry no current-state quote.
+    Reported {
+        /// Exact pre-commit economics retained for a newly accepted command.
+        quote: Option<ImmediateExecutionQuote>,
+        /// Complete matching report or exact cached replay.
+        report: ExecutionReport,
+    },
+}
+
+impl ImmediateExecutionOutcome {
+    /// Returns the quote associated with either a decline or a new acceptance.
+    #[must_use]
+    pub const fn quote(&self) -> Option<ImmediateExecutionQuote> {
+        match self {
+            Self::Declined(quote) => Some(*quote),
+            Self::Reported { quote, .. } => *quote,
+        }
+    }
+
+    /// Returns the matching report, or `None` when the predicate declined.
+    #[must_use]
+    pub const fn report(&self) -> Option<&ExecutionReport> {
+        match self {
+            Self::Declined(_) => None,
+            Self::Reported { report, .. } => Some(report),
+        }
+    }
+
+    /// Consumes the outcome and returns its report, if matching ran.
+    #[must_use]
+    pub fn into_report(self) -> Option<ExecutionReport> {
+        match self {
+            Self::Declined(_) => None,
+            Self::Reported { report, .. } => Some(report),
+        }
+    }
+
+    pub(crate) fn reported(
+        quote: Option<ImmediateExecutionQuote>,
+        report: ExecutionReport,
+    ) -> Self {
+        Self::Reported { quote, report }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ImmediateExecutionPreflight {
+    pub(crate) preparation: CommandPreparation,
+    pub(crate) quote: Option<ImmediateExecutionQuote>,
 }
 
 fn reserve_order_book_query_vec<T>(
@@ -8068,6 +8220,70 @@ impl OrderBook {
             request,
             self.public_depth_candidates(request.side.opposite()),
         )
+    }
+
+    /// Atomically quotes and conditionally submits one canonical IOC order.
+    ///
+    /// Core matching rejection and exact replay bypass `accept` and return a
+    /// report without a current-state quote. Otherwise `accept` receives the
+    /// exact private execution quote while this method holds exclusive access
+    /// to the book. Returning `false` drops the preparation without consuming
+    /// command/order identity, sequence, trade, event, or book state. Returning
+    /// `true` commits the same prepared command, so no other command can make
+    /// the accepted quote stale.
+    ///
+    /// The predicate runs before matching mutation. If it panics, unwinding
+    /// drops the preparation and leaves semantic state unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MatchingError`] for command collision, configured capacity,
+    /// identifier/sequence exhaustion, or an internal prepared-commit
+    /// contradiction.
+    pub fn submit_immediate_execution_if(
+        &mut self,
+        submission: ImmediateExecutionSubmission,
+        accept: impl FnOnce(ImmediateExecutionQuote) -> bool,
+    ) -> Result<ImmediateExecutionOutcome, MatchingError> {
+        let preflight = self.prepare_conditional_immediate_execution(submission)?;
+        match preflight.preparation {
+            CommandPreparation::Replay(report) => {
+                Ok(ImmediateExecutionOutcome::reported(None, report))
+            }
+            CommandPreparation::Ready(prepared) => {
+                let quote = preflight.quote;
+                if let Some(value) = quote
+                    && !accept(value)
+                {
+                    return Ok(ImmediateExecutionOutcome::Declined(value));
+                }
+                let report = self.commit(prepared)?;
+                let retained_quote = (!report.replayed).then_some(quote).flatten();
+                Ok(ImmediateExecutionOutcome::reported(retained_quote, report))
+            }
+        }
+    }
+
+    pub(crate) fn prepare_conditional_immediate_execution(
+        &self,
+        submission: ImmediateExecutionSubmission,
+    ) -> Result<ImmediateExecutionPreflight, MatchingError> {
+        match self.prepare(submission.command())? {
+            preparation @ CommandPreparation::Replay(_) => Ok(ImmediateExecutionPreflight {
+                preparation,
+                quote: None,
+            }),
+            CommandPreparation::Ready(prepared) => {
+                let quote = prepared
+                    .core_rejection()
+                    .is_none()
+                    .then(|| self.immediate_execution_quote(submission.request));
+                Ok(ImmediateExecutionPreflight {
+                    preparation: CommandPreparation::Ready(prepared),
+                    quote,
+                })
+            }
+        }
     }
 
     /// Quotes the exact external execution economics of one immediately active

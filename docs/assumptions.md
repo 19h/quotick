@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A139 are stable and are referenced from code comments and other
+identifiers A1-A140 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -5198,6 +5198,61 @@ consumption on rejection, noncanonical risk reservation, accepted unsupported
 TIF, stop activation as market-to-limit, recovery drift, or version-19
 acceptance falsifies A139.
 
+## A140 — atomic conditional immediate execution
+
+**Assumption.** `ImmediateExecutionSubmission` maps its command and order
+identities, instrument coordinates, timestamp, account, side, positive
+quantity, market-or-limit constraint, and self-trade policy to exactly one
+ordinary fully displayed `ImmediateOrCancel` `NewOrder`. One exclusive mutable
+shard borrow spans core command preparation, the coupled-risk authorization
+precheck when present, the A124 private quote, a caller-supplied acceptance
+predicate, and commit of the same prepared command.
+
+The predicate runs only when core preparation and coupled-risk authorization
+permit execution. It observes the exact A124 quote from the same book
+generation that will be committed. Predicate decline or unwind drops the
+preparation before consuming an order identity or changing sequence, events,
+trades, matching state, risk state, or WAL bytes. Acceptance commits without
+an intervening shard mutation. Core or risk business rejection and exact retry
+bypass the predicate and return a reported outcome without a current quote;
+risk rejection remains an ordinary sequenced report and retry remains the
+existing nonmutating replay.
+
+Durable variants invoke the predicate before command append. Acceptance and
+core or risk rejection retain the existing command-before-state-before-report
+protocol, poisoning and recovery rules; decline, unwind, and replay append
+nothing. The callback decision is process-local and is neither persisted nor
+authenticated. A140 does not reserve a standalone A124 quote, validate a quote
+across borrows, represent fees, report projected cancel-resting or cancel-both
+side effects inside the quote, or generalize the canonical IOC display,
+lifetime, and order-type subset. It reuses the existing command and report wire
+encodings and requires no wire-version change.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A7, A9, A10, A12, A15, A18,
+A19, A22, A37, A39, A44, A45, A47, A55, A57, A67, A72, A80, A81, A82,
+A83, A85, A103, A115, A124, A140] With quote cost `Q`, ordinary IOC commit
+cost `M`, and caller predicate cost `F`, acceptance costs `O(Q + M + F)` and
+decline costs `O(Q + F)`, with A124's exact ordinary-policy and decrement-and-
+cancel bounds for `Q`. Coupled risk adds expected `O(1)` authorization before
+the predicate and repeats that unchanged expected `O(1)` check at commit.
+Fixed auxiliary state is `O(1)` and the API introduces no allocation. Durable
+acceptance and core or risk rejection append the existing two frames; decline,
+unwind, and exact retry append zero.
+
+**Falsification probe.** For both sides, market and limit constraints, signed
+prices, displayed, reserve, and hidden makers, every A124 termination, and all
+four self-trade policies, run predicates that accept, decline, and unwind.
+Exercise core rejection, every applicable coupled-risk rejection, exact retry,
+and command-ID collision; count predicate calls and compare every accepted
+quote with its committed trace. On decline or unwind, require identical order-
+identity availability, event and trade sequences, private/public book, risk
+reservations, exposure, positions, and WAL length. On acceptance and business
+rejection, require canonical command/report frame order, poison-on-failure, and
+exact plain and coupled-risk recovery; on retry require no WAL growth. Any
+noncanonical IOC mapping, predicate call on rejection or replay, quote/trace
+divergence, mutation before acceptance, interposed shard state, partial durable
+decision, recovery drift, allocation, or new wire value falsifies A140.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -5377,12 +5432,18 @@ capability, a remaining risk, or an opportunity.
   hidden priority share the execution preflight scanners and are covered by a
   20,000-case literal two-class queue differential.
 
-- **High impact risk:** an immediate-execution quote neither reserves liquidity
-  nor fences a later command. Another committed command can invalidate the
-  economics after the reported event sequence; admission, account controls,
-  risk, fees, and the resting-order cancellation effects of cancel-resting or
-  cancel-both are also excluded. Atomic quote-to-command commitment or remote
-  quote validity therefore requires a separately sequenced protocol.
+- **High impact:** A140 now binds one exact private quote, a local acceptance
+  predicate, coupled-risk authorization, and the same canonical fully
+  displayed IOC commit under one exclusive shard borrow. Predicate decline or
+  unwind changes no matching, risk, identity, sequence, or WAL state; exact
+  replay and business rejection bypass the predicate.
+
+- **High impact risk:** a standalone A124 quote still neither reserves
+  liquidity nor fences a later borrow. A140 closes only the process-local
+  canonical IOC path. Remote or asynchronous quote validity, callback
+  authentication/durability, fees, arbitrary display/lifetime/order types,
+  cross-shard execution, and projected cancel-resting or cancel-both maker
+  effects require separately specified protocols.
 
 - **Medium impact opportunity:** the exact quantity partition, signed
   notional, worst price, and termination can drive deterministic slippage,

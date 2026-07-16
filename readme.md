@@ -278,6 +278,13 @@ Run any program with `cargo run --example <name>`.
   state. Minimum-quantity IOC also supports all four policies; its exact
   decrement-and-cancel preflight counts only external trades while consuming
   prevented self quantity and is atomic on threshold failure.
+- Typed conditional immediate execution maps one request to a canonical fully
+  displayed market or limit IOC, exposes its exact private quote to a local
+  predicate under the same exclusive shard borrow, and commits that prepared
+  command only on acceptance. Core or risk rejection and exact replay bypass
+  the predicate; decline or unwind changes no identity, sequence, matching,
+  risk, or WAL state. Plain, coupled-risk, and both durable paths share the
+  contract.
 - Exact-command idempotency: retries replay the cached report without
   consuming capacity, and `CommandId` reuse with different content is a typed
   collision error; event and trade sequences are strictly monotonic.
@@ -355,6 +362,9 @@ Run any program with `cargo run --example <name>`.
 - Coupled shards for both continuous matching and call auctions: core
   business rejections always precede risk, and risk rejections are ordinary
   sequenced reports, never errors.
+- Conditional immediate execution performs the coupled-risk gate before its
+  quote-acceptance predicate and retains the existing risk authorization and
+  trace application on commit.
 - Reservation lifecycle derived from the sequenced trace across fills,
   cancellation, GTD expiry, stop arming/activation, replacement, mass
   cancellation, account controls, and self-trade prevention; dormant stops
@@ -515,6 +525,8 @@ Live continuous and call-auction command/report history is likewise a local
 borrowed order-management interface; it provides no authenticated remote
 transport, account filtering, entitlement, pagination, audit export, eviction,
 or generation rollover.
+Conditional immediate-execution predicates are likewise process-local and are
+not persisted, authenticated, transported, or valid across shard borrows.
 
 The matching model is a continuous price-time-priority book with sequenced
 instrument-wide trading-state controls, plus a separate bounded call-auction
@@ -552,7 +564,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 139 tagged assumptions (A1–A139), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 140 tagged assumptions (A1–A140), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -620,7 +632,9 @@ includes:
 
 - **Matching and risk:** displayed/hidden queue classes, hidden and reserve
   admission and replenishment, frozen-best market-to-limit pricing and
-  residuals, GTD intake and canonical expiry sweeps, dormant
+  residuals, conditional immediate-execution accept/decline/unwind and core,
+  risk, replay, WAL, and recovery boundaries, GTD intake and canonical expiry
+  sweeps, dormant
   stop intake, canonical bounded trigger sweeps, activation-time failures,
   mass cancellation, account and trading-state controls, every self-trade
   policy, atomic FOK decrement-and-cancel barriers and exact minimum-quantity

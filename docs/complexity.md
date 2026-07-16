@@ -525,6 +525,20 @@ output is one fixed-size value containing provenance, the exact quantity
 partition, worst execution price, and termination. Both paths allocate nothing
 and do not mutate or reserve book state.
 
+`submit_immediate_execution_if` composes ordinary command preparation, the
+same private quote, a caller predicate of cost `F`, and commit of the same
+canonical fully displayed IOC command. If `Q` is the applicable quote bound
+above and `M` is the ordinary IOC matching bound, acceptance is
+`O(Q + M + F)` and decline is `O(Q + F)`. The second scan on acceptance changes
+the constant factor, not the asymptotic bound. Core rejection and exact replay
+bypass both quote and predicate after their existing preparation work. The
+coupled-risk path adds two expected `O(1)` authorization checks on acceptance,
+one before the predicate and the unchanged commit-time check; a risk rejection
+bypasses the predicate. The operation uses `O(1)` auxiliary state, introduces
+no allocation, and decline or predicate unwind mutates nothing. Durable
+acceptance and core or risk rejection append the existing command and report
+frames; decline, unwind, and exact replay append zero frames.
+
 ## Default matching limits and memory
 
 This section states the default resource envelopes, the buffer pools, the

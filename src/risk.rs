@@ -16,10 +16,11 @@ use crate::bounded_hash::BoundedHashMap;
 use crate::domain::{AccountId, OrderId, Price, Side};
 use crate::instrument::InstrumentDefinition;
 use crate::matching::{
-    Command, CommandOutcome, CommandPreparation, EventKind, ExecutionReport, MatchingCapacity,
-    MatchingError, NewOrder, OrderBook, OrderBookCheckpoint, OrderBookCheckpointError,
-    OrderBookLimits, OrderBookLimitsSpec, OrderType, PreparedCommand, RejectReason, ReplaceOrder,
-    SelfTradePrevention, Trade,
+    Command, CommandOutcome, CommandPreparation, EventKind, ExecutionReport,
+    ImmediateExecutionOutcome, ImmediateExecutionPreflight, ImmediateExecutionQuote,
+    ImmediateExecutionSubmission, MatchingCapacity, MatchingError, NewOrder, OrderBook,
+    OrderBookCheckpoint, OrderBookCheckpointError, OrderBookLimits, OrderBookLimitsSpec, OrderType,
+    PreparedCommand, RejectReason, ReplaceOrder, SelfTradePrevention, Trade,
 };
 
 /// Account-level order-entry state.
@@ -1989,6 +1990,62 @@ impl RiskManagedOrderBook {
             CommandPreparation::Replay(report) => Ok(report),
             CommandPreparation::Ready(prepared) => self.commit(prepared),
         }
+    }
+
+    /// Atomically risk-gates, quotes, and conditionally submits one canonical IOC order.
+    ///
+    /// Core or risk rejection and exact replay bypass `accept`. For a command
+    /// that passes both gates, the predicate receives exact matching economics
+    /// under exclusive coupled-state access. Decline mutates neither matching
+    /// nor risk state; acceptance commits the same preparation and applies its
+    /// resulting trades exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MatchingError`] for collision, configured capacity,
+    /// identifier/sequence exhaustion, or a prepared-commit contradiction.
+    pub fn submit_immediate_execution_if(
+        &mut self,
+        submission: ImmediateExecutionSubmission,
+        accept: impl FnOnce(ImmediateExecutionQuote) -> bool,
+    ) -> Result<ImmediateExecutionOutcome, MatchingError> {
+        let preflight = self.prepare_conditional_immediate_execution(submission)?;
+        match preflight.preparation {
+            CommandPreparation::Replay(report) => {
+                Ok(ImmediateExecutionOutcome::reported(None, report))
+            }
+            CommandPreparation::Ready(prepared) => {
+                let quote = preflight.quote;
+                if let Some(value) = quote
+                    && !accept(value)
+                {
+                    return Ok(ImmediateExecutionOutcome::Declined(value));
+                }
+                let report = self.commit(prepared)?;
+                let retained_quote = if report.replayed { None } else { quote };
+                Ok(ImmediateExecutionOutcome::reported(retained_quote, report))
+            }
+        }
+    }
+
+    pub(crate) fn prepare_conditional_immediate_execution(
+        &self,
+        submission: ImmediateExecutionSubmission,
+    ) -> Result<ImmediateExecutionPreflight, MatchingError> {
+        let mut preflight = self
+            .book
+            .prepare_conditional_immediate_execution(submission)?;
+        if let CommandPreparation::Ready(prepared) = &preflight.preparation {
+            debug_assert_eq!(
+                self.risk.reservation_count(),
+                self.book.active_order_count(),
+                "coupled preparation requires matching/risk cardinality parity"
+            );
+            if preflight.quote.is_some() && self.risk.authorize(prepared.command()).is_err() {
+                preflight.quote = None;
+            }
+        }
+        Ok(preflight)
     }
 
     /// Prepares matching operational/core checks against immutable coupled state.

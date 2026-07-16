@@ -10,8 +10,9 @@ use quotick::instrument::{
 use quotick::journal::{Durability, Journal, JournalOptions, JournalReader, RecordKind};
 use quotick::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, Command, CommandOutcome,
+    ImmediateExecutionOutcome, ImmediateExecutionRequest, ImmediateExecutionSubmission,
     MatchingCapacity, MatchingError, NewOrder, OrderBookLimits, OrderBookLimitsSpec, OrderType,
-    RejectReason, SelfTradePrevention, TimeInForce,
+    RejectReason, SelfTradePrevention, StopActivation, TimeInForce,
 };
 use quotick::risk::{
     AccountRiskDefinition, AccountRiskState, RiskError, RiskLimitSpec, RiskLimits,
@@ -112,6 +113,35 @@ fn command(command_id: u64, order_id: u64, owner: u64, quantity: u64) -> Command
         self_trade_prevention: SelfTradePrevention::CancelAggressor,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
+}
+
+fn sell(command_id: u64, order_id: u64, owner: u64, quantity: u64) -> Command {
+    let Command::New(mut order) = command(command_id, order_id, owner, quantity) else {
+        unreachable!("fixture is a new order")
+    };
+    order.side = Side::Sell;
+    Command::New(order)
+}
+
+fn immediate_submission(
+    command_id: u64,
+    order_id: u64,
+    quantity: u64,
+) -> ImmediateExecutionSubmission {
+    ImmediateExecutionSubmission::new(
+        CommandId::new(command_id).unwrap(),
+        OrderId::new(order_id).unwrap(),
+        InstrumentId::new(1).unwrap(),
+        InstrumentVersion::new(1).unwrap(),
+        TimestampNs::from_unix_nanos(command_id),
+        ImmediateExecutionRequest::new(
+            account(12),
+            Side::Buy,
+            Quantity::new(quantity).unwrap(),
+            StopActivation::Limit(Price::from_raw(100)),
+            SelfTradePrevention::CancelAggressor,
+        ),
+    )
 }
 
 fn account_control(
@@ -222,6 +252,80 @@ fn durable_risk_round_trip_binds_sorted_profiles_and_restores_reservations() {
             .unwrap()
             .quantity_lots(),
         5
+    );
+    reopened.managed().validate().unwrap();
+}
+
+#[test]
+fn durable_risk_conditional_execution_is_atomic_with_wal_and_positions() {
+    let file = TestFile::new("conditional-immediate");
+    let mut durable =
+        DurableRiskOrderBook::open(file.path(), definition(), &profiles(), options()).unwrap();
+    durable.submit(sell(1, 1, 11, 5)).unwrap();
+    let value = immediate_submission(2, 2, 3);
+    let frames_before = frames(file.path()).len();
+
+    assert!(matches!(
+        durable
+            .submit_immediate_execution_if(value, |_| false)
+            .unwrap(),
+        ImmediateExecutionOutcome::Declined(_)
+    ));
+    assert_eq!(frames(file.path()).len(), frames_before);
+    assert_eq!(
+        durable
+            .managed()
+            .risk()
+            .snapshot(account(12))
+            .unwrap()
+            .position_lots(),
+        0
+    );
+
+    let accepted = durable
+        .submit_immediate_execution_if(value, |quote| quote.raw_price_notional() <= 300)
+        .unwrap();
+    assert!(matches!(
+        accepted,
+        ImmediateExecutionOutcome::Reported {
+            quote: Some(_),
+            report
+        } if report.outcome == CommandOutcome::Accepted
+    ));
+    assert_eq!(frames(file.path()).len(), frames_before + 2);
+    assert_eq!(
+        durable
+            .managed()
+            .risk()
+            .snapshot(account(12))
+            .unwrap()
+            .position_lots(),
+        3
+    );
+    let frames_after = frames(file.path()).len();
+    assert!(matches!(
+        durable
+            .submit_immediate_execution_if(value, |_| panic!("replay bypasses the predicate"))
+            .unwrap(),
+        ImmediateExecutionOutcome::Reported {
+            quote: None,
+            report
+        } if report.replayed
+    ));
+    assert_eq!(frames(file.path()).len(), frames_after);
+    durable.sync_all().unwrap();
+    drop(durable);
+
+    let reopened =
+        DurableRiskOrderBook::open(file.path(), definition(), &profiles(), options()).unwrap();
+    assert_eq!(
+        reopened
+            .managed()
+            .risk()
+            .snapshot(account(12))
+            .unwrap()
+            .position_lots(),
+        3
     );
     reopened.managed().validate().unwrap();
 }
