@@ -285,6 +285,11 @@ Run any program with `cargo run --example <name>`.
   reports, the retry cache, checkpoints, and fixed dense/open-addressed hash
   indexes — the matching hot path never allocates, grows, or rehashes,
   including under deletion churn.
+- Typed fallible read-only extraction for public depth, complete private
+  resting-order snapshots, and account-scoped active order identifiers. Each
+  path reserves its bounded caller-owned vector before traversal, preserves
+  canonical output order, and reports allocation or private-index
+  contradictions without mutating the book.
 - Protected command-history and event tails that keep cancellation, expiry
   sweeps, block-and-cancel, and entry-closing transitions available when
   ordinary capacity is exhausted; residual-aware admission proves whether a
@@ -516,7 +521,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 116 tagged assumptions (A1–A116), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 117 tagged assumptions (A1–A117), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |

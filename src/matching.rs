@@ -1528,6 +1528,79 @@ pub struct LevelSnapshot {
     pub order_count: u64,
 }
 
+/// Caller-owned output allocated by a read-only order-book query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderBookQueryResource {
+    /// Public aggregate price levels.
+    DepthLevels,
+    /// Complete private resting-order snapshots.
+    ActiveOrders,
+    /// Active order identifiers selected from one account list.
+    AccountOrderIds,
+}
+
+impl fmt::Display for OrderBookQueryResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::DepthLevels => "depth-level output",
+            Self::ActiveOrders => "active-order output",
+            Self::AccountOrderIds => "account-order-identifier output",
+        })
+    }
+}
+
+/// Failure while constructing caller-owned read-only order-book output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OrderBookQueryError {
+    /// The complete bounded output vector could not be reserved.
+    ReservationFailed {
+        /// Output whose reservation failed.
+        resource: OrderBookQueryResource,
+        /// Maximum number of output entries required by the query.
+        maximum: usize,
+    },
+    /// Private account or resting-order state contradicted its invariants.
+    InvariantViolation(InvariantViolation),
+}
+
+impl fmt::Display for OrderBookQueryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReservationFailed { resource, maximum } => write!(
+                formatter,
+                "order-book {resource} could not reserve {maximum} entries"
+            ),
+            Self::InvariantViolation(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for OrderBookQueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ReservationFailed { .. } => None,
+            Self::InvariantViolation(error) => Some(error),
+        }
+    }
+}
+
+impl From<InvariantViolation> for OrderBookQueryError {
+    fn from(error: InvariantViolation) -> Self {
+        Self::InvariantViolation(error)
+    }
+}
+
+fn reserve_order_book_query_vec<T>(
+    maximum: usize,
+    resource: OrderBookQueryResource,
+) -> Result<Vec<T>, OrderBookQueryError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(maximum)
+        .map_err(|_| OrderBookQueryError::ReservationFailed { resource, maximum })?;
+    Ok(output)
+}
+
 /// Process-local allocation state of one bounded price-level arena.
 ///
 /// These counters are operational telemetry. They do not affect matching
@@ -6270,13 +6343,41 @@ impl OrderBook {
         }
     }
 
-    /// Returns up to `limit` levels in market-priority order.
+    /// Fallibly returns up to `limit` public levels in market-priority order.
+    ///
+    /// The result reserves no more than the side's bounded occupied-price
+    /// cardinality before copying any level. Fully hidden-only prices remain
+    /// absent from output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrderBookQueryError::ReservationFailed`] without partial output
+    /// if the caller-owned result vector cannot be reserved.
+    pub fn try_depth(
+        &self,
+        side: Side,
+        limit: usize,
+    ) -> Result<Vec<LevelSnapshot>, OrderBookQueryError> {
+        let maximum = self.levels(side).len().min(limit);
+        let mut output =
+            reserve_order_book_query_vec(maximum, OrderBookQueryResource::DepthLevels)?;
+        match side {
+            Side::Buy => output.extend(self.depth_levels(side).rev().take(limit)),
+            Side::Sell => output.extend(self.depth_levels(side).take(limit)),
+        }
+        Ok(output)
+    }
+
+    /// Returns up to `limit` public levels using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if result-vector allocation fails. Use [`Self::try_depth`]
+    /// when allocation failure must remain typed.
     #[must_use]
     pub fn depth(&self, side: Side, limit: usize) -> Vec<LevelSnapshot> {
-        match side {
-            Side::Buy => self.depth_levels(side).rev().take(limit).collect(),
-            Side::Sell => self.depth_levels(side).take(limit).collect(),
-        }
+        self.try_depth(side, limit)
+            .expect("order-book depth output allocation failed")
     }
 
     /// Iterates aggregate levels in ascending price order without allocating.
@@ -6326,7 +6427,7 @@ impl OrderBook {
         })
     }
 
-    /// Returns every active resting order in ascending identifier order.
+    /// Fallibly returns every active resting order in ascending identifier order.
     ///
     /// This allocates and sorts in `O(O log O)` time. It is intended for
     /// snapshots, recovered-state bootstrap, and diagnostics rather than the
@@ -6334,15 +6435,51 @@ impl OrderBook {
     ///
     /// # Errors
     ///
-    /// Returns [`InvariantViolation`] if a resting order contains an impossible
-    /// zero total or displayed leaves quantity.
-    pub fn active_orders(&self) -> Result<Vec<OrderSnapshot>, InvariantViolation> {
-        let mut orders = Vec::with_capacity(self.resting_order_count());
+    /// Returns [`OrderBookQueryError::ReservationFailed`] before copying output
+    /// if the complete bounded vector cannot be reserved, or
+    /// [`OrderBookQueryError::InvariantViolation`] if a resting order contains
+    /// an impossible zero total or displayed leaves quantity.
+    pub fn try_active_orders(&self) -> Result<Vec<OrderSnapshot>, OrderBookQueryError> {
+        let maximum = self.resting_order_count();
+        let mut orders =
+            reserve_order_book_query_vec(maximum, OrderBookQueryResource::ActiveOrders)?;
         for order in self.active_order_states() {
-            orders.push(order?);
+            if orders.len() == maximum {
+                return Err(InvariantViolation::new(
+                    "active resting-order count exceeds its indexed cardinality",
+                )
+                .into());
+            }
+            orders.push(order.map_err(OrderBookQueryError::InvariantViolation)?);
+        }
+        if orders.len() != maximum {
+            return Err(InvariantViolation::new(
+                "active resting-order count is below its indexed cardinality",
+            )
+            .into());
         }
         orders.sort_unstable_by_key(|order| order.order_id);
         Ok(orders)
+    }
+
+    /// Returns every active resting order using the fallible production path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] if private resting-order state is invalid.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if result-vector allocation fails. Use
+    /// [`Self::try_active_orders`] when allocation failure must remain typed.
+    pub fn active_orders(&self) -> Result<Vec<OrderSnapshot>, InvariantViolation> {
+        match self.try_active_orders() {
+            Ok(orders) => Ok(orders),
+            Err(OrderBookQueryError::InvariantViolation(error)) => Err(error),
+            Err(OrderBookQueryError::ReservationFailed { .. }) => {
+                panic!("order-book active-order output allocation failed")
+            }
+        }
     }
 
     /// Iterates resting-order state in dense process-local order without allocating.
@@ -6473,59 +6610,113 @@ impl OrderBook {
         }
     }
 
-    /// Returns one account's selected active order IDs in canonical ascending order.
+    /// Fallibly returns one account's active order IDs in canonical ascending order.
     ///
     /// This allocates `O(K)` output, traverses only the `K` selected orders, and
     /// sorts them in `O(K log K)` time without auxiliary allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrderBookQueryError::ReservationFailed`] before traversal if
+    /// the complete bounded vector cannot be reserved, or
+    /// [`OrderBookQueryError::InvariantViolation`] if the private account list
+    /// contradicts its declared identity, side, or cardinality.
+    pub fn try_account_active_order_ids(
+        &self,
+        account_id: AccountId,
+        scope: MassCancelScope,
+    ) -> Result<Vec<OrderId>, OrderBookQueryError> {
+        let Some(index) = self.account_orders.get(&account_id) else {
+            return Ok(Vec::new());
+        };
+        let selected_count = match scope {
+            MassCancelScope::All => index
+                .order_count(Side::Buy)
+                .checked_add(index.order_count(Side::Sell))
+                .ok_or_else(|| {
+                    InvariantViolation::new(format!(
+                        "account {account_id} active-order count is exhausted"
+                    ))
+                })?,
+            MassCancelScope::Side(side) => index.order_count(side),
+        };
+        if selected_count > self.orders.len() {
+            return Err(InvariantViolation::new(format!(
+                "account {account_id} active-order count exceeds total active orders"
+            ))
+            .into());
+        }
+        let mut selected =
+            reserve_order_book_query_vec(selected_count, OrderBookQueryResource::AccountOrderIds)?;
+        match scope {
+            MassCancelScope::All => {
+                self.try_append_account_side_ids(account_id, index, Side::Buy, &mut selected)?;
+                self.try_append_account_side_ids(account_id, index, Side::Sell, &mut selected)?;
+            }
+            MassCancelScope::Side(side) => {
+                self.try_append_account_side_ids(account_id, index, side, &mut selected)?;
+            }
+        }
+        selected.sort_unstable();
+        if selected.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(InvariantViolation::new(format!(
+                "account {account_id} query traversed one active order more than once"
+            ))
+            .into());
+        }
+        Ok(selected)
+    }
+
+    /// Returns account order IDs using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if output allocation fails or private account-list state is
+    /// corrupt. Use [`Self::try_account_active_order_ids`] when either failure
+    /// must remain typed.
     #[must_use]
     pub fn account_active_order_ids(
         &self,
         account_id: AccountId,
         scope: MassCancelScope,
     ) -> Vec<OrderId> {
-        let Some(index) = self.account_orders.get(&account_id) else {
-            return Vec::new();
-        };
-        let selected_count = match scope {
-            MassCancelScope::All => index
-                .order_count(Side::Buy)
-                .saturating_add(index.order_count(Side::Sell)),
-            MassCancelScope::Side(side) => index.order_count(side),
-        };
-        let mut selected = Vec::with_capacity(selected_count);
-        match scope {
-            MassCancelScope::All => {
-                self.append_account_side_ids(index, Side::Buy, &mut selected);
-                self.append_account_side_ids(index, Side::Sell, &mut selected);
-            }
-            MassCancelScope::Side(side) => {
-                self.append_account_side_ids(index, side, &mut selected);
-            }
-        }
-        selected.sort_unstable();
-        selected
+        self.try_account_active_order_ids(account_id, scope)
+            .expect("order-book account-order query failed")
     }
 
-    fn append_account_side_ids(
+    fn try_append_account_side_ids(
         &self,
+        account_id: AccountId,
         index: &AccountOrderIndex,
         side: Side,
         selected: &mut Vec<OrderId>,
-    ) {
+    ) -> Result<(), InvariantViolation> {
         let mut current = index.head(side);
         for _ in 0..index.order_count(side) {
-            let order_id = current.expect("account index ended before its declared count");
+            let order_id = current.ok_or_else(|| {
+                InvariantViolation::new(format!(
+                    "account {account_id} {side:?} list ended before its declared count"
+                ))
+            })?;
             selected.push(order_id);
-            current = self
-                .orders
-                .get(&order_id)
-                .expect("account index order must exist")
-                .account_next;
+            let order = self.orders.get(&order_id).ok_or_else(|| {
+                InvariantViolation::new(format!(
+                    "account {account_id} list references absent order {order_id}"
+                ))
+            })?;
+            if order.account_id != account_id || order.side != side {
+                return Err(InvariantViolation::new(format!(
+                    "account {account_id} {side:?} list references order {order_id} with another owner or side"
+                )));
+            }
+            current = order.account_next;
         }
-        debug_assert!(
-            current.is_none(),
-            "account index exceeds its declared count"
-        );
+        if current.is_some() {
+            return Err(InvariantViolation::new(format!(
+                "account {account_id} {side:?} list exceeds its declared count"
+            )));
+        }
+        Ok(())
     }
 
     /// Audits all index, FIFO-link, aggregate, and spread invariants.
@@ -8849,11 +9040,14 @@ impl OrderBook {
         debug_assert!(selected.capacity() >= selected_count);
         match scope {
             MassCancelScope::All => {
-                self.append_account_side_ids(index, Side::Buy, selected);
-                self.append_account_side_ids(index, Side::Sell, selected);
+                self.try_append_account_side_ids(account_id, index, Side::Buy, selected)
+                    .expect("validated account buy list must remain queryable");
+                self.try_append_account_side_ids(account_id, index, Side::Sell, selected)
+                    .expect("validated account sell list must remain queryable");
             }
             MassCancelScope::Side(side) => {
-                self.append_account_side_ids(index, side, selected);
+                self.try_append_account_side_ids(account_id, index, side, selected)
+                    .expect("validated account side list must remain queryable");
             }
         }
         debug_assert_eq!(selected.len(), selected_count);
@@ -9427,11 +9621,12 @@ mod price_level_index_tests {
 
     use super::{
         AccountAdmissionState, AccountControl, AccountControlAction, AccountControlSnapshot,
-        Command, CommandOutcome, CommandPreparation, EventTraceBuilder, IncomingPreview,
-        InvariantViolation, MassCancel, MassCancelScope, MatchingCapacity, MatchingError, NewOrder,
-        OrderBook, OrderBookLimits, OrderBookLimitsSpec, OrderDisplay, OrderSelectionPool,
-        OrderType, PriceLevel, PriceLevels, RejectReason, ReplaceOrder, RestingOrder,
-        SelfTradePrevention, TimeInForce, try_event_arena,
+        BuyStopKey, Command, CommandOutcome, CommandPreparation, EventTraceBuilder,
+        IncomingPreview, InvariantViolation, MassCancel, MassCancelScope, MatchingCapacity,
+        MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsSpec,
+        OrderBookQueryError, OrderDisplay, OrderSelectionPool, OrderType, PriceLevel, PriceLevels,
+        RejectReason, ReplaceOrder, RestingOrder, SelfTradePrevention, TimeInForce,
+        try_event_arena,
     };
     use crate::instrument::{
         InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -10094,6 +10289,78 @@ mod price_level_index_tests {
     }
 
     #[test]
+    fn fallible_private_queries_reject_corrupt_cardinalities_before_growth() {
+        let mut book = OrderBook::new(reserve_definition());
+        let order_id = OrderId::new(10).unwrap();
+        let account_id = AccountId::new(1).unwrap();
+        book.append_order(RestingOrder {
+            order_id,
+            account_id,
+            side: Side::Buy,
+            price: Price::from_raw(100),
+            leaves: 1,
+            displayed: 1,
+            display: OrderDisplay::FullyDisplayed,
+            self_trade_prevention: SelfTradePrevention::CancelAggressor,
+            expires_at: None,
+            stop: None,
+            previous: None,
+            next: None,
+            account_previous: None,
+            account_next: None,
+        });
+        book.seen_order_ids.insert(order_id);
+        book.validate().unwrap();
+
+        let fake_stop_id = OrderId::new(99).unwrap();
+        assert!(
+            book.buy_stops
+                .insert(
+                    BuyStopKey {
+                        trigger_price: Price::from_raw(200),
+                        priority_sequence: 1,
+                        order_id: fake_stop_id,
+                    },
+                    fake_stop_id,
+                )
+                .is_none()
+        );
+        let OrderBookQueryError::InvariantViolation(error) = book.try_active_orders().unwrap_err()
+        else {
+            panic!("corrupt resting cardinality must be an invariant failure");
+        };
+        assert!(error.detail().contains("exceeds its indexed cardinality"));
+
+        let impossible_count = book.orders.len() + 1;
+        book.account_orders
+            .get_mut(&account_id)
+            .unwrap()
+            .buys
+            .order_count = impossible_count;
+        let OrderBookQueryError::InvariantViolation(error) = book
+            .try_account_active_order_ids(account_id, MassCancelScope::Side(Side::Buy))
+            .unwrap_err()
+        else {
+            panic!("corrupt account cardinality must be an invariant failure");
+        };
+        assert!(error.detail().contains("exceeds total active orders"));
+
+        book.account_orders
+            .get_mut(&account_id)
+            .unwrap()
+            .buys
+            .order_count = 1;
+        book.orders.get_mut(&order_id).unwrap().account_next = Some(order_id);
+        let OrderBookQueryError::InvariantViolation(error) = book
+            .try_account_active_order_ids(account_id, MassCancelScope::Side(Side::Buy))
+            .unwrap_err()
+        else {
+            panic!("corrupt account topology must be an invariant failure");
+        };
+        assert!(error.detail().contains("exceeds its declared count"));
+    }
+
+    #[test]
     fn allocation_free_validation_rejects_price_and_account_cycles() {
         let mut book = OrderBook::new(reserve_definition());
         for order_id in [10_u64, 20] {
@@ -10211,11 +10478,13 @@ mod price_level_index_tests {
         }
 
         let mut live_topology = Vec::new();
-        book.append_account_side_ids(
+        book.try_append_account_side_ids(
+            account_id,
             book.account_orders.get(&account_id).unwrap(),
             Side::Buy,
             &mut live_topology,
-        );
+        )
+        .unwrap();
         assert_eq!(
             live_topology,
             [30_u64, 10, 20].map(|order_id| OrderId::new(order_id).unwrap())
@@ -10223,11 +10492,14 @@ mod price_level_index_tests {
 
         let restored = OrderBook::from_checkpoint(&book.checkpoint(1, 7).unwrap()).unwrap();
         let mut restored_topology = Vec::new();
-        restored.append_account_side_ids(
-            restored.account_orders.get(&account_id).unwrap(),
-            Side::Buy,
-            &mut restored_topology,
-        );
+        restored
+            .try_append_account_side_ids(
+                account_id,
+                restored.account_orders.get(&account_id).unwrap(),
+                Side::Buy,
+                &mut restored_topology,
+            )
+            .unwrap();
         assert_eq!(
             restored_topology,
             [30_u64, 20, 10].map(|order_id| OrderId::new(order_id).unwrap())

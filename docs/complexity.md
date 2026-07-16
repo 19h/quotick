@@ -146,6 +146,18 @@ arenas in `O(S_i log(S_i + 1))`, using `O(1)` auxiliary space and no heap
 allocation. Human-readable failure-detail formatting may allocate after
 corruption is detected.
 
+Read-only order-book output has an explicit caller-owned allocation boundary.
+For `P` occupied execution prices, `V <= P` public prices, and requested depth
+limit `L`, `try_depth` reserves at most `min(P, L)` entries before traversal,
+costs `O(P)` time in the hidden-only worst case, and returns
+`O(min(V, L))` space. For `T` active identities including `S` dormant stops
+and `R = T - S` resting orders, `try_active_orders` costs
+`O(T + R log R)` time and `O(R)` output space. For one account selection of
+`K` orders, `try_account_active_order_ids` costs expected
+`O(1) + O(K log K)` time and `O(K)` output space, independent of unrelated
+orders. All three reserve before copying, perform no authoritative mutation,
+and drop any private partial construction on an invariant failure.
+
 ## Call-auction discovery and allocation
 
 For `B` canonical aggregate bid levels and `A` canonical aggregate ask

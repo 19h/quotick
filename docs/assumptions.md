@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A116 are stable and are referenced from code comments and other
+identifiers A1-A117 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -206,9 +206,11 @@ ownership, path/string construction, ledger diagnostic/reconciliation
 collections, failure-detail formatting, caller-owned or cloned generic auction
 allocation plans, and wide ledger magnitudes can still allocate or abort.
 
-Continuous and call-auction market-data batch/snapshot/depth output has
-explicit fallible APIs, while convenience wrappers can still panic on
-allocation failure.
+Continuous order-book depth, private active-order, and account-order-ID output,
+plus continuous and call-auction market-data batch/snapshot/depth output, has
+explicit fallible APIs. Convenience wrappers can still panic on allocation
+failure; the account-order-ID convenience wrapper can also panic if private
+topology is corrupt.
 
 **Dependent results.** Typed failure exists at the enumerated boundaries; no
 end-to-end allocation-failure continuation claim follows. Authoritative bounded
@@ -3863,10 +3865,63 @@ report contradiction, mismatched definition, self-settlement, partial economic
 effect, split WAL/checkpoint grouping, retry frame growth, recovery divergence,
 or venue/clearing policy inference falsifies A116.
 
+## A117 — fallible continuous order-book query output
+
+**Assumption.** A read-only query observes one immutable borrow of one A3
+continuous-book shard. `try_depth` exposes only non-zero public displayed
+aggregates, with bids descending and asks ascending, and reserves at most the
+lesser of the requested limit and occupied execution-price count before
+traversal. Hidden-only prices remain absent. `try_active_orders` reserves the
+exact indexed non-dormant count, rejects any traversal/cardinality
+contradiction before vector growth, validates every snapshot, and sorts the
+complete private result by `OrderId`.
+
+`try_account_active_order_ids` performs one expected constant-time A41 account
+lookup, derives and fallibly reserves the selected side/all count, traverses
+only those intrusive links, validates owner, side, declared list length, and
+unique identity, and sorts by `OrderId`. An unknown account returns an empty
+vector. Reservation follows the standard library's
+[`Vec::try_reserve_exact`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.try_reserve_exact)
+contract: the requested semantic maximum is exact for the query, while the
+allocator may provide additional physical capacity. No query mutates the book,
+and no partial vector is returned on resource or invariant failure.
+
+**Dependent results.** [A3, A10, A12, A41, A52, A72, A83, A117] For `P`
+occupied execution prices, `V <= P` public prices, and depth limit `L`, depth
+costs `O(P)` time in the hidden-only worst case, returns
+`O(min(V, L))` rows, and requests at most `min(P, L)` capacity. For `T` active
+identities, `S` dormant stops, and `R = T - S` resting orders, complete private
+output costs `O(T + R log R)` time and `O(R)` result space. For `K` selected
+account orders, expected work is `O(1) + O(K log K)` and result space is
+`O(K)`, independent of unrelated active orders. Existing convenience methods
+delegate to these paths and retain A12's panic boundary. Read-only query output
+changes no WAL or snapshot state and therefore requires no wire-version change.
+
+**Falsification probe.** Compare fallible and convenience results for empty,
+one-sided, crossed, reserve, and fully hidden books; both sides; limits `0`, `1`,
+occupied cardinality, and `usize::MAX`; unknown accounts; side/all account
+scope; and noncanonical dense/hash iteration order. Require market-priority
+public depth, hidden-only exclusion, canonical ascending private identities,
+exact reported reservation resources and maxima, and byte-identical book state
+before and after every success and failure. Corrupt dormant/resting counts,
+account heads, tails, counts, links, owners, sides, and duplicate membership in
+white-box fixtures. Inject every output-reservation failure and exercise at
+least 250,000 active identities under allocation counting. Any implicit vector
+growth, leaked partial output, unrelated-order scan in an account query,
+private identity in public depth, nondeterministic ordering, mutation, or
+untyped fallible-path failure falsifies A117.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **Medium impact:** continuous public-depth, complete private resting-order,
+  and account-scoped identifier extraction now has typed fallible output under
+  A117. Bounds and canonical ordering are covered through hidden liquidity,
+  account-list corruption, and large caller-owned results. Target-hardware
+  allocator latency, resident memory, and sustained 250,000-order snapshot
+  cadence remain unknown until measured.
 
 - **High impact:** continuous FOK and minimum-quantity IOC now have atomic
   behavior under all four STP policies. FOK decrement-and-cancel requires the

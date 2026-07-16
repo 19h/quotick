@@ -464,6 +464,18 @@ order identifiers: price FIFO links and account/side membership links. Ordinary
 account insertion/removal is `O(1)`; canonical account selection traverses the
 selected links and sorts unique `OrderId` values in the already-prepared vector.
 
+Read-only extraction is a separate caller-owned allocation boundary.
+`try_depth` reserves at most `min(P, L)` levels for `P` occupied execution
+prices and requested limit `L`, then returns only public prices in market
+priority. `try_active_orders` reserves the exact indexed resting cardinality,
+validates that cardinality during dense traversal, and sorts by `OrderId`.
+`try_account_active_order_ids` performs one expected `O(1)` account lookup,
+reserves the selected intrusive-list count, validates owner, side, list length,
+and duplicate identity, then sorts by `OrderId`. Any reservation or private-
+topology failure returns before output ownership changes hands, and none of the
+three queries mutates authoritative state. Source-compatible convenience
+wrappers retain the A12 allocation-failure boundary.
+
 `OrderBookLimits` bounds all monotonic and active matching indexes plus total
 retained events;
 `RiskManagedLimits` independently adds the registered-profile maximum. Mandatory
