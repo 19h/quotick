@@ -45,7 +45,7 @@ fn definition() -> InstrumentDefinition {
             .expect("price rules"),
         quantity: QuantityRules::new(1, 1, 1_000).expect("quantity rules"),
         reserve: quotick::instrument::ReserveOrderRules::disabled(),
-        hidden_orders_supported: false,
+        hidden_orders_supported: true,
         base_units_per_lot: 1,
         quote_units_per_price_unit: 1,
         trading_state: TradingState::Open,
@@ -81,6 +81,29 @@ fn order(
         self_trade_prevention: stp,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
+}
+
+fn market_to_limit(
+    command_id: u64,
+    order_id: u64,
+    account_id: u64,
+    side: Side,
+    quantity: u64,
+) -> Command {
+    let Command::New(mut value) = order(
+        command_id,
+        order_id,
+        account_id,
+        side,
+        quantity,
+        1,
+        TimeInForce::GoodTilCancelled,
+        SelfTradePrevention::CancelAggressor,
+    ) else {
+        unreachable!("order fixture is always new")
+    };
+    value.order_type = OrderType::MarketToLimit;
+    Command::New(value)
 }
 
 fn cancel(command_id: u64, order_id: u64, account_id: u64) -> Command {
@@ -291,6 +314,146 @@ fn assert_mirrors(book: &OrderBook, replica: &MarketDataReplica) {
             );
         }
     }
+}
+
+#[test]
+fn market_to_limit_publication_enforces_the_captured_price_and_replicates_residual_depth() {
+    let mut book = OrderBook::new(definition());
+    let mut publisher = MarketDataPublisher::from_book(&book).unwrap();
+    let mut replica = MarketDataReplica::new(instrument(), version(), TradingState::Open);
+    replica.apply_snapshot(&publisher.snapshot()).unwrap();
+    for command in [
+        order(
+            1,
+            1,
+            11,
+            Side::Sell,
+            2,
+            100,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ),
+        order(
+            2,
+            2,
+            12,
+            Side::Sell,
+            5,
+            110,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ),
+    ] {
+        replica
+            .apply_batch(&publish(&mut book, &mut publisher, command))
+            .unwrap();
+    }
+
+    let pre_command = OrderBook::from_checkpoint(&book.checkpoint(1, 5).unwrap()).unwrap();
+    let mut rejecting = MarketDataPublisher::from_book(&pre_command).unwrap();
+    let mut reordering = MarketDataPublisher::from_book(&pre_command).unwrap();
+    let command = market_to_limit(3, 3, 13, Side::Buy, 5);
+    let report = book.submit(command).unwrap();
+    let mut reordered = report.clone();
+    let reordered_events = reordered.events.make_mut();
+    let (first, remainder) = reordered_events.split_at_mut(1);
+    std::mem::swap(&mut first[0].kind, &mut remainder[0].kind);
+    assert_eq!(
+        reordering.publish(command, &reordered, &book),
+        Err(MarketDataError::TraceMismatch(
+            "market-to-limit pricing event is not immediately after acceptance"
+        ))
+    );
+    assert!(reordering.is_poisoned());
+
+    let mut corrupted = report.clone();
+    let pricing = corrupted
+        .events
+        .make_mut()
+        .iter_mut()
+        .find(|event| matches!(event.kind, EventKind::MarketToLimitPriced { .. }))
+        .unwrap();
+    let EventKind::MarketToLimitPriced { limit_price, .. } = &mut pricing.kind else {
+        unreachable!()
+    };
+    *limit_price = Price::from_raw(110);
+    assert_eq!(
+        rejecting.publish(command, &corrupted, &book),
+        Err(MarketDataError::TraceMismatch(
+            "MarketToLimitPriced does not match the canonical captured best price"
+        ))
+    );
+    assert!(rejecting.is_poisoned());
+
+    let batch = publisher.publish(command, &report, &book).unwrap();
+    assert_eq!(batch.updates().len(), report.events.len());
+    assert!(batch.updates().iter().any(|update| matches!(
+        update.kind(),
+        MarketDataKind::Trade { print, .. } if print.price == Price::from_raw(100)
+    )));
+    replica.apply_batch(&batch).unwrap();
+    assert_mirrors(&book, &replica);
+    assert_eq!(replica.best_bid().unwrap().price, Price::from_raw(100));
+    assert_eq!(replica.best_ask().unwrap().price, Price::from_raw(110));
+    publisher.validate_against(&book).unwrap();
+}
+
+#[test]
+fn market_to_limit_publication_prices_from_hidden_only_best_liquidity() {
+    let mut book = OrderBook::new(definition());
+    let mut publisher = MarketDataPublisher::from_book(&book).unwrap();
+    let mut replica = MarketDataReplica::new(instrument(), version(), TradingState::Open);
+    replica.apply_snapshot(&publisher.snapshot()).unwrap();
+
+    let Command::New(mut hidden) = order(
+        1,
+        1,
+        11,
+        Side::Sell,
+        1,
+        90,
+        TimeInForce::GoodTilCancelled,
+        SelfTradePrevention::CancelAggressor,
+    ) else {
+        unreachable!("order fixture is always new")
+    };
+    hidden.display = quotick::matching::OrderDisplay::Hidden;
+    for command in [
+        Command::New(hidden),
+        order(
+            2,
+            2,
+            12,
+            Side::Sell,
+            2,
+            100,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ),
+    ] {
+        replica
+            .apply_batch(&publish(&mut book, &mut publisher, command))
+            .unwrap();
+    }
+    assert_eq!(replica.best_ask().unwrap().price, Price::from_raw(100));
+
+    let command = market_to_limit(3, 3, 13, Side::Buy, 2);
+    let report = book.submit(command).unwrap();
+    assert!(matches!(
+        report.events[1].kind,
+        EventKind::MarketToLimitPriced { limit_price, .. }
+            if limit_price == Price::from_raw(90)
+    ));
+    let batch = publisher.publish(command, &report, &book).unwrap();
+    assert!(batch.updates().iter().any(|update| matches!(
+        update.kind(),
+        MarketDataKind::Trade { print, .. } if print.price == Price::from_raw(90)
+    )));
+    replica.apply_batch(&batch).unwrap();
+    assert_mirrors(&book, &replica);
+    assert_eq!(replica.best_bid().unwrap().price, Price::from_raw(90));
+    assert_eq!(replica.best_ask().unwrap().price, Price::from_raw(100));
+    publisher.validate_against(&book).unwrap();
 }
 
 #[test]

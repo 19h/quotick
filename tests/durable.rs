@@ -233,6 +233,65 @@ fn submit_writes_command_then_report_and_reopen_reconstructs_state() {
 }
 
 #[test]
+fn durable_market_to_limit_recovers_the_frozen_residual_and_exact_retry() {
+    let file = TestFile::new("market-to-limit");
+    let maker = limit_command(
+        1,
+        1,
+        11,
+        Side::Sell,
+        2,
+        100,
+        TimeInForce::GoodTilCancelled,
+        SelfTradePrevention::CancelAggressor,
+    );
+    let Command::New(mut taking) = command(2, 2, 5) else {
+        unreachable!("command fixture is always new")
+    };
+    taking.account_id = AccountId::new(12).unwrap();
+    taking.order_type = OrderType::MarketToLimit;
+    let taking = Command::New(taking);
+
+    let mut durable = DurableOrderBook::open(file.path(), definition(), options()).unwrap();
+    durable.submit(maker).unwrap();
+    let report = durable.submit(taking).unwrap();
+    let observation = durable
+        .book()
+        .try_active_order_observation(OrderId::new(2).unwrap())
+        .unwrap();
+    assert_eq!(
+        observation.resting_order().unwrap().price,
+        Price::from_raw(100)
+    );
+    durable.sync_all().unwrap();
+    let length_before_reopen = fs::metadata(file.path()).unwrap().len();
+    drop(durable);
+
+    let mut reopened = DurableOrderBook::open(file.path(), definition(), options()).unwrap();
+    assert_eq!(
+        reopened
+            .book()
+            .try_active_order_observation(OrderId::new(2).unwrap())
+            .unwrap(),
+        observation
+    );
+    let retained = reopened
+        .book()
+        .retained_command_report(CommandId::new(2).unwrap())
+        .unwrap();
+    assert_eq!(retained.command(), &taking);
+    assert_eq!(retained.report(), &report);
+    let retry = reopened.submit(taking).unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.events, report.events);
+    assert_eq!(
+        fs::metadata(file.path()).unwrap().len(),
+        length_before_reopen
+    );
+    reopened.book().validate().unwrap();
+}
+
+#[test]
 fn durable_fok_decrement_and_cancel_recovers_atomic_decisions_and_retry() {
     let file = TestFile::new("fok-decrement-and-cancel");
     let external = limit_command(

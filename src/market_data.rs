@@ -27,7 +27,7 @@ use crate::matching::{
     AccountAdmissionState, AccountControlAction, AccountControlSnapshot, BestBidOffer,
     CancelReason, Command, CommandOutcome, DepthSummary, DisplayedLiquidityQuote,
     DisplayedLiquidityRequest, Event, EventKind, ExecutionReport, LevelSnapshot, MassCancelScope,
-    OrderBook, OrderBookLimits, OrderDisplay, OrderType, PublicDepthImbalance,
+    NewOrder, OrderBook, OrderBookLimits, OrderDisplay, OrderType, PublicDepthImbalance,
     PublicLevelObservation, SelfTradePrevention, StopActivation, StopReference, TimeInForce, Trade,
     TradingStateControlAction, TradingStateObservation, TradingStateSnapshot,
 };
@@ -830,12 +830,25 @@ struct StopTriggerProgress {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MarketToLimitProgress {
+    priced: Option<(OrderId, Price)>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MassCancelProgress {
     order_count: u64,
     quantity_lots: u128,
     last_order_id: Option<OrderId>,
     last_expiry: Option<(TimestampNs, OrderId)>,
     completed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PublicationProgress {
+    replacement: Option<(Side, Option<TimestampNs>)>,
+    mass_cancel: MassCancelProgress,
+    stop_trigger: StopTriggerProgress,
+    market_to_limit: MarketToLimitProgress,
 }
 
 /// Stateful adapter from private matching traces to anonymized public depth.
@@ -1154,6 +1167,37 @@ impl MarketDataPublisher {
                 "event context differs from its command",
             ));
         }
+        if let Command::New(order) = command
+            && order.order_type == OrderType::MarketToLimit
+        {
+            match report.outcome {
+                CommandOutcome::Accepted
+                    if !matches!(
+                        report.events.first().map(|event| event.kind),
+                        Some(EventKind::OrderAccepted { order_id, .. })
+                            if order_id == order.order_id
+                    ) || !matches!(
+                        report.events.get(1).map(|event| event.kind),
+                        Some(EventKind::MarketToLimitPriced { order_id, .. })
+                            if order_id == order.order_id
+                    ) =>
+                {
+                    return self.fail(MarketDataError::TraceMismatch(
+                        "market-to-limit pricing event is not immediately after acceptance",
+                    ));
+                }
+                CommandOutcome::Rejected(_)
+                    if report.events.iter().any(|event| {
+                        matches!(event.kind, EventKind::MarketToLimitPriced { .. })
+                    }) =>
+                {
+                    return self.fail(MarketDataError::TraceMismatch(
+                        "rejected market-to-limit report contains a pricing event",
+                    ));
+                }
+                _ => {}
+            }
+        }
         if report.replayed {
             if report
                 .events
@@ -1183,9 +1227,7 @@ impl MarketDataPublisher {
             .map_err(|_| {
                 MarketDataError::PreparationAllocationFailed(MarketDataResource::BatchUpdates)
             })?;
-        let mut replacement_state = None;
-        let mut mass_cancel_progress = MassCancelProgress::default();
-        let mut stop_trigger_progress = StopTriggerProgress::default();
+        let mut progress = PublicationProgress::default();
         for event in &report.events {
             let expected = self
                 .last_sequence
@@ -1201,13 +1243,7 @@ impl MarketDataPublisher {
                     actual: event.sequence,
                 });
             }
-            let kind = match self.apply_event(
-                command,
-                *event,
-                &mut replacement_state,
-                &mut mass_cancel_progress,
-                &mut stop_trigger_progress,
-            ) {
+            let kind = match self.apply_event(command, *event, &mut progress) {
                 Ok(kind) => kind,
                 Err(error) => return self.fail(error),
             };
@@ -1228,18 +1264,31 @@ impl MarketDataPublisher {
                     | Command::TradingStateControl(_)
                     | Command::ExpirySweep(_)
             );
-        if requires_completion != mass_cancel_progress.completed {
+        if requires_completion != progress.mass_cancel.completed {
             return self.fail(MarketDataError::TraceMismatch(
                 "aggregate cancellation/control command and completion event disagree",
             ));
         }
         let requires_stop_completion = report.outcome == CommandOutcome::Accepted
             && matches!(command, Command::StopTriggerSweep(_));
-        if requires_stop_completion != stop_trigger_progress.completed
-            || stop_trigger_progress.active.is_some()
+        if requires_stop_completion != progress.stop_trigger.completed
+            || progress.stop_trigger.active.is_some()
         {
             return self.fail(MarketDataError::TraceMismatch(
                 "stop-trigger command and activation completion disagree",
+            ));
+        }
+        let requires_market_to_limit_price = report.outcome == CommandOutcome::Accepted
+            && matches!(
+                command,
+                Command::New(NewOrder {
+                    order_type: OrderType::MarketToLimit,
+                    ..
+                })
+            );
+        if requires_market_to_limit_price != progress.market_to_limit.priced.is_some() {
+            return self.fail(MarketDataError::TraceMismatch(
+                "market-to-limit command and pricing event disagree",
             ));
         }
         if let Err(error) = self.validate_publication(&updates, book) {
@@ -1431,9 +1480,7 @@ impl MarketDataPublisher {
         &mut self,
         command: Command,
         event: Event,
-        replacement_state: &mut Option<(Side, Option<TimestampNs>)>,
-        mass_cancel_progress: &mut MassCancelProgress,
-        stop_trigger_progress: &mut StopTriggerProgress,
+        progress: &mut PublicationProgress,
     ) -> Result<MarketDataKind, MarketDataError> {
         match event.kind {
             EventKind::OrderAccepted {
@@ -1441,6 +1488,15 @@ impl MarketDataPublisher {
                 quantity,
                 display,
             } => Self::handle_order_accepted(command, order_id, quantity, display),
+            EventKind::MarketToLimitPriced {
+                order_id,
+                limit_price,
+            } => self.handle_market_to_limit_priced(
+                command,
+                order_id,
+                limit_price,
+                &mut progress.market_to_limit,
+            ),
             EventKind::OrderRefreshed {
                 order_id,
                 price,
@@ -1457,10 +1513,14 @@ impl MarketDataPublisher {
                 order_id,
                 price,
                 (leaves_quantity, working_quantity),
-                replacement_state,
-                stop_trigger_progress,
+                progress,
             ),
-            EventKind::Trade(trade) => self.handle_trade(command, trade, stop_trigger_progress),
+            EventKind::Trade(trade) => self.handle_trade(
+                command,
+                trade,
+                &mut progress.stop_trigger,
+                &progress.market_to_limit,
+            ),
             EventKind::OrderCancelled {
                 order_id,
                 quantity,
@@ -1470,8 +1530,8 @@ impl MarketDataPublisher {
                 order_id,
                 quantity,
                 reason,
-                mass_cancel_progress,
-                stop_trigger_progress,
+                &mut progress.mass_cancel,
+                &mut progress.stop_trigger,
             ),
             EventKind::OrderReplaced {
                 order_id,
@@ -1493,7 +1553,7 @@ impl MarketDataPublisher {
                 new_display,
                 priority_retained,
                 event.sequence,
-                replacement_state,
+                &mut progress.replacement,
             ),
             EventKind::SelfTradePrevented {
                 aggressor_order_id,
@@ -1506,7 +1566,7 @@ impl MarketDataPublisher {
                 resting_order_id,
                 quantity,
                 policy,
-                stop_trigger_progress,
+                progress,
             ),
             EventKind::MassCancelCompleted {
                 account_id,
@@ -1519,7 +1579,7 @@ impl MarketDataPublisher {
                 scope,
                 cancelled_order_count,
                 cancelled_quantity_lots,
-                mass_cancel_progress,
+                &mut progress.mass_cancel,
             ),
             EventKind::AccountControlApplied {
                 account_id,
@@ -1536,7 +1596,7 @@ impl MarketDataPublisher {
                 revision,
                 cancelled_order_count,
                 cancelled_quantity_lots,
-                mass_cancel_progress,
+                &mut progress.mass_cancel,
             ),
             EventKind::TradingStateControlApplied {
                 previous_state,
@@ -1551,7 +1611,7 @@ impl MarketDataPublisher {
                 revision,
                 cancelled_order_count,
                 cancelled_quantity_lots,
-                mass_cancel_progress,
+                &mut progress.mass_cancel,
             ),
             EventKind::ExpirySweepCompleted {
                 previous_watermark,
@@ -1564,7 +1624,7 @@ impl MarketDataPublisher {
                 current_watermark,
                 expired_order_count,
                 expired_quantity_lots,
-                mass_cancel_progress,
+                &mut progress.mass_cancel,
             ),
             EventKind::StopOrderArmed {
                 order_id,
@@ -1590,7 +1650,7 @@ impl MarketDataPublisher {
                 trigger_price,
                 reference,
                 priority_sequence,
-                stop_trigger_progress,
+                &mut progress.stop_trigger,
             ),
             EventKind::StopTriggerSweepCompleted {
                 previous_reference,
@@ -1603,7 +1663,7 @@ impl MarketDataPublisher {
                 current_reference,
                 triggered_order_count,
                 remaining_eligible_order_count,
-                stop_trigger_progress,
+                &mut progress.stop_trigger,
             ),
             EventKind::CommandRejected(_) => Ok(MarketDataKind::NoBookChange),
         }
@@ -1631,30 +1691,57 @@ impl MarketDataPublisher {
         Ok(MarketDataKind::NoBookChange)
     }
 
+    fn handle_market_to_limit_priced(
+        &self,
+        command: Command,
+        order_id: OrderId,
+        limit_price: Price,
+        progress: &mut MarketToLimitProgress,
+    ) -> Result<MarketDataKind, MarketDataError> {
+        let Command::New(order) = command else {
+            return Err(MarketDataError::TraceMismatch(
+                "non-new command emitted MarketToLimitPriced",
+            ));
+        };
+        if order.order_type != OrderType::MarketToLimit
+            || order.order_id != order_id
+            || progress.priced.is_some()
+        {
+            return Err(MarketDataError::TraceMismatch(
+                "MarketToLimitPriced differs from the source command",
+            ));
+        }
+        let expected = self
+            .orders
+            .values()
+            .filter(|resting| resting.side == order.side.opposite())
+            .map(|resting| resting.price)
+            .reduce(|left, right| match order.side {
+                Side::Buy => left.min(right),
+                Side::Sell => left.max(right),
+            });
+        if expected != Some(limit_price) {
+            return Err(MarketDataError::TraceMismatch(
+                "MarketToLimitPriced does not match the canonical captured best price",
+            ));
+        }
+        progress.priced = Some((order_id, limit_price));
+        Ok(MarketDataKind::NoBookChange)
+    }
+
     fn handle_order_rested(
         &mut self,
         command: Command,
         order_id: OrderId,
         price: Price,
         quantities: (Quantity, Quantity),
-        replacement_state: &mut Option<(Side, Option<TimestampNs>)>,
-        stop_trigger_progress: &mut StopTriggerProgress,
+        progress: &mut PublicationProgress,
     ) -> Result<MarketDataKind, MarketDataError> {
         let (leaves_quantity, working_quantity) = quantities;
         let (account_id, side, display, expires_at) =
             match command {
                 Command::New(new_order) if new_order.order_id == order_id => {
-                    if new_order.order_type != OrderType::Limit(price) {
-                        return Err(MarketDataError::TraceMismatch(
-                            "resting price differs from the new limit",
-                        ));
-                    }
-                    (
-                        new_order.account_id,
-                        new_order.side,
-                        new_order.display,
-                        new_order.time_in_force.expires_at(),
-                    )
+                    Self::new_order_rested_source(new_order, order_id, price, progress)?
                 }
                 Command::Replace(replace) if replace.order_id == order_id => {
                     if replace.new_price != price {
@@ -1663,7 +1750,8 @@ impl MarketDataPublisher {
                         ));
                     }
                     let (side, expires_at) =
-                        replacement_state
+                        progress
+                            .replacement
                             .take()
                             .ok_or(MarketDataError::TraceMismatch(
                                 "replacement rested without losing its previous priority",
@@ -1671,7 +1759,7 @@ impl MarketDataPublisher {
                     (replace.account_id, side, replace.new_display, expires_at)
                 }
                 Command::StopTriggerSweep(_) => {
-                    let triggered = stop_trigger_progress.active.take().ok_or(
+                    let triggered = progress.stop_trigger.active.take().ok_or(
                         MarketDataError::TraceMismatch(
                             "stop-triggered residual rested without an activation",
                         ),
@@ -1681,7 +1769,7 @@ impl MarketDataPublisher {
                         || triggered.stop.activation != StopActivation::Limit(price)
                         || !triggered.stop.time_in_force.may_rest()
                     {
-                        stop_trigger_progress.active = Some(triggered);
+                        progress.stop_trigger.active = Some(triggered);
                         return Err(MarketDataError::TraceMismatch(
                             "stop-triggered residual differs from dormant state",
                         ));
@@ -1735,6 +1823,30 @@ impl MarketDataPublisher {
         }
     }
 
+    fn new_order_rested_source(
+        order: NewOrder,
+        order_id: OrderId,
+        price: Price,
+        progress: &PublicationProgress,
+    ) -> Result<(AccountId, Side, OrderDisplay, Option<TimestampNs>), MarketDataError> {
+        let price_matches = match order.order_type {
+            OrderType::Limit(limit) => limit == price,
+            OrderType::MarketToLimit => progress.market_to_limit.priced == Some((order_id, price)),
+            OrderType::Market | OrderType::Stop { .. } => false,
+        };
+        if !price_matches {
+            return Err(MarketDataError::TraceMismatch(
+                "resting price differs from the new limit",
+            ));
+        }
+        Ok((
+            order.account_id,
+            order.side,
+            order.display,
+            order.time_in_force.expires_at(),
+        ))
+    }
+
     fn handle_order_refreshed(
         &mut self,
         order_id: OrderId,
@@ -1772,6 +1884,7 @@ impl MarketDataPublisher {
         command: Command,
         trade: Trade,
         stop_trigger_progress: &mut StopTriggerProgress,
+        market_to_limit_progress: &MarketToLimitProgress,
     ) -> Result<MarketDataKind, MarketDataError> {
         if trade.instrument_id != self.instrument_id {
             return Err(MarketDataError::WrongInstrument);
@@ -1789,6 +1902,18 @@ impl MarketDataPublisher {
         if taker_order_id != Some(trade.taker_order_id) {
             return Err(MarketDataError::TraceMismatch(
                 "trade taker differs from the source command order",
+            ));
+        }
+        if matches!(
+            command,
+            Command::New(NewOrder {
+                order_type: OrderType::MarketToLimit,
+                ..
+            })
+        ) && market_to_limit_progress.priced != Some((trade.taker_order_id, trade.price))
+        {
+            return Err(MarketDataError::TraceMismatch(
+                "market-to-limit trade differs from its captured price",
             ));
         }
         let maker = self.orders.get(&trade.maker_order_id).copied().ok_or(
@@ -2658,10 +2783,10 @@ impl MarketDataPublisher {
         resting_order_id: OrderId,
         quantity: Quantity,
         policy: SelfTradePrevention,
-        stop_trigger_progress: &mut StopTriggerProgress,
+        progress: &mut PublicationProgress,
     ) -> Result<MarketDataKind, MarketDataError> {
         let triggered = if matches!(command, Command::StopTriggerSweep(_)) {
-            stop_trigger_progress.active
+            progress.stop_trigger.active
         } else {
             None
         };
@@ -2678,11 +2803,28 @@ impl MarketDataPublisher {
                 "self-trade aggressor differs from the source command",
             ));
         }
-        if self.orders.get(&resting_order_id).is_none_or(|resting| {
+        let resting = self.orders.get(&resting_order_id).copied();
+        if resting.is_none_or(|resting| {
             Some(resting.account_id) != aggressor_account || quantity.lots() > resting.displayed
         }) {
             return Err(MarketDataError::TraceMismatch(
                 "self-trade resting order is absent or owned by another account",
+            ));
+        }
+        if matches!(
+            command,
+            Command::New(NewOrder {
+                order_type: OrderType::MarketToLimit,
+                ..
+            })
+        ) && progress.market_to_limit.priced
+            != Some((
+                aggressor_order_id,
+                resting.expect("checked resting order exists").price,
+            ))
+        {
+            return Err(MarketDataError::TraceMismatch(
+                "market-to-limit self-trade differs from its captured price",
             ));
         }
         if policy == SelfTradePrevention::DecrementAndCancel {
@@ -2693,7 +2835,7 @@ impl MarketDataPublisher {
                         "self-trade decrement exceeds triggered-stop leaves",
                     ),
                 )?;
-                stop_trigger_progress.active = (active.stop.leaves != 0).then_some(active);
+                progress.stop_trigger.active = (active.stop.leaves != 0).then_some(active);
             }
             Ok(level.map_or(MarketDataKind::NoBookChange, MarketDataKind::Level))
         } else {

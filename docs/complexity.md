@@ -84,6 +84,9 @@ levels exhausted by one command:
 
 - Cached private execution-best price/order and public-best level discovery is
   `O(1)`; the two prices can differ when the execution best is hidden-only.
+- Market-to-limit capture reads the private execution-best cache in `O(1)`
+  time and freezes an ordinary one-price limit. Its matching and residual
+  insertion therefore have the same bound as that effective limit order.
 - The cache carries a key-checked stable AVL slot handle into maker mutation,
   so partial fills, removal from a still-occupied level, and reserve
   displayed-class-tail refresh are `O(1)` and perform no ordered price search.
@@ -719,6 +722,8 @@ but retains no per-command unused capacity. A sweep over `K <= O_max` active
 GTD orders has the exact bound `K + 1` and therefore fits the same protected
 tail. Stop-trigger sweeps cannot use that tail and may require more than
 `K + 1` events because every activation can match or refresh reserve slices.
+An accepted market-to-limit command adds exactly one pricing event to its
+ordinary effective-limit bound.
 
 ## Risk engine
 
@@ -736,9 +741,10 @@ bounded storage.
 Risk state uses `O(A + O)` memory. Profile registration is expected `O(1)`,
 allocation-free within the constructor-owned bound, and disabled after the
 first sequenced command. Dormant stops retain one reservation valued from the
-activation limit or market collar. Arming and triggering are expected `O(1)`
-risk-map transitions; triggering changes the dormant flag without duplicating
-account exposure.
+activation limit or market collar. Market-to-limit authorization uses the
+market collar in `O(1)`; a residual reservation uses the captured limit.
+Arming and triggering are expected `O(1)` risk-map transitions; triggering
+changes the dormant flag without duplicating account exposure.
 
 ## Market data
 
@@ -752,6 +758,9 @@ updates and `U <= E` affected prices, publication reserves `O(E)` output before
 mutation and validates unique affected prices in expected
 `O(E + U log P)` time using fixed hash scratch. Replica batch capacity
 preflight is expected `O(E)` before `O(E log P)` application.
+One market-to-limit pricing event scans `O` private tracked orders to derive an
+execution best that includes hidden-only liquidity, uses `O(1)` auxiliary
+space, and emits `NoBookChange`. Its later events retain their ordinary bounds.
 
 - Publisher bootstrap is expected `O(O + P log P + S log(O + 1) + T)` for `S`
   dormant stops.

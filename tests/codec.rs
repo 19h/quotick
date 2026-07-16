@@ -177,6 +177,34 @@ fn hidden_order_display_has_a_stable_command_tag() {
 }
 
 #[test]
+fn market_to_limit_has_a_stable_command_tag_and_layout() {
+    let mut value = command(1, 2, Side::Buy);
+    let Command::New(order) = &mut value else {
+        unreachable!("command fixture is a new order");
+    };
+    order.order_type = OrderType::MarketToLimit;
+    order.time_in_force = TimeInForce::GoodTilCancelled;
+
+    let encoded = value.encode().expect("market-to-limit command encodes");
+    let mut expected = vec![0];
+    expected.extend_from_slice(&1_u64.to_le_bytes());
+    expected.extend_from_slice(&2_u64.to_le_bytes());
+    expected.extend_from_slice(&3_u64.to_le_bytes());
+    expected.extend_from_slice(&4_u64.to_le_bytes());
+    expected.extend_from_slice(&1_u64.to_le_bytes());
+    expected.push(0);
+    expected.extend_from_slice(&5_u64.to_le_bytes());
+    expected.push(0);
+    expected.push(3);
+    expected.push(0);
+    expected.push(2);
+    expected.extend_from_slice(&9_u64.to_le_bytes());
+
+    assert_eq!(encoded, expected);
+    assert_eq!(Command::decode(&encoded).unwrap(), value);
+}
+
+#[test]
 fn stop_command_codecs_have_stable_little_endian_layouts() {
     let stop = Command::New(NewOrder {
         command_id: id(CommandId::new(1)),
@@ -891,6 +919,54 @@ fn execution_report_codec_has_a_stable_little_endian_layout() {
 }
 
 #[test]
+fn market_to_limit_pricing_and_rejections_have_stable_tags() {
+    let command_id = id(CommandId::new(1));
+    let order_id = id(OrderId::new(2));
+    let priced = ExecutionReport {
+        command_id,
+        outcome: CommandOutcome::Accepted,
+        events: vec![Event {
+            sequence: 3,
+            command_id,
+            occurred_at: TimestampNs::from_unix_nanos(4),
+            kind: EventKind::MarketToLimitPriced {
+                order_id,
+                limit_price: Price::from_raw(-5),
+            },
+        }]
+        .into(),
+        replayed: false,
+    };
+    let encoded = priced.encode().unwrap();
+    assert_eq!(encoded[38], 15);
+    assert_eq!(&encoded[39..47], &2_u64.to_le_bytes());
+    assert_eq!(&encoded[47..55], &(-5_i64).to_le_bytes());
+    assert_eq!(ExecutionReport::decode(&encoded).unwrap(), priced);
+
+    for (reason, tag) in [
+        (RejectReason::MarketToLimitBookEmpty, 56_u8),
+        (RejectReason::MarketToLimitRequiresRestingLifetime, 57_u8),
+    ] {
+        let rejected = ExecutionReport {
+            command_id,
+            outcome: CommandOutcome::Rejected(reason),
+            events: vec![Event {
+                sequence: 3,
+                command_id,
+                occurred_at: TimestampNs::from_unix_nanos(4),
+                kind: EventKind::CommandRejected(reason),
+            }]
+            .into(),
+            replayed: false,
+        };
+        let encoded = rejected.encode().unwrap();
+        assert_eq!(encoded[9], tag);
+        assert_eq!(encoded.last(), Some(&tag));
+        assert_eq!(ExecutionReport::decode(&encoded).unwrap(), rejected);
+    }
+}
+
+#[test]
 fn minimum_quantity_ioc_has_a_stable_little_endian_layout() {
     let mut value = command(1, 2, Side::Buy);
     let Command::New(order) = &mut value else {
@@ -1016,6 +1092,8 @@ fn every_rejection_reason_has_a_stable_round_trip() {
         RejectReason::StopReferenceSourceMismatch,
         RejectReason::StopReferenceVersionDiscontinuity,
         RejectReason::StopReferenceSequenceDiscontinuity,
+        RejectReason::MarketToLimitBookEmpty,
+        RejectReason::MarketToLimitRequiresRestingLifetime,
     ];
     for (index, reason) in reasons.into_iter().enumerate() {
         let command_id = id(CommandId::new(
@@ -1150,6 +1228,10 @@ fn every_event_variant_round_trips() {
             current_reference: stop_reference(1, 1, 2, 22),
             triggered_order_count: 1,
             remaining_eligible_order_count: 0,
+        },
+        EventKind::MarketToLimitPriced {
+            order_id,
+            limit_price: Price::from_raw(-14),
         },
         EventKind::OrderCancelled {
             order_id,

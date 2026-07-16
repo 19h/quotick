@@ -86,6 +86,9 @@ impl StopActivation {
 pub enum OrderType {
     /// Execute at available prices and never rest.
     Market,
+    /// Capture the current best executable opposite price, execute only at
+    /// that price, and rest any residual there.
+    MarketToLimit,
     /// Execute at the specified price or better.
     Limit(Price),
     /// Remain dormant until the explicit last-trade reference reaches the
@@ -108,13 +111,13 @@ impl OrderType {
                 trigger_price,
                 activation,
             } => Some((trigger_price, activation)),
-            Self::Market | Self::Limit(_) => None,
+            Self::Market | Self::MarketToLimit | Self::Limit(_) => None,
         }
     }
 
     const fn active(self) -> Self {
         match self {
-            Self::Market | Self::Limit(_) => self,
+            Self::Market | Self::MarketToLimit | Self::Limit(_) => self,
             Self::Stop { activation, .. } => activation.order_type(),
         }
     }
@@ -908,6 +911,10 @@ pub enum RejectReason {
     StopMarketCannotPost,
     /// The replacement schema cannot amend a dormant stop-market constraint.
     StopMarketCannotBeReplaced,
+    /// No executable opposite price existed for a market-to-limit order.
+    MarketToLimitBookEmpty,
+    /// A market-to-limit order used a lifetime that cannot retain its residual.
+    MarketToLimitRequiresRestingLifetime,
 }
 
 impl From<AdmissionError> for RejectReason {
@@ -1007,6 +1014,13 @@ pub enum EventKind {
         quantity: Quantity,
         /// Accepted display policy.
         display: OrderDisplay,
+    },
+    /// A market-to-limit order froze its one-price execution constraint.
+    MarketToLimitPriced {
+        /// Accepted market-to-limit order.
+        order_id: OrderId,
+        /// Best executable opposite price captured before matching or STP.
+        limit_price: Price,
     },
     /// An order or remainder entered the FIFO queue.
     OrderRested {
@@ -6192,6 +6206,9 @@ impl IncomingPreview {
         let constraint = match self.order_type {
             OrderType::Market => StopActivation::Market,
             OrderType::Limit(limit) => StopActivation::Limit(limit),
+            OrderType::MarketToLimit => {
+                unreachable!("unpriced market-to-limit order cannot inspect liquidity")
+            }
             OrderType::Stop { .. } => {
                 unreachable!("dormant stop constraint cannot enter liquidity inspection")
             }
@@ -7096,7 +7113,21 @@ impl OrderBook {
                         return Err(RejectReason::StopMarketCannotPost);
                     }
                 }
-                let active_order_type = command.order_type.active();
+                let active_order_type = match command.order_type {
+                    OrderType::MarketToLimit => {
+                        if !matches!(
+                            command.time_in_force,
+                            TimeInForce::GoodTilCancelled | TimeInForce::GoodTilTimestamp { .. }
+                        ) {
+                            return Err(RejectReason::MarketToLimitRequiresRestingLifetime);
+                        }
+                        OrderType::Limit(
+                            self.best_price(command.side.opposite())
+                                .ok_or(RejectReason::MarketToLimitBookEmpty)?,
+                        )
+                    }
+                    order_type => order_type.active(),
+                };
                 if command.display.is_reserve()
                     && !(matches!(active_order_type, OrderType::Limit(_))
                         && command.time_in_force.may_rest())
@@ -7407,6 +7438,20 @@ impl OrderBook {
         let (events, trades) = match command {
             Command::New(order) if order.order_type.stop().is_some() => (2_u128, 0),
             Command::New(order) if order.time_in_force == TimeInForce::PostOnly => (2_u128, 0),
+            Command::New(order) if order.order_type == OrderType::MarketToLimit => {
+                let price = self
+                    .best_price(order.side.opposite())
+                    .expect("accepted market-to-limit order must have an opposite price");
+                let mut preview = IncomingPreview::from(order);
+                preview.order_type = OrderType::Limit(price);
+                let (events, trades) = self.maximum_matching_work(preview, 1)?;
+                (
+                    events
+                        .checked_add(1)
+                        .ok_or(MatchingError::SequenceExhausted)?,
+                    trades,
+                )
+            }
             Command::New(order) => {
                 let terminal_events = u128::from(order.time_in_force != TimeInForce::FillOrKill);
                 self.maximum_matching_work(IncomingPreview::from(order), terminal_events)?
@@ -7860,6 +7905,14 @@ impl OrderBook {
     }
 
     fn check_new_capacity(&self, command: NewOrder) -> Result<(), MatchingError> {
+        if command.order_type == OrderType::MarketToLimit
+            && (!matches!(
+                command.time_in_force,
+                TimeInForce::GoodTilCancelled | TimeInForce::GoodTilTimestamp { .. }
+            ) || self.best_price(command.side.opposite()).is_none())
+        {
+            return Ok(());
+        }
         if self.seen_order_ids.contains(&command.order_id) {
             return Ok(());
         }
@@ -7883,7 +7936,14 @@ impl OrderBook {
             }
             return Ok(());
         }
-        let OrderType::Limit(price) = command.order_type else {
+        let effective_order_type = match command.order_type {
+            OrderType::MarketToLimit => OrderType::Limit(
+                self.best_price(command.side.opposite())
+                    .expect("accepted market-to-limit capacity check must have an opposite price"),
+            ),
+            order_type => order_type,
+        };
+        let OrderType::Limit(price) = effective_order_type else {
             return Ok(());
         };
         if !command.time_in_force.may_rest() {
@@ -7898,7 +7958,8 @@ impl OrderBook {
         if !active_orders_full && !active_accounts_full && !price_levels_full {
             return Ok(());
         }
-        let preview = IncomingPreview::from(command);
+        let mut preview = IncomingPreview::from(command);
+        preview.order_type = effective_order_type;
         let Some(removed_orders) = self.resting_residual_removed_orders(preview) else {
             return Ok(());
         };
@@ -10012,7 +10073,7 @@ impl OrderBook {
 
     fn apply_new(
         &mut self,
-        command: NewOrder,
+        mut command: NewOrder,
         mut events: EventTraceBuilder,
     ) -> Result<ExecutionReport, MatchingError> {
         assert!(
@@ -10034,6 +10095,8 @@ impl OrderBook {
                 display: command.display,
             },
         )?;
+
+        self.price_market_to_limit(&mut command, &mut events)?;
 
         if let OrderType::Stop {
             trigger_price,
@@ -10113,6 +10176,30 @@ impl OrderBook {
             events: events.finish(),
             replayed: false,
         })
+    }
+
+    fn price_market_to_limit(
+        &mut self,
+        command: &mut NewOrder,
+        events: &mut EventTraceBuilder,
+    ) -> Result<(), MatchingError> {
+        if command.order_type != OrderType::MarketToLimit {
+            return Ok(());
+        }
+        let limit_price = self
+            .best_price(command.side.opposite())
+            .expect("accepted market-to-limit order must have an opposite price");
+        self.push_event(
+            events,
+            command.command_id,
+            command.received_at,
+            EventKind::MarketToLimitPriced {
+                order_id: command.order_id,
+                limit_price,
+            },
+        )?;
+        command.order_type = OrderType::Limit(limit_price);
+        Ok(())
     }
 
     fn cancel_unavailable_minimum(
@@ -11200,6 +11287,9 @@ impl OrderBook {
             (Side::Sell, OrderType::Limit(limit)) => {
                 self.best_price(Side::Buy).is_some_and(|bid| limit <= bid)
             }
+            (_, OrderType::MarketToLimit) => {
+                unreachable!("unpriced market-to-limit order cannot enter active crossing")
+            }
             (_, OrderType::Stop { .. }) => {
                 unreachable!("dormant stop constraint cannot enter active crossing")
             }
@@ -11218,6 +11308,9 @@ impl OrderBook {
             (_, OrderType::Market) => true,
             (Side::Buy, OrderType::Limit(limit)) => limit >= price,
             (Side::Sell, OrderType::Limit(limit)) => limit <= price,
+            (_, OrderType::MarketToLimit) => {
+                unreachable!("unpriced market-to-limit order cannot enter active matching")
+            }
             (_, OrderType::Stop { .. }) => {
                 unreachable!("dormant stop constraint cannot enter active matching")
             }
@@ -11243,6 +11336,9 @@ impl OrderBook {
                 (_, OrderType::Market) => true,
                 (Side::Buy, OrderType::Limit(limit)) => limit >= current_price,
                 (Side::Sell, OrderType::Limit(limit)) => limit <= current_price,
+                (_, OrderType::MarketToLimit) => {
+                    unreachable!("unpriced market-to-limit order cannot enter residual preview")
+                }
                 (_, OrderType::Stop { .. }) => {
                     unreachable!("dormant stop constraint cannot enter residual preview")
                 }
@@ -12461,6 +12557,9 @@ mod price_level_index_tests {
                 (_, OrderType::Market) => true,
                 (Side::Buy, OrderType::Limit(limit)) => limit >= current_price,
                 (Side::Sell, OrderType::Limit(limit)) => limit <= current_price,
+                (_, OrderType::MarketToLimit) => {
+                    unreachable!("generated FOK order is already priced")
+                }
                 (_, OrderType::Stop { .. }) => {
                     unreachable!("dormant stop constraint cannot enter test FOK model")
                 }
@@ -12615,6 +12714,9 @@ mod price_level_index_tests {
                 match incoming.order_type {
                     OrderType::Market => StopActivation::Market,
                     OrderType::Limit(price) => StopActivation::Limit(price),
+                    OrderType::MarketToLimit => {
+                        unreachable!("generated order is already priced")
+                    }
                     OrderType::Stop { .. } => {
                         unreachable!("generated order is immediately active")
                     }
@@ -13766,6 +13868,9 @@ mod price_level_index_tests {
             let constraint = match incoming.order_type {
                 OrderType::Market => StopActivation::Market,
                 OrderType::Limit(price) => StopActivation::Limit(price),
+                OrderType::MarketToLimit => {
+                    unreachable!("generated order is already priced")
+                }
                 OrderType::Stop { .. } => unreachable!("generated order is immediately active"),
             };
             let actual = book.immediate_execution_quote(ImmediateExecutionRequest::new(
@@ -13794,7 +13899,7 @@ mod price_level_index_tests {
                 0 => StopActivation::Market,
                 1 => match incoming.order_type {
                     OrderType::Limit(price) => StopActivation::Limit(price),
-                    OrderType::Market | OrderType::Stop { .. } => {
+                    OrderType::Market | OrderType::MarketToLimit | OrderType::Stop { .. } => {
                         unreachable!("generated order is a limit")
                     }
                 },

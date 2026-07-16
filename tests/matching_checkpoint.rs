@@ -182,6 +182,57 @@ fn immutable_matching_checkpoint_clones_share_row_and_event_storage() {
 }
 
 #[test]
+fn market_to_limit_checkpoint_codec_restores_pricing_trace_and_residual() {
+    let maker = order(
+        1,
+        1,
+        11,
+        Side::Sell,
+        2,
+        OrderDisplay::FullyDisplayed,
+        OrderType::Limit(Price::from_raw(100)),
+        TimeInForce::GoodTilCancelled,
+        SelfTradePrevention::CancelAggressor,
+    );
+    let taking = order(
+        2,
+        2,
+        12,
+        Side::Buy,
+        5,
+        OrderDisplay::FullyDisplayed,
+        OrderType::MarketToLimit,
+        TimeInForce::GoodTilCancelled,
+        SelfTradePrevention::CancelAggressor,
+    );
+    let mut book = OrderBook::new(definition());
+    book.submit(maker).unwrap();
+    let report = book.submit(taking).unwrap();
+    let observation = book
+        .try_active_order_observation(OrderId::new(2).unwrap())
+        .unwrap();
+
+    let encoded = book.checkpoint(9, 13).unwrap().encode().unwrap();
+    let decoded = OrderBookCheckpoint::decode(&encoded).unwrap();
+    let mut restored = OrderBook::from_checkpoint(&decoded).unwrap();
+    assert_eq!(
+        restored
+            .try_active_order_observation(OrderId::new(2).unwrap())
+            .unwrap(),
+        observation
+    );
+    let retained = restored
+        .retained_command_report(CommandId::new(2).unwrap())
+        .unwrap();
+    assert_eq!(retained.command(), &taking);
+    assert_eq!(retained.report(), &report);
+    let retry = restored.submit(taking).unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.events, report.events);
+    restored.validate().unwrap();
+}
+
+#[test]
 fn fok_decrement_and_cancel_checkpoint_restores_atomic_reports_and_retries() {
     let external = order(
         1,

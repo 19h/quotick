@@ -998,7 +998,7 @@ impl InstrumentDefinition {
         self.spec.quantity.validate(order.quantity)?;
         self.validate_display(order.display, order.quantity)?;
         match order.order_type {
-            OrderType::Market => {}
+            OrderType::Market | OrderType::MarketToLimit => {}
             OrderType::Limit(price) => self.spec.price.validate(price)?,
             OrderType::Stop {
                 trigger_price,

@@ -1324,8 +1324,10 @@ impl RiskEngine {
             order.quantity.lots(),
             notional,
             order.order_type.stop().is_some()
-                || (matches!(order.order_type, OrderType::Limit(_))
-                    && order.time_in_force.may_rest()),
+                || (matches!(
+                    order.order_type,
+                    OrderType::Limit(_) | OrderType::MarketToLimit
+                ) && order.time_in_force.may_rest()),
         )
     }
 
@@ -1385,7 +1387,7 @@ impl RiskEngine {
         quantity: u64,
     ) -> Result<u128, RejectReason> {
         let constraint = match order_type {
-            OrderType::Market => RiskPriceConstraint::Market,
+            OrderType::Market | OrderType::MarketToLimit => RiskPriceConstraint::Market,
             OrderType::Limit(price) => RiskPriceConstraint::Limit(price),
             OrderType::Stop { activation, .. } => match activation {
                 crate::matching::StopActivation::Market => RiskPriceConstraint::Market,
@@ -1459,7 +1461,7 @@ impl RiskEngine {
                                 RiskPriceConstraint::Limit(price)
                             }
                         },
-                        OrderType::Market | OrderType::Limit(_) => {
+                        OrderType::Market | OrderType::MarketToLimit | OrderType::Limit(_) => {
                             unreachable!("StopOrderArmed requires a stop command")
                         }
                     };

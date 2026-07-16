@@ -244,9 +244,12 @@ Run any program with `cargo run --example <name>`.
 - Deterministic price-time priority with ordered price levels, intrusive FIFO
   links, and mutation-maintained best-level caches giving `O(1)` best-price
   reads and `O(1)` maker-level mutation.
-- Market and limit orders with GTC, GTD, IOC, minimum-quantity IOC, FOK, and
-  post-only behavior
-  (market orders can neither rest nor post); native reserve (iceberg) orders with
+- Market, frozen-best market-to-limit, and limit orders. Market-to-limit
+  accepts GTC/GTD, captures the private executable best before STP, executes
+  only there, and rests any residual at that price; an explicit pricing event
+  survives publication and recovery. Ordinary orders support GTC, GTD, IOC,
+  minimum-quantity IOC, FOK, and post-only behavior (market orders can neither
+  rest nor post); native reserve (iceberg) orders with
   fixed displayed peaks, hidden total leaves, bounded replenishment, and
   displayed-class-tail priority on refresh; and instrument-gated fully hidden
   resting limit orders with zero public depth and deterministic priority behind
@@ -434,7 +437,7 @@ Run any program with `cargo run --example <name>`.
 
 ### Durability and recovery
 
-- Versioned CRC-32C WAL frames (format 19) with bounded payloads and
+- Versioned CRC-32C WAL frames (format 20) with bounded payloads and
   contiguous sequences, as a single-file `Journal` or a size-bounded
   `SegmentedJournal` rotating whole frames and batches under one global
   sequence.
@@ -444,7 +447,7 @@ Run any program with `cargo run --example <name>`.
   writer leases with explicit abandoned-writer recovery.
 - Strict corruption detection: only a physically incomplete final frame may be
   repaired, and closed segments are always scanned strictly.
-- Versioned, bounded `QSNP` semantic snapshots (format 19) with monotonic
+- Versioned, bounded `QSNP` semantic snapshots (format 20) with monotonic
   exact-prefix lineage and synchronized atomic replacement.
 - Durable runtimes for matching, coupled risk/matching, call auctions, and
   coupled auction/risk record every command before committing the in-memory
@@ -549,12 +552,12 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 120 tagged assumptions (A1–A120), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 139 tagged assumptions (A1–A139), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
-| [WAL format v19](docs/wal-v19.md) | Current write-ahead-log frame and record schema |
-| [Snapshot format v19](docs/snapshot-v19.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
+| [WAL format v20](docs/wal-v20.md) | Current write-ahead-log frame and record schema |
+| [Snapshot format v20](docs/snapshot-v20.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
 | [Market-data payload v3](docs/market-data-v3.md) | Current continuous market-data update/snapshot payloads |
 | [Auction market-data payload v5](docs/auction-market-data-v5.md) | Current call-auction market-data payloads |
 | [Auction-risk checkpoint payload v1](docs/auction-risk-checkpoint-v1.md) | Current coupled call-auction risk checkpoint payload |
@@ -576,6 +579,7 @@ byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/wal-v16.md](docs/wal-v16.md),
 [docs/wal-v17.md](docs/wal-v17.md),
 [docs/wal-v18.md](docs/wal-v18.md),
+[docs/wal-v19.md](docs/wal-v19.md),
 [docs/snapshot-v2.md](docs/snapshot-v2.md),
 [docs/snapshot-v3.md](docs/snapshot-v3.md),
 [docs/snapshot-v4.md](docs/snapshot-v4.md),
@@ -592,7 +596,8 @@ byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/snapshot-v15.md](docs/snapshot-v15.md),
 [docs/snapshot-v16.md](docs/snapshot-v16.md),
 [docs/snapshot-v17.md](docs/snapshot-v17.md),
-[docs/snapshot-v18.md](docs/snapshot-v18.md), continuous
+[docs/snapshot-v18.md](docs/snapshot-v18.md),
+[docs/snapshot-v19.md](docs/snapshot-v19.md), continuous
 [market-data v2](docs/market-data-v2.md), and call-auction
 [market-data v1](docs/auction-market-data-v1.md) and
 [market-data v2](docs/auction-market-data-v2.md) and
@@ -614,7 +619,8 @@ fixed-seed PRNGs against independent in-test reference models. Coverage
 includes:
 
 - **Matching and risk:** displayed/hidden queue classes, hidden and reserve
-  admission and replenishment, GTD intake and canonical expiry sweeps, dormant
+  admission and replenishment, frozen-best market-to-limit pricing and
+  residuals, GTD intake and canonical expiry sweeps, dormant
   stop intake, canonical bounded trigger sweeps, activation-time failures,
   mass cancellation, account and trading-state controls, every self-trade
   policy, atomic FOK decrement-and-cancel barriers and exact minimum-quantity

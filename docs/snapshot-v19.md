@@ -1,5 +1,9 @@
 # Semantic Snapshot Format Version 19
 
+> **Expired.** Runtime version 20 rejects this envelope. The current schema is
+> [snapshot format version 20](snapshot-v20.md). Historical bytes below are
+> unchanged.
+
 `SnapshotFile` stores one complete typed semantic value in a bounded,
 versioned CRC-32C envelope. Version 19 preserves the version-18 kind registry
 and direct row schemas. Chronological call-auction history embeds the version-

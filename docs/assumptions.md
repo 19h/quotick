@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A138 are stable and are referenced from code comments and other
+identifiers A1-A139 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -287,11 +287,17 @@ integrity; concern about the second requires authenticated records.
 
 ## A15 — format version immutability
 
-**Assumption.** WAL format version 19, snapshot format version 19, continuous
+**Assumption.** WAL format version 20, snapshot format version 20, continuous
 market-data payload version 3, call-auction market-data payload version 5, and
 trading-calendar payload version 1 are immutable. WAL and snapshot versions
-`1` through `18` are expired and rejected explicitly rather than inferred or
-migrated. WAL v19 preserves v18 values except that each private call-auction
+`1` through `19` are expired and rejected explicitly rather than inferred or
+migrated. WAL v20 preserves v19 values and adds continuous order-type tag `3`,
+`MarketToLimit`; event-kind tag `15`, `MarketToLimitPriced`; and rejection
+tags `56` and `57` for empty opposite liquidity and a non-resting lifetime.
+Snapshot v20 preserves v19 direct rows and embeds WAL-v20 values in
+chronological histories; matching and coupled-risk kinds `2` and `3` therefore
+retain the submitted unpriced command and explicit captured price. WAL v19
+preserved v18 values except that each private call-auction
 trade grows from 56 B to 72 B by inserting its immutable instrument ID and
 definition version before order/account/price/quantity fields. Snapshot v19
 preserves v18 direct rows and embeds WAL-v19 values in chronological histories;
@@ -335,15 +341,16 @@ authoritative predecessors exist.
 recovery, anchor interpretation, stable auction records/images, stable calendar
 images, and fail-closed format boundaries.
 
-**Falsification probe.** Byte-compare golden WAL-v19, snapshot-v19,
+**Falsification probe.** Byte-compare golden WAL-v20, snapshot-v20,
 market-data-v3, auction-market-data-v5, and trading-calendar-v1 fixtures through
 every supported release; mutate valid WAL frames and images to versions `1`
-through `18`; verify definition booleans, every display, TIF, rejection, and
+through `19`; verify definition booleans, every display, TIF, rejection, and
 cancellation tag, continuous expiry/stop/source tags, raw auction record tags
 `9`/`10`, replacement, mass-cancel, amendment, and allocation-policy tags,
 priority-class scalars, auction-trade instrument ID/version fields, uncross
 self-trade tags, rejection tag `23`, indicative command/action/event/update
-tags and nullable state, snapshot kinds `1` through `5`, hidden-maker trade
+tags and nullable state, market-to-limit command/event/rejection tags,
+snapshot kinds `1` through `5`, hidden-maker trade
 application, auction replacement and mass-cancel projection, and every calendar
 scalar/row offset.
 Any changed supported bytes/interpretation or acceptance across an expired
@@ -713,7 +720,7 @@ effect, accepted partial state, or incorrect final balance falsifies A36.
 
 **Assumption.** The reserve-, mass-cancel-, account-control-, GTD-, stop-, fully
 hidden, and minimum-quantity command/report variants defined through version 8
-remain explicit variants inside deployable WAL version 19. Version 9 added
+remain explicit variants inside deployable WAL version 20. Version 9 added
 durable stop-reference source identity, source version, source sequence, and
 typed discontinuity/collision outcomes; it does not infer them from WAL version
 8. No earlier matching WAL requires runtime compatibility. Expired envelopes
@@ -724,10 +731,10 @@ minimum-quantity, or anchor semantics.
 **Dependent results.** Explicit fully displayed/reserve/fully hidden/GTD/stop
 state, refresh, expiry, and trigger events, canonical mass cancellation,
 revisioned account fencing, and anchored cutover under WAL envelope version
-`19`.
+`20`.
 
 **Falsification probe.** Inventory every persisted matching WAL and decode
-golden version-19 fixtures before deployment. Reject version-18 artifacts with
+golden version-20 fixtures before deployment. Reject version-19 artifacts with
 and without re-labelled headers, and mutate every hidden/minimum-quantity/
 expiry/stop/source tag, definition flag, threshold, deadline, watermark,
 reference, trigger, activation, aggregate, and ordering relation.
@@ -1733,7 +1740,7 @@ continuity is bounded by A65/A66.
 ## A65 — durable auction WAL grammar
 
 **Assumption.** One `DurableCallAuctionEngine` owns the only writer lease for
-one WAL-version-19 single-file or marker-selected segmented auction shard. Its
+one WAL-version-20 single-file or marker-selected segmented auction shard. Its
 uncut grammar is one immutable definition followed by command/report pairs and
 at most one final dangling command. Submission prepares before command append,
 commits the same token, then appends the exact report; acknowledgement strength
@@ -1778,7 +1785,7 @@ unaudited dangling completion falsifies A65.
 
 ## A66 — auction checkpoint lineage
 
-**Assumption.** A snapshot-version-19 call-auction checkpoint and its recovery
+**Assumption.** A snapshot-version-20 call-auction checkpoint and its recovery
 WAL represent one immutable A65 command/report lineage. The image retains the
 definition/WAL origin, completed report boundary, phase/cycle, book revision,
 next priority/trade counters, canonical accepted identities and active orders,
@@ -1788,7 +1795,7 @@ row. A completed checkpoint is released only after
 independent replay requires exact direct-state equality; A97/A98 separate
 non-replaying capture from that proof. Numeric generation is never accepted
 without exact uncut prefix equality or a kind/checksum/generation/slot-bound
-version-19 anchor. Capture/validation resource or temporary-constructor failure
+version-20 anchor. Capture/validation resource or temporary-constructor failure
 under A78 occurs before snapshot/cutover mutation and leaves the durable shard
 unpoisoned; semantic contradiction poisons it.
 
@@ -3387,7 +3394,7 @@ venue-specific rules.
 **Dependent results.** [A1, A5, A9, A15, A20, A21, A22, A37, A39, A45, A50,
 A70, A83, A88, A102, A103, A105, A115] Allocation-free `O(1)`-space threshold
 inspection, atomic failure, reserve/hidden-aware eligibility, stop activation,
-no-change public projection, risk release, stable WAL-v19/snapshot-v19 bytes,
+no-change public projection, risk release, stable WAL-v20/snapshot-v20 bytes,
 checkpoint/WAL recovery, and exact retry are deterministic. The specialized
 A115 scan has the time bound stated there; other policies retain the one-pass
 FOK eligibility bound.
@@ -3552,7 +3559,7 @@ aggregate reduction. It emits one replayable `OrderAmended` event in the
 ordinary history lane. Coupled risk removes the exact quantity and conservative
 notional delta without a new entry gate. Public payload v5 emits one anonymous
 `Amended` aggregate delta with unchanged order count and invalidates any prior
-indication. WAL/snapshot v19 preserve
+indication. WAL/snapshot v20 preserve
 exact retry and checkpoint-plus-suffix recovery.
 
 **Falsification probe.** Exercise market and limit orders at head, middle, and
@@ -3596,7 +3603,7 @@ construction. Validation and fill construction are `O(B + A)` time with
 instrument quantity increment, the engine emits the resulting deterministic
 trade/remainder trace, risk consumes that trace without an independent
 allocation inference, and auction market-data payload v5 projects the same
-events while adding A112. WAL v19 and snapshot v19 persist the explicit policy
+events while adding A112. WAL v20 and snapshot v20 persist the explicit policy
 for
 full replay, checkpoint recovery, and exact retry. A61 price-time behavior
 remains separately selectable and byte-tagged.
@@ -3637,7 +3644,7 @@ queues remain mutation-time FIFO structures; rebuilding caller-owned order
 scratch resolves their identities and performs an allocation-free unstable
 sort in `O(O log O + P)` time. Both `PriceTime` and `ProRataTime` therefore
 honor market/price/class/time/ID order. Risk consumes the resulting execution
-trace without independently inferring class. WAL v19 and snapshot v19 preserve
+trace without independently inferring class. WAL v20 and snapshot v20 preserve
 the class through full replay, direct checkpoint restore, suffix recovery, and
 exact retry.
 
@@ -3683,8 +3690,8 @@ constructor-owned scratch and the existing allocation-free kernel. One command
 adds one fixed-size event and one optional fixed-size live state. Risk
 authorization and application are `O(1)` no-ops.
 
-WAL v19 retains command/action tag `7` and event-kind tag `9`; nullable reports
-are 98 B or 138 B. Snapshot v19 derives the current value from accepted
+WAL v20 retains command/action tag `7` and event-kind tag `9`; nullable reports
+are 98 B or 138 B. Snapshot v20 derives the current value from accepted
 history and checkpoint-plus-suffix invalidation. Auction market-data v5 uses
 kind tag `6`, 84 B or 124 B updates, complete one-update replay batches, and an
 optional snapshot value. Publisher, replica, direct restore, full-WAL recovery,
@@ -3748,8 +3755,8 @@ the current indication. Exact retry reuses the report. Coupled risk changes no
 reservation, exposure, position, or netting scratch. Public payload version 5
 emits `NoPublicChange` for the original rejection and no retry update.
 
-WAL v19 encodes self-trade policy tag `1` and rejection tag `23`; its generic
-one-event rejected report is 49 B. Snapshot v19 retains the command/report row
+WAL v20 encodes self-trade policy tag `1` and rejection tag `23`; its generic
+one-event rejected report is 49 B. Snapshot v20 retains the command/report row
 without changing direct order, counter, phase, indication, or risk rows. An
 accepted `Abort` uncross is valid only when all canonical pairs have unequal
 account IDs. `Permit` retains the prior same-account trade and coupled net-zero
@@ -3806,7 +3813,7 @@ levels, uses `O(1)` auxiliary space, and allocates nothing.
 before, within, and after sufficient external liquidity at the same and worse
 prices. Exercise partial current reserve slices, multiple refreshes, direct and
 dormant entry, both sides, risk reservations, public no-change/trade
-projection, stable WAL-v19/snapshot-v19 recovery, exact retry, and later
+projection, stable WAL-v20/snapshot-v20 recovery, exact retry, and later
 successful external continuation. Differentially compare at least 20,000
 generated books with a literal slice/requeue reference queue. Any accepted
 partial FOK, counted self decrement, reachable self STP event, mutation on
@@ -3845,7 +3852,7 @@ most `R_p` remaining reserve rounds there, the scan costs
 space, and zero allocations. Instrument admission bounds each replenishment
 count by `u32`, so the binary search performs at most 32 aggregate passes per
 price. Direct and dormant entry, risk, private/public projection, checkpoint,
-WAL-v19, snapshot-v19, exact retry, and subsequent execution reproduce the
+WAL-v20, snapshot-v20, exact retry, and subsequent execution reproduce the
 same result. Legacy rejection tag `51` remains decodable but is not emitted for
 a well-formed A115 command.
 
@@ -3907,7 +3914,7 @@ and `O(T)` identity storage, followed by A79's `O(L log L)` preparation,
 adversarial transaction-hash collision cluster can make batch identity and
 overlay work `O(T²)` without storage growth.
 
-WAL/snapshot version 19 preserves trade identity before settlement. One
+WAL/snapshot version 20 preserves trade identity before settlement. One
 multi-trade settlement occupies one kind-`7` frame and one batch checkpoint
 record. Exact retry appends no frame and applies no second effect. A separately
 committed subset or different grouping is a typed nonmutating partial-commit or
@@ -4030,7 +4037,8 @@ work `O(N²)` without storage growth.
 One fee-enriched settlement occupies one ordinary kind-`7` ledger-batch frame
 and one batch checkpoint record. Standard entry/batch encoding already carries
 the postings, references, effective date, and booking timestamp, so WAL and
-snapshot version 19 do not change. DVP and fees share one event sequence, final
+their values remain unchanged inside WAL/snapshot version 20. DVP and fees
+share one event sequence, final
 balance image, capacity decision, exact-retry identity, append-before-commit
 transition, checkpoint, and recovery result. No prefix is observable after
 construction, capacity, period, timestamp, balance, WAL, or recovery failure.
@@ -4087,7 +4095,7 @@ The original event's content and grouping are proved before mutation. One-entry
 busts use an ordinary entry; every other correction is one ordered batch. The
 standard entry/kind-`7` batch encoding therefore yields one WAL frame, one
 checkpoint record, one final balance image, exact retry without frame growth,
-and unchanged WAL/snapshot version 19.
+and unchanged value semantics inside WAL/snapshot version 20.
 
 **Falsification probe.** Exercise fee-free and fee-enriched one/multi-trade
 busts; replacement settlements with different trades and fees; zero, duplicate,
@@ -5126,10 +5134,90 @@ value and typed publisher/risk failure. Any unprovenanced absence, state-class
 ambiguity, local-corruption success, mutation, successful-path allocation,
 recovery difference, publisher/risk panic, or wire-byte change falsifies A138.
 
+## A139 — frozen-best continuous market-to-limit
+
+**Assumption.** `OrderType::MarketToLimit` is a direct continuous new-order
+instruction with no submitted price. It is admitted only with GTC or GTD. After
+instrument, quantity, display, identity, account-fence, expiry, and lifetime
+validation, but before matching or STP, the engine captures the current best
+executable opposite price from the private price index. The captured price
+includes a hidden-only best level and is independent of the public BBO.
+
+Acceptance emits ordinary `OrderAccepted` followed immediately by exactly one
+`MarketToLimitPriced { order_id, limit_price }`. The matching kernel then uses
+one ordinary limit constraint at that exact price. It cannot execute a worse
+level; any residual rests at the captured price under the submitted fully
+displayed, reserve, or fully hidden policy. Cancel-resting STP can remove the
+captured maker but cannot reprice the aggressor to newly exposed liquidity.
+The pricing event and converted residual do not change direct stop activation,
+which remains market-or-limit only.
+
+IOC, minimum-quantity IOC, FOK, and post-only are rejected with
+`MarketToLimitRequiresRestingLifetime` before opposite-book availability is
+evaluated. A valid lifetime with no opposite executable price is rejected with
+`MarketToLimitBookEmpty`. Both are sequenced business outcomes and do not
+consume the submitted order identity. Accepted capacity preflight uses the
+captured price as its effective limit and must reject an unavailable residual
+price level before acceptance or any maker mutation.
+
+Risk authorization values the unpriced command over the complete signed market
+collar. If execution leaves a residual, trace application creates a reservation
+from the actual captured limit and remaining total leaves. The publisher
+derives the same executable best by scanning its complete private order mirror,
+including hidden orders, before any trace mutation; it requires the pricing
+event before every market-to-limit trade, STP interaction, or residual and maps
+that event to `NoBookChange`. The high-level best-opposite/residual concept is
+also defined by
+[ASX 24 Operating Rules, Procedure 4020](https://www.asx.com.au/content/dam/asx/rules-guidance-notes-waivers/asx-24-operating-rules/rules/ASX-24-Operating-Rules-Section-04.pdf).
+Quotick's hidden-liquidity, lifetime, STP, risk, and wire rules are internal and
+do not assert venue protocol conformance.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A9, A10, A12, A15, A17, A18,
+A19, A22, A37, A39, A42, A44, A57, A67, A72, A73, A80, A81, A82, A85,
+A91, A103, A139] Capture and successful-path conversion are `O(1)` before
+ordinary effective-limit matching. The publisher pricing check is `O(O)` time
+over `O` tracked active orders and `O(1)` auxiliary space. WAL-v20,
+snapshot-v20, direct checkpoint restore, coupled-risk recovery, publisher
+replay, and exact retry retain the submitted type, captured price, report, and
+residual exactly.
+
+**Falsification probe.** Submit buy and sell market-to-limit orders against
+empty books; visible, reserve, and hidden-only best levels; multiple worse
+levels; all six TIF variants; all three display policies; every STP policy;
+positive, zero, and negative prices; partial and full fills; saturated active,
+account, and price-level capacity; and signed-collar risk limits. Require one
+pricing event immediately after acceptance, no worse-price execution, exact
+residual price/display, no accepted-ID consumption on rejection, market-collar
+authorization, limit-priced residual reservation, and exact retry without WAL
+growth. Corrupt, omit, duplicate, reorder, or reprice the pricing event and
+require publisher poison or recovery divergence before public output. Restore
+through direct checkpoints, raw and segmented WAL, coupled risk, and snapshot
+cutover, then require identical observation and report bytes. Any public-BBO
+capture, post-STP repricing, worse-level trade, late capacity failure, identity
+consumption on rejection, noncanonical risk reservation, accepted unsupported
+TIF, stop activation as market-to-limit, recovery drift, or version-19
+acceptance falsifies A139.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** continuous matching now supports a frozen-best
+  market-to-limit instruction with GTC/GTD residuals, hidden-best capture,
+  reserve/hidden display, all STP policies, conservative pre-trade risk,
+  explicit private pricing provenance, public projection, and WAL/snapshot
+  recovery.
+
+- **Medium impact risk:** Quotick captures the private executable best,
+  including hidden-only liquidity. Venue protocols can define market-to-limit
+  against a displayed, protected, routed, or otherwise filtered best and can
+  permit different lifetime or display combinations; those adapters require
+  separately versioned conformance rules.
+
+- **Medium impact opportunity:** the explicit pricing event permits exact OMS,
+  risk, surveillance, and replay attribution of the conversion price without
+  inferring it from public BBO or the first trade.
 
 - **High impact:** authoritative continuous public-depth observations now
   share the same coherent-extrema and selected-row validation semantics as
@@ -5464,7 +5552,7 @@ capability, a remaining risk, or an opportunity.
 - **High impact:** call-auction uncross now selects explicit price-time or
   price/class-tier pro-rata-time allocation. Pro-rata shares use exact
   instrument-increment floors, FIFO residual quanta, deterministic trade
-  pairing, and WAL-v19/snapshot-v19 recovery. Every live order carries one
+  pairing, and WAL-v20/snapshot-v20 recovery. Every live order carries one
   authoritative typed priority-class scalar used by both policies after
   market/price ordering and before time. An authenticated venue-category-to-
   scalar mapping remains adapter conformance work. Venue algorithms that rank by
@@ -5474,7 +5562,7 @@ capability, a remaining risk, or an opportunity.
 - **High impact:** call-auction self-trade policy now supports fail-closed
   `Abort` on the first canonical equal-`AccountId` pair. The complete uncross
   is rejected before book, trade-ID, phase, risk, or public-depth mutation and
-  recovers exactly through WAL/snapshot version 19. Authenticated beneficial-
+  recovers exactly through WAL/snapshot version 20. Authenticated beneficial-
   owner mapping, alternative-counterparty rearrangement, and venue-specific
   cancel/decrement or aggressor/resting instructions remain external.
 - **High impact:** call-auction collection and sequencing now support bounded
@@ -5482,7 +5570,7 @@ capability, a remaining risk, or an opportunity.
   command selects `K` orders independently of unrelated active interest, emits
   canonical ascending removals plus one aggregate completion, increments the
   book revision exactly once when `K > 0`, releases each risk reservation, and
-  recovers under WAL/snapshot version 19. Public payload version 5 projects the
+  recovers under WAL/snapshot version 20. Public payload version 5 projects the
   same complete batch without account or scope identity. Authenticated firm,
   session, or cross-shard scope and completion aggregation remain external.
 - **High impact risk:** the auction writer lease is local ownership, not a

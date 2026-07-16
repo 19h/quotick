@@ -51,6 +51,26 @@ fn definition() -> InstrumentDefinition {
     .unwrap()
 }
 
+fn positive_price_definition() -> InstrumentDefinition {
+    InstrumentDefinition::new(InstrumentSpec {
+        instrument_id: instrument(),
+        version: version(),
+        effective_from: TimestampNs::from_unix_nanos(0),
+        symbol: InstrumentSymbol::new("RISK-POSITIVE").unwrap(),
+        kind: InstrumentKind::Spot,
+        base_asset_id: AssetId::new(1).unwrap(),
+        quote_asset_id: AssetId::new(2).unwrap(),
+        price: PriceRules::new(0, 1, Price::from_raw(1), Price::from_raw(1_000)).unwrap(),
+        quantity: QuantityRules::new(1, 1, u64::MAX).unwrap(),
+        reserve: quotick::instrument::ReserveOrderRules::disabled(),
+        hidden_orders_supported: false,
+        base_units_per_lot: 1,
+        quote_units_per_price_unit: 1,
+        trading_state: TradingState::Open,
+    })
+    .unwrap()
+}
+
 fn limits() -> RiskLimits {
     RiskLimits::new(RiskLimitSpec {
         max_order_quantity_lots: 100,
@@ -1102,6 +1122,105 @@ fn fills_and_cancels_update_positions_and_release_resting_reservations() {
     assert_eq!(book.risk().reservation_count(), 0);
     assert_eq!(book.book().active_order_count(), 0);
     book.validate().unwrap();
+}
+
+#[test]
+fn market_to_limit_authorization_uses_the_collar_then_reserves_the_captured_price() {
+    let mut book = RiskManagedOrderBook::new(positive_price_definition());
+    book.register_account(account(11), profile(AccountRiskState::Active, 10))
+        .unwrap();
+    book.register_account(account(12), profile(AccountRiskState::Active, 0))
+        .unwrap();
+    book.submit(limit_order(
+        1,
+        1,
+        11,
+        Side::Sell,
+        2,
+        100,
+        TimeInForce::GoodTilCancelled,
+    ))
+    .unwrap();
+
+    let report = book
+        .submit(order(
+            2,
+            2,
+            12,
+            Side::Buy,
+            5,
+            OrderType::MarketToLimit,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ))
+        .unwrap();
+    assert_eq!(report.outcome, CommandOutcome::Accepted);
+    let buyer = book.risk().snapshot(account(12)).unwrap();
+    assert_eq!(buyer.position_lots(), 2);
+    assert_eq!(buyer.open_buy_lots(), 3);
+    assert_eq!(buyer.open_notional(), 300);
+    let residual = book.risk().reservation(OrderId::new(2).unwrap()).unwrap();
+    assert_eq!(
+        residual.constraint(),
+        RiskPriceConstraint::Limit(Price::from_raw(100))
+    );
+    assert_eq!(residual.quantity_lots(), 3);
+    book.validate().unwrap();
+
+    let constrained = RiskLimits::new(RiskLimitSpec {
+        max_order_quantity_lots: 10,
+        max_order_notional: 600,
+        max_open_orders: 4,
+        max_open_quantity_lots: 10,
+        max_open_notional: 10_000,
+        max_long_position_lots: 10,
+        max_short_position_lots: 10,
+    })
+    .unwrap();
+    let mut conservative = RiskManagedOrderBook::new(positive_price_definition());
+    conservative
+        .register_account(account(21), profile(AccountRiskState::Active, 10))
+        .unwrap();
+    conservative
+        .register_account(
+            account(22),
+            RiskProfile::new(AccountRiskState::Active, 0, constrained).unwrap(),
+        )
+        .unwrap();
+    conservative
+        .submit(limit_order(
+            1,
+            1,
+            21,
+            Side::Sell,
+            5,
+            100,
+            TimeInForce::GoodTilCancelled,
+        ))
+        .unwrap();
+    assert_eq!(
+        conservative
+            .submit(order(
+                2,
+                2,
+                22,
+                Side::Buy,
+                5,
+                OrderType::MarketToLimit,
+                TimeInForce::GoodTilCancelled,
+                SelfTradePrevention::CancelAggressor,
+            ))
+            .unwrap()
+            .outcome,
+        CommandOutcome::Rejected(RejectReason::RiskOrderNotionalLimit)
+    );
+    assert!(
+        conservative
+            .risk()
+            .reservation(OrderId::new(2).unwrap())
+            .is_none()
+    );
+    conservative.validate().unwrap();
 }
 
 #[test]

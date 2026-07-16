@@ -668,6 +668,7 @@ fn encode_order_type(encoder: &mut Encoder, order_type: OrderType) {
             encoder.i64(trigger_price.raw());
             encode_stop_activation(encoder, activation);
         }
+        OrderType::MarketToLimit => encoder.u8(3),
     }
 }
 
@@ -679,6 +680,7 @@ fn decode_order_type(decoder: &mut Decoder<'_>) -> Result<OrderType, CodecError>
             trigger_price: Price::from_raw(decoder.i64()?),
             activation: decode_stop_activation(decoder)?,
         }),
+        3 => Ok(OrderType::MarketToLimit),
         tag => Err(CodecError::InvalidTag {
             type_name: "OrderType",
             tag,
@@ -929,6 +931,8 @@ fn encode_reject_reason(encoder: &mut Encoder, value: RejectReason) {
         RejectReason::StopReferenceSourceMismatch => 53,
         RejectReason::StopReferenceVersionDiscontinuity => 54,
         RejectReason::StopReferenceSequenceDiscontinuity => 55,
+        RejectReason::MarketToLimitBookEmpty => 56,
+        RejectReason::MarketToLimitRequiresRestingLifetime => 57,
     });
 }
 
@@ -990,6 +994,8 @@ fn decode_reject_reason(decoder: &mut Decoder<'_>) -> Result<RejectReason, Codec
         53 => Ok(RejectReason::StopReferenceSourceMismatch),
         54 => Ok(RejectReason::StopReferenceVersionDiscontinuity),
         55 => Ok(RejectReason::StopReferenceSequenceDiscontinuity),
+        56 => Ok(RejectReason::MarketToLimitBookEmpty),
+        57 => Ok(RejectReason::MarketToLimitRequiresRestingLifetime),
         tag => Err(CodecError::InvalidTag {
             type_name: "RejectReason",
             tag,
@@ -1766,6 +1772,14 @@ fn encode_event_kind(encoder: &mut Encoder, kind: EventKind) {
             encoder.u64(triggered_order_count);
             encoder.u64(remaining_eligible_order_count);
         }
+        EventKind::MarketToLimitPriced {
+            order_id,
+            limit_price,
+        } => {
+            encoder.u8(15);
+            encoder.u64(order_id.get());
+            encoder.i64(limit_price.raw());
+        }
     }
 }
 
@@ -1858,6 +1872,10 @@ fn decode_event_kind(decoder: &mut Decoder<'_>) -> Result<EventKind, CodecError>
             current_reference: decode_stop_reference(decoder)?,
             triggered_order_count: decoder.u64()?,
             remaining_eligible_order_count: decoder.u64()?,
+        }),
+        15 => Ok(EventKind::MarketToLimitPriced {
+            order_id: order(decoder)?,
+            limit_price: Price::from_raw(decoder.i64()?),
         }),
         tag => Err(CodecError::InvalidTag {
             type_name: "EventKind",
