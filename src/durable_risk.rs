@@ -25,7 +25,8 @@ use crate::matching::{
     ImmediateExecutionCurve, ImmediateExecutionCurveOutcome, ImmediateExecutionOutcome,
     ImmediateExecutionQuote, ImmediateExecutionSubmission, MassCancel, MassCancelObservation,
     MatchingError, NewOrder, OrderBook, OrderBookQueryError, OrderExecution, PreparedCommand,
-    ReplaceOrder, evaluate_conditional_execution,
+    ReplaceOrder, TradingStateControl, TradingStateControlSubmissionObservation,
+    evaluate_conditional_execution,
 };
 use crate::risk::{
     AccountRiskDefinition, RiskError, RiskInvariantViolation, RiskManagedCheckpoint,
@@ -1030,6 +1031,32 @@ impl DurableRiskOrderBook {
         self.submit_conditional_account_control(command, |_, observation| Ok(observation), accept)
     }
 
+    /// Durably risk-gates, observes, and conditionally applies one trading-state control.
+    ///
+    /// Replay plus core or risk rejection bypass observation and `accept`.
+    /// Otherwise the predicate borrows the frozen current state and complete
+    /// canonical transition-and-cancel selection before WAL append. Decline,
+    /// observation failure, or unwind changes neither WAL, matching, nor risk
+    /// state. Acceptance releases all selected reservations exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableRiskError`] for poison, preparation, observation,
+    /// journal, or coupled commit failure. A post-acknowledgement failure
+    /// poisons the instance for deterministic reopen recovery.
+    pub fn try_submit_trading_state_control_if(
+        &mut self,
+        command: TradingStateControl,
+        accept: impl FnOnce(&TradingStateControlSubmissionObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<TradingStateControlSubmissionObservation>, DurableRiskError>
+    {
+        self.submit_conditional_trading_state_control(
+            command,
+            |_, observation| Ok(observation),
+            accept,
+        )
+    }
+
     /// Durably risk-gates, quotes, and conditionally submits one canonical IOC order.
     ///
     /// Replay plus core or risk rejection bypass `accept`. Decline occurs
@@ -1176,6 +1203,24 @@ impl DurableRiskOrderBook {
         let preflight = self
             .managed
             .prepare_conditional_account_control::<DurableRiskError>(command)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_trading_state_control<T>(
+        &mut self,
+        command: TradingStateControl,
+        observe: impl FnOnce(
+            &OrderBook,
+            TradingStateControlSubmissionObservation,
+        ) -> Result<T, DurableRiskError>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, DurableRiskError> {
+        if self.is_poisoned() {
+            return Err(DurableRiskError::Poisoned);
+        }
+        let preflight = self
+            .managed
+            .prepare_conditional_trading_state_control::<DurableRiskError>(command)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 

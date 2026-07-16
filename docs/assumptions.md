@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A147 are stable and are referenced from code comments and other
+identifiers A1-A148 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -5741,6 +5741,88 @@ acceptance; lease loss; reservation release on noncommit or missing release on
 acceptance; interposed shard transition; durable protocol or recovery drift;
 or new wire value falsifies A147.
 
+## A148 — atomic conditional trading-state-control observation
+
+**Assumption.** One `try_submit_trading_state_control_if` call on an
+`OrderBook`, `RiskManagedOrderBook`, `DurableOrderBook`, or
+`DurableRiskOrderBook` holds the corresponding exclusive mutable shard borrow
+across ordinary `TradingStateControl` preparation, construction of one
+`TradingStateControlSubmissionObservation`, a borrowed local predicate, and
+commit of that same preparation. It reuses the ordinary revisioned instrument
+state, all-order cancellation, coupled-risk trace, report, persistence, and
+recovery paths.
+
+The observation contains the exact current A136 `TradingStateObservation`,
+requested target state, action, and resulting state. For a core-admissible
+`TransitionAndCancel` selecting `O` active orders, preparation fills the same
+move-only A87 all-order lease acquired by ordinary preparation, canonicalizes
+its IDs in ascending `OrderId` order, makes one exact fallible request for `O`
+caller-owned `ActiveOrderSnapshot` rows, validates every selected fully
+displayed, reserve, fully hidden, or dormant-stop state through A138, and
+reports the exact checked `u128` total leaves. Accepted commit validates and
+consumes those identical prepared IDs without another all-order scan or sort.
+`Transition` has no selected orders, requests no caller-owned selected output,
+and acquires no selection lease.
+
+Exact replay plus wrong-route, wrong-version, stale-revision, exhausted-
+revision, unchanged-state, transition-and-cancel-to-open, and other core
+business rejections return a reported `ConditionalCommandOutcome` without
+observation or predicate execution. Coupled risk performs its existing
+account-independent state-control authorization before observation. A query
+failure, predicate decline, or unwind drops preparation and returns any lease
+before sequence, event, matching, risk, history, public, or WAL mutation.
+Acceptance advances the instrument state once and releases exactly the
+selected reservations through the ordinary cancellation trace.
+
+Durable acceptance and business rejection retain command-before-state-before-
+report and append the existing two frames. Query failure, decline, unwind, and
+replay append zero frames. The observation and callback decision are process-
+local, unencoded, unauthenticated, and valid only within the call. Existing
+command, report, checkpoint, market-data, and wire values are unchanged.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A7, A9, A10, A12, A15, A19,
+A20, A22, A37, A39, A48, A52, A59, A72, A77, A80, A81, A82, A84, A87,
+A103, A117, A136, A138, A146, A147, A148] Let `A` be ordinary trading-state-
+control preparation cost, `O` active selected orders, `F` predicate cost, and
+`M` ordinary control commit cost. Transition-and-cancel selection,
+canonicalization, and complete selected-state validation cost expected
+`O(O log O)`. Acceptance costs `O(A + O log O + F + M)` and decline costs
+`O(A + O log O + F)`. Accepted commit reuses the prepared IDs and does not
+repeat all-order selection or sorting. The fixed prepared lease owns `O(O)`
+selected-ID scratch, the returned or retained observation owns `O(O)` rows,
+and evaluator auxiliary state is `O(1)`. Transition acceptance is
+`O(A + F + M)`, decline is `O(A + F)`, and its observation has `O(1)` state
+with no selected-output allocation or lease. Core rejection and replay retain
+their existing preparation path and skip selected output and `F`. Coupled
+acceptance releases `O` reservations in expected `O(O)` time. Durable
+acceptance and business rejection append two existing frames; query failure,
+decline, unwind, and replay append zero. Count, revision, and quantity
+arithmetic is exact integer arithmetic; approximation error is zero.
+
+**Falsification probe.** Across all four surfaces, exercise empty and mixed
+fully displayed, reserve, fully hidden, dormant stop-market, and dormant stop-
+limit books with nonmonotonic identities. Run transition-and-cancel and
+transition-only controls with accepting, declining, and unwinding predicates.
+Require exact instrument/version/sequence/current-state/revision/target/action/
+resulting-state provenance, ascending IDs, complete snapshots, selected count,
+`u128` total leaves, one predicate call for a valid empty cancellation set, and
+allocation-free transition-only observation. Exercise wrong route/version,
+stale and exhausted revisions, unchanged state, transition-and-cancel-to-open,
+every core rejection, exact retry, command-ID collision, selected-output
+reservation failure, selected-state corruption, selection-pool exhaustion,
+and durable write/report failure.
+
+Count predicate and allocation calls; compare selection-pool availability,
+private/public book, instrument state/revision, risk positions/reservations/
+exposures, command history, WAL frames, and plain/coupled-risk reopen state.
+Any selected output or predicate on rejection or replay; transition-only lease
+or output allocation; noncanonical, incomplete, aliased, or provenance-drifted
+observation; second all-order selection or sort at commit; partial state or
+cancellation mutation; WAL growth before acceptance; lease loss; reservation
+release on noncommit or missing release on acceptance; interposed shard
+transition; durable protocol or recovery drift; or new wire value falsifies
+A148.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -6016,6 +6098,28 @@ capability, a remaining risk, or an opportunity.
   or durability, controller authorization, cross-shard firm/session kill
   coordination, delegated cancel-on-behalf authority, or completion
   aggregation.
+
+- **High impact:** A148 closes the instrument-state/order-query-to-control race
+  inside one local call. A transition-and-cancel predicate receives the exact
+  current instrument state, requested target and action, resulting state, and
+  canonical complete active-order set that acceptance removes. Transition-only
+  binds current and resulting state without selected-order output or a lease.
+
+- **Medium impact opportunity:** one trading-state-control predicate can gate
+  on current revision/state and the exact global cancellation set, including
+  per-order leaves, display, expiry, dormant trigger state, aggregate quantity,
+  and book sequence, without correlating separate state and order queries.
+
+- **Medium impact risk:** conditional transition-and-cancel materializes
+  `O(O)` private caller output and executes its predicate synchronously while
+  the shard is exclusively borrowed. Allocation, validation, callback latency,
+  and external blocking extend local control latency; no callback deadline or
+  scheduling isolation is provided. Conditional transition avoids that output.
+
+- **High impact boundary:** A148 is one process-local synchronous instrument
+  control. It adds no remote or asynchronous validity, callback authentication
+  or durability, controller authorization, session/calendar scheduling,
+  cross-shard coordination, or completion aggregation.
 
 - **Medium impact opportunity:** one predicate can gate immediate slippage,
   per-price concentration, passive resting admission, reserve/hidden residual

@@ -126,6 +126,14 @@ no account-list traversal, acquires no selection lease, and allocates no
 selected-order output; its preparation and commit retain the ordinary expected
 `O(1)` fence work.
 
+Conditional transition-and-cancel moves the ordinary all-order scan and sort
+into preparation, constructs complete caller-owned selected-state output, and
+commits the same prepared IDs without another all-order scan or sort. For `O`
+active orders it adds `O(O log O)` preparation time, `O(O)` leased ID scratch,
+and `O(O)` caller output to the ordinary removal bound. Conditional transition
+has one fixed-size state observation, no selection lease, and no selected-order
+output.
+
 For `K` GTD orders at or before one inclusive expiry watermark, preparation
 counts the ordered expiry prefix in `O(K + 1)` time and leases `O(K)` existing
 selection scratch. Commit traverses that prefix again in canonical
@@ -699,6 +707,29 @@ selected-state construction and also skips `F`. Coupled acceptance releases
 rejection append the existing two frames; query failure, decline, unwind, and
 replay append zero. Count, revision, and quantity arithmetic has zero
 approximation error, and no wire value or fixed authoritative state changes.
+
+`try_submit_trading_state_control_if` composes ordinary
+`TradingStateControl` preparation with the exact current state, requested
+target/action/resulting state and, for transition-and-cancel, one canonical
+complete active-order selection. Let `A` be ordinary trading-state-control
+preparation cost, `O` active selected orders, `F` predicate cost, and `M`
+ordinary control commit cost. Selection, in-place ascending-ID sorting, exact
+output reservation, and complete selected-state validation cost expected
+`O(O log O)`.
+
+Transition-and-cancel acceptance is `O(A + O log O + F + M)` time; decline is
+`O(A + O log O + F)`. Accepted commit validates and drains the prepared IDs
+without a second all-order scan or sort. The constructor-owned lease retains
+`O(O)` ID scratch, caller output owns `O(O)` `ActiveOrderSnapshot` rows, and
+evaluator auxiliary state is `O(1)`. Transition acceptance is `O(A + F + M)`
+and decline is `O(A + F)`, with one `O(1)` observation and no selected output
+or lease. Core rejection and exact replay skip observation/output and `F`;
+coupled-risk state-control authorization is account-independent and precedes
+observation. Coupled acceptance releases `O` reservations in expected `O(O)`
+time. Durable acceptance and business rejection append the existing two
+frames; query failure, decline, unwind, and replay append zero. Count,
+revision, and quantity arithmetic has zero approximation error, and no wire
+value or fixed authoritative state changes.
 
 ## Default matching limits and memory
 

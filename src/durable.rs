@@ -28,7 +28,8 @@ use crate::matching::{
     ImmediateExecutionQuote, ImmediateExecutionSubmission, InvariantViolation, MassCancel,
     MassCancelObservation, MatchingError, NewOrder, OrderBook, OrderBookCheckpoint,
     OrderBookCheckpointCapture, OrderBookCheckpointError, OrderBookLimits, OrderBookQueryError,
-    OrderExecution, PreparedCommand, ReplaceOrder, evaluate_conditional_execution,
+    OrderExecution, PreparedCommand, ReplaceOrder, TradingStateControl,
+    TradingStateControlSubmissionObservation, evaluate_conditional_execution,
 };
 use crate::snapshot::{
     CheckpointAnchor, CheckpointCutoverReceipt, CheckpointSlot, SnapshotError, SnapshotFile,
@@ -900,6 +901,32 @@ impl DurableOrderBook {
         self.submit_conditional_account_control(command, |_, observation| Ok(observation), accept)
     }
 
+    /// Durably observes and conditionally applies one trading-state control.
+    ///
+    /// Replay and core rejection bypass observation and `accept`. Otherwise
+    /// the predicate borrows the frozen current state and complete canonical
+    /// transition-and-cancel selection before WAL append. Transition-only
+    /// observations are selection-free. Observation failure, decline, or
+    /// unwind changes neither WAL nor semantic state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] for poison, preparation, observation, journal,
+    /// or commit failure. A post-acknowledgement failure poisons the instance
+    /// for deterministic reopen recovery.
+    pub fn try_submit_trading_state_control_if(
+        &mut self,
+        command: TradingStateControl,
+        accept: impl FnOnce(&TradingStateControlSubmissionObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<TradingStateControlSubmissionObservation>, DurableError>
+    {
+        self.submit_conditional_trading_state_control(
+            command,
+            |_, observation| Ok(observation),
+            accept,
+        )
+    }
+
     /// Durably and atomically quotes and conditionally submits one canonical IOC order.
     ///
     /// Replay and core rejection bypass `accept`. A declined quote is returned
@@ -1041,6 +1068,24 @@ impl DurableOrderBook {
         let preflight = self
             .book
             .prepare_conditional_account_control::<DurableError>(command)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_trading_state_control<T>(
+        &mut self,
+        command: TradingStateControl,
+        observe: impl FnOnce(
+            &OrderBook,
+            TradingStateControlSubmissionObservation,
+        ) -> Result<T, DurableError>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, DurableError> {
+        if self.is_poisoned() {
+            return Err(DurableError::Poisoned);
+        }
+        let preflight = self
+            .book
+            .prepare_conditional_trading_state_control::<DurableError>(command)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 

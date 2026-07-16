@@ -24,8 +24,8 @@ use crate::matching::{
     ImmediateExecutionSubmission, MassCancel, MassCancelObservation, MatchingCapacity,
     MatchingError, NewOrder, OrderBook, OrderBookCheckpoint, OrderBookCheckpointError,
     OrderBookLimits, OrderBookLimitsSpec, OrderBookQueryError, OrderExecution, OrderType,
-    PreparedCommand, RejectReason, ReplaceOrder, SelfTradePrevention, Trade,
-    evaluate_conditional_execution,
+    PreparedCommand, RejectReason, ReplaceOrder, SelfTradePrevention, Trade, TradingStateControl,
+    TradingStateControlSubmissionObservation, evaluate_conditional_execution,
 };
 
 /// Account-level order-entry state.
@@ -2161,6 +2161,35 @@ impl RiskManagedOrderBook {
         self.submit_conditional_account_control(command, |_, observation| Ok(observation), accept)
     }
 
+    /// Atomically risk-gates, observes, and conditionally applies one trading-state control.
+    ///
+    /// Core or risk rejection and replay bypass `accept`. Otherwise the
+    /// predicate borrows the frozen current instrument state and, for
+    /// transition-and-cancel, every canonical selected active state. Decline,
+    /// observation failure, or unwind changes neither matching nor risk state.
+    /// Acceptance applies the same preparation and releases all selected
+    /// reservations exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConditionalOrderError::Matching`] for preparation or coupled
+    /// commit failure and [`ConditionalOrderError::Query`] when the complete
+    /// observation cannot be validated or reserved.
+    pub fn try_submit_trading_state_control_if(
+        &mut self,
+        command: TradingStateControl,
+        accept: impl FnOnce(&TradingStateControlSubmissionObservation) -> bool,
+    ) -> Result<
+        ConditionalCommandOutcome<TradingStateControlSubmissionObservation>,
+        ConditionalOrderError,
+    > {
+        self.submit_conditional_trading_state_control(
+            command,
+            |_, observation| Ok(observation),
+            accept,
+        )
+    }
+
     /// Atomically risk-gates, quotes, and conditionally submits one canonical IOC order.
     ///
     /// Core or risk rejection and exact replay bypass `accept`. For a command
@@ -2298,6 +2327,19 @@ impl RiskManagedOrderBook {
         self.submit_conditional_execution(preflight, observe, accept)
     }
 
+    fn submit_conditional_trading_state_control<T, E>(
+        &mut self,
+        command: TradingStateControl,
+        observe: impl FnOnce(&OrderBook, TradingStateControlSubmissionObservation) -> Result<T, E>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, E>
+    where
+        E: From<MatchingError> + From<OrderBookQueryError>,
+    {
+        let preflight = self.prepare_conditional_trading_state_control::<E>(command)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
     fn submit_conditional_execution<T, U, E>(
         &mut self,
         preflight: ConditionalExecutionPreflight<T>,
@@ -2402,6 +2444,49 @@ impl RiskManagedOrderBook {
                     Some(
                         self.book
                             .try_account_control_submission_observation(command, &mut prepared)
+                            .map_err(E::from)?,
+                    )
+                } else {
+                    None
+                };
+                ConditionalExecutionPreflight {
+                    preparation: CommandPreparation::Ready(prepared),
+                    observation,
+                }
+            }
+        };
+        Ok(self.apply_conditional_risk_gate(preflight))
+    }
+
+    pub(crate) fn prepare_conditional_trading_state_control<E>(
+        &self,
+        command: TradingStateControl,
+    ) -> Result<ConditionalExecutionPreflight<TradingStateControlSubmissionObservation>, E>
+    where
+        E: From<MatchingError> + From<OrderBookQueryError>,
+    {
+        let preparation = self
+            .book
+            .prepare(Command::TradingStateControl(command))
+            .map_err(E::from)?;
+        let preflight = match preparation {
+            preparation @ CommandPreparation::Replay(_) => ConditionalExecutionPreflight {
+                preparation,
+                observation: None,
+            },
+            CommandPreparation::Ready(mut prepared) => {
+                let observation = if prepared.core_rejection().is_none()
+                    && self
+                        .risk
+                        .authorize(Command::TradingStateControl(command))
+                        .is_ok()
+                {
+                    Some(
+                        self.book
+                            .try_trading_state_control_submission_observation(
+                                command,
+                                &mut prepared,
+                            )
                             .map_err(E::from)?,
                     )
                 } else {
