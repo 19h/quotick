@@ -1383,6 +1383,26 @@ periods, batches, and recovery.
     19. Authorization, correction reason, external position synchronization,
     and clearing evidence remain authoritative external inputs.
 
+### Borrowed history inspection
+
+46. `Ledger::try_record_view` and `Ledger::retained_history` resolve the
+    authoritative journal against the transaction index under one immutable
+    ledger borrow. Sequence numbers are stable and one-based; zero and values
+    beyond the retained journal are absent. A present contradiction is instead
+    a typed `LedgerHistoryError` identifying sequence overflow, a missing
+    transaction, or mismatched indexed sequence, identity, or batch content.
+    - `LedgerRecordView` preserves exact entry, correction, and ordered-batch
+      grouping. `LedgerRecordTransactions` streams each event's entries in its
+      declared order. Both history and transaction iterators are exact-size and
+      double-ended and allocate no output storage.
+    - Resolving `R` records containing `T` transactions performs expected
+      `O(T)` bounded-hash work with `O(1)` iterator state. A full adversarial
+      transaction-index collision cluster can increase complete traversal to
+      `O(T^2)` without changing the finite storage bound.
+    - The cloned `record` compatibility query and checkpoint materialization
+      compose the same resolver. They clone only immutable entry or batch
+      handles after typed journal/index consistency has been established.
+
 Signed balances are intentional accounting state. Credit limits, collateral,
 and margin are not inferred by the ledger. The implemented order risk layer
 consumes seeded positions and matching traces; it does not derive available
@@ -2112,6 +2132,11 @@ require the exact typed resource failure.
 Ledger immutable-value tests additionally prove posting-vector and batch-entry
 pointer identity across clones, commit, record materialization, checkpoint
 capture, and borrowed restoration while codec fixtures remain value-identical.
+Borrowed ledger-history tests prove one-based lookup, exact entry/correction/
+batch grouping, chronological and reverse traversal, transaction-order
+iteration, shared-storage identity, nonmutation, typed missing/mismatched-index
+failure, direct checkpoint restoration, and checkpoint-prefix/WAL-suffix
+recovery.
 
 Call-auction settlement tests prove one-entry and multi-entry report mappings,
 exact DVP balances, canonical explicit fee binding and balances, invalid fee
@@ -2352,7 +2377,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Security boundary | authenticated principals, authorization policy, secret management, audit export, and abuse controls |
 | Medium | Gateways and schemas | versioned binary protocol, FIX adapter, backpressure, session recovery, and conformance fixtures |
 | Medium | Market-data distribution | constructor-reserved per-instrument short-gap replay for continuous updates and complete call-auction command batches, with typed gap/collision/eviction/boundary handling and snapshot fallback, is implemented; remaining work is authenticated transport framing, entitlement, fanout, remote retransmission sessions, bandwidth control, and conformance fixtures |
-| Medium | Order-management history | bounded zero-copy live lookup and chronological iteration over continuous and call-auction command/report history are implemented and survive WAL/checkpoint recovery; remaining work is authenticated account-scoped authorization, filtering, remote pagination/transport, audit export, and fenced history-generation rollover |
+| Medium | Order-management and ledger history | bounded zero-copy live lookup and chronological iteration over continuous/call-auction command/report history and typed fail-closed ledger record history are implemented and survive WAL/checkpoint recovery; remaining work is authenticated account-scoped authorization, filtering, remote pagination/transport, audit export, and fenced history-generation rollover |
 | Medium | Operations | metrics, traces, structured logs, health, capacity limits, alert rules, and runbooks |
 | Medium | Performance evidence | pinned-hardware benchmarks, allocation counts, tail latency, saturation, and regression thresholds |
 | Medium | Verification expansion | model-based/property tests, fuzzing, crash simulation, concurrency model checking, and long soak tests |

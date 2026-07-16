@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use quotick::durable_ledger::{DurableLedger, DurableLedgerError};
 use quotick::journal::{Durability, JournalOptions, JournalReader, RecordKind, RecoveryMode};
-use quotick::ledger::{JournalEntry, LedgerBatch, Posting};
+use quotick::ledger::{JournalEntry, LedgerBatch, LedgerRecordView, Posting};
 use quotick::snapshot::SnapshotOptions;
 use quotick::{AccountId, AccountingDate, AssetId, TimestampNs, TransactionId};
 
@@ -104,6 +104,24 @@ fn durable_batch_is_one_frame_one_event_and_exact_retry_adds_no_frame() {
     assert_eq!(recovered.ledger().record_count(), 1);
     assert_eq!(recovered.ledger().entry_count(), 2);
     assert_eq!(recovered.ledger().balance(account(1), asset()), 70);
+    let history = recovered
+        .ledger()
+        .retained_history()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].sequence(), 1);
+    let LedgerRecordView::Batch(batch_view) = history[0].record() else {
+        panic!("full-WAL recovery must retain the batch grouping");
+    };
+    assert_eq!(
+        batch_view
+            .entries()
+            .iter()
+            .map(JournalEntry::transaction_id)
+            .collect::<Vec<_>>(),
+        [transaction(1), transaction(2)]
+    );
     assert!(recovered.post_batch(batch()).unwrap().replayed);
     recovered.ledger().validate().unwrap();
 }
@@ -184,6 +202,16 @@ fn batch_grouping_survives_checkpoint_prefix_and_wal_suffix_recovery() {
     assert_eq!(recovered.ledger().record_count(), 2);
     assert_eq!(recovered.ledger().entry_count(), 3);
     assert_eq!(recovered.ledger().balance(account(1), asset()), 75);
+    let history = recovered
+        .ledger()
+        .retained_history()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].sequence(), 1);
+    assert!(matches!(history[0].record(), LedgerRecordView::Batch(_)));
+    assert_eq!(history[1].sequence(), 2);
+    assert!(matches!(history[1].record(), LedgerRecordView::Entry(_)));
     assert!(recovered.post_batch(value).unwrap().replayed);
     recovered.ledger().validate().unwrap();
 }

@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A120 are stable and are referenced from code comments and other
+identifiers A1-A121 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -216,9 +216,11 @@ Continuous order-book depth and private active-order output, call-auction limit
 depth, continuous and call-auction account-order-ID output, plus continuous and
 call-auction market-data batch/snapshot/depth outputs have explicit fallible
 APIs. Continuous and call-auction authoritative books also expose
-allocation-free market-priority depth iterators. Convenience wrappers can
-still panic on allocation failure; the account-order-ID wrappers can also
-panic if private topology is corrupt.
+allocation-free market-priority depth iterators. Borrowed ledger-record lookup,
+history iteration, and per-record transaction iteration allocate no output and
+return typed journal/index contradictions. Convenience wrappers can still
+panic on allocation failure; the account-order-ID wrappers can also panic if
+private topology is corrupt.
 
 **Dependent results.** Typed failure exists at the enumerated boundaries; no
 end-to-end allocation-failure continuation claim follows. Authoritative bounded
@@ -4099,6 +4101,54 @@ allocation, copy, reordered/duplicated/omitted row, `replayed = true` cached
 report, retry insertion, state or capacity mutation, recovery difference, or
 borrowed view surviving a mutable engine transition falsifies A120.
 
+## A121 — zero-copy fail-closed ledger history inspection
+
+**Assumption.** A borrowed ledger-history query observes one immutable borrow
+of one A29 ledger generation. `try_record_view` uses stable one-based event
+sequences: zero and positions beyond the retained journal return `Ok(None)`.
+For a retained position it resolves the journal record against the
+authoritative transaction index. Absence, sequence/identity disagreement, or
+batch-content disagreement is a typed `LedgerHistoryError`, never an absent
+record result.
+
+`LedgerRecordView` preserves the exact entry, correction, or ordered-batch
+grouping. `LedgerRecordTransactions` follows event-declared transaction order.
+`retained_history` is chronological, exact-size, and double-ended by record;
+the per-record transaction iterator is also exact-size and double-ended. These
+interfaces create no second history store, own no output collection, clone no
+entry or batch, and perform no balance, index, journal, capacity, WAL, snapshot,
+or checkpoint mutation. Error-detail formatting after a contradiction remains
+an A12 allocation boundary.
+
+**Dependent results.** [A11, A12, A29, A30, A42, A69, A79, A89, A90, A121]
+One entry or correction resolves in expected `O(1)` time. A batch with `N`
+transactions resolves in expected `O(N)` time. Complete traversal of `R`
+records containing `T` transactions therefore performs expected `O(T)` index
+work with `O(1)` iterator state and no output allocation. A full adversarial
+transaction-index collision cluster can require `O(T^2)` complete-traversal
+work without storage growth. The cloned `record` compatibility query and A89
+checkpoint materialization compose the same typed resolver and clone only the
+A90 immutable outer handles after consistency succeeds. Direct checkpoint,
+full-WAL, and checkpoint-plus-suffix recovery expose the same grouping,
+sequence, content, and ordering without a wire-version change.
+
+**Falsification probe.** Exercise empty, single-entry, correction, and batch
+history; zero, first, last, and out-of-range sequences; alternating front/back
+record traversal; alternating front/back transaction traversal; and exact
+iterator lengths. Compare pointer identity with transaction lookup and value
+parity with cloned `record`. Remove an indexed transaction; alter its sequence,
+identity, or batch content; require the exact query contradiction from direct
+lookup and iteration and a typed invalid checkpoint capture from the shared
+resolver. Repeat after direct-checkpoint, full-WAL, and checkpoint-prefix/WAL-
+suffix recovery while checking balances, generation, capacities, journal/index
+contents, and WAL length before and after every query. Count allocations on the
+successful paths.
+
+Any output allocation, nested clone, grouping/order/sequence drift, silent
+absence for a retained contradiction, partial history collection, mutation,
+recovery difference, divergent checkpoint resolution, or borrowed view
+surviving a mutable ledger transition falsifies A121.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -4138,8 +4188,15 @@ capability, a remaining risk, or an opportunity.
   checkpoint allocation. Target-hardware cache behavior for full-history scans
   remains unknown until measured.
 
-- **High impact risk:** the local history view exposes complete private
-  command/report content to its in-process caller. Authentication,
+- **Medium impact:** ledger event history now supports zero-copy, fail-closed
+  one-based lookup and chronological/reverse iteration under A121. Exact entry,
+  correction, and batch grouping and event-declared transaction order survive
+  direct checkpoint and checkpoint-plus-suffix recovery. Target-hardware cache
+  behavior for maximum-history scans remains unknown until measured.
+
+- **High impact risk:** the local history views expose complete private
+  command/report and ledger-event content to their in-process caller.
+  Authentication,
   account-scoped authorization/filtering, entitlement, remote pagination and
   transport, audit export, eviction, and fenced generation rollover remain
   separate interfaces or lifecycle protocols.

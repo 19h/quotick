@@ -120,6 +120,59 @@ impl fmt::Display for LedgerQueryError {
 
 impl std::error::Error for LedgerQueryError {}
 
+/// Journal/index inconsistency detected by a borrowed ledger-history query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LedgerHistoryError {
+    /// A zero-based journal position cannot be represented as a one-based sequence.
+    SequenceOverflow {
+        /// Zero-based journal position.
+        index: usize,
+    },
+    /// One journal member is absent from the authoritative transaction index.
+    MissingTransaction {
+        /// One-based ledger-event sequence.
+        sequence: u64,
+        /// Missing transaction identity.
+        transaction_id: TransactionId,
+    },
+    /// One indexed transaction contradicts its journal sequence, identity, or content.
+    TransactionMismatch {
+        /// One-based ledger-event sequence.
+        sequence: u64,
+        /// Contradictory transaction identity.
+        transaction_id: TransactionId,
+    },
+}
+
+impl fmt::Display for LedgerHistoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SequenceOverflow { index } => {
+                write!(
+                    formatter,
+                    "ledger journal index {index} has no representable sequence"
+                )
+            }
+            Self::MissingTransaction {
+                sequence,
+                transaction_id,
+            } => write!(
+                formatter,
+                "ledger record {sequence} transaction {transaction_id} is absent from the index"
+            ),
+            Self::TransactionMismatch {
+                sequence,
+                transaction_id,
+            } => write!(
+                formatter,
+                "ledger record {sequence} transaction {transaction_id} contradicts the index"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LedgerHistoryError {}
+
 impl fmt::Display for LedgerPreparationResource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -629,6 +682,142 @@ impl LedgerRecord {
             Self::Correction(correction) => correction.reversal.transaction_id,
             Self::Batch(batch) => batch.entries[0].transaction_id,
         }
+    }
+}
+
+/// Borrowed canonical content of one sequenced ledger event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LedgerRecordView<'a> {
+    /// One independently committed financial or administrative entry.
+    Entry(&'a JournalEntry),
+    /// One atomic reversal-plus-replacement correction.
+    Correction {
+        /// Exact reversal entry.
+        reversal: &'a JournalEntry,
+        /// Exact replacement entry.
+        replacement: &'a JournalEntry,
+    },
+    /// One atomic ordered group of two or more entries.
+    Batch(&'a LedgerBatch),
+}
+
+impl<'a> LedgerRecordView<'a> {
+    /// Returns the number of transaction entries introduced by this event.
+    #[must_use]
+    pub fn transaction_count(self) -> usize {
+        match self {
+            Self::Entry(_) => 1,
+            Self::Correction { .. } => 2,
+            Self::Batch(batch) => batch.entries().len(),
+        }
+    }
+
+    /// Returns the event's first transaction identifier.
+    #[must_use]
+    pub fn primary_transaction_id(self) -> TransactionId {
+        match self {
+            Self::Entry(entry) => entry.transaction_id(),
+            Self::Correction { reversal, .. } => reversal.transaction_id(),
+            Self::Batch(batch) => batch.primary_transaction_id(),
+        }
+    }
+
+    /// Returns one transaction entry in event-declared order.
+    #[must_use]
+    pub fn transaction(self, index: usize) -> Option<&'a JournalEntry> {
+        match (self, index) {
+            (Self::Entry(entry), 0) => Some(entry),
+            (Self::Correction { reversal, .. }, 0) => Some(reversal),
+            (Self::Correction { replacement, .. }, 1) => Some(replacement),
+            (Self::Batch(batch), index) => batch.entries().get(index),
+            (Self::Entry(_) | Self::Correction { .. }, _) => None,
+        }
+    }
+
+    /// Iterates transaction entries in event-declared order without allocation.
+    #[must_use]
+    pub fn transactions(self) -> LedgerRecordTransactions<'a> {
+        LedgerRecordTransactions {
+            record: self,
+            front: 0,
+            back: self.transaction_count(),
+        }
+    }
+}
+
+impl From<LedgerRecordView<'_>> for LedgerRecord {
+    fn from(record: LedgerRecordView<'_>) -> Self {
+        match record {
+            LedgerRecordView::Entry(entry) => Self::Entry(entry.clone()),
+            LedgerRecordView::Correction {
+                reversal,
+                replacement,
+            } => Self::Correction(LedgerCorrection {
+                reversal: reversal.clone(),
+                replacement: replacement.clone(),
+            }),
+            LedgerRecordView::Batch(batch) => Self::Batch(batch.clone()),
+        }
+    }
+}
+
+/// Double-ended exact-size transaction iterator for one borrowed ledger event.
+#[derive(Clone, Debug)]
+pub struct LedgerRecordTransactions<'a> {
+    record: LedgerRecordView<'a>,
+    front: usize,
+    back: usize,
+}
+
+impl<'a> Iterator for LedgerRecordTransactions<'a> {
+    type Item = &'a JournalEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        let index = self.front;
+        self.front += 1;
+        self.record.transaction(index)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.back - self.front;
+        (remaining, Some(remaining))
+    }
+}
+
+impl DoubleEndedIterator for LedgerRecordTransactions<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        self.back -= 1;
+        self.record.transaction(self.back)
+    }
+}
+
+impl ExactSizeIterator for LedgerRecordTransactions<'_> {}
+impl std::iter::FusedIterator for LedgerRecordTransactions<'_> {}
+
+/// One borrowed ledger event paired with its stable one-based sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetainedLedgerRecord<'a> {
+    sequence: u64,
+    record: LedgerRecordView<'a>,
+}
+
+impl<'a> RetainedLedgerRecord<'a> {
+    /// Returns the stable one-based ledger-event sequence.
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    /// Returns the borrowed canonical event content.
+    #[must_use]
+    pub const fn record(self) -> LedgerRecordView<'a> {
+        self.record
     }
 }
 
@@ -4063,47 +4252,127 @@ impl Ledger {
         })
     }
 
+    /// Returns one borrowed canonical event at a one-based ledger sequence.
+    ///
+    /// A valid result borrows the authoritative journal and transaction index,
+    /// clones no entry, and allocates no output. Sequence zero and positions
+    /// beyond the retained journal return `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerHistoryError`] if the journal and transaction index
+    /// contradict one another.
+    pub fn try_record_view(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<LedgerRecordView<'_>>, LedgerHistoryError> {
+        let Some(index) = sequence
+            .checked_sub(1)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(record) = self.journal.get(index) else {
+            return Ok(None);
+        };
+        self.resolve_retained_record(index, record)
+            .map(|record| Some(record.record))
+    }
+
+    /// Iterates retained ledger events in sequence order without allocation.
+    ///
+    /// The iterator is double-ended and exact-sized by event count. Resolving
+    /// all `R` records containing `T` transactions performs expected `O(T)`
+    /// index work with `O(1)` iterator state.
+    #[must_use]
+    pub fn retained_history(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = Result<RetainedLedgerRecord<'_>, LedgerHistoryError>>
+    + ExactSizeIterator
+    + '_ {
+        self.journal
+            .iter()
+            .enumerate()
+            .map(move |(index, record)| self.resolve_retained_record(index, record))
+    }
+
     /// Returns a cloned canonical event at a one-based ledger sequence.
     ///
     /// The clone shares immutable batch/entry/posting storage and allocates no
     /// nested vectors.
     #[must_use]
     pub fn record(&self, sequence: u64) -> Option<LedgerRecord> {
-        let index = sequence
-            .checked_sub(1)
-            .and_then(|value| usize::try_from(value).ok())?;
-        self.journal
-            .get(index)
-            .and_then(|record| self.materialize_record(record))
+        self.try_record_view(sequence)
+            .ok()
+            .flatten()
+            .map(LedgerRecord::from)
     }
 
-    fn materialize_record(&self, record: &LedgerRecordKey) -> Option<LedgerRecord> {
-        match record {
-            LedgerRecordKey::Entry(transaction_id) => self
-                .entries
-                .get(transaction_id)
-                .map(|posted| LedgerRecord::Entry(posted.entry.clone())),
+    fn resolve_retained_record<'a>(
+        &'a self,
+        index: usize,
+        record: &'a LedgerRecordKey,
+    ) -> Result<RetainedLedgerRecord<'a>, LedgerHistoryError> {
+        let sequence = u64::try_from(index)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or(LedgerHistoryError::SequenceOverflow { index })?;
+        let record = match record {
+            LedgerRecordKey::Entry(transaction_id) => LedgerRecordView::Entry(
+                self.resolve_history_transaction(sequence, *transaction_id, None)?,
+            ),
             LedgerRecordKey::Correction {
                 reversal_transaction_id,
                 replacement_transaction_id,
-            } => {
-                let reversal = self.entries.get(reversal_transaction_id)?.entry.clone();
-                let replacement = self.entries.get(replacement_transaction_id)?.entry.clone();
-                Some(LedgerRecord::Correction(LedgerCorrection {
-                    reversal,
-                    replacement,
-                }))
+            } => LedgerRecordView::Correction {
+                reversal: self.resolve_history_transaction(
+                    sequence,
+                    *reversal_transaction_id,
+                    None,
+                )?,
+                replacement: self.resolve_history_transaction(
+                    sequence,
+                    *replacement_transaction_id,
+                    None,
+                )?,
+            },
+            LedgerRecordKey::Batch(batch) => {
+                for entry in batch.entries() {
+                    self.resolve_history_transaction(
+                        sequence,
+                        entry.transaction_id(),
+                        Some(entry),
+                    )?;
+                }
+                LedgerRecordView::Batch(batch)
             }
-            LedgerRecordKey::Batch(batch) => batch
-                .entries
-                .iter()
-                .all(|entry| {
-                    self.entries
-                        .get(&entry.transaction_id)
-                        .is_some_and(|posted| posted.entry == *entry)
-                })
-                .then(|| LedgerRecord::Batch(batch.clone())),
+        };
+        Ok(RetainedLedgerRecord { sequence, record })
+    }
+
+    fn resolve_history_transaction(
+        &self,
+        sequence: u64,
+        transaction_id: TransactionId,
+        expected: Option<&JournalEntry>,
+    ) -> Result<&JournalEntry, LedgerHistoryError> {
+        let posted =
+            self.entries
+                .get(&transaction_id)
+                .ok_or(LedgerHistoryError::MissingTransaction {
+                    sequence,
+                    transaction_id,
+                })?;
+        if posted.sequence != sequence
+            || posted.entry.transaction_id() != transaction_id
+            || expected.is_some_and(|entry| posted.entry != *entry)
+        {
+            return Err(LedgerHistoryError::TransactionMismatch {
+                sequence,
+                transaction_id,
+            });
         }
+        Ok(&posted.entry)
     }
 
     /// Returns a committed entry by transaction identifier.
@@ -4360,33 +4629,10 @@ impl Ledger {
             LedgerCheckpointCaptureResource::CaptureRecords,
         )?;
         for (index, record_key) in self.journal.iter().enumerate() {
-            let expected_sequence = u64::try_from(index)
-                .ok()
-                .and_then(|value| value.checked_add(1))
-                .ok_or_else(|| LedgerInvariantViolation::new("ledger sequence overflow"))?;
-            for transaction_id in (0..record_key.transaction_count())
-                .filter_map(|position| record_key.transaction_id_at(position))
-            {
-                let posted = self.entries.get(&transaction_id).ok_or_else(|| {
-                    LedgerInvariantViolation::new(format!(
-                        "journal transaction {transaction_id} is absent from the entry index"
-                    ))
-                })?;
-                if posted.sequence != expected_sequence
-                    || posted.entry.transaction_id() != transaction_id
-                {
-                    return Err(LedgerCheckpointCaptureError::Invalid(
-                        LedgerInvariantViolation::new(format!(
-                            "ledger transaction {transaction_id} has an invalid sequence or identity"
-                        )),
-                    ));
-                }
-            }
-            records.push(self.materialize_record(record_key).ok_or_else(|| {
-                LedgerInvariantViolation::new(format!(
-                    "ledger record {expected_sequence} cannot be materialized"
-                ))
-            })?);
+            let record = self
+                .resolve_retained_record(index, record_key)
+                .map_err(|error| LedgerInvariantViolation::new(error.to_string()))?;
+            records.push(LedgerRecord::from(record.record));
         }
         Ok(records)
     }
@@ -5112,6 +5358,43 @@ mod resource_limit_tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn borrowed_history_reports_missing_and_mismatched_index_entries() {
+        let transaction_id = TransactionId::new(1).unwrap();
+        let mut missing = Ledger::try_with_limits(limits()).unwrap();
+        missing.post(entry()).unwrap();
+        missing.entries.remove(&transaction_id);
+        let error = missing.try_record_view(1).unwrap_err();
+        assert_eq!(
+            error,
+            LedgerHistoryError::MissingTransaction {
+                sequence: 1,
+                transaction_id,
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "ledger record 1 transaction 1 is absent from the index"
+        );
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(missing.retained_history().next(), Some(Err(error)));
+
+        let mut mismatched = Ledger::try_with_limits(limits()).unwrap();
+        mismatched.post(entry()).unwrap();
+        mismatched
+            .entries
+            .get_mut(&transaction_id)
+            .unwrap()
+            .sequence = 2;
+        assert_eq!(
+            mismatched.try_record_view(1),
+            Err(LedgerHistoryError::TransactionMismatch {
+                sequence: 1,
+                transaction_id,
+            })
+        );
     }
 
     #[test]

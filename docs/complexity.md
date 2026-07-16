@@ -27,6 +27,7 @@ Contents:
 - [Call-auction checkpoints](#call-auction-checkpoints)
 - [Ledger checkpoints](#ledger-checkpoints)
 - [Ledger operations](#ledger-operations)
+- [Borrowed ledger history](#borrowed-ledger-history)
 
 ## Instrument catalog
 
@@ -807,6 +808,7 @@ rows before canonical sorting.
 
 `JournalEntry` posting vectors and `LedgerBatch` entry vectors are immutable
 shared values. Record materialization, capture, and borrowed restoration
+resolve the journal through the same transaction-index consistency path, then
 clone only `Arc` handles and allocate no nested vectors. The live journal
 retains the shared batch itself rather than a second transaction-ID vector.
 The checkpoint's top-level balance and record images are shared as well, so a
@@ -823,6 +825,24 @@ storage is retired, but complete checkpoint history and its validation remain
 `O(R + E + L + A)`.
 
 ## Ledger operations
+
+### Borrowed ledger history
+
+For `R` retained records containing `T` transaction entries,
+`try_record_view` converts and checks one one-based sequence in `O(1)` time,
+then performs expected `O(1)` transaction-index work for an entry or correction
+and expected `O(N)` work for an `N`-entry batch. Sequence zero and positions
+beyond `R` return absence without index work. A retained journal/index
+contradiction is a typed result.
+
+`retained_history` has `O(1)` setup and exact-size, double-ended iterator state.
+Consuming all records performs expected `O(T)` index work. Each
+`LedgerRecordTransactions` iterator has `O(1)` setup and state and consumes one
+record in `O(N)` time. Successful borrowed lookup and iteration allocate no
+output, clone no entry or batch, and mutate no ledger or durable state. A full
+adversarial transaction-hash collision cluster can increase complete traversal
+to `O(T^2)` without storage growth. The compatibility `record` method adds one
+immutable outer-handle clone after the same resolver succeeds.
 
 Reversal validation is `O(L)` for the target entry's posting legs plus
 expected `O(1)` transaction/reversal-index access. Correction balance
