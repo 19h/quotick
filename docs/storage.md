@@ -233,7 +233,7 @@ semantic generation plus exact history lineage. It decides as follows:
   size exceeds the caller's configured limit is preserved.
 
 The complete wire and decision contract is
-[Semantic snapshot format version 12](snapshot-v12.md).
+[Semantic snapshot format version 13](snapshot-v13.md).
 
 Direct users must dedicate the target and its two sidecars to snapshots.
 `DurableOrderBook`, `DurableRiskOrderBook`, `DurableLedger`, and

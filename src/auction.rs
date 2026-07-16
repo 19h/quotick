@@ -8,10 +8,11 @@
 //! levels and `A` ask levels. It performs no heap allocation and uses checked
 //! `u128` aggregate quantity arithmetic.
 //!
-//! A separate price-time allocator reconciles canonical order-level interest to
-//! one clearing result, fallibly reserves both exact fill vectors, and emits
-//! independent per-side plans in `O(O_b + O_a)` time and `O(F_b + F_a)` result
-//! space. Neither kernel mutates an order book or constructs counterparty pairs.
+//! Separate price-time and price/class-tier pro-rata allocators reconcile
+//! canonical order-level interest to one clearing result, fallibly reserve both
+//! exact fill vectors, and emit independent per-side plans in `O(O_b + O_a)`
+//! time and `O(F_b + F_a)` result space. Neither kernel mutates an order book or
+//! constructs counterparty pairs.
 
 use std::fmt;
 
@@ -207,7 +208,7 @@ pub enum AuctionOrderConstraint {
     Limit(Price),
 }
 
-/// One positive order-level quantity supplied to price-time auction allocation.
+/// One positive order-level quantity supplied to auction allocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuctionOrder {
     order_id: OrderId,
@@ -275,6 +276,31 @@ impl AuctionOrder {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuctionAllocationLimits {
     max_orders_per_side: usize,
+}
+
+/// Deterministic order-level allocation within one aggregate clearing result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuctionAllocationPolicy {
+    /// Strict market/price/class/time/identity priority.
+    PriceTime,
+    /// Strict market/price/class tiers with pro-rata marginal allocation and
+    /// time/identity priority for residual allocation quanta.
+    ProRataTime,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AuctionAllocationMethod {
+    policy: AuctionAllocationPolicy,
+    allocation_quantum_lots: u64,
+}
+
+impl AuctionAllocationMethod {
+    pub(crate) const fn new(policy: AuctionAllocationPolicy, allocation_quantum_lots: u64) -> Self {
+        Self {
+            policy,
+            allocation_quantum_lots,
+        }
+    }
 }
 
 impl AuctionAllocationLimits {
@@ -401,6 +427,8 @@ impl AuctionAllocationPlan {
 pub enum AuctionAllocationError {
     /// The configured per-side order maximum was zero.
     InvalidOrderLimit(usize),
+    /// The configured pro-rata allocation quantum was zero.
+    InvalidAllocationQuantum(u64),
     /// A supplied side exceeded its explicit operational bound.
     OrderLimitExceeded {
         /// Side exceeding the bound.
@@ -418,6 +446,17 @@ pub enum AuctionAllocationError {
         side: Side,
         /// Zero-based source index.
         index: usize,
+    },
+    /// An order quantity was not aligned to the pro-rata allocation quantum.
+    OrderQuantityOffAllocationGrid {
+        /// Side containing the invalid order.
+        side: Side,
+        /// Zero-based source index.
+        index: usize,
+        /// Supplied order quantity in instrument-defined lots.
+        quantity_lots: u64,
+        /// Required allocation quantum in instrument-defined lots.
+        allocation_quantum_lots: u64,
     },
     /// Market/price/class/time/ID priority was not strictly canonical.
     NonCanonicalOrders {
@@ -455,6 +494,9 @@ impl fmt::Display for AuctionAllocationError {
             Self::InvalidOrderLimit(limit) => {
                 write!(formatter, "invalid auction allocation order limit {limit}")
             }
+            Self::InvalidAllocationQuantum(quantum) => {
+                write!(formatter, "invalid auction allocation quantum {quantum}")
+            }
             Self::OrderLimitExceeded {
                 side,
                 count,
@@ -469,6 +511,15 @@ impl fmt::Display for AuctionAllocationError {
             Self::LimitPriceOffGrid { side, index } => write!(
                 formatter,
                 "auction {side:?} limit order at index {index} is off grid"
+            ),
+            Self::OrderQuantityOffAllocationGrid {
+                side,
+                index,
+                quantity_lots,
+                allocation_quantum_lots,
+            } => write!(
+                formatter,
+                "auction {side:?} order quantity {quantity_lots} at index {index} is not aligned to allocation quantum {allocation_quantum_lots}"
             ),
             Self::NonCanonicalOrders { side, index } => write!(
                 formatter,
@@ -974,8 +1025,68 @@ pub fn allocate_clearing_price_time(
     clearing: AuctionClearing,
     limits: AuctionAllocationLimits,
 ) -> Result<AuctionAllocationPlan, AuctionAllocationError> {
-    let (buy_fill_count, sell_fill_count) =
-        validate_allocation_request(bids, asks, grid, clearing, limits)?;
+    allocate_clearing_with_policy(
+        bids,
+        asks,
+        grid,
+        clearing,
+        AuctionAllocationPolicy::PriceTime,
+        1,
+        limits,
+    )
+}
+
+/// Allocates a non-zero clearing result by price/class-tier pro-rata priority.
+///
+/// Market, economically better price, and lower priority-class tiers precede
+/// worse tiers. Every tier before the marginal tier fills completely. Orders
+/// in the marginal tier receive their floored proportional share in multiples
+/// of `allocation_quantum_lots`; remaining quanta are assigned once in
+/// canonical time/identity order. The implementation uses exact fixed-width
+/// multiply/divide without constructing an overflowing intermediate product.
+///
+/// # Errors
+///
+/// Returns [`AuctionAllocationError`] for the price-time validation failures,
+/// a zero allocation quantum, an order quantity off the allocation grid,
+/// arithmetic exhaustion, or fill-vector reservation failure.
+pub fn allocate_clearing_pro_rata_time(
+    bids: &[AuctionOrder],
+    asks: &[AuctionOrder],
+    grid: AuctionPriceGrid,
+    clearing: AuctionClearing,
+    allocation_quantum_lots: u64,
+    limits: AuctionAllocationLimits,
+) -> Result<AuctionAllocationPlan, AuctionAllocationError> {
+    allocate_clearing_with_policy(
+        bids,
+        asks,
+        grid,
+        clearing,
+        AuctionAllocationPolicy::ProRataTime,
+        allocation_quantum_lots,
+        limits,
+    )
+}
+
+pub(crate) fn allocate_clearing_with_policy(
+    bids: &[AuctionOrder],
+    asks: &[AuctionOrder],
+    grid: AuctionPriceGrid,
+    clearing: AuctionClearing,
+    policy: AuctionAllocationPolicy,
+    allocation_quantum_lots: u64,
+    limits: AuctionAllocationLimits,
+) -> Result<AuctionAllocationPlan, AuctionAllocationError> {
+    let (buy_fill_count, sell_fill_count) = validate_policy_allocation_request(
+        bids,
+        asks,
+        grid,
+        clearing,
+        policy,
+        allocation_quantum_lots,
+        limits,
+    )?;
     let mut buy_fills = Vec::new();
     buy_fills
         .try_reserve_exact(buy_fill_count)
@@ -984,20 +1095,36 @@ pub fn allocate_clearing_price_time(
     sell_fills
         .try_reserve_exact(sell_fill_count)
         .map_err(|_| AuctionAllocationError::CapacityReservationFailed(Side::Sell))?;
-    build_allocation_plan(bids, asks, clearing, &mut buy_fills, &mut sell_fills)
+    build_allocation_plan(
+        bids,
+        asks,
+        clearing,
+        policy,
+        allocation_quantum_lots,
+        &mut buy_fills,
+        &mut sell_fills,
+    )
 }
 
 /// Uses caller-owned fill vectors whose capacities cover the validated result.
-pub(crate) fn allocate_clearing_price_time_reusing(
+pub(crate) fn allocate_clearing_reusing(
     bids: &[AuctionOrder],
     asks: &[AuctionOrder],
     grid: AuctionPriceGrid,
     clearing: AuctionClearing,
+    method: AuctionAllocationMethod,
     limits: AuctionAllocationLimits,
     plan: &mut AuctionAllocationPlan,
 ) -> Result<(), AuctionAllocationError> {
-    let (buy_fill_count, sell_fill_count) =
-        validate_allocation_request(bids, asks, grid, clearing, limits)?;
+    let (buy_fill_count, sell_fill_count) = validate_policy_allocation_request(
+        bids,
+        asks,
+        grid,
+        clearing,
+        method.policy,
+        method.allocation_quantum_lots,
+        limits,
+    )?;
     if plan.buy_fills.capacity() < buy_fill_count {
         return Err(AuctionAllocationError::CapacityReservationFailed(Side::Buy));
     }
@@ -1009,22 +1136,62 @@ pub(crate) fn allocate_clearing_price_time_reusing(
     plan.buy_fills.clear();
     plan.sell_fills.clear();
     let executable_quantity = clearing.executable_quantity();
-    append_fills(
+    append_policy_fills(
         bids,
         Side::Buy,
         clearing.price(),
         executable_quantity,
+        method.policy,
+        method.allocation_quantum_lots,
         &mut plan.buy_fills,
     )?;
-    append_fills(
+    append_policy_fills(
         asks,
         Side::Sell,
         clearing.price(),
         executable_quantity,
+        method.policy,
+        method.allocation_quantum_lots,
         &mut plan.sell_fills,
     )?;
     plan.clearing = clearing;
     Ok(())
+}
+
+fn validate_policy_allocation_request(
+    bids: &[AuctionOrder],
+    asks: &[AuctionOrder],
+    grid: AuctionPriceGrid,
+    clearing: AuctionClearing,
+    policy: AuctionAllocationPolicy,
+    allocation_quantum_lots: u64,
+    limits: AuctionAllocationLimits,
+) -> Result<(usize, usize), AuctionAllocationError> {
+    let price_time_counts = validate_allocation_request(bids, asks, grid, clearing, limits)?;
+    if policy == AuctionAllocationPolicy::PriceTime {
+        return Ok(price_time_counts);
+    }
+    validate_allocation_quantum(bids, Side::Buy, allocation_quantum_lots)?;
+    validate_allocation_quantum(asks, Side::Sell, allocation_quantum_lots)?;
+    let executable_quantity = clearing.executable_quantity();
+    Ok((
+        walk_pro_rata_fills(
+            bids,
+            Side::Buy,
+            clearing.price(),
+            executable_quantity,
+            allocation_quantum_lots,
+            |_, _, _| Ok(()),
+        )?,
+        walk_pro_rata_fills(
+            asks,
+            Side::Sell,
+            clearing.price(),
+            executable_quantity,
+            allocation_quantum_lots,
+            |_, _, _| Ok(()),
+        )?,
+    ))
 }
 
 fn validate_allocation_request(
@@ -1068,24 +1235,30 @@ fn build_allocation_plan(
     bids: &[AuctionOrder],
     asks: &[AuctionOrder],
     clearing: AuctionClearing,
+    policy: AuctionAllocationPolicy,
+    allocation_quantum_lots: u64,
     buy_fills: &mut Vec<AuctionOrderFill>,
     sell_fills: &mut Vec<AuctionOrderFill>,
 ) -> Result<AuctionAllocationPlan, AuctionAllocationError> {
     buy_fills.clear();
     sell_fills.clear();
     let executable_quantity = clearing.executable_quantity();
-    append_fills(
+    append_policy_fills(
         bids,
         Side::Buy,
         clearing.price(),
         executable_quantity,
+        policy,
+        allocation_quantum_lots,
         buy_fills,
     )?;
-    append_fills(
+    append_policy_fills(
         asks,
         Side::Sell,
         clearing.price(),
         executable_quantity,
+        policy,
+        allocation_quantum_lots,
         sell_fills,
     )?;
     Ok(AuctionAllocationPlan {
@@ -1217,6 +1390,194 @@ fn append_fills(
         return Err(AuctionAllocationError::InsufficientEligibleQuantity(side));
     }
     Ok(())
+}
+
+fn validate_allocation_quantum(
+    orders: &[AuctionOrder],
+    side: Side,
+    allocation_quantum_lots: u64,
+) -> Result<(), AuctionAllocationError> {
+    if allocation_quantum_lots == 0 {
+        return Err(AuctionAllocationError::InvalidAllocationQuantum(0));
+    }
+    for (index, order) in orders.iter().copied().enumerate() {
+        if order.quantity.lots() % allocation_quantum_lots != 0 {
+            return Err(AuctionAllocationError::OrderQuantityOffAllocationGrid {
+                side,
+                index,
+                quantity_lots: order.quantity.lots(),
+                allocation_quantum_lots,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn append_policy_fills(
+    orders: &[AuctionOrder],
+    side: Side,
+    clearing_price: Price,
+    executable_quantity: u128,
+    policy: AuctionAllocationPolicy,
+    allocation_quantum_lots: u64,
+    fills: &mut Vec<AuctionOrderFill>,
+) -> Result<(), AuctionAllocationError> {
+    match policy {
+        AuctionAllocationPolicy::PriceTime => {
+            append_fills(orders, side, clearing_price, executable_quantity, fills)
+        }
+        AuctionAllocationPolicy::ProRataTime => {
+            walk_pro_rata_fills(
+                orders,
+                side,
+                clearing_price,
+                executable_quantity,
+                allocation_quantum_lots,
+                |source_index, order, quantity_lots| {
+                    fills.push(AuctionOrderFill {
+                        source_index,
+                        order_id: order.order_id,
+                        quantity_lots,
+                    });
+                    Ok(())
+                },
+            )?;
+            Ok(())
+        }
+    }
+}
+
+fn walk_pro_rata_fills(
+    orders: &[AuctionOrder],
+    side: Side,
+    clearing_price: Price,
+    mut remaining: u128,
+    allocation_quantum_lots: u64,
+    mut emit: impl FnMut(usize, AuctionOrder, u64) -> Result<(), AuctionAllocationError>,
+) -> Result<usize, AuctionAllocationError> {
+    if allocation_quantum_lots == 0 {
+        return Err(AuctionAllocationError::InvalidAllocationQuantum(0));
+    }
+    let allocation_quantum = u128::from(allocation_quantum_lots);
+    let mut source_index = 0_usize;
+    let mut fill_count = 0_usize;
+    while remaining != 0 {
+        let Some(first) = orders.get(source_index).copied() else {
+            return Err(AuctionAllocationError::InsufficientEligibleQuantity(side));
+        };
+        if !is_eligible(first, side, clearing_price) {
+            return Err(AuctionAllocationError::InsufficientEligibleQuantity(side));
+        }
+        let mut tier_end = source_index + 1;
+        while orders.get(tier_end).is_some_and(|order| {
+            is_eligible(*order, side, clearing_price) && same_allocation_tier(first, *order)
+        }) {
+            tier_end += 1;
+        }
+        let mut tier_quantity = 0_u128;
+        for order in orders[source_index..tier_end].iter().copied() {
+            tier_quantity = tier_quantity
+                .checked_add(u128::from(order.quantity.lots()))
+                .ok_or(AuctionAllocationError::QuantityOverflow(side))?;
+        }
+        if remaining >= tier_quantity {
+            for (offset, order) in orders[source_index..tier_end].iter().copied().enumerate() {
+                emit(source_index + offset, order, order.quantity.lots())?;
+                fill_count = fill_count
+                    .checked_add(1)
+                    .ok_or(AuctionAllocationError::FillQuantityOverflow(side))?;
+            }
+            remaining -= tier_quantity;
+            source_index = tier_end;
+            continue;
+        }
+
+        if remaining % allocation_quantum != 0 || tier_quantity % allocation_quantum != 0 {
+            return Err(AuctionAllocationError::InsufficientEligibleQuantity(side));
+        }
+        let remaining_quanta = remaining / allocation_quantum;
+        let tier_quanta = tier_quantity / allocation_quantum;
+        let mut allocated_quanta = 0_u128;
+        for order in orders[source_index..tier_end].iter().copied() {
+            let order_quanta = order.quantity.lots() / allocation_quantum_lots;
+            let base = exact_mul_div_floor(order_quanta, remaining_quanta, tier_quanta)
+                .ok_or(AuctionAllocationError::FillQuantityOverflow(side))?;
+            allocated_quanta = allocated_quanta
+                .checked_add(u128::from(base))
+                .ok_or(AuctionAllocationError::QuantityOverflow(side))?;
+        }
+        let mut residual_quanta = remaining_quanta
+            .checked_sub(allocated_quanta)
+            .ok_or(AuctionAllocationError::QuantityOverflow(side))?;
+        for (offset, order) in orders[source_index..tier_end].iter().copied().enumerate() {
+            let order_quanta = order.quantity.lots() / allocation_quantum_lots;
+            let mut fill_quanta = exact_mul_div_floor(order_quanta, remaining_quanta, tier_quanta)
+                .ok_or(AuctionAllocationError::FillQuantityOverflow(side))?;
+            if residual_quanta != 0 && fill_quanta < order_quanta {
+                fill_quanta = fill_quanta
+                    .checked_add(1)
+                    .ok_or(AuctionAllocationError::FillQuantityOverflow(side))?;
+                residual_quanta -= 1;
+            }
+            if fill_quanta == 0 {
+                continue;
+            }
+            let quantity_lots = fill_quanta
+                .checked_mul(allocation_quantum_lots)
+                .ok_or(AuctionAllocationError::FillQuantityOverflow(side))?;
+            emit(source_index + offset, order, quantity_lots)?;
+            fill_count = fill_count
+                .checked_add(1)
+                .ok_or(AuctionAllocationError::FillQuantityOverflow(side))?;
+        }
+        if residual_quanta != 0 {
+            return Err(AuctionAllocationError::InsufficientEligibleQuantity(side));
+        }
+        remaining = 0;
+    }
+    Ok(fill_count)
+}
+
+fn same_allocation_tier(first: AuctionOrder, other: AuctionOrder) -> bool {
+    first.constraint == other.constraint && first.priority_class == other.priority_class
+}
+
+fn exact_mul_div_floor(factor: u64, multiplier: u128, divisor: u128) -> Option<u64> {
+    if divisor == 0 || multiplier >= divisor {
+        return None;
+    }
+    let mut quotient = 0_u64;
+    let mut remainder = 0_u128;
+    for bit in (0..u64::BITS).rev() {
+        let (doubled, double_carry) = modular_double(remainder, divisor);
+        remainder = doubled;
+        let mut carry = double_carry;
+        if factor & (1_u64 << bit) != 0 {
+            let (added, add_carry) = modular_add(remainder, multiplier, divisor);
+            remainder = added;
+            carry += add_carry;
+        }
+        quotient = quotient.checked_mul(2)?.checked_add(carry)?;
+    }
+    Some(quotient)
+}
+
+fn modular_double(value: u128, modulus: u128) -> (u128, u64) {
+    let complement = modulus - value;
+    if value >= complement {
+        (value - complement, 1)
+    } else {
+        (value + value, 0)
+    }
+}
+
+fn modular_add(left: u128, right: u128, modulus: u128) -> (u128, u64) {
+    let complement = modulus - right;
+    if left >= complement {
+        (left - complement, 1)
+    } else {
+        (left + right, 0)
+    }
 }
 
 fn validate_price_band(

@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use quotick::auction::{
-    AuctionLevel, AuctionMarketInterest, AuctionOrderConstraint, AuctionPricePolicy,
-    discover_bounded_clearing_price,
+    AuctionAllocationPolicy, AuctionLevel, AuctionMarketInterest, AuctionOrderConstraint,
+    AuctionPricePolicy, discover_bounded_clearing_price,
 };
 use quotick::auction_book::{
     CallAuctionAdmissionError, CallAuctionAmendError, CallAuctionBook, CallAuctionBookLimits,
@@ -178,7 +178,9 @@ fn crossed_limit_and_market_interest_clears_and_allocates_without_mutation() {
     assert_eq!(clearing.sell_quantity(), 10);
     assert_eq!(clearing.executable_quantity(), 10);
 
-    let plan = book.allocation_plan(indicative).unwrap();
+    let plan = book
+        .allocation_plan(indicative, AuctionAllocationPolicy::PriceTime)
+        .unwrap();
     assert_eq!(
         plan.buy_fills()
             .iter()
@@ -242,7 +244,9 @@ fn shard_sequence_enforces_market_price_and_fifo_priority() {
         )
         .unwrap()
         .unwrap();
-    let plan = book.allocation_plan(indicative).unwrap();
+    let plan = book
+        .allocation_plan(indicative, AuctionAllocationPolicy::PriceTime)
+        .unwrap();
     assert_eq!(
         plan.buy_fills()
             .iter()
@@ -250,6 +254,69 @@ fn shard_sequence_enforces_market_price_and_fifo_priority() {
             .collect::<Vec<_>>(),
         vec![(10, 2), (11, 4), (12, 1)]
     );
+    book.validate().unwrap();
+}
+
+#[test]
+fn allocation_policy_explicitly_selects_price_time_or_pro_rata_time() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(8, 4, 16)).unwrap();
+    book.admit(order(
+        1,
+        1,
+        Side::Buy,
+        AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        10,
+    ))
+    .unwrap();
+    book.admit(order(
+        2,
+        2,
+        Side::Buy,
+        AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        20,
+    ))
+    .unwrap();
+    book.admit(order(
+        3,
+        3,
+        Side::Sell,
+        AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        15,
+    ))
+    .unwrap();
+    let indicative = book
+        .indicative_clearing(
+            book.instrument_price_band(),
+            Price::from_raw(100),
+            AuctionPricePolicy::REFERENCE_THEN_LOWER,
+        )
+        .unwrap()
+        .unwrap();
+
+    let price_time = book
+        .allocation_plan(indicative, AuctionAllocationPolicy::PriceTime)
+        .unwrap();
+    let pro_rata = book
+        .allocation_plan(indicative, AuctionAllocationPolicy::ProRataTime)
+        .unwrap();
+
+    assert_eq!(
+        price_time
+            .buy_fills()
+            .iter()
+            .map(|fill| (fill.order_id().get(), fill.quantity_lots()))
+            .collect::<Vec<_>>(),
+        vec![(1, 10), (2, 5)]
+    );
+    assert_eq!(
+        pro_rata
+            .buy_fills()
+            .iter()
+            .map(|fill| (fill.order_id().get(), fill.quantity_lots()))
+            .collect::<Vec<_>>(),
+        vec![(1, 5), (2, 10)]
+    );
+    assert_eq!(book.active_order_count(), 3);
     book.validate().unwrap();
 }
 
@@ -280,7 +347,7 @@ fn allocation_rejects_foreign_and_stale_indicative_results() {
         .admit(order(2, 2, Side::Sell, AuctionOrderConstraint::Market, 5))
         .unwrap();
     assert_eq!(
-        second.allocation_plan(indicative),
+        second.allocation_plan(indicative, AuctionAllocationPolicy::PriceTime),
         Err(CallAuctionPlanError::ForeignBook)
     );
 
@@ -288,7 +355,7 @@ fn allocation_rejects_foreign_and_stale_indicative_results() {
         .admit(order(3, 1, Side::Buy, AuctionOrderConstraint::Market, 1))
         .unwrap();
     assert_eq!(
-        first.allocation_plan(indicative),
+        first.allocation_plan(indicative, AuctionAllocationPolicy::PriceTime),
         Err(CallAuctionPlanError::StaleRevision {
             observed: 2,
             current: 3,
@@ -398,7 +465,9 @@ fn quantity_reduction_retains_identity_priority_and_reconciles_indexes() {
         )
         .unwrap()
         .unwrap();
-    let plan = book.allocation_plan(indicative).unwrap();
+    let plan = book
+        .allocation_plan(indicative, AuctionAllocationPolicy::PriceTime)
+        .unwrap();
     assert_eq!(
         plan.buy_fills()
             .iter()
@@ -973,7 +1042,9 @@ fn verify_model(book: &mut CallAuctionBook, model: &HashMap<OrderId, ModelOrder>
     assert_eq!(actual, expected, "step {step}");
     if let Some(indicative) = actual_indicative {
         let clearing = indicative.clearing();
-        let plan = book.allocation_plan(indicative).unwrap();
+        let plan = book
+            .allocation_plan(indicative, AuctionAllocationPolicy::PriceTime)
+            .unwrap();
         let actual_buys = plan
             .buy_fills()
             .iter()

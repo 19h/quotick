@@ -1,4 +1,4 @@
-use quotick::auction::{AuctionOrderConstraint, AuctionPricePolicy};
+use quotick::auction::{AuctionAllocationPolicy, AuctionOrderConstraint, AuctionPricePolicy};
 use quotick::auction_book::{
     CallAuctionBook, CallAuctionBookLimits, CallAuctionBookLimitsSpec, CallAuctionCommitError,
     CallAuctionOrder, CallAuctionPrepareError, CallAuctionRemainderPolicy,
@@ -82,7 +82,14 @@ fn order(
 }
 
 fn policy(remainder: CallAuctionRemainderPolicy) -> CallAuctionUncrossPolicy {
-    CallAuctionUncrossPolicy::new(remainder, CallAuctionSelfTradePolicy::Permit)
+    allocation_policy(AuctionAllocationPolicy::PriceTime, remainder)
+}
+
+fn allocation_policy(
+    allocation: AuctionAllocationPolicy,
+    remainder: CallAuctionRemainderPolicy,
+) -> CallAuctionUncrossPolicy {
+    CallAuctionUncrossPolicy::new(allocation, remainder, CallAuctionSelfTradePolicy::Permit)
 }
 
 fn indicative(
@@ -155,6 +162,92 @@ fn prepare_pairs_priority_fills_and_commit_removes_every_filled_order_atomically
     assert_eq!(book.active_order_count(), 0);
     assert_eq!(book.accepted_order_id_count(), 4);
     assert_eq!(book.next_trade_id(), 4);
+    book.validate().unwrap();
+}
+
+#[test]
+fn pro_rata_uncross_uses_instrument_quantity_increment_and_commits_exact_fills() {
+    let definition = definition_with_quantities(QuantityRules::new(5, 5, 1_000).unwrap());
+    let mut book = CallAuctionBook::try_with_limits(definition, limits(8, 16)).unwrap();
+    book.admit(order(
+        1,
+        1,
+        Side::Buy,
+        AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        10,
+    ))
+    .unwrap();
+    book.admit(order(
+        2,
+        2,
+        Side::Buy,
+        AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        20,
+    ))
+    .unwrap();
+    book.admit(order(
+        3,
+        3,
+        Side::Sell,
+        AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        15,
+    ))
+    .unwrap();
+
+    let indicative = indicative(&mut book, 100);
+    let prepared = book
+        .prepare_uncross(
+            indicative,
+            allocation_policy(
+                AuctionAllocationPolicy::ProRataTime,
+                CallAuctionRemainderPolicy::RetainAll,
+            ),
+        )
+        .unwrap();
+
+    assert_eq!(
+        prepared
+            .allocation_plan()
+            .buy_fills()
+            .iter()
+            .map(|fill| (fill.order_id().get(), fill.quantity_lots()))
+            .collect::<Vec<_>>(),
+        vec![(1, 5), (2, 10)]
+    );
+    assert_eq!(
+        prepared
+            .trades()
+            .iter()
+            .map(|trade| {
+                (
+                    trade.buy_order_id().get(),
+                    trade.sell_order_id().get(),
+                    trade.quantity().lots(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![(1, 3, 5), (2, 3, 10)]
+    );
+    let result = book.commit_uncross(prepared).unwrap();
+    assert_eq!(
+        result.policy().allocation(),
+        AuctionAllocationPolicy::ProRataTime
+    );
+    assert_eq!(
+        book.order(OrderId::new(1).unwrap())
+            .unwrap()
+            .quantity
+            .lots(),
+        5
+    );
+    assert_eq!(
+        book.order(OrderId::new(2).unwrap())
+            .unwrap()
+            .quantity
+            .lots(),
+        10
+    );
+    assert!(book.order(OrderId::new(3).unwrap()).is_none());
     book.validate().unwrap();
 }
 

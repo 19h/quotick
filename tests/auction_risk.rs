@@ -1,4 +1,4 @@
-use quotick::auction::{AuctionOrderConstraint, AuctionPricePolicy};
+use quotick::auction::{AuctionAllocationPolicy, AuctionOrderConstraint, AuctionPricePolicy};
 use quotick::auction_book::{
     CallAuctionBookLimits, CallAuctionBookLimitsSpec, CallAuctionOrder, CallAuctionRemainderPolicy,
     CallAuctionSelfTradePolicy, CallAuctionUncrossPolicy,
@@ -229,6 +229,20 @@ fn uncross_command(
     command_id: u64,
     remainder: CallAuctionRemainderPolicy,
 ) -> CallAuctionCommand {
+    uncross_command_with_allocation(
+        engine,
+        command_id,
+        AuctionAllocationPolicy::PriceTime,
+        remainder,
+    )
+}
+
+fn uncross_command_with_allocation(
+    engine: &CallAuctionRiskManagedEngine,
+    command_id: u64,
+    allocation: AuctionAllocationPolicy,
+    remainder: CallAuctionRemainderPolicy,
+) -> CallAuctionCommand {
     CallAuctionCommand::Uncross(CallAuctionUncrossCommand {
         command_id: CommandId::new(command_id).unwrap(),
         instrument_id: instrument(),
@@ -239,6 +253,7 @@ fn uncross_command(
         reference_price: Price::from_raw(100),
         price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
         uncross_policy: CallAuctionUncrossPolicy::new(
+            allocation,
             remainder,
             CallAuctionSelfTradePolicy::Permit,
         ),
@@ -710,6 +725,102 @@ fn uncross_updates_positions_and_retains_only_exact_partial_reservations() {
         0
     );
     assert_eq!(engine.risk().reservation_count(), 0);
+    engine.validate().unwrap();
+}
+
+#[test]
+fn pro_rata_uncross_drives_exact_positions_and_partial_reservations() {
+    let mut engine = managed(3);
+    for owner in 1..=3 {
+        engine
+            .register_account(account(owner), broad_profile(AccountRiskState::Active, 0))
+            .unwrap();
+    }
+    engine
+        .submit(phase_command(1, 1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    for command in [
+        submit_command(
+            2,
+            order(
+                1,
+                1,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                10,
+            ),
+        ),
+        submit_command(
+            3,
+            order(
+                2,
+                2,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                20,
+            ),
+        ),
+        submit_command(
+            4,
+            order(
+                3,
+                3,
+                Side::Sell,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                15,
+            ),
+        ),
+    ] {
+        engine.submit(command).unwrap();
+    }
+    engine
+        .submit(phase_command(5, 1, 1, CallAuctionPhase::Frozen))
+        .unwrap();
+    let uncross = uncross_command_with_allocation(
+        &engine,
+        6,
+        AuctionAllocationPolicy::ProRataTime,
+        CallAuctionRemainderPolicy::RetainAll,
+    );
+
+    engine.submit(uncross).unwrap();
+
+    assert_eq!(
+        engine.risk().snapshot(account(1)).unwrap().position_lots(),
+        5
+    );
+    assert_eq!(
+        engine.risk().snapshot(account(2)).unwrap().position_lots(),
+        10
+    );
+    assert_eq!(
+        engine.risk().snapshot(account(3)).unwrap().position_lots(),
+        -15
+    );
+    assert_eq!(
+        engine
+            .risk()
+            .reservation(OrderId::new(1).unwrap())
+            .unwrap()
+            .quantity_lots(),
+        5
+    );
+    assert_eq!(
+        engine
+            .risk()
+            .reservation(OrderId::new(2).unwrap())
+            .unwrap()
+            .quantity_lots(),
+        10
+    );
+    assert!(
+        engine
+            .risk()
+            .reservation(OrderId::new(3).unwrap())
+            .is_none()
+    );
+    assert!(engine.submit(uncross).unwrap().replayed);
+    assert_eq!(engine.risk().reservation_count(), 2);
     engine.validate().unwrap();
 }
 

@@ -550,27 +550,34 @@ order-level allocation plan.
    an uncross. A separate collection book now supplies canonical interest and
    can consume a plan process-locally; durable sequenced execution still
    requires an auction command state machine.
-6. Price-time allocation consumes separate buy and sell order slices. Market
-   constraints precede limits; limit prices are economically best-to-worst
-   (descending buys and ascending sells); equal constraints are strictly
-   ordered by caller-defined class, priority sequence, then `OrderId`. Every
-   limit must use the discovery grid, and an explicit finite limit bounds each
-   input side before scanning or allocation.
+6. Allocation consumes separate buy and sell order slices under explicit
+   `PriceTime` or `ProRataTime` policy. Market constraints precede limits;
+   limit prices are economically best-to-worst (descending buys and ascending
+   sells); equal constraints are strictly ordered by caller-defined class,
+   priority sequence, then `OrderId`. Every limit must use the discovery grid,
+   and an explicit finite limit bounds each input side before scanning or
+   allocation.
 7. Eligible order quantities are reconstructed at the selected clearing price
    and must exactly equal the discovery result's buy and sell aggregates. A
-   non-zero executable quantity is allocated independently on each side by one
-   literal priority walk. Every emitted fill is positive, retains its source
-   index and order identity, and both fill sums equal `E(p)`, including when the
-   aggregate exceeds `u64::MAX` lots.
+   non-zero executable quantity is allocated independently on each side.
+   `PriceTime` performs one literal priority walk. `ProRataTime` fully fills
+   every market/price/class tier before the marginal tier, floors each marginal
+   order's exact proportional share in instrument quantity-increment quanta,
+   and assigns residual quanta once in time/`OrderId` order; worse tiers receive
+   zero. Every emitted fill is positive, retains its source index and order
+   identity, and both fill sums equal `E(p)`, including when the aggregate
+   exceeds `u64::MAX` lots.
 8. The allocator first determines exact fill cardinalities and fallibly reserves
    both complete result vectors before emitting either side. For `B` supplied
    buys, `A` supplied sells, and `F_b + F_a` positive fills, validation and
-   allocation are `O(B + A)` time and result storage is `O(F_b + F_a)`; no
-   vector grows during fill construction.
+   allocation are `O(B + A)` time and result storage is `O(F_b + F_a)`; the
+   pro-rata marginal tier uses fixed 64-step exact multiply/divide operations
+   without an overflowing product. No vector grows during fill construction.
 9. The allocation plan is immutable analytical output. It does not pair buyer
-   and seller counterparties, apply self-trade prevention, implement pro-rata
-   or size priority, mutate order leaves, assign trade/event identifiers,
-   publish imbalance data, or provide command/WAL/checkpoint atomicity.
+   and seller counterparties, apply self-trade prevention, infer a venue
+   allocation policy, implement size-ranking or hybrid allocation, mutate order
+   leaves, assign trade/event identifiers, publish imbalance data, or provide
+   command/WAL/checkpoint atomicity.
 
 ## Call-auction collection-book invariants
 
@@ -632,7 +639,8 @@ interest for discovery, allocation, and uncross preparation.
      account-index failure precedes mutation.
 6. Indicative discovery rebuilds canonical aggregate scratch and invokes the
    A60 kernel with current market totals. Allocation-plan construction rebuilds
-   canonical order scratch and invokes A61. The indicative result carries a
+   canonical order scratch and invokes A61 or A110 under an explicit allocation
+   policy. The indicative result carries a
    process-local book identity and exact mutation revision; allocation rejects
    a foreign or stale result before rebuilding scratch, then independently
    reconciles eligible totals. Analysis never changes active order state.
@@ -645,12 +653,14 @@ interest for discovery, allocation, and uncross preparation.
    `O(K(log K + log O + log P))` and independent of unrelated active orders.
    Aggregate scratch plus discovery is `O(B + A)`.
    Order scratch is `O(O log O + P)` because intrusive links contain stable
-   order identities resolved through the AVL; A61 then adds `O(O)` validation
-   and `O(F_b + F_a)` caller-owned immutable result space. With `L` configured
+   order identities resolved through the AVL; A61/A110 then add `O(O)`
+   validation and `O(F_b + F_a)` caller-owned immutable result space. With `L`
+   configured
    prepared-uncross leases, collection state occupies
    `O(I_max + O_max + P_max + L O_max)` reserved memory.
-8. `prepare_uncross` first acquires one isolated constructor-owned buffer set and
-   writes the revision-bound A61 allocation into its existing side-fill arrays.
+8. `prepare_uncross` first acquires one isolated constructor-owned buffer set
+   and writes the revision-bound selected A61/A110 allocation into its existing
+   side-fill arrays.
    A two-pointer priority walk determines the exact buyer/seller pair count,
    proves that the existing trade capacity covers it, and fills that vector in
    place. Every pair uses the common clearing price, positive `Quantity`, both
@@ -685,8 +695,8 @@ interest for discovery, allocation, and uncross preparation.
       preparation, stale commit, or committed result returns that set.
     - The book primitive itself has no command sequence, phase, idempotency,
       or durability semantics. `CallAuctionEngine` supplies the first three,
-      and the version-12 durable wrapper supplies stable wire encoding,
-      full-WAL recovery, and snapshot-version-12 checkpoint/cutover recovery.
+      and the version-13 durable wrapper supplies stable wire encoding,
+      full-WAL recovery, and snapshot-version-13 checkpoint/cutover recovery.
     - The separate `CallAuctionRiskManagedEngine` supplies optional profile
       admission, reservations, positions, and independently replayed coupled
       checkpoints; settlement, public/private auction transport, preventive
@@ -859,7 +869,7 @@ admission and tracks reservations and positions.
    risk-rejected submits and replacements because they still require core
    preparation.
 8. The coupled checkpoint has a stable complete-value little-endian codec and
-   direct restore under default or explicit limits. Snapshot version 12 assigns
+   direct restore under default or explicit limits. Snapshot version 13 assigns
    it `QSNP` kind `5`. `DurableCallAuctionRiskEngine` binds a canonical
    definition/profile prefix, persists command/report pairs, completes at most
    one dangling non-retry command, verifies risk-aware replay, and supports
@@ -871,16 +881,17 @@ admission and tracks reservations and positions.
 This section defines WAL persistence, recovery, and checkpoint rules for the
 call-auction engine.
 
-1. WAL version 12 retains stable record-kind tags `9` and `10` for one
+1. WAL version 13 retains stable record-kind tags `9` and `10` for one
    call-auction command and its complete execution report. All multibyte fields
    are little-endian, enum tags are explicit, and decoding reconstructs and
    validates domain values, contiguous event sequencing, report outcome/event
    grammar, clearing totals, trade identity, uncross body counts, the exact
    two-event replacement trace, one-event retained-priority amendment, and
-   canonical mass-cancel aggregates.
+   canonical mass-cancel aggregates. Uncross commands and completion events
+   carry the same explicit price-time or pro-rata-time allocation-policy tag.
 2. An uncut auction journal contains one immutable instrument definition
    followed by strict command/report pairs. A compacted journal instead begins
-   with one kind-`8` anchor bound to snapshot-version-12 call-auction kind `4`,
+   with one kind-`8` anchor bound to snapshot-version-13 call-auction kind `4`,
    followed by the same suffix grammar. A report without a command, consecutive
    commands, a second definition, an interior anchor, a
    continuous-matching/risk/ledger record, or any other kind fails recovery. At
@@ -1703,8 +1714,8 @@ capture, verification, and cutover rules.
       namespace mutation.
 
 The authoritative persisted framing and payload schemas are
-[WAL format version 12](wal-v12.md) and
-[Semantic snapshot format version 12](snapshot-v12.md). Filesystem and device
+[WAL format version 13](wal-v13.md) and
+[Semantic snapshot format version 13](snapshot-v13.md). Filesystem and device
 assumptions are bounded by the [Local storage contract](storage.md).
 
 ## Failure model
@@ -1811,7 +1822,9 @@ overflow, and two independent 20,000-case generated suites against exhaustive
 enumeration. Order-level allocation tests cover market, price,
 class, time and ID priority; ineligible tails; partial fills; exact aggregate
 reconciliation; operational limits; totals above `u64::MAX`; and 20,000
-generated plans against a literal priority walk.
+generated plans against a literal priority walk. Pro-rata tests cover strict
+price/class tiers, instrument-increment quanta, FIFO residuals, products wider
+than `u128`, and 20,000 generated plans against direct integer arithmetic.
 
 Capacity tests cover invalid policies, every active/account/control/side-level/identity
 boundary, ordinary-history exhaustion, invalid-control reserve protection,
@@ -2038,14 +2051,22 @@ There is no additional claim that semantic checkpoint history is size bounded.
   [official Nasdaq rulebook](https://listingcenter.nasdaq.com/rulebook/nasdaq/rules/nasdaq-equity-4).
   Quotick's venue-neutral analytical kernel makes maximum quantity, minimum
   absolute imbalance, optional pressure, reference distance, an explicit static
-  candidate band, aggregate market interest, final price direction, and one
-  market/price/class/time/ID allocation rule explicit. It does not claim Nasdaq
+  candidate band, aggregate market interest, final price direction, and
+  explicit market/price/class price-time or pro-rata-time allocation rules. It
+  does not claim Nasdaq
   conformance: order eligibility, entered-price constraints, exact priority
   categories, benchmark calculation and updates, collars, post-only
   adjustments, counterparty pairing, and uncross execution remain outside this
   kernel. `CallAuctionBook` adds an internal process-local priority pairing and
   remainder-policy transition; it does not make those semantics Nasdaq
   conformant.
+- Eurex distinguishes price-time, pro-rata, and time-pro-rata allocation in its
+  [T7 matching principles](https://www.eurex.com/ex-en/trade/order-book-trading/matching-principles).
+  CME documents timestamp-priority residual allocation in a
+  [Globex matching-algorithm change notice](https://www.cmegroup.com/tools-information/lookups/advisories/electronic-trading/20080609.html).
+  Quotick's exact priority-class tiers, quantity-increment floor, and FIFO
+  residual are internal deterministic rules and do not claim compatibility
+  with either venue.
 - Gregorian calendar strings used at service boundaries follow
   [ISO 8601-1:2019](https://www.iso.org/standard/70907.html). The internal
   `AccountingDate` wire scalar is signed days relative to 1970-01-01 and does
@@ -2064,7 +2085,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Snapshots and compaction | single-file and segmented matching/risk/ledger/call-auction WAL cutover plus off-thread direct and WAL-synchronized plain/coupled continuous-matching and call-auction replay verification are implemented; verified matching/risk/auction handles can retire an older prefix by cursor-streaming only its synchronized suffix. Remaining evidence is bounded checkpoint memory and writer audit-copy/projection/direct-reconstruction pause, bounded suffix-copy pause, semantic generation rollover, and externally retained audit/idempotency proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
-| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, sourced explicit-reference stop-market/stop-limit activation with durable source identity/version/sequence and gap/reset validation, native reserve and fully hidden continuous queue classes, atomic minimum-quantity IOC, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, account/side mass cancellation, atomic new-identity replacement with full priority loss, aggregate depth queries, banded discovery, price-time allocation, deterministic pairing/atomic uncross, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, and plain/coupled-risk full-WAL plus cutover recovery are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authenticated external stop-reference acquisition/normalization and missed-reference recovery, auction reference and dynamic-band derivation, venue-specific display/priority/allocation policies, preventive self-trade policies, ledger integration, volatility/interruption auctions, pegged, discretionary, venue-specific in-place amendment/uncross/publication semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
+| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, sourced explicit-reference stop-market/stop-limit activation with durable source identity/version/sequence and gap/reset validation, native reserve and fully hidden continuous queue classes, atomic minimum-quantity IOC, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, account/side mass cancellation, atomic new-identity replacement with full priority loss, aggregate depth queries, banded discovery, explicit price-time and price/class-tier pro-rata-time allocation, deterministic pairing/atomic uncross, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, and plain/coupled-risk full-WAL plus cutover recovery are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authenticated external stop-reference acquisition/normalization and missed-reference recovery, auction reference and dynamic-band derivation, venue-specific display/priority/allocation policies, preventive self-trade policies, ledger integration, volatility/interruption auctions, pegged, discretionary, venue-specific in-place amendment/uncross/publication semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
 | High | Instrument lifecycle expansion | authoritative calendar ingestion/distribution/activation, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |

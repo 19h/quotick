@@ -1,4 +1,4 @@
-use quotick::auction::{AuctionOrderConstraint, AuctionPricePolicy};
+use quotick::auction::{AuctionAllocationPolicy, AuctionOrderConstraint, AuctionPricePolicy};
 use quotick::auction_book::{
     CallAuctionBookLimits, CallAuctionBookLimitsSpec, CallAuctionOrder, CallAuctionPrepareError,
     CallAuctionRemainderPolicy, CallAuctionSelfTradePolicy, CallAuctionUncrossPolicy,
@@ -199,6 +199,24 @@ fn uncross_command(
     expected_revision: u64,
     remainder: CallAuctionRemainderPolicy,
 ) -> CallAuctionCommand {
+    uncross_command_with_allocation(
+        engine,
+        command_id,
+        auction_id,
+        expected_revision,
+        AuctionAllocationPolicy::PriceTime,
+        remainder,
+    )
+}
+
+fn uncross_command_with_allocation(
+    engine: &CallAuctionEngine,
+    command_id: u64,
+    auction_id: u64,
+    expected_revision: u64,
+    allocation: AuctionAllocationPolicy,
+    remainder: CallAuctionRemainderPolicy,
+) -> CallAuctionCommand {
     CallAuctionCommand::Uncross(CallAuctionUncrossCommand {
         command_id: CommandId::new(command_id).unwrap(),
         instrument_id: instrument(),
@@ -209,6 +227,7 @@ fn uncross_command(
         reference_price: Price::from_raw(100),
         price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
         uncross_policy: CallAuctionUncrossPolicy::new(
+            allocation,
             remainder,
             CallAuctionSelfTradePolicy::Permit,
         ),
@@ -302,6 +321,89 @@ fn lifecycle_sequences_collection_freeze_uncross_and_exact_replay() {
     assert!(replay.events.shares_storage_with(&report.events));
     assert_eq!(engine.next_command_sequence(), 7);
     assert_eq!(engine.next_event_sequence(), 8);
+    engine.validate().unwrap();
+}
+
+#[test]
+fn pro_rata_policy_drives_trade_events_and_exact_idempotent_replay() {
+    let mut engine =
+        CallAuctionEngine::try_with_limits(definition(), engine_limits(8, 16, 32)).unwrap();
+    engine
+        .submit(phase_command(1, 1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            2,
+            order(
+                1,
+                1,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                10,
+            ),
+        ))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            3,
+            order(
+                2,
+                2,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                20,
+            ),
+        ))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            4,
+            order(
+                3,
+                3,
+                Side::Sell,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                15,
+            ),
+        ))
+        .unwrap();
+    engine
+        .submit(phase_command(5, 1, 1, CallAuctionPhase::Frozen))
+        .unwrap();
+    let command = uncross_command_with_allocation(
+        &engine,
+        6,
+        1,
+        2,
+        AuctionAllocationPolicy::ProRataTime,
+        CallAuctionRemainderPolicy::RetainAll,
+    );
+
+    let report = engine.submit(command).unwrap();
+
+    assert_eq!(
+        report
+            .events
+            .iter()
+            .filter_map(|event| match event.kind {
+                CallAuctionEventKind::Trade(trade) => Some((
+                    trade.buy_order_id().get(),
+                    trade.sell_order_id().get(),
+                    trade.quantity().lots(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![(1, 3, 5), (2, 3, 10)]
+    );
+    assert!(matches!(
+        report.events.last().unwrap().kind,
+        CallAuctionEventKind::UncrossCompleted { policy, .. }
+            if policy.allocation() == AuctionAllocationPolicy::ProRataTime
+    ));
+    let replay = engine.submit(command).unwrap();
+    assert!(replay.replayed);
+    assert!(replay.events.shares_storage_with(&report.events));
     engine.validate().unwrap();
 }
 

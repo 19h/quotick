@@ -15,11 +15,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::auction::{
-    AuctionAllocationError, AuctionAllocationLimits, AuctionAllocationPlan, AuctionClearing,
-    AuctionError, AuctionLevel, AuctionMarketInterest, AuctionOrder, AuctionOrderConstraint,
-    AuctionOrderFill, AuctionPriceBand, AuctionPriceGrid, AuctionPricePolicy,
-    allocate_clearing_price_time, allocate_clearing_price_time_reusing,
-    discover_bounded_clearing_price,
+    AuctionAllocationError, AuctionAllocationLimits, AuctionAllocationMethod,
+    AuctionAllocationPlan, AuctionAllocationPolicy, AuctionClearing, AuctionError, AuctionLevel,
+    AuctionMarketInterest, AuctionOrder, AuctionOrderConstraint, AuctionOrderFill,
+    AuctionPriceBand, AuctionPriceGrid, AuctionPricePolicy, allocate_clearing_reusing,
+    allocate_clearing_with_policy, discover_bounded_clearing_price,
 };
 use crate::bounded_hash::BoundedHashMap;
 use crate::domain::{
@@ -759,6 +759,7 @@ pub enum CallAuctionSelfTradePolicy {
 /// Explicit policy applied by one atomic call-auction uncross.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CallAuctionUncrossPolicy {
+    allocation: AuctionAllocationPolicy,
     remainder: CallAuctionRemainderPolicy,
     self_trade: CallAuctionSelfTradePolicy,
 }
@@ -767,13 +768,21 @@ impl CallAuctionUncrossPolicy {
     /// Creates an explicit uncross policy.
     #[must_use]
     pub const fn new(
+        allocation: AuctionAllocationPolicy,
         remainder: CallAuctionRemainderPolicy,
         self_trade: CallAuctionSelfTradePolicy,
     ) -> Self {
         Self {
+            allocation,
             remainder,
             self_trade,
         }
+    }
+
+    /// Returns the order-level allocation treatment.
+    #[must_use]
+    pub const fn allocation(self) -> AuctionAllocationPolicy {
+        self.allocation
     }
 
     /// Returns the unexecuted-remainder treatment.
@@ -2438,7 +2447,7 @@ impl CallAuctionBook {
         })
     }
 
-    /// Constructs an immutable price-time allocation plan for current interest.
+    /// Constructs an immutable allocation plan for current interest.
     ///
     /// Canonical input scratch is reused without allocation. The returned fill
     /// vector capacity requests use the exact derived fill cardinalities and
@@ -2452,6 +2461,7 @@ impl CallAuctionBook {
     pub fn allocation_plan(
         &mut self,
         indicative: CallAuctionIndicative,
+        policy: AuctionAllocationPolicy,
     ) -> Result<AuctionAllocationPlan, CallAuctionPlanError> {
         if indicative.book_instance_id != self.instance_id {
             return Err(CallAuctionPlanError::ForeignBook);
@@ -2465,11 +2475,13 @@ impl CallAuctionBook {
         self.rebuild_order_scratch();
         let limits = AuctionAllocationLimits::new(self.limits.max_active_orders())
             .map_err(CallAuctionPlanError::Allocation)?;
-        allocate_clearing_price_time(
+        allocate_clearing_with_policy(
             &self.buy_order_scratch,
             &self.sell_order_scratch,
             self.grid,
             indicative.clearing,
+            policy,
+            self.definition.quantity_rules().increment_lots(),
             limits,
         )
         .map_err(CallAuctionPlanError::Allocation)
@@ -2478,10 +2490,11 @@ impl CallAuctionBook {
     /// Fully prepares deterministic pairing and remainder treatment without
     /// mutating active orders, trade identity, or collection revision.
     ///
-    /// The supplied policy explicitly permits self-trade; no preventive policy
-    /// is inferred. One constructor-owned lease supplies both side-fill vectors,
-    /// the counterparty-pair vector, and the cancellation vector. Dropping the
-    /// preparation or committed result returns that isolated storage to the pool.
+    /// The supplied policy explicitly selects allocation and permits self-trade;
+    /// neither behavior is inferred. One constructor-owned lease supplies both
+    /// side-fill vectors, the counterparty-pair vector, and the cancellation
+    /// vector. Dropping the preparation or committed result returns that isolated
+    /// storage to the pool.
     ///
     /// # Errors
     ///
@@ -2520,11 +2533,15 @@ impl CallAuctionBook {
             .map_err(CallAuctionPlanError::Allocation)
             .map_err(CallAuctionPrepareError::Plan)?;
         let buffers = pooled.buffers_mut();
-        allocate_clearing_price_time_reusing(
+        allocate_clearing_reusing(
             &self.buy_order_scratch,
             &self.sell_order_scratch,
             self.grid,
             indicative.clearing,
+            AuctionAllocationMethod::new(
+                policy.allocation,
+                self.definition.quantity_rules().increment_lots(),
+            ),
             limits,
             &mut buffers.plan,
         )

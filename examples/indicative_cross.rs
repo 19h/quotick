@@ -2,7 +2,7 @@
 
 mod support;
 
-use quotick::auction::{AuctionOrderConstraint, AuctionPricePolicy};
+use quotick::auction::{AuctionAllocationPolicy, AuctionOrderConstraint, AuctionPricePolicy};
 use quotick::auction_book::{
     CallAuctionOrder, CallAuctionRemainderPolicy, CallAuctionSelfTradePolicy,
     CallAuctionUncrossPolicy,
@@ -214,6 +214,7 @@ fn main() {
         reference_price: Price::from_raw(10_100),
         price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
         uncross_policy: CallAuctionUncrossPolicy::new(
+            AuctionAllocationPolicy::PriceTime,
             CallAuctionRemainderPolicy::RetainAll,
             CallAuctionSelfTradePolicy::Permit,
         ),

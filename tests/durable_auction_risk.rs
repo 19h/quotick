@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use quotick::auction::{AuctionOrderConstraint, AuctionPricePolicy};
+use quotick::auction::{AuctionAllocationPolicy, AuctionOrderConstraint, AuctionPricePolicy};
 use quotick::auction_book::{
     CallAuctionOrder, CallAuctionRemainderPolicy, CallAuctionSelfTradePolicy,
     CallAuctionUncrossPolicy,
@@ -188,6 +188,7 @@ fn uncross(command_id: u64, remainder: CallAuctionRemainderPolicy) -> CallAuctio
         reference_price: Price::from_raw(100),
         price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
         uncross_policy: CallAuctionUncrossPolicy::new(
+            AuctionAllocationPolicy::PriceTime,
             remainder,
             CallAuctionSelfTradePolicy::Permit,
         ),
@@ -394,7 +395,7 @@ fn checkpoint_is_snapshot_kind_five_and_replays_only_the_suffix() {
     durable.close().unwrap();
 
     let bytes = fs::read(&snapshot).unwrap();
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 12);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 13);
     assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 5);
     let mut recovered = DurableCallAuctionRiskEngine::open_with_checkpoint(
         &wal,

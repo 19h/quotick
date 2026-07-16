@@ -1,4 +1,7 @@
-# Semantic Snapshot Format Version 12
+# Expired Semantic Snapshot Format Version 12
+
+Version 12 is expired. The runtime accepts only
+[semantic snapshot format version 13](snapshot-v13.md).
 
 `SnapshotFile` stores one complete typed semantic value in a bounded,
 versioned CRC-32C envelope. Version 12 preserves the version-11 kind registry,

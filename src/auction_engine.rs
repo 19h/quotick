@@ -4825,6 +4825,7 @@ mod tests {
                 reference_price: Price::from_raw(50),
                 price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
                 uncross_policy: CallAuctionUncrossPolicy::new(
+                    crate::auction::AuctionAllocationPolicy::PriceTime,
                     CallAuctionRemainderPolicy::CancelAll,
                     CallAuctionSelfTradePolicy::Permit,
                 ),

@@ -1,4 +1,4 @@
-use quotick::auction::{AuctionOrderConstraint, AuctionPricePolicy};
+use quotick::auction::{AuctionAllocationPolicy, AuctionOrderConstraint, AuctionPricePolicy};
 use quotick::auction_book::{
     CallAuctionBookLimits, CallAuctionBookLimitsSpec, CallAuctionOrder, CallAuctionRemainderPolicy,
     CallAuctionSelfTradePolicy, CallAuctionUncrossPolicy,
@@ -131,6 +131,24 @@ fn uncross(
     phase_revision: u64,
     remainder: CallAuctionRemainderPolicy,
 ) -> CallAuctionCommand {
+    uncross_with_allocation(
+        engine,
+        command_id,
+        auction_id,
+        phase_revision,
+        AuctionAllocationPolicy::PriceTime,
+        remainder,
+    )
+}
+
+fn uncross_with_allocation(
+    engine: &CallAuctionEngine,
+    command_id: u64,
+    auction_id: u64,
+    phase_revision: u64,
+    allocation: AuctionAllocationPolicy,
+    remainder: CallAuctionRemainderPolicy,
+) -> CallAuctionCommand {
     CallAuctionCommand::Uncross(CallAuctionUncrossCommand {
         command_id: CommandId::new(command_id).unwrap(),
         instrument_id: instrument(),
@@ -141,6 +159,7 @@ fn uncross(
         reference_price: Price::from_raw(100),
         price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
         uncross_policy: CallAuctionUncrossPolicy::new(
+            allocation,
             remainder,
             CallAuctionSelfTradePolicy::Permit,
         ),
@@ -434,6 +453,97 @@ fn crossed_depth_market_interest_uncross_replay_and_two_cycle_remainders_reconci
         }
     ));
     assert_eq!(engine.book().active_order_count(), 0);
+}
+
+#[test]
+fn pro_rata_trade_trace_reconciles_public_depth_without_policy_disclosure() {
+    let mut engine = engine();
+    let mut publisher = CallAuctionMarketDataPublisher::from_engine(&engine).unwrap();
+    let mut replica = CallAuctionMarketDataReplica::new(definition());
+    execute(
+        &mut engine,
+        &mut publisher,
+        &mut replica,
+        phase(1, 1, 0, CallAuctionPhase::Collecting),
+    );
+    for command in [
+        submit(
+            2,
+            1,
+            1,
+            1,
+            1,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+            10,
+        ),
+        submit(
+            3,
+            1,
+            1,
+            2,
+            2,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+            20,
+        ),
+        submit(
+            4,
+            1,
+            1,
+            3,
+            3,
+            Side::Sell,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+            15,
+        ),
+    ] {
+        execute(&mut engine, &mut publisher, &mut replica, command);
+    }
+    execute(
+        &mut engine,
+        &mut publisher,
+        &mut replica,
+        phase(5, 1, 1, CallAuctionPhase::Frozen),
+    );
+    let command = uncross_with_allocation(
+        &engine,
+        6,
+        1,
+        2,
+        AuctionAllocationPolicy::ProRataTime,
+        CallAuctionRemainderPolicy::RetainAll,
+    );
+
+    let batch = execute(&mut engine, &mut publisher, &mut replica, command);
+
+    assert_eq!(
+        batch
+            .updates()
+            .iter()
+            .filter_map(|update| match update.kind() {
+                CallAuctionMarketDataKind::Trade { print, .. } => {
+                    Some(print.quantity().lots())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![5, 10]
+    );
+    assert!(matches!(
+        batch.updates().last().unwrap().kind(),
+        CallAuctionMarketDataKind::UncrossCompleted {
+            trade_count: 2,
+            cancellation_count: 0,
+            ..
+        }
+    ));
+    assert_eq!(
+        engine.book().limit_depth(Side::Buy, usize::MAX)[0].quantity(),
+        15
+    );
+    assert!(engine.book().limit_depth(Side::Sell, usize::MAX).is_empty());
+    assert_mirrors(&engine, &replica);
 }
 
 #[test]

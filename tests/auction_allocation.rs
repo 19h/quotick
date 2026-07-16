@@ -1,7 +1,7 @@
 use quotick::auction::{
     AuctionAllocationError, AuctionAllocationLimits, AuctionLevel, AuctionOrder,
     AuctionOrderConstraint, AuctionPriceGrid, AuctionPricePolicy, allocate_clearing_price_time,
-    discover_clearing_price,
+    allocate_clearing_pro_rata_time, discover_clearing_price,
 };
 use quotick::{OrderId, Price, Quantity, Side};
 
@@ -183,6 +183,105 @@ fn executable_quantity_can_exceed_one_order_level_u64() {
             .map(|fill| u128::from(fill.quantity_lots()))
             .sum::<u128>(),
         total
+    );
+}
+
+#[test]
+fn pro_rata_fills_only_the_marginal_price_class_and_assigns_fifo_residual() {
+    let bids = [
+        market(1, 2, 0, 1),
+        limit(2, 110, 3, 0, 2),
+        limit(3, 100, 10, 0, 3),
+        limit(4, 100, 20, 0, 4),
+        limit(5, 100, 30, 0, 5),
+        limit(6, 100, 100, 1, 6),
+    ];
+    let asks = [limit(10, 100, 18, 0, 1)];
+    let clearing =
+        quotick::auction::AuctionClearing::from_quantities(Price::from_raw(100), 165, 18);
+
+    let plan =
+        allocate_clearing_pro_rata_time(&bids, &asks, grid(), clearing, 1, limits()).unwrap();
+
+    assert_eq!(
+        plan.buy_fills()
+            .iter()
+            .map(|fill| (fill.order_id().get(), fill.quantity_lots()))
+            .collect::<Vec<_>>(),
+        vec![(1, 2), (2, 3), (3, 3), (4, 4), (5, 6)]
+    );
+    assert_eq!(plan.sell_fills()[0].quantity_lots(), 18);
+}
+
+#[test]
+fn pro_rata_uses_the_allocation_quantum_and_never_emits_off_grid_fills() {
+    let bids = [
+        limit(1, 100, 10, 0, 1),
+        limit(2, 100, 20, 0, 2),
+        limit(3, 100, 30, 0, 3),
+    ];
+    let asks = [limit(10, 100, 25, 0, 1)];
+    let clearing = quotick::auction::AuctionClearing::from_quantities(Price::from_raw(100), 60, 25);
+
+    let plan =
+        allocate_clearing_pro_rata_time(&bids, &asks, grid(), clearing, 5, limits()).unwrap();
+
+    assert_eq!(
+        plan.buy_fills()
+            .iter()
+            .map(|fill| (fill.order_id().get(), fill.quantity_lots()))
+            .collect::<Vec<_>>(),
+        vec![(1, 5), (2, 10), (3, 10)]
+    );
+    assert!(
+        plan.buy_fills()
+            .iter()
+            .chain(plan.sell_fills())
+            .all(|fill| fill.quantity_lots() % 5 == 0)
+    );
+}
+
+#[test]
+fn pro_rata_handles_products_wider_than_u128_without_approximation() {
+    let bids = [limit(1, 100, u64::MAX, 0, 1), limit(2, 100, u64::MAX, 0, 2)];
+    let asks = [limit(10, 100, u64::MAX, 0, 1)];
+    let clearing = quotick::auction::AuctionClearing::from_quantities(
+        Price::from_raw(100),
+        u128::from(u64::MAX) * 2,
+        u128::from(u64::MAX),
+    );
+
+    let plan =
+        allocate_clearing_pro_rata_time(&bids, &asks, grid(), clearing, 1, limits()).unwrap();
+
+    assert_eq!(plan.buy_fills()[0].quantity_lots(), 1_u64 << 63);
+    assert_eq!(plan.buy_fills()[1].quantity_lots(), (1_u64 << 63) - 1);
+    assert_eq!(
+        plan.buy_fills()
+            .iter()
+            .map(|fill| u128::from(fill.quantity_lots()))
+            .sum::<u128>(),
+        u128::from(u64::MAX)
+    );
+}
+
+#[test]
+fn pro_rata_rejects_zero_quantum_and_off_grid_order_quantity() {
+    let clearing = quotick::auction::AuctionClearing::from_quantities(Price::from_raw(100), 6, 5);
+    let bids = [limit(1, 100, 6, 0, 1)];
+    let asks = [limit(10, 100, 5, 0, 1)];
+    assert_eq!(
+        allocate_clearing_pro_rata_time(&bids, &asks, grid(), clearing, 0, limits()),
+        Err(AuctionAllocationError::InvalidAllocationQuantum(0))
+    );
+    assert_eq!(
+        allocate_clearing_pro_rata_time(&bids, &asks, grid(), clearing, 5, limits()),
+        Err(AuctionAllocationError::OrderQuantityOffAllocationGrid {
+            side: Side::Buy,
+            index: 0,
+            quantity_lots: 6,
+            allocation_quantum_lots: 5,
+        })
     );
 }
 
@@ -463,6 +562,68 @@ fn linear_allocator_matches_a_literal_priority_walk() {
                 ))
                 .collect::<Vec<_>>(),
             reference_fills(&asks, Side::Sell, clearing_price, target),
+        );
+    }
+}
+
+#[test]
+fn pro_rata_allocator_matches_direct_small_integer_arithmetic() {
+    let mut generator = Generator(0x5e82_3ac7_1d49_b60f);
+    for _ in 0..20_000 {
+        let order_count = usize::try_from(generator.bounded(12) + 2).unwrap();
+        let mut bids = Vec::with_capacity(order_count);
+        let mut total = 0_u128;
+        for index in 0..order_count {
+            let quantity = generator.bounded(1_000_000) + 1;
+            total += u128::from(quantity);
+            bids.push(limit(
+                u64::try_from(index + 1).unwrap(),
+                100,
+                quantity,
+                0,
+                u64::try_from(index).unwrap(),
+            ));
+        }
+        let executable = u128::from(generator.next()) % (total - 1) + 1;
+        let asks = [limit(1_000, 100, u64::try_from(executable).unwrap(), 0, 0)];
+        let clearing = quotick::auction::AuctionClearing::from_quantities(
+            Price::from_raw(100),
+            total,
+            executable,
+        );
+
+        let plan = allocate_clearing_pro_rata_time(
+            &bids,
+            &asks,
+            grid(),
+            clearing,
+            1,
+            AuctionAllocationLimits::new(order_count).unwrap(),
+        )
+        .unwrap();
+
+        let mut expected = bids
+            .iter()
+            .map(|order| u128::from(order.quantity().lots()) * executable / total)
+            .collect::<Vec<_>>();
+        let allocated = expected.iter().sum::<u128>();
+        for quantity in expected
+            .iter_mut()
+            .take(usize::try_from(executable - allocated).unwrap())
+        {
+            *quantity += 1;
+        }
+        assert_eq!(
+            plan.buy_fills()
+                .iter()
+                .map(|fill| (fill.source_index(), u128::from(fill.quantity_lots())))
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, quantity)| *quantity != 0)
+                .collect::<Vec<_>>()
         );
     }
 }

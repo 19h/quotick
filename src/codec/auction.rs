@@ -1,6 +1,6 @@
 use crate::auction::{
-    AuctionClearing, AuctionFinalTieBreak, AuctionOrderConstraint, AuctionPressureRule,
-    AuctionPriceBand, AuctionPricePolicy,
+    AuctionAllocationPolicy, AuctionClearing, AuctionFinalTieBreak, AuctionOrderConstraint,
+    AuctionPressureRule, AuctionPriceBand, AuctionPricePolicy,
 };
 use crate::auction_book::{
     CallAuctionCancellation, CallAuctionOrder, CallAuctionOrderSnapshot,
@@ -135,6 +135,10 @@ fn decode_price_policy(decoder: &mut Decoder<'_>) -> Result<AuctionPricePolicy, 
 }
 
 fn encode_uncross_policy(encoder: &mut Encoder, policy: CallAuctionUncrossPolicy) {
+    encoder.u8(match policy.allocation() {
+        AuctionAllocationPolicy::PriceTime => 0,
+        AuctionAllocationPolicy::ProRataTime => 1,
+    });
     encoder.u8(match policy.remainder() {
         CallAuctionRemainderPolicy::RetainAll => 0,
         CallAuctionRemainderPolicy::CancelMarket => 1,
@@ -148,6 +152,16 @@ fn encode_uncross_policy(encoder: &mut Encoder, policy: CallAuctionUncrossPolicy
 fn decode_uncross_policy(
     decoder: &mut Decoder<'_>,
 ) -> Result<CallAuctionUncrossPolicy, CodecError> {
+    let allocation = match decoder.u8()? {
+        0 => AuctionAllocationPolicy::PriceTime,
+        1 => AuctionAllocationPolicy::ProRataTime,
+        tag => {
+            return Err(CodecError::InvalidTag {
+                type_name: "AuctionAllocationPolicy",
+                tag,
+            });
+        }
+    };
     let remainder = match decoder.u8()? {
         0 => CallAuctionRemainderPolicy::RetainAll,
         1 => CallAuctionRemainderPolicy::CancelMarket,
@@ -168,7 +182,9 @@ fn decode_uncross_policy(
             });
         }
     };
-    Ok(CallAuctionUncrossPolicy::new(remainder, self_trade))
+    Ok(CallAuctionUncrossPolicy::new(
+        allocation, remainder, self_trade,
+    ))
 }
 
 fn encode_order(encoder: &mut Encoder, value: CallAuctionOrder) {

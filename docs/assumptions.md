@@ -267,14 +267,16 @@ integrity; concern about the second requires authenticated records.
 
 ## A15 — format version immutability
 
-**Assumption.** WAL format version 12, snapshot format version 12, continuous
+**Assumption.** WAL format version 13, snapshot format version 13, continuous
 market-data payload version 3, call-auction market-data payload version 4, and
 trading-calendar payload version 1 are immutable. WAL and snapshot versions
-`1` through `11` are expired and rejected explicitly rather than inferred or
-migrated. WAL v12 preserves v11 values and adds call-auction command/action tag
-`6` for retained-priority amendment, rejection tag `22` for a non-reduction,
-and event-kind tag `8` for `OrderAmended`. Snapshot v12 preserves v11 direct
-rows and embeds WAL-v12 values in chronological histories.
+`1` through `12` are expired and rejected explicitly rather than inferred or
+migrated. WAL v13 preserves v12 values and adds one explicit allocation-policy
+byte to call-auction uncross commands and completion events. Snapshot v13
+preserves v12 direct rows and embeds WAL-v13 values in chronological histories.
+WAL v12 added call-auction command/action tag `6` for retained-priority
+amendment, rejection tag `22` for a non-reduction, and event-kind tag `8` for
+`OrderAmended`; those values remain unchanged in v13.
 Continuous market-data v3 preserves v2 bytes but adds the absent-public-maker
 trade interpretation required for fully hidden execution. Call-auction market-
 data v4 preserves v3 layouts and adds book-reason tag `5`, `Amended`.
@@ -290,12 +292,12 @@ authoritative predecessors exist.
 recovery, anchor interpretation, stable auction records/images, stable calendar
 images, and fail-closed format boundaries.
 
-**Falsification probe.** Byte-compare golden WAL-v12, snapshot-v12,
+**Falsification probe.** Byte-compare golden WAL-v13, snapshot-v13,
 market-data-v3, auction-market-data-v4, and trading-calendar-v1 fixtures through
 every supported release; mutate valid WAL frames and images to versions `1`
-through `11`; verify definition booleans, every display, TIF, rejection, and
+through `12`; verify definition booleans, every display, TIF, rejection, and
 cancellation tag, continuous expiry/stop/source tags, raw auction record tags
-`9`/`10`, replacement, mass-cancel, and amendment tags,
+`9`/`10`, replacement, mass-cancel, amendment, and allocation-policy tags,
 snapshot kinds `1` through `5`, hidden-maker trade application, auction
 replacement and mass-cancel projection, and every calendar scalar/row offset.
 Any changed supported bytes/interpretation or acceptance across an expired
@@ -665,7 +667,7 @@ effect, accepted partial state, or incorrect final balance falsifies A36.
 
 **Assumption.** The reserve-, mass-cancel-, account-control-, GTD-, stop-, fully
 hidden, and minimum-quantity command/report variants defined through version 8
-remain explicit variants inside deployable WAL version 12. Version 9 added
+remain explicit variants inside deployable WAL version 13. Version 9 added
 durable stop-reference source identity, source version, source sequence, and
 typed discontinuity/collision outcomes; it does not infer them from WAL version
 8. No earlier matching WAL requires runtime compatibility. Expired envelopes
@@ -1435,9 +1437,9 @@ allocation; differentially compare at least 20,000 generated plans with a
 literal priority walk and sum every side in `u128`. Any noncanonical
 acceptance, zero/over-target fill, side-total divergence, allocation after a
 failed reservation, or interpretation as an executed uncross falsifies A61.
-Venue pro-rata, size, displayed/non-displayed, imbalance, and self-trade
-fixtures falsify price-time universality and require explicit versioned
-policies.
+A selected `ProRataTime` policy is governed separately by A110. Venue size-
+ranking, hybrid, displayed/non-displayed, imbalance, and self-trade fixtures
+falsify price-time universality and require explicit versioned policies.
 
 ## A62 — call-auction collection book
 
@@ -1471,8 +1473,8 @@ under arbitrary bounded identity churn. Replacement preflight includes the
 target's released active slot and singleton price-level slot, while
 accepted-ID headroom remains monotonic.
 Market then price then FIFO input is reconstructed deterministically for
-A60/A61. Every indicative result is bound to a process-local book identity and
-exact mutation revision; foreign/stale allocation is rejected before order
+A60/A61/A110. Every indicative result is bound to a process-local book identity
+and exact mutation revision; foreign/stale allocation is rejected before order
 reconstruction. Admission is `O(log I + log O + log P)`, cancellation is `O(log
 O + log P)`, indicative discovery is `O(B + A)`, and allocation-input
 construction is `O(O log O + P)` because intrusive links name orders by ID.
@@ -1499,18 +1501,19 @@ sequence. Any accepted invalid command, reused ID, lost FIFO relation, model
 divergence, accepted foreign/stale plan, heap growth in collection
 mutation/scratch, partial replacement, unintended replacement priority
 retention, amendment priority loss, or retained-order
-mutation by analysis falsifies A62. A venue with multiple priority categories,
-reserve/display semantics, price/side amendments, quantity increases, or
-pro-rata allocation requires
-a new versioned policy/state machine.
+mutation by analysis falsifies A62. A venue with additional priority
+categories, reserve/display semantics, price/side amendments, quantity
+increases, size ranking, or a different pro-rata/hybrid calculation requires a
+new versioned policy/state machine.
 
 ## A63 — process-local uncross
 
-**Assumption.** One process-local uncross explicitly selects remainder
-treatment (`RetainAll`, `CancelMarket`, or `CancelAll`) and the only
-represented self-trade policy (`Permit`). A61 price-time fills are
-authoritative. Pairing walks both fill vectors in priority order; a
-same-account pair is a trade, not prevention. Book-local trade identity and one
+**Assumption.** One process-local uncross explicitly selects A61 `PriceTime` or
+A110 `ProRataTime` allocation, remainder treatment (`RetainAll`,
+`CancelMarket`, or `CancelAll`), and the only represented self-trade policy
+(`Permit`). The selected fills are authoritative. Pairing walks both fill
+vectors in canonical order; a same-account pair is a trade, not prevention.
+Book-local trade identity and one
 collection revision advance only at commit. Positive residual leaves remain lot
 aligned and at or below the entry maximum but may be below the new-order
 minimum.
@@ -1813,7 +1816,7 @@ A66-style auction image, reconstructs reservations from active orders, and is
 released only after full history replay through the coupled gate; A99/A100
 stage that proof.
 
-Snapshot-v12 kind `5` and `DurableCallAuctionRiskEngine` bind a canonical
+Snapshot-v13 kind `5` and `DurableCallAuctionRiskEngine` bind a canonical
 definition/profile prefix, risk-aware command/report replay, one
 dangling-command completion, exact uncut prefix proof, and
 single-file/segmented A/B cutover. Dynamic profile/control mutation,
@@ -3217,7 +3220,7 @@ specific rules.
 **Dependent results.** [A1, A5, A9, A15, A20, A21, A22, A37, A39, A45, A50,
 A70, A83, A88, A102, A103, A105] Allocation-free `O(1)`-space threshold
 inspection, atomic failure, reserve/hidden-aware eligibility, stop activation,
-no-change public projection, risk release, stable WAL-v12/snapshot-v12 bytes,
+no-change public projection, risk release, stable WAL-v13/snapshot-v13 bytes,
 checkpoint/WAL recovery, and exact retry are deterministic.
 
 **Falsification probe.** Exercise thresholds below, equal to, and above
@@ -3377,7 +3380,7 @@ one book revision, no accepted-ID/count/level change, and exact queue/account
 aggregate reduction. It emits one replayable `OrderAmended` event in the
 ordinary history lane. Coupled risk removes the exact quantity and conservative
 notional delta without a new entry gate. Public payload v4 emits one anonymous
-`Amended` aggregate delta with unchanged order count. WAL/snapshot v12 preserve
+`Amended` aggregate delta with unchanged order count. WAL/snapshot v13 preserve
 exact retry and checkpoint-plus-suffix recovery.
 
 **Falsification probe.** Exercise market and limit orders at head, middle, and
@@ -3391,6 +3394,51 @@ constraint, price, priority, previous quantity, new quantity, or book revision.
 Any accepted non-reduction, priority/identity change, new risk rejection,
 private public-field disclosure, count drift, duplicate retry effect,
 allocation growth, or recovery divergence falsifies A109.
+
+## A110 — price-class pro-rata auction allocation
+
+**Assumption.** `ProRataTime` receives the same complete canonical order
+population and A60 clearing result as A61. Allocation tiers are one market or
+exact limit-price constraint plus one priority class. Market, economically
+better price, and lower priority-class tiers precede worse tiers. Each order
+quantity and the clearing executable quantity are aligned to the instrument's
+positive quantity increment, which is the allocation quantum.
+
+Every tier before the marginal tier fills completely. If `R` quanta remain in
+a marginal tier containing `Q` quanta, order `i` with `q_i` quanta receives
+`floor(q_i × R / Q)` quanta. Residual quanta are assigned at most once per
+order in ascending priority-sequence/`OrderId` order. Worse tiers receive zero.
+Both sides apply the rule independently and must reconcile to the same
+executable quantity. No size sorting, time weighting, top-order preference,
+minimum allocation, displayed/hidden distinction, or hybrid FIFO percentage is
+inferred.
+
+**Dependent results.** [A1, A4, A12, A15, A60, A62, A63, A64, A65, A66,
+A67, A68, A74, A75, A76, A78, A97, A99, A108, A110] The kernel computes exact
+shares without constructing an overflowing product, using at most four fixed
+64-step multiply/divides per marginal order across validation and
+construction. Validation and fill construction are `O(B + A)` time with
+`O(F_b + F_a)` result space. The collection book uses the
+instrument quantity increment, the engine emits the resulting deterministic
+trade/remainder trace, risk consumes that trace without an independent
+allocation inference, and auction market-data payload v4 remains a projection
+of the same events. WAL v13 and snapshot v13 persist the explicit policy for
+full replay, checkpoint recovery, and exact retry. A61 price-time behavior
+remains separately selectable and byte-tagged.
+
+**Falsification probe.** Exercise market, better-price, marginal-price, and
+priority-class boundaries; non-unit quantity increments; base shares of zero;
+multiple residual quanta; equal priority sequences with `OrderId` tie breaks;
+balanced and one-sided excess; and totals whose direct `u64 × u128` product
+exceeds `u128`. Reject zero quantum, off-quantum order quantities, malformed
+canonical order, aggregate disagreement, zero execution, and bounded-capacity
+failure before output or mutation. Differentially compare at least 20,000
+generated small-integer plans with direct arithmetic. Compare price-time and
+pro-rata divergence through book preparation, pairing, engine events, risk,
+codec tags, full-WAL recovery, snapshot recovery, and exact retry. Any
+truncation approximation, non-FIFO residual, tier leakage, off-grid fill,
+side-total disagreement, policy loss, replay divergence, or capacity growth
+falsifies A110.
 
 ## Bounded scope expansion
 
@@ -3420,12 +3468,19 @@ capability, a remaining risk, or an opportunity.
   aggregate/risk release and one anonymous public delta. Venue-specific price/
   side amendment, quantity increase, and protocol-adapter semantics remain
   outside this state machine and require an explicit versioned policy.
+- **High impact:** call-auction uncross now selects explicit price-time or
+  price/class-tier pro-rata-time allocation. Pro-rata shares use exact
+  instrument-increment floors, FIFO residual quanta, deterministic trade
+  pairing, and WAL-v13/snapshot-v13 recovery. Venue algorithms that rank by
+  size, weight by time, reserve top-order or minimum shares, split FIFO and
+  pro-rata percentages, or distinguish display categories remain separate
+  conformance work rather than aliases of `ProRataTime`.
 - **High impact:** call-auction collection and sequencing now support bounded
   account/side mass cancellation through an intrusive owner index. One accepted
   command selects `K` orders independently of unrelated active interest, emits
   canonical ascending removals plus one aggregate completion, increments the
   book revision exactly once when `K > 0`, releases each risk reservation, and
-  recovers under WAL/snapshot version 12. Public payload version 4 projects the
+  recovers under WAL/snapshot version 13. Public payload version 4 projects the
   same complete batch without account or scope identity. Authenticated firm,
   session, or cross-shard scope and completion aggregation remain external.
 - **High impact risk:** the auction writer lease is local ownership, not a
@@ -3513,9 +3568,10 @@ capability, a remaining risk, or an opportunity.
   separate bounded call-auction book
   now collects crossed market/limit interest, replaces owned orders atomically
   under a fresh identity and priority, mass-cancels account/side interest in
-  canonical order, feeds statically banded aggregate discovery, produces one
-  price-time order-level allocation plan, and consumes it through deterministic
-  process-local pairing and one atomic book commit. A bounded sequenced
+  canonical order, feeds statically banded aggregate discovery, produces an
+  explicitly selected price-time or price/class-tier pro-rata-time order-level
+  allocation plan, and consumes it through deterministic process-local pairing
+  and one atomic book commit. A bounded sequenced
   controller now adds explicit collection/freeze/close phases, exact revision/
   auction identity, sequenced business outcomes, idempotency, and protected
   terminal history. Stable auction wire schemas,
@@ -3524,7 +3580,8 @@ capability, a remaining risk, or an opportunity.
   phase/trade/final-clearing publication with retained complete-batch replay
   and gap-repair snapshots are implemented. Reference/dynamic-band
   construction, indicative publication,
-  auction display and pro-rata/size/venue allocation policies, preventive
+  auction display and venue-specific size-ranked, time-weighted, minimum-share,
+  or hybrid allocation policies, preventive
   self-trade policies, auction-ledger integration, settlement, authenticated
   public/private transport, market-on-auction and imbalance-only order types,
   authoritative external continuous stop-reference ingestion, pegged triggers,

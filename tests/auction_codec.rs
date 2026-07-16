@@ -1,4 +1,6 @@
-use quotick::auction::{AuctionOrderConstraint, AuctionPriceGrid, AuctionPricePolicy};
+use quotick::auction::{
+    AuctionAllocationPolicy, AuctionOrderConstraint, AuctionPriceGrid, AuctionPricePolicy,
+};
 use quotick::auction_book::{
     CallAuctionOrder, CallAuctionRemainderPolicy, CallAuctionSelfTradePolicy,
     CallAuctionUncrossPolicy,
@@ -130,6 +132,13 @@ fn replace(
 }
 
 fn uncross(command_id: u64) -> CallAuctionCommand {
+    uncross_with_allocation(command_id, AuctionAllocationPolicy::PriceTime)
+}
+
+fn uncross_with_allocation(
+    command_id: u64,
+    allocation: AuctionAllocationPolicy,
+) -> CallAuctionCommand {
     let grid = AuctionPriceGrid::new(1).unwrap();
     CallAuctionCommand::Uncross(CallAuctionUncrossCommand {
         command_id: CommandId::new(command_id).unwrap(),
@@ -146,6 +155,7 @@ fn uncross(command_id: u64) -> CallAuctionCommand {
         reference_price: Price::from_raw(100),
         price_policy: AuctionPricePolicy::PRESSURE_THEN_REFERENCE_HIGHER,
         uncross_policy: CallAuctionUncrossPolicy::new(
+            allocation,
             CallAuctionRemainderPolicy::CancelAll,
             CallAuctionSelfTradePolicy::Permit,
         ),
@@ -177,6 +187,7 @@ fn every_call_auction_command_variant_round_trips() {
         cancel(3, 1, 1),
         replace(4, 1, auction_order(2, 1, Side::Sell, 3)),
         uncross(5),
+        uncross_with_allocation(8, AuctionAllocationPolicy::ProRataTime),
         mass_cancel(6, 1, MassCancelScope::Side(Side::Buy)),
         amend(7, 1, 1, 4),
     ];
@@ -184,6 +195,54 @@ fn every_call_auction_command_variant_round_trips() {
         let encoded = command.encode().unwrap();
         assert_eq!(CallAuctionCommand::decode(&encoded).unwrap(), command);
     }
+}
+
+#[test]
+fn call_auction_uncross_policy_has_stable_explicit_allocation_tags() {
+    let price_time = uncross(5).encode().unwrap();
+    let pro_rata = uncross_with_allocation(5, AuctionAllocationPolicy::ProRataTime)
+        .encode()
+        .unwrap();
+
+    assert_eq!(price_time.len(), 78);
+    assert_eq!(price_time[65..70], [1, 1, 0, 2, 0]);
+    assert_eq!(pro_rata[65..70], [1, 1, 1, 2, 0]);
+    assert_eq!(
+        CallAuctionCommand::decode(&pro_rata).unwrap(),
+        uncross_with_allocation(5, AuctionAllocationPolicy::ProRataTime)
+    );
+}
+
+#[test]
+fn pro_rata_completion_has_a_stable_explicit_allocation_tag() {
+    let mut engine = CallAuctionEngine::try_new(definition()).unwrap();
+    for command in [
+        phase(1, 0, CallAuctionPhase::Collecting),
+        submit(2, auction_order(1, 1, Side::Buy, 10)),
+        submit(3, auction_order(2, 2, Side::Buy, 20)),
+        submit(4, auction_order(3, 3, Side::Sell, 15)),
+        phase(5, 1, CallAuctionPhase::Frozen),
+    ] {
+        engine.submit(command).unwrap();
+    }
+    let report = engine
+        .submit(uncross_with_allocation(
+            6,
+            AuctionAllocationPolicy::ProRataTime,
+        ))
+        .unwrap();
+    let encoded = report.encode().unwrap();
+    let completion_start = encoded.len() - 1 - 108;
+
+    assert_eq!(encoded[completion_start + 24], 5);
+    assert_eq!(
+        encoded[completion_start + 73..completion_start + 76],
+        [1, 2, 0]
+    );
+    assert_eq!(
+        CallAuctionExecutionReport::decode(&encoded).unwrap(),
+        report
+    );
 }
 
 #[test]
@@ -311,6 +370,16 @@ fn call_auction_codecs_reject_invalid_tags_lengths_bands_and_report_grammar() {
         ))
     );
 
+    let mut invalid_allocation = uncross(1).encode().unwrap();
+    invalid_allocation[67] = 255;
+    assert_eq!(
+        CallAuctionCommand::decode(&invalid_allocation),
+        Err(CodecError::InvalidTag {
+            type_name: "AuctionAllocationPolicy",
+            tag: 255,
+        })
+    );
+
     let report = representative_reports().remove(0);
     let mut zero_sequence = report.encode().unwrap();
     zero_sequence[8..16].copy_from_slice(&0_u64.to_le_bytes());
@@ -358,7 +427,7 @@ fn call_auction_codecs_reject_invalid_tags_lengths_bands_and_report_grammar() {
         ))
     );
 
-    let completion_start = uncross.len() - 1 - 107;
+    let completion_start = uncross.len() - 1 - 108;
     let mut zero_execution = uncross.clone();
     zero_execution[completion_start + 41..completion_start + 73].fill(0);
     assert_eq!(

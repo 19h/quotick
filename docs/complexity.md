@@ -153,11 +153,13 @@ constant market interest, and evaluates full constant-state intervals inside
 an aligned band without enumerating the numeric price range or allocating.
 
 For `O_b` supplied buy orders, `O_a` supplied sell orders, and `F_b + F_a`
-positive fills, price-time allocation is `O(O_b + O_a)` time and
-`O(F_b + F_a)` result space. Both fill-vector capacity requests use the exact
-derived cardinalities and succeed before either side is constructed; the
-allocator may grant more capacity, and no vector grows while fills are
-emitted.
+positive fills, both price-time and price/class-tier pro-rata-time allocation
+are `O(O_b + O_a)` time and `O(F_b + F_a)` result space. Pro-rata allocation
+uses at most four fixed 64-step exact multiply/divides per marginal order
+across cardinality validation and fill construction; no product wider than
+`u128` is constructed. Both fill-vector capacity requests use the exact derived
+cardinalities and succeed before either side is constructed; the allocator may
+grant more capacity, and no vector grows while fills are emitted.
 
 ## Call-auction collection book
 

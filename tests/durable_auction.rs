@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use quotick::auction::{
-    AuctionOrderConstraint, AuctionPriceBand, AuctionPriceGrid, AuctionPricePolicy,
+    AuctionAllocationPolicy, AuctionOrderConstraint, AuctionPriceBand, AuctionPriceGrid,
+    AuctionPricePolicy,
 };
 use quotick::auction_book::{
     CallAuctionBookLimits, CallAuctionBookLimitsSpec, CallAuctionOrder, CallAuctionRemainderPolicy,
@@ -12,8 +13,9 @@ use quotick::auction_book::{
 use quotick::auction_engine::{
     CallAuctionAmendOrder, CallAuctionCheckpoint, CallAuctionCheckpointCapture, CallAuctionCommand,
     CallAuctionEngine, CallAuctionEngineError, CallAuctionEngineLimits,
-    CallAuctionEngineLimitsSpec, CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl,
-    CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionExecutionReport,
+    CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl, CallAuctionReplaceOrder,
+    CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use quotick::codec::{BinaryCodec, CodecError};
 use quotick::durable_auction::{
@@ -219,6 +221,22 @@ fn uncross_for(
     revision: u64,
     remainder: CallAuctionRemainderPolicy,
 ) -> CallAuctionCommand {
+    uncross_for_allocation(
+        command_id,
+        auction_id,
+        revision,
+        AuctionAllocationPolicy::PriceTime,
+        remainder,
+    )
+}
+
+fn uncross_for_allocation(
+    command_id: u64,
+    auction_id: AuctionId,
+    revision: u64,
+    allocation: AuctionAllocationPolicy,
+    remainder: CallAuctionRemainderPolicy,
+) -> CallAuctionCommand {
     CallAuctionCommand::Uncross(CallAuctionUncrossCommand {
         command_id: CommandId::new(command_id).unwrap(),
         instrument_id: InstrumentId::new(71).unwrap(),
@@ -234,6 +252,7 @@ fn uncross_for(
         reference_price: Price::from_raw(100),
         price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
         uncross_policy: CallAuctionUncrossPolicy::new(
+            allocation,
             remainder,
             CallAuctionSelfTradePolicy::Permit,
         ),
@@ -258,6 +277,21 @@ fn frame_wire_tags(path: &Path) -> Vec<u16> {
         .map(|frame| {
             let offset = usize::try_from(frame.unwrap().offset()).unwrap();
             u16::from_le_bytes(bytes[offset + 6..offset + 8].try_into().unwrap())
+        })
+        .collect()
+}
+
+fn trade_triplets(report: &CallAuctionExecutionReport) -> Vec<(u64, u64, u64)> {
+    report
+        .events
+        .iter()
+        .filter_map(|event| match event.kind {
+            CallAuctionEventKind::Trade(trade) => Some((
+                trade.buy_order_id().get(),
+                trade.sell_order_id().get(),
+                trade.quantity().lots(),
+            )),
+            _ => None,
         })
         .collect()
 }
@@ -632,6 +666,67 @@ fn durable_auction_round_trip_recovers_phase_book_trades_and_exact_retry() {
 }
 
 #[test]
+fn pro_rata_uncross_recovers_identically_from_wal_and_snapshot_history() {
+    let area = TestPath::directory("pro-rata-recovery");
+    fs::create_dir_all(area.path()).unwrap();
+    let wal = area.join("auction.wal");
+    let snapshot = area.join("auction.qsnp");
+    let mut durable = DurableCallAuctionEngine::open(&wal, definition(), options()).unwrap();
+    for command in [
+        phase(1, 0, CallAuctionPhase::Collecting),
+        submit(2, order(1, 1, Side::Buy, 10)),
+        submit(3, order(2, 2, Side::Buy, 20)),
+        submit(4, order(3, 3, Side::Sell, 15)),
+        phase(5, 1, CallAuctionPhase::Frozen),
+    ] {
+        durable.submit(command).unwrap();
+    }
+    let command = uncross_for_allocation(
+        6,
+        auction(),
+        2,
+        AuctionAllocationPolicy::ProRataTime,
+        CallAuctionRemainderPolicy::CancelAll,
+    );
+    let report = durable.submit(command).unwrap();
+    assert_eq!(trade_triplets(&report), vec![(1, 3, 5), (2, 3, 10)]);
+    let verified = durable
+        .capture_checkpoint_candidate()
+        .unwrap()
+        .verify()
+        .unwrap();
+    durable
+        .write_verified_checkpoint(&snapshot, &verified, SnapshotOptions::default())
+        .unwrap();
+    durable.close().unwrap();
+
+    let mut wal_recovered = DurableCallAuctionEngine::open(&wal, definition(), options()).unwrap();
+    let wal_replay = wal_recovered.submit(command).unwrap();
+    assert!(wal_replay.replayed);
+    assert_eq!(trade_triplets(&wal_replay), vec![(1, 3, 5), (2, 3, 10)]);
+    wal_recovered.close().unwrap();
+
+    let mut snapshot_recovered = DurableCallAuctionEngine::open_with_checkpoint(
+        &wal,
+        &snapshot,
+        definition(),
+        options(),
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(snapshot_recovered.recovery().checkpointed_commands, 6);
+    assert_eq!(snapshot_recovered.recovery().replayed_commands, 0);
+    let snapshot_replay = snapshot_recovered.submit(command).unwrap();
+    assert!(snapshot_replay.replayed);
+    assert_eq!(
+        trade_triplets(&snapshot_replay),
+        vec![(1, 3, 5), (2, 3, 10)]
+    );
+    snapshot_recovered.engine().validate().unwrap();
+    snapshot_recovered.close().unwrap();
+}
+
+#[test]
 fn durable_cancel_replace_recovers_new_identity_priority_and_exact_retry() {
     let file = TestPath::file("replace");
     let mut durable = DurableCallAuctionEngine::open(file.path(), definition(), options()).unwrap();
@@ -960,7 +1055,7 @@ fn auction_checkpoint_has_stable_kind_codec_and_direct_restore() {
     SnapshotFile::write(&snapshot, &shared, SnapshotOptions::default()).unwrap();
     let bytes = fs::read(snapshot).unwrap();
     assert_eq!(&bytes[0..4], b"QSNP");
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 12);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 13);
     assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 4);
 }
 
