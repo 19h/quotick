@@ -28,6 +28,7 @@ Contents:
 - [Ledger checkpoints](#ledger-checkpoints)
 - [Ledger operations](#ledger-operations)
 - [Borrowed ledger history](#borrowed-ledger-history)
+- [Account-and-asset ledger statements](#account-and-asset-ledger-statements)
 - [Point-in-time ledger balances](#point-in-time-ledger-balances)
 
 ## Instrument catalog
@@ -910,15 +911,31 @@ adversarial transaction-hash collision cluster can increase complete traversal
 to `O(T^2)` without storage growth. The compatibility `record` method adds one
 immutable outer-handle clone after the same resolver succeeds.
 
+### Account-and-asset ledger statements
+
+For `R` retained records containing `T` transaction entries whose posting
+counts are `L_i`, `account_statement` composes borrowed history resolution
+with one `O(log(L_i + 1))` binary search over each entry's canonical
+`(asset, account)` posting order. Complete traversal is expected
+`O(T + sum(log(L_i + 1)))` time with `O(1)` iterator state. A full adversarial
+transaction-index collision cluster can increase history resolution to
+`O(T^2)` without storage growth.
+
+Forward and reverse traversal borrow each selected entry and posting, allocate
+no output or auxiliary storage, and mutate no ledger or durable state. The
+iterator still resolves and checks records with no matching posting, so sparse
+selection changes output cardinality but not the complete-history traversal
+bound.
+
 ### Point-in-time ledger balances
 
-For a requested prefix containing `R` records, `E` transaction entries, and
-`L` posting legs, `try_balance_at` performs expected `O(E + L)` time with
-`O(1)` auxiliary space. The selected key is scanned through two sign-filtered
-passes per record; this is a constant factor, and each pass visits every entry
-and posting leg at most once. Generation zero and future-generation rejection
-are `O(1)`. A current-generation query adds one expected `O(1)` balance-index
-lookup and equality check.
+For a requested prefix containing `R` records and `E` transaction entries
+whose posting counts are `L_i`, `try_balance_at` performs expected
+`O(E + sum(log(L_i + 1)))` time with `O(1)` auxiliary space. The selected key
+is looked up through two sign-filtered passes per record; this is a constant
+factor, and each pass visits every entry at most once. Generation zero and
+future-generation rejection are `O(1)`. A current-generation query adds one
+expected `O(1)` balance-index lookup and equality check.
 
 The query returns one `i128`, allocates no output or auxiliary storage, and
 mutates no ledger or durable state. Entry, correction, and batch records are

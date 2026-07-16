@@ -136,6 +136,22 @@ fn durable_batch_is_one_frame_one_event_and_exact_retry_adds_no_frame() {
             .collect::<Vec<_>>(),
         [transaction(1), transaction(2)]
     );
+    assert_eq!(
+        recovered
+            .ledger()
+            .account_statement(account(1), asset())
+            .map(|line| {
+                let line = line.unwrap();
+                (
+                    line.sequence(),
+                    line.transaction_index(),
+                    line.entry().transaction_id(),
+                    line.posting().amount,
+                )
+            })
+            .collect::<Vec<_>>(),
+        [(1, 0, transaction(1), 100), (1, 1, transaction(2), -30),]
+    );
     assert!(recovered.post_batch(batch()).unwrap().replayed);
     recovered.ledger().validate().unwrap();
 }
@@ -240,6 +256,26 @@ fn batch_grouping_survives_checkpoint_prefix_and_wal_suffix_recovery() {
     assert!(matches!(history[0].record(), LedgerRecordView::Batch(_)));
     assert_eq!(history[1].sequence(), 2);
     assert!(matches!(history[1].record(), LedgerRecordView::Entry(_)));
+    assert_eq!(
+        recovered
+            .ledger()
+            .account_statement(account(1), asset())
+            .map(|line| {
+                let line = line.unwrap();
+                (
+                    line.sequence(),
+                    line.transaction_index(),
+                    line.entry().transaction_id(),
+                    line.posting().amount,
+                )
+            })
+            .collect::<Vec<_>>(),
+        [
+            (1, 0, transaction(1), 100),
+            (1, 1, transaction(2), -30),
+            (2, 0, transaction(3), 5),
+        ]
+    );
     assert!(recovered.post_batch(value).unwrap().replayed);
     recovered.ledger().validate().unwrap();
 }

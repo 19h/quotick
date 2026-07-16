@@ -4203,24 +4203,25 @@ transaction-index resolution. Entry, correction, and ordered-batch records are
 indivisible; no correction or batch member is a queryable boundary.
 
 For the selected `(AccountId, AssetId)` key, reconstruction scans each
-record's transaction entries in event-declared order. While both term signs
-remain, it consumes a term opposite to the current accumulated sign. Once one
-sign remains, the accumulated value moves monotonically toward the record's
-atomic final value. A current-generation query additionally requires the
-reconstructed value to equal the authoritative balance index. The query owns
-no output, allocates no auxiliary storage, and changes no balance, index,
+record's transaction entries in event-declared order and uses the canonical
+`(asset, account)` posting order for binary-search lookup. While both term
+signs remain, it consumes a term opposite to the current accumulated sign.
+Once one sign remains, the accumulated value moves monotonically toward the
+record's atomic final value. A current-generation query additionally requires
+the reconstructed value to equal the authoritative balance index. The query
+owns no output, allocates no auxiliary storage, and changes no balance, index,
 journal, capacity, WAL, snapshot, or checkpoint state.
 
 **Dependent results.** [A6, A11, A12, A29, A31, A36, A42, A69, A79, A89,
 A90, A121, A122] Generation zero and absent keys return zero. Corrections and
 batches expose only their atomic final effects, including cancelling signed
 extremes whose member order would overflow. For `E` inspected transaction
-entries and `L` inspected posting legs, the query performs expected `O(E + L)`
-time and `O(1)` auxiliary space; the two sign passes are a constant factor. A
-full adversarial transaction-index collision cluster can increase index
-resolution to `O(E^2)` without storage growth. Direct checkpoint, full-WAL,
-and checkpoint-prefix/WAL-suffix recovery reproduce the same generation and
-balance without a wire-version change.
+entries whose posting counts are `L_i`, the query performs expected
+`O(E + sum(log(L_i + 1)))` time and `O(1)` auxiliary space; the two sign passes
+are a constant factor. A full adversarial transaction-index collision cluster
+can increase index resolution to `O(E^2)` without storage growth. Direct
+checkpoint, full-WAL, and checkpoint-prefix/WAL-suffix recovery reproduce the
+same generation and balance without a wire-version change.
 
 **Falsification probe.** Query empty, first, intermediate, current, and future
 generations; known and absent keys; positive, negative, and zero crossings;
@@ -4381,6 +4382,53 @@ reserve leaves omitted ahead of a hidden target, priority divergence, silent
 relevant corruption, mutation, allocation, or implied fill prediction
 falsifies A125.
 
+## A126 — zero-copy account-and-asset ledger statements
+
+**Assumption.** `JournalEntry::posting` binary-searches the canonical
+`(asset, account)` posting order established by entry validation. Because one
+entry cannot repeat an `(AccountId, AssetId)` key, a present lookup identifies
+exactly one immutable posting.
+
+`Ledger::account_statement` observes one immutable ledger generation and
+composes the A121 retained-history resolver. It yields one
+`LedgerStatementLine` for every transaction containing the selected account
+and asset, in ledger-record and event-declared transaction order. Each line
+borrows the canonical `JournalEntry` and `Posting` and retains the enclosing
+one-based sequence, complete `LedgerRecordView`, and zero-based transaction
+position, so filtering does not erase entry, correction, or batch boundaries.
+Reverse traversal yields the exact reverse order. A journal/index
+contradiction is emitted as its typed `LedgerHistoryError` at that record
+position rather than being filtered as absence.
+
+The interface creates no second account-history index or owned output,
+allocates no successful-path storage, and changes no balance, index, journal,
+capacity, WAL, snapshot, or checkpoint state. It is process-local filtering,
+not principal authentication, account authorization, entitlement, audit
+export, remote pagination, transport, or generation rollover.
+
+**Dependent results.** [A11, A12, A29, A30, A42, A69, A79, A89, A90, A121,
+A126] For `R` records containing `T` transactions whose posting counts are
+`L_i`, complete traversal performs expected
+`O(T + sum(log(L_i + 1)))` work with `O(1)` iterator state and no output
+allocation. A full adversarial transaction-index collision cluster can
+increase history resolution to `O(T^2)` without storage growth. Empty and
+absent-key statements are empty. Direct checkpoint, full-WAL, and checkpoint-
+prefix/WAL-suffix recovery retain identical line order, values, grouping, and
+pointer-borrowing semantics without a wire-version change.
+
+**Falsification probe.** Exercise present and absent keys across ordinary
+entries, both correction members, multi-entry batches, unrelated accounts and
+assets, empty history, and interleaved forward/reverse traversal. Compare at
+least 1,024 generated records with an independent literal transaction/posting
+filter in both directions. Require entry/posting pointer identity, exact
+sequence and transaction position, unchanged generation/balance/capacity
+state, and no successful-path allocation. Remove or mismatch a transaction-
+index row and require the exact A121 error rather than omission. Repeat after
+direct-checkpoint, full-WAL, and checkpoint-prefix/WAL-suffix restoration. Any
+duplicate, omitted, reordered, cloned, or wrongly grouped posting; linear leg
+scan; silent contradiction; mutation; allocation; recovery difference; or
+implied authorization falsifies A126.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -4477,12 +4525,19 @@ capability, a remaining risk, or an opportunity.
   prefix/WAL-suffix recovery. Target-hardware latency and cache behavior for
   maximum-history scans remain unknown until measured.
 
+- **Medium impact:** account-and-asset statement filtering now streams borrowed
+  canonical postings in both directions under A126 without a secondary index
+  or output allocation. Stable record sequence, transaction position, and
+  complete atomic grouping remain attached to every line. Maximum-history
+  scan latency and sparse-key selectivity on target hardware remain unknown
+  until measured.
+
 - **High impact risk:** the local history views expose complete private
-  command/report and ledger-event content to their in-process caller.
-  Authentication,
-  account-scoped authorization/filtering, entitlement, remote pagination and
-  transport, audit export, eviction, and fenced generation rollover remain
-  separate interfaces or lifecycle protocols.
+  command/report and ledger-event content to their in-process caller. A126
+  provides local account-and-asset filtering but no authentication or
+  authorization. Entitlement, remote pagination and transport, audit export,
+  eviction, and fenced generation rollover remain separate interfaces or
+  lifecycle protocols.
 
 - **High impact:** continuous FOK and minimum-quantity IOC now have atomic
   behavior under all four STP policies. FOK decrement-and-cancel requires the

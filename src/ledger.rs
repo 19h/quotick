@@ -901,6 +901,138 @@ impl<'a> RetainedLedgerRecord<'a> {
     }
 }
 
+/// One borrowed posting selected for an account-and-asset statement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LedgerStatementLine<'a> {
+    retained: RetainedLedgerRecord<'a>,
+    transaction_index: usize,
+    entry: &'a JournalEntry,
+    posting: &'a Posting,
+}
+
+impl<'a> LedgerStatementLine<'a> {
+    /// Returns the stable one-based sequence of the enclosing ledger event.
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.retained.sequence()
+    }
+
+    /// Returns the complete borrowed event containing this posting.
+    #[must_use]
+    pub const fn record(self) -> LedgerRecordView<'a> {
+        self.retained.record()
+    }
+
+    /// Returns the zero-based transaction position inside the enclosing event.
+    #[must_use]
+    pub const fn transaction_index(self) -> usize {
+        self.transaction_index
+    }
+
+    /// Returns the canonical transaction entry containing this posting.
+    #[must_use]
+    pub const fn entry(self) -> &'a JournalEntry {
+        self.entry
+    }
+
+    /// Returns the exact signed posting selected by the statement key.
+    #[must_use]
+    pub const fn posting(self) -> &'a Posting {
+        self.posting
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LedgerStatementRecord<'a> {
+    retained: Option<RetainedLedgerRecord<'a>>,
+    error: Option<LedgerHistoryError>,
+    account_id: AccountId,
+    asset_id: AssetId,
+    front: usize,
+    back: usize,
+}
+
+impl<'a> LedgerStatementRecord<'a> {
+    fn new(
+        retained: Result<RetainedLedgerRecord<'a>, LedgerHistoryError>,
+        account_id: AccountId,
+        asset_id: AssetId,
+    ) -> Self {
+        match retained {
+            Ok(retained) => Self {
+                retained: Some(retained),
+                error: None,
+                account_id,
+                asset_id,
+                front: 0,
+                back: retained.record().transaction_count(),
+            },
+            Err(error) => Self {
+                retained: None,
+                error: Some(error),
+                account_id,
+                asset_id,
+                front: 0,
+                back: 0,
+            },
+        }
+    }
+
+    fn line(&self, transaction_index: usize) -> Option<LedgerStatementLine<'a>> {
+        let retained = self.retained?;
+        let entry = retained.record().transaction(transaction_index)?;
+        let posting = entry.posting(self.account_id, self.asset_id)?;
+        Some(LedgerStatementLine {
+            retained,
+            transaction_index,
+            entry,
+            posting,
+        })
+    }
+}
+
+impl<'a> Iterator for LedgerStatementRecord<'a> {
+    type Item = Result<LedgerStatementLine<'a>, LedgerHistoryError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(error) = self.error.take() {
+            return Some(Err(error));
+        }
+        while self.front < self.back {
+            let transaction_index = self.front;
+            self.front += 1;
+            if let Some(line) = self.line(transaction_index) {
+                return Some(Ok(line));
+            }
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.error.is_some() {
+            return (1, Some(1));
+        }
+        (0, Some(self.back - self.front))
+    }
+}
+
+impl DoubleEndedIterator for LedgerStatementRecord<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if let Some(error) = self.error.take() {
+            return Some(Err(error));
+        }
+        while self.front < self.back {
+            self.back -= 1;
+            if let Some(line) = self.line(self.back) {
+                return Some(Ok(line));
+            }
+        }
+        None
+    }
+}
+
+impl std::iter::FusedIterator for LedgerStatementRecord<'_> {}
+
 /// Ledger validation or arithmetic failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LedgerError {
@@ -1495,6 +1627,20 @@ impl JournalEntry {
     #[must_use]
     pub fn postings(&self) -> &[Posting] {
         self.postings.as_slice()
+    }
+
+    /// Returns this entry's posting for one account and asset, if present.
+    ///
+    /// The canonical posting order makes lookup `O(log(L + 1))` for `L`
+    /// posting legs. The returned value borrows the immutable posting vector.
+    #[must_use]
+    pub fn posting(&self, account_id: AccountId, asset_id: AssetId) -> Option<&Posting> {
+        self.postings
+            .binary_search_by_key(&(asset_id, account_id), |posting| {
+                (posting.asset_id, posting.account_id)
+            })
+            .ok()
+            .map(|index| &self.postings[index])
     }
 
     /// Returns whether two immutable entries share the identical posting vector.
@@ -4376,6 +4522,28 @@ impl Ledger {
             .map(move |(index, record)| self.resolve_retained_record(index, record))
     }
 
+    /// Iterates retained postings for one account and asset in journal order.
+    ///
+    /// Each line borrows its canonical entry and posting, retains the enclosing
+    /// entry/correction/batch view and stable sequence, and identifies the
+    /// transaction's zero-based position inside that event. The iterator is
+    /// double-ended and allocates no output or auxiliary storage.
+    ///
+    /// Resolving `R` records containing `T` transactions and posting counts
+    /// `L_i` performs expected `O(T + sum(log(L_i + 1)))` work with `O(1)`
+    /// iterator state. This is local filtering only; authorization and remote
+    /// pagination are external lifecycle responsibilities.
+    #[must_use]
+    pub fn account_statement(
+        &self,
+        account_id: AccountId,
+        asset_id: AssetId,
+    ) -> impl DoubleEndedIterator<Item = Result<LedgerStatementLine<'_>, LedgerHistoryError>> + '_
+    {
+        self.retained_history()
+            .flat_map(move |retained| LedgerStatementRecord::new(retained, account_id, asset_id))
+    }
+
     /// Reconstructs one signed balance after an exact committed record boundary.
     ///
     /// Generation zero denotes the empty ledger. Corrections and batches are
@@ -4490,10 +4658,7 @@ impl Ledger {
             let index = *transaction_index;
             *transaction_index += 1;
             let entry = record.transaction(index)?;
-            if let Some(posting) = entry
-                .postings()
-                .iter()
-                .find(|posting| posting.account_id == account_id && posting.asset_id == asset_id)
+            if let Some(posting) = entry.posting(account_id, asset_id)
                 && posting.amount.is_positive() == positive
             {
                 return Some(posting.amount);
@@ -5586,6 +5751,12 @@ mod resource_limit_tests {
         );
         assert!(std::error::Error::source(&error).is_none());
         assert_eq!(missing.retained_history().next(), Some(Err(error)));
+        assert_eq!(
+            missing
+                .account_statement(AccountId::new(1).unwrap(), AssetId::new(1).unwrap())
+                .next(),
+            Some(Err(error))
+        );
         let as_of_error = missing
             .try_balance_at(1, AccountId::new(1).unwrap(), AssetId::new(1).unwrap())
             .unwrap_err();
@@ -5608,6 +5779,15 @@ mod resource_limit_tests {
                 sequence: 1,
                 transaction_id,
             })
+        );
+        assert_eq!(
+            mismatched
+                .account_statement(AccountId::new(1).unwrap(), AssetId::new(1).unwrap())
+                .next(),
+            Some(Err(LedgerHistoryError::TransactionMismatch {
+                sequence: 1,
+                transaction_id,
+            }))
         );
     }
 

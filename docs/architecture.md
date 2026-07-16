@@ -1472,10 +1472,27 @@ periods, batches, and recovery.
       authoritative balance index. The operation allocates no output or
       auxiliary storage and performs no ledger, WAL, snapshot, or checkpoint
       mutation.
-    - For `E` inspected transaction entries and `L` inspected posting legs,
-      reconstruction is expected `O(E + L)` time with `O(1)` auxiliary space.
-      A full adversarial transaction-index collision cluster can increase the
-      index-resolution component to `O(E^2)` without storage growth.
+    - For `E` inspected transaction entries whose posting counts are `L_i`,
+      reconstruction is expected `O(E + sum(log(L_i + 1)))` time with `O(1)`
+      auxiliary space. A full adversarial transaction-index collision cluster
+      can increase the index-resolution component to `O(E^2)` without storage
+      growth.
+48. `JournalEntry::posting` uses the canonical `(asset, account)` order to
+    locate one unique posting in `O(log(L + 1))` time for `L` entry legs.
+    `Ledger::account_statement` composes that lookup with the invariant-46
+    resolver for every retained transaction under one immutable ledger borrow.
+    - Every `LedgerStatementLine` borrows its exact entry and posting and
+      carries the enclosing stable sequence, complete `LedgerRecordView`, and
+      zero-based transaction position. Entry, correction, and batch grouping
+      therefore survives account-and-asset filtering.
+    - Forward and reverse traversal preserve exact journal/transaction order.
+      A journal/index contradiction remains a typed history error at its record
+      position; it is not filtered as an absent account posting.
+    - For `T` transactions whose posting counts are `L_i`, complete traversal
+      is expected `O(T + sum(log(L_i + 1)))` time with `O(1)` iterator state.
+      It allocates no output or auxiliary storage and does not mutate ledger or
+      durable state. Authentication, authorization, remote pagination,
+      transport, and audit export remain external lifecycle interfaces.
 
 Signed balances are intentional accounting state. Credit limits, collateral,
 and margin are not inferred by the ledger. The implemented order risk layer
@@ -2253,6 +2270,12 @@ batch grouping, chronological and reverse traversal, transaction-order
 iteration, shared-storage identity, nonmutation, typed missing/mismatched-index
 failure, direct checkpoint restoration, and checkpoint-prefix/WAL-suffix
 recovery.
+Account-and-asset statement tests cover canonical binary posting lookup,
+pointer-identical borrowed lines, exact record/transaction positions, entry/
+correction/batch grouping, absent and unrelated keys, interleaved forward and
+reverse traversal, nonmutation, typed history corruption, and an independent
+literal filter over 1,024 generated records. Direct checkpoint, full-WAL, and
+checkpoint-prefix/WAL-suffix recovery preserve the same ordered lines.
 Point-in-time ledger-balance tests cover the empty, first, current, and future
 generation boundaries; absent keys; atomic corrections and extreme cancelling
 batches; 1,024 generated record boundaries; typed history, overflow, and
@@ -2498,7 +2521,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Security boundary | authenticated principals, authorization policy, secret management, audit export, and abuse controls |
 | Medium | Gateways and schemas | versioned binary protocol, FIX adapter, backpressure, session recovery, and conformance fixtures |
 | Medium | Market-data distribution | constructor-reserved per-instrument short-gap replay for continuous updates and complete call-auction command batches, with typed gap/collision/eviction/boundary handling and snapshot fallback, is implemented; remaining work is authenticated transport framing, entitlement, fanout, remote retransmission sessions, bandwidth control, and conformance fixtures |
-| Medium | Order-management and ledger history | bounded zero-copy live lookup and chronological iteration over continuous/call-auction command/report history, typed fail-closed ledger record history, and allocation-free exact point-in-time ledger balance reconstruction are implemented and survive WAL/checkpoint recovery; remaining work is authenticated account-scoped authorization, filtering, remote pagination/transport, audit export, and fenced history-generation rollover |
+| Medium | Order-management and ledger history | bounded zero-copy live lookup and chronological iteration over continuous/call-auction command/report history, typed fail-closed ledger record history, allocation-free account/asset posting filtering, and allocation-free exact point-in-time ledger balance reconstruction are implemented and survive WAL/checkpoint recovery; remaining work is authenticated account-scoped authorization, remote pagination/transport, audit export, and fenced history-generation rollover |
 | Medium | Operations | metrics, traces, structured logs, health, capacity limits, alert rules, and runbooks |
 | Medium | Performance evidence | pinned-hardware benchmarks, allocation counts, tail latency, saturation, and regression thresholds |
 | Medium | Verification expansion | model-based/property tests, fuzzing, crash simulation, concurrency model checking, and long soak tests |
