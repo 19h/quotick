@@ -109,6 +109,15 @@ price-level removals in `O(K log P)`, independent of total active-order count
 `O`. Total time is `O(K(log K + log P))` with `O(K)` prepared scratch space.
 Block-and-cancel has the identical bound; enable is expected `O(1)`.
 
+The conditional mass-cancel variant moves that exact `K`-member traversal and
+sort into preparation, then performs `K` expected constant-time active-order
+lookups and fixed selected-row validations while constructing exactly reserved
+caller output. Accepted commit validates and drains the same prepared IDs
+without another account-list traversal or sort. Its asymptotic matching bound
+remains `O(K(log K + log P))`; the constructor-owned lease retains `O(K)` ID
+scratch and the caller-owned observation adds `O(K)` rows. Decline and unwind
+omit all price-level removals.
+
 For `K` GTD orders at or before one inclusive expiry watermark, preparation
 counts the ordered expiry prefix in `O(K + 1)` time and leases `O(K)` existing
 selection scratch. Commit traverses that prefix again in canonical
@@ -641,6 +650,27 @@ ordinary commit releases the existing reservation. Durable acceptance and
 business rejection append two existing frames; observation failure, decline,
 unwind, and replay append zero. No command/report codec, event bound, or fixed
 authoritative state changes.
+
+`try_submit_mass_cancel_if` composes ordinary `MassCancel` preparation with
+canonical selection into the preparation's fixed-capacity lease, exactly
+reserved complete selected-state output, a predicate, and ordinary mass-cancel
+commit. Let `A` be ordinary preparation cost, `K` selected orders, `F`
+predicate cost, and `M` ordinary mass-cancel commit cost. The expected `O(1)`
+account lookup, `K`-member traversal, in-place sort, and `K` selected-row
+lookups/validation cost expected `O(K log K)`.
+
+Acceptance is `O(A + K log K + F + M)` time; decline is
+`O(A + K log K + F)` time. Accepted commit reuses the prepared IDs and does not
+repeat account-list selection or sorting. The constructor-owned lease contains
+`O(K)` ID scratch, caller output owns `O(K)` `ActiveOrderSnapshot` rows, and
+evaluator auxiliary state is `O(1)`. Core rejection and exact replay skip
+selection, output reservation, and `F`; a valid empty selection invokes `F`
+with zero rows. Coupled acceptance releases `K` reservations in expected
+`O(K)` time. Durable acceptance and business rejection append two existing
+frames; output failure, decline, unwind, and replay append zero. Count and
+quantity calculations use exact integer arithmetic with zero approximation
+error. No command/report codec, event bound, or fixed authoritative state
+changes.
 
 ## Default matching limits and memory
 

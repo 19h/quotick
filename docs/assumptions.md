@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A145 are stable and are referenced from code comments and other
+identifiers A1-A146 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -5584,6 +5584,82 @@ on noncommit, missing reservation release on acceptance, interposed shard
 transition, durable protocol or recovery drift, or new wire value falsifies
 A145.
 
+## A146 — atomic conditional mass-cancellation observation
+
+**Assumption.** One `try_submit_mass_cancel_if` call on an `OrderBook`,
+`RiskManagedOrderBook`, `DurableOrderBook`, or `DurableRiskOrderBook` holds the
+corresponding exclusive mutable shard borrow across ordinary `MassCancel`
+preparation, canonical selected-ID construction in that preparation's move-only
+A87 lease, complete caller-owned selected-state construction, a borrowed local
+predicate, and commit of that same preparation. It reuses the ordinary mass-
+cancellation, coupled-risk trace, report, persistence, and recovery paths.
+
+For a core-admissible all-order or one-side scope containing `K` active orders,
+selection performs one expected A41 account lookup, traverses exactly those
+intrusive members, validates owner/side/link/count state, and sorts unique IDs
+in ascending `OrderId` order inside the already leased vector. One exact
+fallible request for `K` `ActiveOrderSnapshot` rows then materializes every
+selected fully displayed, reserve, fully hidden, or dormant-stop state through
+the A138 exact-order validator. `MassCancelObservation` binds that ordered
+state to instrument ID, immutable definition version, last visible book event
+sequence, account, scope, selected count, and the checked exact `u128` sum of
+total leaves. Caller output never aliases the constructor-owned lease.
+
+Exact replay plus wrong-route, wrong-version, and other core business
+rejections return a reported `ConditionalCommandOutcome` without selection,
+caller output, or predicate execution. An empty valid selection instead
+constructs an empty observation and invokes the predicate. Output reservation
+or selected-list corruption returns `ConditionalOrderError::Query` before the
+predicate or semantic mutation. Predicate decline or unwind drops the
+preparation, clears and returns its lease, and changes no sequence, event,
+matching, risk, history, public, or WAL state. Acceptance validates and consumes
+the identical prepared IDs without another account-list traversal or sort.
+Coupled risk releases exactly those reservations once from the ordinary trace.
+
+Durable acceptance and business rejection retain command-before-state-before-
+report and append two existing frames. Query failure, decline, unwind, and
+replay append zero frames. The observation and callback decision are process-
+local, unencoded, unauthenticated, and valid only within the call. Existing
+command, report, checkpoint, market-data, and wire values are unchanged.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A7, A9, A10, A12, A15, A18,
+A19, A20, A22, A37, A38, A39, A41, A48, A52, A54, A57, A72, A77, A80,
+A81, A82, A84, A87, A103, A117, A138, A145, A146] Let `A` be ordinary
+mass-cancel preparation cost, `K` selected orders, `F` predicate cost, and `M`
+ordinary mass-cancel commit cost. Selection, ascending canonicalization, and
+complete snapshot validation cost expected `O(K log K)` after the expected
+`O(1)` account lookup. Acceptance costs `O(A + K log K + F + M)` and decline
+costs `O(A + K log K + F)`. Accepted commit does not repeat the selection or
+sort. The fixed prepared lease owns `O(K)` selected-ID scratch and the returned
+or retained caller observation owns `O(K)` rows; evaluator auxiliary state is
+`O(1)`. Core rejection and replay retain their existing preparation path and
+skip selection, caller allocation, and `F`. Coupled risk adds expected `O(K)`
+reservation release on acceptance. Durable acceptance and business rejection
+append two existing frames; query failure, decline, unwind, and replay append
+zero. Count and quantity arithmetic is exact integer arithmetic; approximation
+error is zero.
+
+**Falsification probe.** Across all four surfaces, exercise empty, all-order,
+buy-only, and sell-only scopes over mixed fully displayed, reserve, fully
+hidden, dormant stop-market, and dormant stop-limit state with nonmonotonic
+identities. Run accepting, declining, and unwinding predicates. Require exact
+instrument/version/sequence/account/scope provenance, ascending IDs, complete
+snapshots, selected count, `u128` total leaves, unchanged unrelated orders, and
+one predicate call for a valid empty selection. Exercise wrong route/version,
+every core rejection, exact retry, command-ID collision, selected-output
+reservation failure, account-list corruption, selection-pool exhaustion, and
+durable write/report failure.
+
+Count predicate and allocation calls; compare selection-pool availability,
+private/public book, risk positions/reservations/exposures, command history,
+WAL frames, and plain/coupled-risk reopen state. Any selection, output, or
+predicate on rejection or replay; unrelated-order scan; noncanonical,
+incomplete, aliased, or provenance-drifted observation; second selection at
+commit; mutation or WAL growth before acceptance; lease loss; reservation
+release on noncommit or missing release on acceptance; interposed shard
+transition; durable protocol or recovery drift; or new wire value falsifies
+A146.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -5814,6 +5890,28 @@ capability, a remaining risk, or an opportunity.
   only within one synchronous process-local call. It provides no remote or
   asynchronous validity, callback authentication or durability, cross-shard
   cancellation, or external cancel-on-behalf authorization.
+
+- **High impact:** A146 closes the account-query-to-mass-cancel race inside one
+  local call. The predicate receives the exact canonical selected resting and
+  dormant-stop states, count, total leaves, scope, and book provenance that the
+  accepted preparation removes across plain, coupled-risk, durable, and
+  durable-risk books.
+
+- **Medium impact opportunity:** one mass-cancellation predicate can gate on
+  exact per-order price, leaves, working quantity, display mode, expiry,
+  dormant trigger state, aggregate selected quantity, and source sequence
+  without correlating a separate account-order query.
+
+- **Medium impact risk:** conditional mass cancellation materializes `O(K)`
+  private caller output and executes its predicate synchronously while the
+  shard is exclusively borrowed. Allocation, validation, callback latency, and
+  external blocking extend local cancellation latency; no callback deadline or
+  scheduling isolation is provided.
+
+- **High impact boundary:** A146 is one process-local synchronous account/scope
+  decision. It adds no remote or asynchronous validity, callback
+  authentication or durability, cross-shard firm/session kill coordination,
+  delegated cancel-on-behalf authorization, or completion aggregation.
 
 - **Medium impact opportunity:** one predicate can gate immediate slippage,
   per-price concentration, passive resting admission, reserve/hidden residual

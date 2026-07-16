@@ -25,9 +25,10 @@ use crate::matching::{
     ConditionalExecutionPreflight, ConditionalExecutionPreparation, ConditionalOrderOutcome,
     ExecutionReport, ImmediateExecutionCurve, ImmediateExecutionCurveOutcome,
     ImmediateExecutionOutcome, ImmediateExecutionQuote, ImmediateExecutionSubmission,
-    InvariantViolation, MatchingError, NewOrder, OrderBook, OrderBookCheckpoint,
-    OrderBookCheckpointCapture, OrderBookCheckpointError, OrderBookLimits, OrderBookQueryError,
-    OrderExecution, PreparedCommand, ReplaceOrder, evaluate_conditional_execution,
+    InvariantViolation, MassCancel, MassCancelObservation, MatchingError, NewOrder, OrderBook,
+    OrderBookCheckpoint, OrderBookCheckpointCapture, OrderBookCheckpointError, OrderBookLimits,
+    OrderBookQueryError, OrderExecution, PreparedCommand, ReplaceOrder,
+    evaluate_conditional_execution,
 };
 use crate::snapshot::{
     CheckpointAnchor, CheckpointCutoverReceipt, CheckpointSlot, SnapshotError, SnapshotFile,
@@ -857,6 +858,27 @@ impl DurableOrderBook {
         self.submit_conditional_cancel_order(cancellation, |_, observation| Ok(observation), accept)
     }
 
+    /// Durably materializes and conditionally applies one account mass cancel.
+    ///
+    /// Replay and core rejection bypass selection and `accept`. Otherwise the
+    /// predicate borrows complete selected resting and dormant-stop states
+    /// before WAL append. Output failure, decline, or unwind changes neither
+    /// WAL nor semantic state. Acceptance persists and commits the preparation
+    /// containing the same canonical selected identifiers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] for poison, preparation, selected-output,
+    /// journal, or commit failure. A post-acknowledgement failure poisons the
+    /// instance for deterministic reopen recovery.
+    pub fn try_submit_mass_cancel_if(
+        &mut self,
+        command: MassCancel,
+        accept: impl FnOnce(&MassCancelObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<MassCancelObservation>, DurableError> {
+        self.submit_conditional_mass_cancel(command, |_, observation| Ok(observation), accept)
+    }
+
     /// Durably and atomically quotes and conditionally submits one canonical IOC order.
     ///
     /// Replay and core rejection bypass `accept`. A declined quote is returned
@@ -968,6 +990,21 @@ impl DurableOrderBook {
         let preflight = self
             .book
             .prepare_conditional_cancel_order::<DurableError>(cancellation)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_mass_cancel<T>(
+        &mut self,
+        command: MassCancel,
+        observe: impl FnOnce(&OrderBook, MassCancelObservation) -> Result<T, DurableError>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, DurableError> {
+        if self.is_poisoned() {
+            return Err(DurableError::Poisoned);
+        }
+        let preflight = self
+            .book
+            .prepare_conditional_mass_cancel::<DurableError>(command)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 

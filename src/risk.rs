@@ -20,10 +20,11 @@ use crate::matching::{
     ConditionalCommandOutcome, ConditionalExecutionPreflight, ConditionalExecutionPreparation,
     ConditionalOrderError, ConditionalOrderOutcome, EventKind, ExecutionReport,
     ImmediateExecutionCurve, ImmediateExecutionCurveOutcome, ImmediateExecutionOutcome,
-    ImmediateExecutionQuote, ImmediateExecutionSubmission, MatchingCapacity, MatchingError,
-    NewOrder, OrderBook, OrderBookCheckpoint, OrderBookCheckpointError, OrderBookLimits,
-    OrderBookLimitsSpec, OrderBookQueryError, OrderExecution, OrderType, PreparedCommand,
-    RejectReason, ReplaceOrder, SelfTradePrevention, Trade, evaluate_conditional_execution,
+    ImmediateExecutionQuote, ImmediateExecutionSubmission, MassCancel, MassCancelObservation,
+    MatchingCapacity, MatchingError, NewOrder, OrderBook, OrderBookCheckpoint,
+    OrderBookCheckpointError, OrderBookLimits, OrderBookLimitsSpec, OrderBookQueryError,
+    OrderExecution, OrderType, PreparedCommand, RejectReason, ReplaceOrder, SelfTradePrevention,
+    Trade, evaluate_conditional_execution,
 };
 
 /// Account-level order-entry state.
@@ -2115,6 +2116,27 @@ impl RiskManagedOrderBook {
         self.submit_conditional_cancel_order(cancellation, |_, observation| Ok(observation), accept)
     }
 
+    /// Atomically materializes and conditionally applies one coupled mass cancel.
+    ///
+    /// Core rejection and replay bypass selection and `accept`. Otherwise the
+    /// predicate borrows complete selected resting and dormant-stop states in
+    /// canonical order. Decline, unwind, or query failure changes neither
+    /// matching nor risk state. Acceptance commits the same selected
+    /// identifiers and releases their reservations exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConditionalOrderError::Matching`] for preparation or coupled
+    /// commit failure and [`ConditionalOrderError::Query`] when caller-owned
+    /// selected state cannot be reserved or validated.
+    pub fn try_submit_mass_cancel_if(
+        &mut self,
+        command: MassCancel,
+        accept: impl FnOnce(&MassCancelObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<MassCancelObservation>, ConditionalOrderError> {
+        self.submit_conditional_mass_cancel(command, |_, observation| Ok(observation), accept)
+    }
+
     /// Atomically risk-gates, quotes, and conditionally submits one canonical IOC order.
     ///
     /// Core or risk rejection and exact replay bypass `accept`. For a command
@@ -2226,6 +2248,19 @@ impl RiskManagedOrderBook {
         self.submit_conditional_execution(preflight, observe, accept)
     }
 
+    fn submit_conditional_mass_cancel<T, E>(
+        &mut self,
+        command: MassCancel,
+        observe: impl FnOnce(&OrderBook, MassCancelObservation) -> Result<T, E>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, E>
+    where
+        E: From<MatchingError> + From<OrderBookQueryError>,
+    {
+        let preflight = self.prepare_conditional_mass_cancel::<E>(command)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
     fn submit_conditional_execution<T, U, E>(
         &mut self,
         preflight: ConditionalExecutionPreflight<T>,
@@ -2290,6 +2325,17 @@ impl RiskManagedOrderBook {
         let preflight = self
             .book
             .prepare_conditional_cancel_order::<E>(cancellation)?;
+        Ok(self.apply_conditional_risk_gate(preflight))
+    }
+
+    pub(crate) fn prepare_conditional_mass_cancel<E>(
+        &self,
+        command: MassCancel,
+    ) -> Result<ConditionalExecutionPreflight<MassCancelObservation>, E>
+    where
+        E: From<MatchingError> + From<OrderBookQueryError>,
+    {
+        let preflight = self.book.prepare_conditional_mass_cancel::<E>(command)?;
         Ok(self.apply_conditional_risk_gate(preflight))
     }
 

@@ -306,6 +306,14 @@ Run any program with `cargo run --example <name>`.
   no matching, risk, history, or WAL state. Acceptance releases the coupled
   reservation exactly once. Plain, coupled-risk, and both durable paths share
   the contract.
+- Conditional mass cancellation binds one canonical account/side selection to
+  the ordinary mass-cancel commit. Its caller-owned observation contains every
+  selected validated resting or dormant-stop state in ascending `OrderId`
+  order plus exact count, total leaves, scope, and book provenance. Acceptance
+  consumes the same prepared identifiers without a second account-list
+  selection; query failure, decline, unwind, and replay preserve matching,
+  risk, history, and WAL state. Plain, coupled-risk, and both durable paths
+  share the contract.
 - A fallible private immediate-execution curve uses that same reserve/hidden/
   STP scanner to return one exact market-ordered aggregate per contributing
   price. It requests capacity for the exact row count before copying, then
@@ -392,7 +400,9 @@ Run any program with `cargo run --example <name>`.
   risk gate before their quote-, curve-, or dormant-state acceptance predicate
   and retain the existing risk authorization and trace application on commit.
   Conditional cancellation observes after ordinary coupled preparation and
-  releases the target reservation only on commit.
+  releases the target reservation only on commit. Conditional mass
+  cancellation likewise releases exactly the observed selected reservations
+  only on commit.
 - Reservation lifecycle derived from the sequenced trace across fills,
   cancellation, GTD expiry, stop arming/activation, replacement, mass
   cancellation, account controls, and self-trade prevention; dormant stops
@@ -553,9 +563,9 @@ Live continuous and call-auction command/report history is likewise a local
 borrowed order-management interface; it provides no authenticated remote
 transport, account filtering, entitlement, pagination, audit export, eviction,
 or generation rollover.
-Conditional IOC, new-order, replacement, and cancellation predicates are
-process-local and are not persisted, authenticated, transported, or valid
-across shard borrows.
+Conditional IOC, new-order, replacement, cancellation, and mass-cancellation
+predicates are process-local and are not persisted, authenticated, transported,
+or valid across shard borrows.
 Their synchronous execution extends the exclusive local shard borrow. A
 dormant-stop observation contains no activation-time forecast, and active
 minimum-quantity IOC observations must be interpreted with the submitted
@@ -600,7 +610,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 145 tagged assumptions (A1–A145), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 146 tagged assumptions (A1–A146), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -670,9 +680,10 @@ includes:
   admission and replenishment, frozen-best market-to-limit pricing and
   residuals, conditional fixed-quote and exact per-price-curve execution for
   canonical IOC, every new-order shape, continuous replacement, and continuous
-  cancellation, including explicit dormant-stop state, accept/decline/unwind,
-  and core, risk, replay, WAL, and recovery boundaries, GTD intake and canonical
-  expiry sweeps, dormant stop intake, canonical bounded trigger sweeps,
+  cancellation and mass cancellation, including explicit dormant-stop state,
+  canonical selected-state output, accept/decline/unwind, and core, risk,
+  replay, WAL, and recovery boundaries, GTD intake and canonical expiry sweeps,
+  dormant stop intake, canonical bounded trigger sweeps,
   activation-time failures,
   mass cancellation, account and trading-state controls, every self-trade
   policy, atomic FOK decrement-and-cancel barriers and exact minimum-quantity

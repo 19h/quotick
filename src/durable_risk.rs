@@ -22,9 +22,9 @@ use crate::matching::{
     ActiveOrderObservation, CancelOrder, Command, CommandPreparation, ConditionalCommandOutcome,
     ConditionalExecutionPreflight, ConditionalExecutionPreparation, ConditionalOrderOutcome,
     ExecutionReport, ImmediateExecutionCurve, ImmediateExecutionCurveOutcome,
-    ImmediateExecutionOutcome, ImmediateExecutionQuote, ImmediateExecutionSubmission,
-    MatchingError, NewOrder, OrderBook, OrderBookQueryError, OrderExecution, PreparedCommand,
-    ReplaceOrder, evaluate_conditional_execution,
+    ImmediateExecutionOutcome, ImmediateExecutionQuote, ImmediateExecutionSubmission, MassCancel,
+    MassCancelObservation, MatchingError, NewOrder, OrderBook, OrderBookQueryError, OrderExecution,
+    PreparedCommand, ReplaceOrder, evaluate_conditional_execution,
 };
 use crate::risk::{
     AccountRiskDefinition, RiskError, RiskInvariantViolation, RiskManagedCheckpoint,
@@ -988,6 +988,26 @@ impl DurableRiskOrderBook {
         self.submit_conditional_cancel_order(cancellation, |_, observation| Ok(observation), accept)
     }
 
+    /// Durably materializes and conditionally applies one coupled mass cancel.
+    ///
+    /// Replay and core rejection bypass selection and `accept`. Otherwise the
+    /// predicate borrows complete canonical selected state before WAL mutation.
+    /// Output failure, decline, or unwind changes neither WAL nor coupled
+    /// semantic state. Acceptance persists and commits the same identifiers,
+    /// releasing every selected reservation exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableRiskError`] for poison, preparation, selected-output,
+    /// journal, or coupled commit failure.
+    pub fn try_submit_mass_cancel_if(
+        &mut self,
+        command: MassCancel,
+        accept: impl FnOnce(&MassCancelObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<MassCancelObservation>, DurableRiskError> {
+        self.submit_conditional_mass_cancel(command, |_, observation| Ok(observation), accept)
+    }
+
     /// Durably risk-gates, quotes, and conditionally submits one canonical IOC order.
     ///
     /// Replay plus core or risk rejection bypass `accept`. Decline occurs
@@ -1101,6 +1121,21 @@ impl DurableRiskOrderBook {
         let preflight = self
             .managed
             .prepare_conditional_cancel_order::<DurableRiskError>(cancellation)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_mass_cancel<T>(
+        &mut self,
+        command: MassCancel,
+        observe: impl FnOnce(&OrderBook, MassCancelObservation) -> Result<T, DurableRiskError>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, DurableRiskError> {
+        if self.is_poisoned() {
+            return Err(DurableRiskError::Poisoned);
+        }
+        let preflight = self
+            .managed
+            .prepare_conditional_mass_cancel::<DurableRiskError>(command)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 
