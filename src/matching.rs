@@ -2473,6 +2473,8 @@ impl DisplayedLiquidityQuote {
 pub enum OrderBookQueryResource {
     /// Public aggregate price levels.
     DepthLevels,
+    /// Private immediate-execution price levels.
+    ImmediateExecutionLevels,
     /// Complete private resting-order snapshots.
     ActiveOrders,
     /// Active order identifiers selected from one account list.
@@ -2483,6 +2485,7 @@ impl fmt::Display for OrderBookQueryResource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::DepthLevels => "depth-level output",
+            Self::ImmediateExecutionLevels => "immediate-execution-level output",
             Self::ActiveOrders => "active-order output",
             Self::AccountOrderIds => "account-order-identifier output",
         })
@@ -2898,6 +2901,7 @@ pub struct ImmediateExecutionQuote {
     unfilled_quantity_lots: u64,
     raw_price_notional: i128,
     worst_execution_price: Option<Price>,
+    contributing_level_count: usize,
     termination: ImmediateExecutionTermination,
 }
 
@@ -2962,10 +2966,104 @@ impl ImmediateExecutionQuote {
         self.worst_execution_price
     }
 
+    /// Returns the number of distinct prices contributing external execution.
+    #[must_use]
+    pub const fn contributing_level_count(self) -> usize {
+        self.contributing_level_count
+    }
+
     /// Returns why the hypothetical immediate execution stopped.
     #[must_use]
     pub const fn termination(self) -> ImmediateExecutionTermination {
         self.termination
+    }
+}
+
+/// Exact external execution aggregated at one private-book price.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImmediateExecutionLevel {
+    price: Price,
+    executed_quantity: Quantity,
+}
+
+impl ImmediateExecutionLevel {
+    fn new(price: Price, executed_quantity_lots: u64) -> Self {
+        Self {
+            price,
+            executed_quantity: Quantity::new(executed_quantity_lots)
+                .expect("an execution-curve level must contain external execution"),
+        }
+    }
+
+    /// Returns this level's private execution price.
+    #[must_use]
+    pub const fn price(self) -> Price {
+        self.price
+    }
+
+    /// Returns this level's positive externally executed quantity.
+    #[must_use]
+    pub const fn executed_quantity(self) -> Quantity {
+        self.executed_quantity
+    }
+
+    /// Returns this level's externally executed quantity in lots.
+    #[must_use]
+    pub const fn executed_quantity_lots(self) -> u64 {
+        self.executed_quantity.lots()
+    }
+
+    /// Returns exact signed raw-price notional for this level.
+    #[must_use]
+    pub const fn raw_price_notional(self) -> i128 {
+        self.price.raw() as i128 * self.executed_quantity.lots() as i128
+    }
+}
+
+/// Exact private execution economics partitioned by contributing price.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImmediateExecutionCurve {
+    quote: ImmediateExecutionQuote,
+    levels: Vec<ImmediateExecutionLevel>,
+}
+
+impl ImmediateExecutionCurve {
+    fn new(quote: ImmediateExecutionQuote, levels: Vec<ImmediateExecutionLevel>) -> Self {
+        debug_assert_eq!(quote.contributing_level_count(), levels.len());
+        debug_assert_eq!(
+            quote.executed_quantity_lots(),
+            levels
+                .iter()
+                .map(|level| level.executed_quantity_lots())
+                .sum()
+        );
+        debug_assert_eq!(
+            quote.raw_price_notional(),
+            levels.iter().map(|level| level.raw_price_notional()).sum()
+        );
+        debug_assert_eq!(
+            quote.worst_execution_price(),
+            levels.last().map(|level| level.price())
+        );
+        Self { quote, levels }
+    }
+
+    /// Returns the complete fixed-size execution quote summarized by the curve.
+    #[must_use]
+    pub const fn quote(&self) -> ImmediateExecutionQuote {
+        self.quote
+    }
+
+    /// Returns contributing prices in aggressor market-priority order.
+    #[must_use]
+    pub fn levels(&self) -> &[ImmediateExecutionLevel] {
+        &self.levels
+    }
+
+    /// Consumes the curve into its quote and caller-owned price-level output.
+    #[must_use]
+    pub fn into_parts(self) -> (ImmediateExecutionQuote, Vec<ImmediateExecutionLevel>) {
+        (self.quote, self.levels)
     }
 }
 
@@ -6503,6 +6601,7 @@ struct ImmediateExecutionQuoteBuilder {
     book_event_sequence: u64,
     request: ImmediateExecutionRequest,
     totals: ExecutionQuoteTotals,
+    contributing_level_count: usize,
 }
 
 impl ImmediateExecutionQuoteBuilder {
@@ -6518,11 +6617,20 @@ impl ImmediateExecutionQuoteBuilder {
             book_event_sequence,
             request,
             totals: ExecutionQuoteTotals::new(request.quantity.lots()),
+            contributing_level_count: 0,
         }
     }
 
-    fn record_execution(&mut self, price: Price, quantity_lots: u64) {
+    fn record_execution(&mut self, price: Price, quantity_lots: u64) -> bool {
+        if quantity_lots == 0 {
+            return false;
+        }
         self.totals.record_execution(price, quantity_lots);
+        self.contributing_level_count = self
+            .contributing_level_count
+            .checked_add(1)
+            .expect("contributing prices cannot exceed addressable price levels");
+        true
     }
 
     fn finish(
@@ -6551,6 +6659,7 @@ impl ImmediateExecutionQuoteBuilder {
             unfilled_quantity_lots,
             raw_price_notional: self.totals.raw_price_notional,
             worst_execution_price: self.totals.worst_execution_price,
+            contributing_level_count: self.contributing_level_count,
             termination,
         }
     }
@@ -8303,6 +8412,44 @@ impl OrderBook {
         &self,
         request: ImmediateExecutionRequest,
     ) -> ImmediateExecutionQuote {
+        self.scan_immediate_execution(request, |_, _| {})
+    }
+
+    /// Fallibly returns exact private execution aggregated by contributing price.
+    ///
+    /// The curve and its embedded [`ImmediateExecutionQuote`] are produced by
+    /// the same hidden/reserve/STP scanner. Levels contain external execution
+    /// only and follow aggressor market priority. The query first obtains the
+    /// fixed-size quote and exact contributing-price count, requests capacity
+    /// for exactly that many caller-owned rows, then repeats the immutable scan
+    /// to populate them. The allocator may grant more physical capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrderBookQueryError::ReservationFailed`] if the exact complete
+    /// level output cannot be reserved. No error returns partial output, and
+    /// the query does not mutate or reserve book liquidity.
+    pub fn try_immediate_execution_curve(
+        &self,
+        request: ImmediateExecutionRequest,
+    ) -> Result<ImmediateExecutionCurve, OrderBookQueryError> {
+        let quote = self.immediate_execution_quote(request);
+        let mut levels = reserve_order_book_query_vec(
+            quote.contributing_level_count(),
+            OrderBookQueryResource::ImmediateExecutionLevels,
+        )?;
+        let repeated_quote = self.scan_immediate_execution(request, |price, quantity_lots| {
+            levels.push(ImmediateExecutionLevel::new(price, quantity_lots));
+        });
+        debug_assert_eq!(repeated_quote, quote);
+        Ok(ImmediateExecutionCurve::new(quote, levels))
+    }
+
+    fn scan_immediate_execution(
+        &self,
+        request: ImmediateExecutionRequest,
+        mut record_level: impl FnMut(Price, u64),
+    ) -> ImmediateExecutionQuote {
         let incoming = IncomingPreview {
             account_id: request.account_id,
             side: request.side,
@@ -8317,9 +8464,9 @@ impl OrderBook {
             request,
         );
         if request.self_trade_prevention == SelfTradePrevention::DecrementAndCancel {
-            self.quote_decrement_and_cancel(incoming, quote)
+            self.quote_decrement_and_cancel(incoming, quote, &mut record_level)
         } else {
-            self.quote_barrier_execution(incoming, quote)
+            self.quote_barrier_execution(incoming, quote, &mut record_level)
         }
     }
 
@@ -8327,6 +8474,7 @@ impl OrderBook {
         &self,
         incoming: IncomingPreview,
         mut quote: ImmediateExecutionQuoteBuilder,
+        record_level: &mut impl FnMut(Price, u64),
     ) -> ImmediateExecutionQuote {
         debug_assert_ne!(
             incoming.self_trade_prevention,
@@ -8347,15 +8495,30 @@ impl OrderBook {
                 .expect("enumerated price must have a level");
             match self.immediate_level_liquidity(incoming, level.head, remaining) {
                 LevelLiquidity::Filled => {
-                    quote.record_execution(current_price, remaining);
+                    Self::record_immediate_execution(
+                        &mut quote,
+                        record_level,
+                        current_price,
+                        remaining,
+                    );
                     return quote.finish(0, ImmediateExecutionTermination::Filled);
                 }
                 LevelLiquidity::Remaining(next) => {
-                    quote.record_execution(current_price, remaining - next);
+                    Self::record_immediate_execution(
+                        &mut quote,
+                        record_level,
+                        current_price,
+                        remaining - next,
+                    );
                     remaining = next;
                 }
                 LevelLiquidity::BlockedBySelfTrade(next) => {
-                    quote.record_execution(current_price, remaining - next);
+                    Self::record_immediate_execution(
+                        &mut quote,
+                        record_level,
+                        current_price,
+                        remaining - next,
+                    );
                     return quote.finish(0, ImmediateExecutionTermination::SelfTradePrevention);
                 }
             }
@@ -8367,6 +8530,7 @@ impl OrderBook {
         &self,
         incoming: IncomingPreview,
         mut quote: ImmediateExecutionQuoteBuilder,
+        record_level: &mut impl FnMut(Price, u64),
     ) -> ImmediateExecutionQuote {
         let mut scan = ImmediateExecutionScanState {
             incoming_remaining: incoming.leaves,
@@ -8395,7 +8559,12 @@ impl OrderBook {
             let external_before = scan.external_executed;
             let progress =
                 self.scan_decrement_and_cancel_level(level, incoming.account_id, &mut scan);
-            quote.record_execution(current_price, scan.external_executed - external_before);
+            Self::record_immediate_execution(
+                &mut quote,
+                record_level,
+                current_price,
+                scan.external_executed - external_before,
+            );
             match progress {
                 MinimumScanProgress::Continue => {}
                 MinimumScanProgress::IncomingExhausted => {
@@ -8411,6 +8580,17 @@ impl OrderBook {
                 }
             }
             price = self.next_worse_price(incoming.side.opposite(), current_price);
+        }
+    }
+
+    fn record_immediate_execution(
+        quote: &mut ImmediateExecutionQuoteBuilder,
+        record_level: &mut impl FnMut(Price, u64),
+        price: Price,
+        quantity_lots: u64,
+    ) {
+        if quote.record_execution(price, quantity_lots) {
+            record_level(price, quantity_lots);
         }
     }
 
@@ -12602,13 +12782,14 @@ mod price_level_index_tests {
         AccountControlSnapshot, ActiveOrderObservation, ActiveOrderSnapshot, BuyStopKey, Command,
         CommandOutcome, CommandPreparation, DisplayedLiquidityQuote, DisplayedLiquidityRequest,
         DisplayedLiquidityTermination, DormantStopState, EventTraceBuilder,
-        ImmediateExecutionQuote, ImmediateExecutionRequest, ImmediateExecutionTermination,
-        IncomingPreview, InvariantViolation, LevelSnapshot, MassCancel, MassCancelScope,
-        MatchingCapacity, MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsSpec,
-        OrderBookQueryError, OrderDisplay, OrderQueueClass, OrderSelectionPool, OrderSnapshot,
-        OrderType, PriceLevel, PriceLevels, PublicLevelObservation, RejectReason, ReplaceOrder,
-        RestingOrder, SelfTradePrevention, StopActivation, TimeInForce, TradingStateObservation,
-        try_event_arena,
+        ImmediateExecutionLevel, ImmediateExecutionQuote, ImmediateExecutionRequest,
+        ImmediateExecutionTermination, IncomingPreview, InvariantViolation, LevelSnapshot,
+        MassCancel, MassCancelScope, MatchingCapacity, MatchingError, NewOrder, OrderBook,
+        OrderBookLimits, OrderBookLimitsSpec, OrderBookQueryError, OrderBookQueryResource,
+        OrderDisplay, OrderQueueClass, OrderSelectionPool, OrderSnapshot, OrderType, PriceLevel,
+        PriceLevels, PublicLevelObservation, RejectReason, ReplaceOrder, RestingOrder,
+        SelfTradePrevention, StopActivation, TimeInForce, TradingStateObservation,
+        reserve_order_book_query_vec, try_event_arena,
     };
     use crate::instrument::{
         InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -12857,16 +13038,17 @@ mod price_level_index_tests {
         false
     }
 
-    fn reference_immediate_execution_quote(
+    fn reference_immediate_execution(
         book: &OrderBook,
         incoming: &NewOrder,
-    ) -> ImmediateExecutionQuote {
+    ) -> (ImmediateExecutionQuote, Vec<ImmediateExecutionLevel>) {
         let requested = incoming.quantity.lots();
         let mut remaining = requested;
         let mut executed = 0_u64;
         let mut self_decrement = 0_u64;
         let mut raw_price_notional = 0_i128;
         let mut worst_execution_price = None;
+        let mut execution_levels = Vec::<(Price, u64)>::new();
         let mut price = book.best_price(incoming.side.opposite());
         let termination = 'book: loop {
             let Some(current_price) = price else {
@@ -12897,6 +13079,13 @@ mod price_level_index_tests {
                         }
                     }
                 } else {
+                    if let Some((price, quantity_lots)) = execution_levels.last_mut()
+                        && *price == current_price
+                    {
+                        *quantity_lots += consumed;
+                    } else {
+                        execution_levels.push((current_price, consumed));
+                    }
                     remaining -= consumed;
                     executed += consumed;
                     raw_price_notional += i128::from(current_price.raw()) * i128::from(consumed);
@@ -12919,7 +13108,7 @@ mod price_level_index_tests {
             }
             price = book.next_worse_price(incoming.side.opposite(), current_price);
         };
-        ImmediateExecutionQuote {
+        let quote = ImmediateExecutionQuote {
             instrument_id: book.definition.instrument_id(),
             instrument_version: book.definition.version(),
             book_event_sequence: book.last_event_sequence(),
@@ -12944,8 +13133,14 @@ mod price_level_index_tests {
             unfilled_quantity_lots: remaining,
             raw_price_notional,
             worst_execution_price,
+            contributing_level_count: execution_levels.len(),
             termination,
-        }
+        };
+        let levels = execution_levels
+            .into_iter()
+            .map(|(price, quantity_lots)| ImmediateExecutionLevel::new(price, quantity_lots))
+            .collect();
+        (quote, levels)
     }
 
     fn reference_displayed_liquidity_quote(
@@ -14077,7 +14272,7 @@ mod price_level_index_tests {
     }
 
     #[test]
-    fn immediate_execution_quote_matches_literal_slice_queue_reference() {
+    fn immediate_execution_quote_and_curve_match_literal_slice_queue_reference() {
         let mut generator = Generator(0xe4b7_83d1_20ca_596f);
         for case in 0..20_000 {
             let (book, incoming) = generated_book_and_fok(&mut generator);
@@ -14089,17 +14284,26 @@ mod price_level_index_tests {
                 }
                 OrderType::Stop { .. } => unreachable!("generated order is immediately active"),
             };
-            let actual = book.immediate_execution_quote(ImmediateExecutionRequest::new(
+            let request = ImmediateExecutionRequest::new(
                 incoming.account_id,
                 incoming.side,
                 incoming.quantity,
                 constraint,
                 incoming.self_trade_prevention,
-            ));
-            let reference = reference_immediate_execution_quote(&book, &incoming);
+            );
+            let actual = book.immediate_execution_quote(request);
+            let curve = book.try_immediate_execution_curve(request).unwrap();
+            let (reference, reference_levels) = reference_immediate_execution(&book, &incoming);
             assert_eq!(
                 actual, reference,
                 "immediate-execution quote diverged in generated case {case}; \
+                 incoming={incoming:?}"
+            );
+            assert_eq!(curve.quote(), reference);
+            assert_eq!(
+                curve.levels(),
+                reference_levels,
+                "immediate-execution curve diverged in generated case {case}; \
                  incoming={incoming:?}"
             );
         }
@@ -14161,19 +14365,31 @@ mod price_level_index_tests {
                 account_next: None,
             });
             book.seen_order_ids.insert(order_id);
-            let quote = book.immediate_execution_quote(ImmediateExecutionRequest::new(
+            let request = ImmediateExecutionRequest::new(
                 AccountId::new(1).unwrap(),
                 Side::Sell,
                 Quantity::new(u64::MAX).unwrap(),
                 StopActivation::Market,
                 SelfTradePrevention::CancelAggressor,
-            ));
+            );
+            let quote = book.immediate_execution_quote(request);
             assert_eq!(quote.executed_quantity_lots(), u64::MAX);
             assert_eq!(
                 quote.raw_price_notional(),
                 i128::from(raw_price) * i128::from(u64::MAX)
             );
             assert_eq!(quote.termination(), ImmediateExecutionTermination::Filled);
+            assert_eq!(quote.contributing_level_count(), 1);
+
+            let curve = book.try_immediate_execution_curve(request).unwrap();
+            assert_eq!(curve.quote(), quote);
+            assert_eq!(curve.levels().len(), 1);
+            assert_eq!(curve.levels()[0].price(), Price::from_raw(raw_price));
+            assert_eq!(curve.levels()[0].executed_quantity_lots(), u64::MAX);
+            assert_eq!(
+                curve.levels()[0].raw_price_notional(),
+                i128::from(raw_price) * i128::from(u64::MAX)
+            );
 
             let displayed = book
                 .try_displayed_liquidity_quote(DisplayedLiquidityRequest::new(
@@ -14192,6 +14408,20 @@ mod price_level_index_tests {
                 DisplayedLiquidityTermination::Filled
             );
         }
+    }
+
+    #[test]
+    fn immediate_execution_curve_unrepresentable_output_is_typed() {
+        assert_eq!(
+            reserve_order_book_query_vec::<ImmediateExecutionLevel>(
+                usize::MAX,
+                OrderBookQueryResource::ImmediateExecutionLevels,
+            ),
+            Err(OrderBookQueryError::ReservationFailed {
+                resource: OrderBookQueryResource::ImmediateExecutionLevels,
+                maximum: usize::MAX,
+            })
+        );
     }
 
     #[test]

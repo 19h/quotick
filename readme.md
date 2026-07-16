@@ -285,6 +285,11 @@ Run any program with `cargo run --example <name>`.
   the predicate; decline or unwind changes no identity, sequence, matching,
   risk, or WAL state. Plain, coupled-risk, and both durable paths share the
   contract.
+- A fallible private immediate-execution curve uses that same reserve/hidden/
+  STP scanner to return one exact market-ordered aggregate per contributing
+  price. It requests capacity for the exact row count before copying, then
+  reconciles quantity, signed raw-price notional, and worst price to its
+  embedded quote.
 - Exact-command idempotency: retries replay the cached report without
   consuming capacity, and `CommandId` reuse with different content is a typed
   collision error; event and trade sequences are strictly monotonic.
@@ -527,6 +532,9 @@ transport, account filtering, entitlement, pagination, audit export, eviction,
 or generation rollover.
 Conditional immediate-execution predicates are likewise process-local and are
 not persisted, authenticated, transported, or valid across shard borrows.
+Private immediate-execution curves can disclose executable reserve-hidden and
+fully hidden quantity by price; this local API supplies no authentication,
+entitlement, disclosure policy, remote pagination, or transport.
 
 The matching model is a continuous price-time-priority book with sequenced
 instrument-wide trading-state controls, plus a separate bounded call-auction
@@ -564,7 +572,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 140 tagged assumptions (A1–A140), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 141 tagged assumptions (A1–A141), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -633,8 +641,8 @@ includes:
 - **Matching and risk:** displayed/hidden queue classes, hidden and reserve
   admission and replenishment, frozen-best market-to-limit pricing and
   residuals, conditional immediate-execution accept/decline/unwind and core,
-  risk, replay, WAL, and recovery boundaries, GTD intake and canonical expiry
-  sweeps, dormant
+  risk, replay, WAL, and recovery boundaries, exact private per-price
+  execution curves, GTD intake and canonical expiry sweeps, dormant
   stop intake, canonical bounded trigger sweeps, activation-time failures,
   mass cancellation, account and trading-state controls, every self-trade
   policy, atomic FOK decrement-and-cancel barriers and exact minimum-quantity

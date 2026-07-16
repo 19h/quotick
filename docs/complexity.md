@@ -522,8 +522,20 @@ the same `O(O_c + P_c log(P + 1) + sum_p D_p log(R_p + 1))` time bound stated
 above. Each crossed price contributes one constant-time signed `i128` notional
 update through the accumulator shared with displayed-liquidity quoting, and
 output is one fixed-size value containing provenance, the exact quantity
-partition, worst execution price, and termination. Both paths allocate nothing
-and do not mutate or reserve book state.
+partition, worst execution price, contributing-price count, and termination.
+Both paths allocate nothing and do not mutate or reserve book state.
+
+For `C` distinct prices contributing positive external execution,
+`try_immediate_execution_curve` first performs the applicable quote scan `Q`,
+fallibly requests capacity for exactly `C` rows, then repeats the identical
+immutable scan while appending one aggregate per contributing price. The
+allocator may grant more capacity. Since every row contains at least one lot,
+`C <= min(P_c, q)` for requested quantity `q`. Total work is
+`O(2Q + C) = O(Q)` and caller-owned output is `O(C)`; scanner auxiliary state
+remains `O(1)`. No row append grows after the request succeeds. Allocation
+failure precedes the second scan and returns no partial output. The embedded
+quote, row quantities, derived signed notionals, and final worst price require
+no additional book traversal.
 
 `submit_immediate_execution_if` composes ordinary command preparation, the
 same private quote, a caller predicate of cost `F`, and commit of the same

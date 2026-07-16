@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A140 are stable and are referenced from code comments and other
+identifiers A1-A141 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -4308,8 +4308,9 @@ book event sequence, and complete request. Requested lots equal external
 executed lots plus decrement-and-cancel self-trade-consumed lots plus unfilled
 lots. Raw-price notional is the exact signed `i128` sum of
 `price.raw() × executed lots`; the final external execution price is the worst
-price. Termination distinguishes a complete external fill, self-trade
-prevention, the supplied price limit, and book exhaustion. The quote is an
+price, and the distinct contributing-price count is exact. Termination
+distinguishes a complete external fill, self-trade prevention, the supplied
+price limit, and book exhaustion. The quote is an
 immutable observation, not admission, an account-control or risk decision, a
 fee calculation, a liquidity reservation, a command commitment, or a report
 of the resting-order cancellations that live cancel-resting or cancel-both
@@ -4338,9 +4339,9 @@ least 20,000 generated multi-price books with an independent literal two-class
 slice/requeue model. Require exact quantity partitioning, signed notional,
 worst price, request/provenance binding, unchanged private/public/history state,
 and zero query allocations. Any priority or STP divergence, self quantity
-credited as execution, incorrect termination or notional, overflow, mutation,
-allocation, stale provenance at the observed boundary, or implied execution
-commitment falsifies A124.
+credited as execution, incorrect termination, count, or notional, overflow,
+mutation, allocation, stale provenance at the observed boundary, or implied
+execution commitment falsifies A124.
 
 ## A125 — exact current-slice queue position
 
@@ -5253,6 +5254,54 @@ noncanonical IOC mapping, predicate call on rejection or replay, quote/trace
 divergence, mutation before acceptance, interposed shard state, partial durable
 decision, recovery drift, allocation, or new wire value falsifies A140.
 
+## A141 — exact private immediate-execution curve
+
+**Assumption.** One `try_immediate_execution_curve` call holds one immutable
+`OrderBook` borrow for its complete operation and accepts the same
+`ImmediateExecutionRequest` as A124. Its first shared scanner pass produces the
+complete A124 quote, including the exact count `C` of distinct prices with
+positive external execution. The query fallibly requests capacity for exactly
+`C` `ImmediateExecutionLevel` rows before an identical second shared scanner
+pass populates caller-owned output. The allocator may grant more capacity.
+
+Rows follow aggressor market priority and contain one distinct execution price
+and its positive aggregate external quantity. Each row's exact signed raw-
+price notional is `price.raw() × executed lots`. Row quantities and notionals
+sum to the embedded quote, row count equals its contributing-price count, and
+the final row price equals its worst execution price. Decrement-and-cancel self
+consumption and unfilled quantity remain in the embedded quote and never form
+rows. Cancel-resting and cancel-both projected maker cancellations remain
+outside both outputs.
+
+Reservation failure identifies `ImmediateExecutionLevels` and returns no
+partial curve. The operation does not mutate matching, risk, reservation,
+identity, sequence, history, WAL, snapshot, or public state; it does not
+reserve liquidity or commit a command. The curve and its callback-free local
+query are not encoded and require no wire-version change.
+
+**Dependent results.** [A1, A2, A3, A4, A7, A12, A19, A22, A44, A45, A47,
+A55, A72, A83, A103, A115, A117, A124, A141] For applicable A124 scan cost
+`Q`, requested quantity `q`, and `C <= min(P_c, q)` contributing prices, the
+two scans plus row construction cost `O(2Q + C) = O(Q)` time, `O(1)` scanner
+state, and `O(C)` caller-owned output. Capacity for exactly `C` rows is
+requested before copying; the allocator may grant more, and successful
+population does not grow the vector. Each row stores one `Price` and one
+`Quantity`; exact row notional is derived in `O(1)`.
+
+**Falsification probe.** For both sides, market and limit constraints, signed
+prices, every termination, and all four self-trade policies, exercise
+displayed, reserve, and fully hidden self/external orders, partial reserve
+slices, repeated refresh, empty execution, price limits, and book exhaustion.
+Compare quote and every curve row with committed IOC trades from identical
+state and with at least 20,000 generated books under an independent literal
+two-class slice/requeue model. Require strict market order, distinct positive
+rows, exact count/quantity/notional/worst-price reconciliation, nonmutation,
+an exact capacity request, typed resource attribution, no partial failure
+output, and no wire change. Any self quantity represented as execution,
+duplicate/zero or misordered row, quote/curve/model divergence, hidden/reserve
+priority drift, post-request growth, mutation, or implied commitment falsifies
+A141.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -5437,6 +5486,17 @@ capability, a remaining risk, or an opportunity.
   displayed IOC commit under one exclusive shard borrow. Predicate decline or
   unwind changes no matching, risk, identity, sequence, or WAL state; exact
   replay and business rejection bypass the predicate.
+
+- **High impact:** A141 now exposes that same exact private path as one
+  market-ordered aggregate per externally executed price. It requests capacity
+  for the exact row count before copying, reconciles every row to the embedded
+  A124 quote, and shares the 20,000-case literal reserve/hidden/STP
+  differential.
+
+- **High impact risk:** the curve exposes executable fully hidden and reserve-
+  hidden quantity by price to its process-local caller. Authentication,
+  entitlement, disclosure/conflation policy, remote pagination/transport, and
+  query-rate controls remain outside the order-book API.
 
 - **High impact risk:** a standalone A124 quote still neither reserves
   liquidity nor fences a later borrow. A140 closes only the process-local
