@@ -26,7 +26,7 @@ use crate::bounded_hash::BoundedHashMap;
 use crate::domain::{
     AccountId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side, TradeId,
 };
-use crate::indexed_avl::IndexedAvlMap;
+use crate::indexed_avl::{DirectionalIter, IndexedAvlMap};
 use crate::instrument::{AdmissionError, InstrumentDefinition};
 use crate::matching::MassCancelScope;
 
@@ -393,6 +393,20 @@ pub struct CallAuctionLevelSnapshot {
 }
 
 impl CallAuctionLevelSnapshot {
+    const fn from_occupied_parts(
+        side: Side,
+        price: Price,
+        quantity: u128,
+        order_count: u64,
+    ) -> Self {
+        Self {
+            side,
+            price,
+            quantity,
+            order_count,
+        }
+    }
+
     pub(crate) const fn from_parts(
         side: Side,
         price: Price,
@@ -402,12 +416,12 @@ impl CallAuctionLevelSnapshot {
         if quantity == 0 || order_count == 0 {
             None
         } else {
-            Some(Self {
+            Some(Self::from_occupied_parts(
                 side,
                 price,
                 quantity,
                 order_count,
-            })
+            ))
         }
     }
 
@@ -1418,6 +1432,8 @@ impl std::error::Error for CallAuctionInvariantViolation {}
 /// Caller-owned output constructed by one read-only call-auction book query.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CallAuctionBookQueryResource {
+    /// Anonymized aggregate limit-price levels.
+    LimitDepth,
     /// Canonically ordered active-order identifiers for one account.
     AccountOrderIds,
 }
@@ -1425,6 +1441,7 @@ pub enum CallAuctionBookQueryResource {
 impl fmt::Display for CallAuctionBookQueryResource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::LimitDepth => formatter.write_str("limit-depth output"),
             Self::AccountOrderIds => formatter.write_str("account-order-identifier output"),
         }
     }
@@ -1605,11 +1622,21 @@ impl AuctionPriceLevels {
         self.by_price.iter()
     }
 
-    fn best_price(&self) -> Option<Price> {
+    fn best(&self) -> Option<(Price, AuctionQueue)> {
         match self.side {
-            Side::Buy => self.by_price.last_key_value().map(|(price, _)| *price),
-            Side::Sell => self.by_price.first_key_value().map(|(price, _)| *price),
+            Side::Buy => self
+                .by_price
+                .last_key_value()
+                .map(|(price, queue)| (*price, *queue)),
+            Side::Sell => self
+                .by_price
+                .first_key_value()
+                .map(|(price, queue)| (*price, *queue)),
         }
+    }
+
+    fn best_price(&self) -> Option<Price> {
+        self.best().map(|(price, _)| price)
     }
 }
 
@@ -1904,6 +1931,26 @@ impl CallAuctionBook {
         self.levels(side).best_price()
     }
 
+    /// Returns the most aggressive occupied aggregate limit level on one side.
+    #[must_use]
+    pub fn best_limit_level(&self, side: Side) -> Option<CallAuctionLevelSnapshot> {
+        self.levels(side)
+            .best()
+            .map(|(price, queue)| Self::limit_level_snapshot(side, price, queue))
+    }
+
+    /// Returns one occupied aggregate limit level by side and price.
+    ///
+    /// The lookup is `O(log(P + 1))` for `P` occupied prices and does not
+    /// allocate.
+    #[must_use]
+    pub fn limit_level(&self, side: Side, price: Price) -> Option<CallAuctionLevelSnapshot> {
+        self.levels(side)
+            .get(price)
+            .copied()
+            .map(|queue| Self::limit_level_snapshot(side, price, queue))
+    }
+
     /// Returns active market quantity on one side in instrument-defined lots.
     #[must_use]
     pub fn market_quantity(&self, side: Side) -> u128 {
@@ -1916,17 +1963,53 @@ impl CallAuctionBook {
         self.market_queue(side).order_count
     }
 
-    /// Returns anonymized limit depth in best-to-worst price order.
+    /// Fallibly returns anonymized limit depth in best-to-worst price order.
     ///
     /// Market-constrained interest is reported separately by
-    /// [`Self::market_quantity`] and [`Self::market_order_count`]. This query is
-    /// `O(min(P, limit))` time and result space for `P` occupied prices.
+    /// [`Self::market_quantity`] and [`Self::market_order_count`]. The complete
+    /// bounded result is reserved before the first level is copied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionBookQueryError::ReservationFailed`] without partial
+    /// output if the caller-owned result vector cannot be reserved.
+    pub fn try_limit_depth(
+        &self,
+        side: Side,
+        limit: usize,
+    ) -> Result<Vec<CallAuctionLevelSnapshot>, CallAuctionBookQueryError> {
+        let maximum = self.levels(side).len().min(limit);
+        let mut output =
+            reserve_call_auction_book_query_vec(maximum, CallAuctionBookQueryResource::LimitDepth)?;
+        output.extend(self.limit_depth_iter(side).take(limit));
+        Ok(output)
+    }
+
+    /// Returns anonymized limit depth using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if result-vector allocation fails. Use
+    /// [`Self::try_limit_depth`] when allocation failure must remain typed.
     #[must_use]
     pub fn limit_depth(&self, side: Side, limit: usize) -> Vec<CallAuctionLevelSnapshot> {
-        match side {
-            Side::Buy => self.limit_depth_levels(side).rev().take(limit).collect(),
-            Side::Sell => self.limit_depth_levels(side).take(limit).collect(),
-        }
+        self.try_limit_depth(side, limit)
+            .expect("call-auction book limit-depth output allocation failed")
+    }
+
+    /// Iterates anonymized limit depth in market-priority order without
+    /// allocating.
+    ///
+    /// Bids are descending and asks are ascending. Market-constrained interest
+    /// is excluded. The iterator is double-ended and exact-sized. Creating it
+    /// is `O(log(P + 1))`; consuming it is `O(P)` time for `P` occupied prices
+    /// and `O(1)` auxiliary space.
+    #[must_use]
+    pub fn limit_depth_iter(
+        &self,
+        side: Side,
+    ) -> impl DoubleEndedIterator<Item = CallAuctionLevelSnapshot> + ExactSizeIterator + '_ {
+        DirectionalIter::new(self.limit_depth_levels(side), side == Side::Buy)
     }
 
     /// Iterates aggregate limit depth in ascending price order without allocating.
@@ -1936,12 +2019,20 @@ impl CallAuctionBook {
     ) -> impl DoubleEndedIterator<Item = CallAuctionLevelSnapshot> + ExactSizeIterator + '_ {
         self.levels(side)
             .iter()
-            .map(move |(&price, queue)| CallAuctionLevelSnapshot {
-                side,
-                price,
-                quantity: queue.total_quantity,
-                order_count: queue.order_count,
-            })
+            .map(move |(&price, queue)| Self::limit_level_snapshot(side, price, *queue))
+    }
+
+    const fn limit_level_snapshot(
+        side: Side,
+        price: Price,
+        queue: AuctionQueue,
+    ) -> CallAuctionLevelSnapshot {
+        CallAuctionLevelSnapshot::from_occupied_parts(
+            side,
+            price,
+            queue.total_quantity,
+            queue.order_count,
+        )
     }
 
     /// Returns immutable state for one active order.
@@ -4029,7 +4120,7 @@ mod tests {
         AuctionOrderConstraint, AuctionQueue, CallAuctionBook, CallAuctionBookLimits,
         CallAuctionBookLimitsSpec, CallAuctionBookQueryError, CallAuctionBookQueryResource,
         CallAuctionCancellation, CallAuctionCapacity, CallAuctionConstructionError,
-        CallAuctionOrder, CallAuctionTrade, CallAuctionUncrossPool,
+        CallAuctionLevelSnapshot, CallAuctionOrder, CallAuctionTrade, CallAuctionUncrossPool,
         reserve_call_auction_book_query_vec, try_uncross_vector,
     };
     use crate::auction::AuctionOrderFill;
@@ -4091,16 +4182,32 @@ mod tests {
 
     #[test]
     fn unrepresentable_book_query_is_typed_and_nonpoisoning() {
-        let resource = CallAuctionBookQueryResource::AccountOrderIds;
-        let error =
-            reserve_call_auction_book_query_vec::<OrderId>(usize::MAX, resource).unwrap_err();
-        assert_eq!(
-            error,
-            CallAuctionBookQueryError::ReservationFailed {
-                resource,
-                maximum: usize::MAX,
-            }
-        );
+        for (error, resource) in [
+            (
+                reserve_call_auction_book_query_vec::<CallAuctionLevelSnapshot>(
+                    usize::MAX,
+                    CallAuctionBookQueryResource::LimitDepth,
+                )
+                .unwrap_err(),
+                CallAuctionBookQueryResource::LimitDepth,
+            ),
+            (
+                reserve_call_auction_book_query_vec::<OrderId>(
+                    usize::MAX,
+                    CallAuctionBookQueryResource::AccountOrderIds,
+                )
+                .unwrap_err(),
+                CallAuctionBookQueryResource::AccountOrderIds,
+            ),
+        ] {
+            assert_eq!(
+                error,
+                CallAuctionBookQueryError::ReservationFailed {
+                    resource,
+                    maximum: usize::MAX,
+                }
+            );
+        }
     }
 
     #[test]

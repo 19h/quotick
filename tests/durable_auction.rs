@@ -472,6 +472,24 @@ fn durable_staged_auction_checkpoint_replays_only_post_capture_suffix() {
         recovered
             .engine()
             .book()
+            .limit_depth_iter(Side::Buy)
+            .map(|level| { (level.price().raw(), level.quantity(), level.order_count(),) })
+            .collect::<Vec<_>>(),
+        [(100, 5, 1)]
+    );
+    assert_eq!(
+        recovered
+            .engine()
+            .book()
+            .try_limit_depth(Side::Sell, usize::MAX)
+            .unwrap()[0]
+            .quantity(),
+        5
+    );
+    assert_eq!(
+        recovered
+            .engine()
+            .book()
             .try_account_active_order_ids(AccountId::new(2).unwrap(), MassCancelScope::All)
             .unwrap(),
         [OrderId::new(2).unwrap()]
@@ -1283,6 +1301,14 @@ fn auction_checkpoint_projection_is_independent_of_order_identity_order() {
     );
     let restored = CallAuctionEngine::from_checkpoint(&checkpoint).unwrap();
     assert_eq!(restored.book().active_order_count(), 3);
+    let best = restored.book().best_limit_level(Side::Buy).unwrap();
+    assert_eq!(best.price(), Price::from_raw(100));
+    assert_eq!(best.quantity(), 18);
+    assert_eq!(best.order_count(), 3);
+    assert_eq!(
+        restored.book().limit_level(Side::Buy, Price::from_raw(100)),
+        Some(best)
+    );
     assert_eq!(
         restored
             .book()

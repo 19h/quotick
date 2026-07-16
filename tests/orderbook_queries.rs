@@ -89,6 +89,15 @@ fn fallible_depth_is_public_only_market_ordered_and_bounded() {
     assert_eq!(book.try_depth(Side::Sell, 1).unwrap()[0].price.raw(), 120);
     assert!(book.try_depth(Side::Buy, 0).unwrap().is_empty());
     assert_eq!(bids, book.depth(Side::Buy, usize::MAX));
+    assert_eq!(bids, book.depth_iter(Side::Buy).collect::<Vec<_>>());
+    assert_eq!(book.depth_iter(Side::Buy).size_hint(), (0, Some(3)));
+    assert_eq!(
+        book.depth_iter(Side::Sell)
+            .rev()
+            .map(|level| level.price.raw())
+            .collect::<Vec<_>>(),
+        [130, 120]
+    );
 }
 
 #[test]

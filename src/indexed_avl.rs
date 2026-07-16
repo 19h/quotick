@@ -630,6 +630,46 @@ impl<K: Ord + Copy + PartialEq, V: Copy + PartialEq> PartialEq for IndexedAvlMap
 
 impl<K: Ord + Copy + Eq, V: Copy + Eq> Eq for IndexedAvlMap<K, V> {}
 
+/// Reorients one double-ended iterator without allocation or dynamic dispatch.
+pub(crate) struct DirectionalIter<I> {
+    inner: I,
+    reverse: bool,
+}
+
+impl<I> DirectionalIter<I> {
+    pub(crate) const fn new(inner: I, reverse: bool) -> Self {
+        Self { inner, reverse }
+    }
+}
+
+impl<I: DoubleEndedIterator> Iterator for DirectionalIter<I> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.reverse {
+            self.inner.next_back()
+        } else {
+            self.inner.next()
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<I: DoubleEndedIterator> DoubleEndedIterator for DirectionalIter<I> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.reverse {
+            self.inner.next()
+        } else {
+            self.inner.next_back()
+        }
+    }
+}
+
+impl<I: DoubleEndedIterator + ExactSizeIterator> ExactSizeIterator for DirectionalIter<I> {}
+
 #[cfg(test)]
 impl<K: Clone, V: Clone> Clone for IndexedAvlMap<K, V> {
     fn clone(&self) -> Self {

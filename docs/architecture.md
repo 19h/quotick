@@ -479,8 +479,10 @@ selected links and sorts unique `OrderId` values in the already-prepared vector.
 Read-only extraction is a separate caller-owned allocation boundary.
 `try_depth` reserves at most `min(P, L)` levels for `P` occupied execution
 prices and requested limit `L`, then returns only public prices in market
-priority. `try_active_orders` reserves the exact indexed resting cardinality,
-validates that cardinality during dense traversal, and sorts by `OrderId`.
+priority. `depth_iter` exposes the same market-priority projection without
+allocating caller-owned output and supports traversal from either end.
+`try_active_orders` reserves the exact indexed resting cardinality, validates
+that cardinality during dense traversal, and sorts by `OrderId`.
 `try_account_active_order_ids` performs one expected `O(1)` account lookup,
 reserves the selected intrusive-list count, validates owner, side, list length,
 and duplicate identity, then sorts by `OrderId`. Any reservation or private-
@@ -680,6 +682,13 @@ interest for discovery, allocation, and uncross preparation.
      previous/tail links, count, quantity, and duplicate identity. Allocation
      or topology failure is typed and returns no partial output; an unknown
      account returns an empty vector and no query mutates collection state.
+   - Read-only aggregate inspection exposes direct and best occupied limit
+     levels without allocation. `limit_depth_iter` is a double-ended exact-size
+     view that traverses bids descending or asks ascending without caller-owned
+     output. `try_limit_depth` reserves at most `min(P, L)` levels before
+     copying and returns typed allocation failure without partial output; its
+     convenience wrapper retains A12's panic boundary. Market-constrained
+     interest remains separate.
 6. Indicative discovery rebuilds canonical aggregate scratch and invokes the
    A60 kernel with current market totals. Allocation-plan construction rebuilds
    canonical market/price/class/time/ID order scratch under A111 and invokes
@@ -697,7 +706,11 @@ interest for discovery, allocation, and uncross preparation.
    `O(K(log K + log O + log P))` and independent of unrelated active orders.
    Read-only account-ID extraction is expected `O(1) + O(K log K)` time and
    `O(K)` caller-owned output for `K` selected orders, also independent of
-   unrelated active orders.
+   unrelated active orders. Direct/best aggregate lookup is
+   `O(log(P + 1))`; allocation-free depth iteration has
+   `O(log(P + 1))` setup, `O(P)` complete traversal, and `O(1)` auxiliary
+   space. Fallible output of limit `L` costs
+   `O(log(P + 1) + min(P, L))` time and `O(min(P, L))` result space.
    Aggregate scratch plus discovery is `O(B + A)`.
    Order scratch is `O(O log O + P)` because intrusive links contain stable
    order identities resolved through the AVL and the preallocated slices are
@@ -1597,10 +1610,13 @@ market-data stream and its replicas.
 This section defines the public call-auction market-data stream and its
 replica contract.
 
-1. `CallAuctionBook::limit_depth` exposes anonymized occupied limit aggregates
-   in best-to-worst order; market-constrained quantity and order count are
-   separate side-specific values. Locked and crossed opposing limits are valid
-   collection state.
+1. `CallAuctionBook::limit_depth_iter`,
+   `CallAuctionBook::try_limit_depth`, and `CallAuctionBook::limit_depth`
+   expose anonymized occupied limit aggregates in best-to-worst order;
+   `CallAuctionBook::limit_level` and `CallAuctionBook::best_limit_level`
+   expose one aggregate without output allocation. Market-constrained quantity
+   and order count are separate side-specific values. Locked and crossed
+   opposing limits are valid collection state.
 2. Every non-replayed auction event maps to one public update at the identical
    source sequence and timestamp. Rejections preserve continuity through
    `NoPublicChange`; exact command retries publish no second update.
@@ -1980,10 +1996,14 @@ cycles, account-index links and aggregates, and remove active orders from every
 queue while exercising the equivalent allocation-free coverage guards. Live
 account-order query tests cover canonical all/side selection, unknown owners,
 typed unrepresentable output, private-index corruption, and nonmutation. Live
-allocation tests invert class and arrival order, place the class boundary at
-price-time and pro-rata marginal tiers, prove amendment retention and
-replacement reassignment, and compare 20,000 four-class mutations with an
-independent literal priority comparator.
+aggregate-depth query tests cover direct/best lookup, market-priority streaming,
+bounded materialization, separate market interest, typed unrepresentable
+output, and nonmutation. Continuous depth-query tests cover allocation-free
+market-priority streaming and hidden-only exclusion. Live allocation tests
+invert class and arrival order, place the class boundary at price-time and
+pro-rata marginal tiers, prove amendment retention and replacement
+reassignment, and compare 20,000 four-class mutations with an independent
+literal priority comparator.
 Call-auction engine audit tests corrupt event grammar, including canonical
 mass-cancel removal/completion traces, and deliberately remove/reinsert an
 early report-cache entry, proving that the allocation-free dense-history pass

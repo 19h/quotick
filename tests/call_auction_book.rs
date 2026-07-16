@@ -735,18 +735,126 @@ fn account_order_queries_are_canonical_scoped_and_nonmutating() {
 }
 
 #[test]
-fn account_order_query_failures_name_the_exact_resource_and_bound() {
+fn aggregate_limit_queries_are_market_ordered_bounded_and_nonmutating() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(8, 8, 16)).unwrap();
+    for command in [
+        order(
+            1,
+            1,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(90)),
+            3,
+        ),
+        order(
+            2,
+            2,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+            5,
+        ),
+        order(
+            3,
+            3,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+            7,
+        ),
+        order(4, 4, Side::Buy, AuctionOrderConstraint::Market, 11),
+        order(
+            5,
+            5,
+            Side::Sell,
+            AuctionOrderConstraint::Limit(Price::from_raw(110)),
+            13,
+        ),
+        order(
+            6,
+            6,
+            Side::Sell,
+            AuctionOrderConstraint::Limit(Price::from_raw(120)),
+            17,
+        ),
+        order(7, 7, Side::Sell, AuctionOrderConstraint::Market, 19),
+    ] {
+        book.admit(command).unwrap();
+    }
+    let before = book.resource_status();
+
+    let bids = book.try_limit_depth(Side::Buy, usize::MAX).unwrap();
+    assert_eq!(
+        bids.iter()
+            .map(|level| {
+                (
+                    level.side(),
+                    level.price().raw(),
+                    level.quantity(),
+                    level.order_count(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [(Side::Buy, 100, 12, 2), (Side::Buy, 90, 3, 1)]
+    );
+    assert_eq!(bids, book.limit_depth(Side::Buy, usize::MAX));
+    assert_eq!(bids, book.limit_depth_iter(Side::Buy).collect::<Vec<_>>());
+    let mut asks = book.limit_depth_iter(Side::Sell);
+    assert_eq!(asks.len(), 2);
+    assert_eq!(asks.next().unwrap().price(), Price::from_raw(110));
+    assert_eq!(asks.len(), 1);
+    assert_eq!(asks.next_back().unwrap().price(), Price::from_raw(120));
+    assert!(asks.next().is_none());
+    assert_eq!(
+        book.try_limit_depth(Side::Sell, 1).unwrap()[0].price(),
+        Price::from_raw(110)
+    );
+    assert!(book.try_limit_depth(Side::Buy, 0).unwrap().is_empty());
+
+    let best_bid = book.best_limit_level(Side::Buy).unwrap();
+    assert_eq!(
+        best_bid,
+        book.limit_level(Side::Buy, Price::from_raw(100)).unwrap()
+    );
+    assert_eq!(best_bid.price(), book.best_limit_price(Side::Buy).unwrap());
+    assert!(book.limit_level(Side::Sell, Price::from_raw(100)).is_none());
+    assert_eq!(book.market_quantity(Side::Buy), 11);
+    assert_eq!(book.market_quantity(Side::Sell), 19);
+    assert_eq!(book.resource_status(), before);
+    book.validate().unwrap();
+
+    let empty = CallAuctionBook::try_with_limits(definition(), limits(1, 1, 1)).unwrap();
+    assert!(empty.best_limit_level(Side::Buy).is_none());
+    assert!(
+        empty
+            .try_limit_depth(Side::Sell, usize::MAX)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn call_auction_query_failures_name_the_exact_resource_and_bound() {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<CallAuctionBookQueryError>();
 
-    let error = CallAuctionBookQueryError::ReservationFailed {
-        resource: CallAuctionBookQueryResource::AccountOrderIds,
-        maximum: 250_000,
-    };
-    assert_eq!(
-        error.to_string(),
-        "call-auction book account-order-identifier output could not reserve 250000 entries"
-    );
+    for (resource, description) in [
+        (
+            CallAuctionBookQueryResource::LimitDepth,
+            "limit-depth output",
+        ),
+        (
+            CallAuctionBookQueryResource::AccountOrderIds,
+            "account-order-identifier output",
+        ),
+    ] {
+        let error = CallAuctionBookQueryError::ReservationFailed {
+            resource,
+            maximum: 250_000,
+        };
+        assert_eq!(
+            error.to_string(),
+            format!("call-auction book {description} could not reserve 250000 entries")
+        );
+        assert!(std::error::Error::source(&error).is_none());
+    }
 }
 
 #[test]

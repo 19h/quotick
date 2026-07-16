@@ -212,11 +212,13 @@ ownership, path/string construction, ledger diagnostic/reconciliation
 collections, failure-detail formatting, caller-owned or cloned generic auction
 allocation plans, and wide ledger magnitudes can still allocate or abort.
 
-Continuous order-book depth and private active-order output, continuous and
-call-auction account-order-ID output, plus continuous and call-auction market-
-data batch/snapshot/depth output, has explicit fallible APIs. Convenience
-wrappers can still panic on allocation failure; the account-order-ID wrappers
-can also panic if private topology is corrupt.
+Continuous order-book depth and private active-order output, call-auction limit
+depth, continuous and call-auction account-order-ID output, plus continuous and
+call-auction market-data batch/snapshot/depth outputs have explicit fallible
+APIs. Continuous and call-auction authoritative books also expose
+allocation-free market-priority depth iterators. Convenience wrappers can
+still panic on allocation failure; the account-order-ID wrappers can also
+panic if private topology is corrupt.
 
 **Dependent results.** Typed failure exists at the enumerated boundaries; no
 end-to-end allocation-failure continuation claim follows. Authoritative bounded
@@ -1506,6 +1508,13 @@ Read-only account/side order-ID extraction reserves the selected lane count,
 validates the same ownership, side, link, count, and quantity state, and returns
 ascending `OrderId` values without mutation. Allocation and topology failures
 remain typed; an unknown account returns an empty vector.
+Aggregate limit-depth inspection excludes market-constrained interest and
+returns bids descending or asks ascending. `limit_depth_iter` borrows the book
+and exposes a double-ended exact-size iterator without allocating output;
+`limit_level` and `best_limit_level` return one copied aggregate without output
+allocation. `try_limit_depth` reserves at most the lesser of occupied side
+prices and the requested limit before copying, returns typed reservation
+failure without partial output, and changes no book state.
 One retained-priority amendment accepts only a strictly smaller positive,
 lot-aligned active quantity. It preserves identity, owner, side, constraint,
 price, queue links, priority class, and priority sequence; changes queue and
@@ -1532,7 +1541,11 @@ cancel preflight is expected `O(1)`; applying `K` selected orders is
 independent of unrelated active orders. Read-only extraction of those `K`
 identifiers is expected `O(1) + O(K log K)` time and `O(K)` caller-owned
 output, also independent of unrelated active orders. No collection-book state
-is mutated.
+is mutated. Aggregate direct/best lookup is `O(log(P + 1))` and allocation-
+free depth iteration has `O(log(P + 1))` setup, `O(P)` complete traversal, and
+`O(1)` auxiliary space. For depth limit `L`, fallible materialization costs
+`O(log(P + 1) + min(P, L))` time and `O(min(P, L))` output space; it reserves
+before traversal and does not mutate the book.
 
 **Falsification probe.** Exercise routing/version and every instrument
 boundary; locked/crossed/market-only interest; middle/head/tail cancellation
@@ -1545,6 +1558,10 @@ and revision exhaustion, account-link corruption, canonical output, one-
 revision commit, and fixed allocation telemetry;
 empty/all/side read-only account queries, unknown owners, typed allocation
 failure, account-link corruption, canonical IDs, and nonmutation;
+empty/one/two-sided aggregate depth, direct and missing-level lookup, best
+lookup, market-only interest, both market-priority directions, limits `0`, `1`,
+occupied cardinality, and `usize::MAX`, iterator/materialized equality, typed
+depth allocation failure, and nonmutation;
 foreign/stale indicative results; exact capacity telemetry; 20,000 mixed
 insert/remove/amend/replace/mass-cancel operations against independent
 aggregate and priority models;
@@ -3887,10 +3904,12 @@ or venue/clearing policy inference falsifies A116.
 continuous-book shard. `try_depth` exposes only non-zero public displayed
 aggregates, with bids descending and asks ascending, and reserves at most the
 lesser of the requested limit and occupied execution-price count before
-traversal. Hidden-only prices remain absent. `try_active_orders` reserves the
-exact indexed non-dormant count, rejects any traversal/cardinality
-contradiction before vector growth, validates every snapshot, and sorts the
-complete private result by `OrderId`.
+traversal. `depth_iter` exposes the same market-priority sequence without
+caller-owned output allocation. It is double-ended and retains occupied-price
+cardinality as an upper size hint because hidden-only prices remain absent.
+`try_active_orders` reserves the exact indexed non-dormant count, rejects any
+traversal/cardinality contradiction before vector growth, validates every
+snapshot, and sorts the complete private result by `OrderId`.
 
 `try_account_active_order_ids` performs one expected constant-time A41 account
 lookup, derives and fallibly reserves the selected side/all count, traverses
@@ -3905,7 +3924,10 @@ and no partial vector is returned on resource or invariant failure.
 **Dependent results.** [A3, A10, A12, A41, A52, A72, A83, A117] For `P`
 occupied execution prices, `V <= P` public prices, and depth limit `L`, depth
 costs `O(P)` time in the hidden-only worst case, returns
-`O(min(V, L))` rows, and requests at most `min(P, L)` capacity. For `T` active
+`O(min(V, L))` rows, and requests at most `min(P, L)` capacity.
+Depth-iterator setup is `O(log(P + 1))`; complete traversal is `O(P)` time and
+`O(1)` auxiliary space.
+For `T` active
 identities, `S` dormant stops, and `R = T - S` resting orders, complete private
 output costs `O(T + R log R)` time and `O(R)` result space. For `K` selected
 account orders, expected work is `O(1) + O(K log K)` and result space is
@@ -4099,12 +4121,15 @@ capability, a remaining risk, or an opportunity.
   settlement-date policy remain external lifecycle inputs.
 
 - **Medium impact:** continuous public-depth and complete private resting-order
-  extraction plus continuous and call-auction account-scoped identifier
-  extraction now have typed fallible output under A117 and A62. Bounds and
-  canonical ordering are covered through hidden liquidity, account-list
-  corruption, and large caller-owned results. Target-hardware allocator
-  latency, resident memory, and sustained 250,000-order snapshot cadence remain
-  unknown until measured.
+  extraction, call-auction aggregate limit depth, plus continuous and
+  call-auction account-scoped identifier extraction now have typed fallible
+  output under A117 and A62. Both authoritative books also expose
+  allocation-free market-priority aggregate iterators; the call-auction book
+  exposes direct and best aggregate-level lookup. Bounds and canonical ordering
+  are covered through hidden/market interest, account-list corruption, typed
+  allocation failure, and large caller-owned results. Target-hardware iterator
+  latency, allocator latency, resident memory, and sustained 250,000-order
+  snapshot cadence remain unknown until measured.
 
 - **Medium impact:** continuous and call-auction live command/report history
   now supports expected constant-time exact lookup and zero-copy chronological

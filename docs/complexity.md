@@ -150,10 +150,13 @@ Read-only order-book output has an explicit caller-owned allocation boundary.
 For `P` occupied execution prices, `V <= P` public prices, and requested depth
 limit `L`, `try_depth` reserves at most `min(P, L)` entries before traversal,
 costs `O(P)` time in the hidden-only worst case, and returns
-`O(min(V, L))` space. For `T` active identities including `S` dormant stops
-and `R = T - S` resting orders, `try_active_orders` costs
-`O(T + R log R)` time and `O(R)` output space. For one account selection of
-`K` orders, `try_account_active_order_ids` costs expected
+`O(min(V, L))` space. `depth_iter` has `O(log(P + 1))` setup, streams the same
+market-priority public projection in `O(P)` complete-traversal time, and uses
+`O(1)` auxiliary space without caller-owned output. For `T` active identities
+including `S` dormant stops and `R = T - S` resting orders,
+`try_active_orders` costs `O(T + R log R)` time and `O(R)` output space. For
+one account selection of `K` orders, `try_account_active_order_ids` costs
+expected
 `O(1) + O(K log K)` time and `O(K)` output space, independent of unrelated
 orders. All three reserve before copying, perform no authoritative mutation,
 and drop any private partial construction on an invariant failure.
@@ -206,6 +209,12 @@ orders, and `P` occupied limit prices:
   aggregates, and sorts them in `O(K log K)`. Its `O(K)` caller-owned output and
   runtime are independent of unrelated active orders; failures return no
   partial vector and mutate no collection state.
+- Direct and best aggregate limit-level lookup are `O(log(P + 1))` and allocate
+  no output. `limit_depth_iter` has `O(log(P + 1))` setup and streams all `P`
+  levels in market priority using `O(1)` auxiliary space. For requested limit
+  `L`, `try_limit_depth` reserves before traversal and costs
+  `O(log(P + 1) + min(P, L))` time with `O(min(P, L))` caller-owned output.
+  Market-constrained interest is excluded and queried separately.
 - Aggregate scratch construction and discovery are `O(B + A)`.
 - Canonical order scratch construction is `O(O log O + P)`: intrusive arrival-
   FIFO identities are resolved through a stable AVL, then both caller-owned

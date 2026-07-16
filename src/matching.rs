@@ -30,7 +30,7 @@ use crate::domain::{
     StopReferenceSequence, StopReferenceSourceId, StopReferenceSourceVersion, TimestampNs, TradeId,
 };
 use crate::history::RetainedCommandReport;
-use crate::indexed_avl::{IndexedAvlHandle, IndexedAvlMap};
+use crate::indexed_avl::{DirectionalIter, IndexedAvlHandle, IndexedAvlMap};
 use crate::instrument::{AdmissionError, InstrumentDefinition, TradingState};
 use crate::trace_arena::AppendOnlyTraceArena;
 
@@ -6362,10 +6362,7 @@ impl OrderBook {
         let maximum = self.levels(side).len().min(limit);
         let mut output =
             reserve_order_book_query_vec(maximum, OrderBookQueryResource::DepthLevels)?;
-        match side {
-            Side::Buy => output.extend(self.depth_levels(side).rev().take(limit)),
-            Side::Sell => output.extend(self.depth_levels(side).take(limit)),
-        }
+        output.extend(self.depth_iter(side).take(limit));
         Ok(output)
     }
 
@@ -6379,6 +6376,20 @@ impl OrderBook {
     pub fn depth(&self, side: Side, limit: usize) -> Vec<LevelSnapshot> {
         self.try_depth(side, limit)
             .expect("order-book depth output allocation failed")
+    }
+
+    /// Iterates public aggregate levels in market-priority order without
+    /// allocating.
+    ///
+    /// Bids are descending and asks are ascending. Prices containing only
+    /// hidden liquidity are omitted. The iterator is double-ended; its upper
+    /// size hint is the occupied execution-price count because hidden-only
+    /// levels can be skipped. Creating it is `O(log(P + 1))`; consuming it is
+    /// `O(P)` time for `P` occupied execution prices and `O(1)` auxiliary
+    /// space.
+    #[must_use]
+    pub fn depth_iter(&self, side: Side) -> impl DoubleEndedIterator<Item = LevelSnapshot> + '_ {
+        DirectionalIter::new(self.depth_levels(side), side == Side::Buy)
     }
 
     /// Iterates aggregate levels in ascending price order without allocating.
