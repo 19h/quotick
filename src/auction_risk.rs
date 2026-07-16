@@ -1980,6 +1980,7 @@ mod tests {
                 side: Side::Buy,
                 constraint: AuctionOrderConstraint::Market,
                 quantity: Quantity::new(1).unwrap(),
+                priority_class: crate::auction::AuctionPriorityClass::HIGHEST,
                 priority_sequence: u64::try_from(priority_sequence).unwrap() + 1,
             });
         }
@@ -2051,6 +2052,7 @@ mod tests {
             side: Side::Buy,
             constraint: AuctionOrderConstraint::Market,
             quantity: Quantity::new(2).unwrap(),
+            priority_class: crate::auction::AuctionPriorityClass::HIGHEST,
             priority_sequence: 3,
         });
         risk.validate().unwrap();

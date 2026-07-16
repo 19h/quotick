@@ -160,6 +160,9 @@ across cardinality validation and fill construction; no product wider than
 `u128` is constructed. Both fill-vector capacity requests use the exact derived
 cardinalities and succeed before either side is constructed; the allocator may
 grant more capacity, and no vector grows while fills are emitted.
+Priority comparison is market/limit category, economic price,
+`AuctionPriorityClass(u16)`, priority sequence, then `OrderId`. The scalar adds
+constant storage per order and no asymptotic work.
 
 ## Call-auction collection book
 
@@ -178,9 +181,11 @@ orders, and `P` occupied limit prices:
   links, sorts snapshots in `O(K log K)`, and removes them in
   `O(K(log O + log P))`; it is independent of unrelated active orders.
 - Aggregate scratch construction and discovery are `O(B + A)`.
-- Canonical order scratch construction is `O(O log O + P)` because intrusive
-  FIFO identities are resolved through a stable AVL; allocation then adds
-  `O(O)` work and `O(F_b + F_a)` result memory.
+- Canonical order scratch construction is `O(O log O + P)`: intrusive arrival-
+  FIFO identities are resolved through a stable AVL, then both caller-owned
+  side slices are allocation-free unstable-sorted by the shared
+  market/price/class/time/ID comparator. Allocation then adds `O(O)` work and
+  `O(F_b + F_a)` result memory.
 - Constructor-reserved collection state, including the account index, is
   `O(I_max + O_max + P_max)` and does not grow during bounded mutation, mass
   cancellation, or analysis scratch reconstruction.

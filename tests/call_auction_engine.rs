@@ -111,6 +111,7 @@ fn order(
         side,
         constraint,
         Quantity::new(quantity).unwrap(),
+        quotick::auction::AuctionPriorityClass::HIGHEST,
     )
 }
 

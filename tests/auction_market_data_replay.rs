@@ -128,6 +128,7 @@ fn order(
             side,
             AuctionOrderConstraint::Limit(Price::from_raw(price)),
             Quantity::new(order_id).unwrap(),
+            quotick::auction::AuctionPriorityClass::HIGHEST,
         ),
         received_at: TimestampNs::from_unix_nanos(command_id),
     })

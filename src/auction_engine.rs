@@ -1830,6 +1830,7 @@ impl CallAuctionCheckpoint {
                             || previous.account_id != order.account_id
                             || previous.side != order.side
                             || previous.constraint != order.constraint
+                            || previous.priority_class != order.priority_class
                             || previous.priority_sequence != order.priority_sequence
                             || previous.quantity != *previous_quantity
                             || order.quantity != amend.new_quantity
@@ -2062,6 +2063,7 @@ fn validate_checkpoint_auction_order(
         || snapshot.side != order.side()
         || snapshot.constraint != order.constraint()
         || snapshot.quantity != order.quantity()
+        || snapshot.priority_class != order.priority_class()
     {
         return Err(CallAuctionCheckpointError::new(
             "auction checkpoint accepted snapshot differs from its command",

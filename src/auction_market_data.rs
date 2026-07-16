@@ -13,7 +13,7 @@
 use std::fmt;
 use std::hash::Hash;
 
-use crate::auction::{AuctionClearing, AuctionOrderConstraint};
+use crate::auction::{AuctionClearing, AuctionOrderConstraint, AuctionPriorityClass};
 use crate::auction_book::{
     CallAuctionBookLimits, CallAuctionCancellation, CallAuctionLevelSnapshot,
     CallAuctionOrderSnapshot, CallAuctionTrade,
@@ -972,6 +972,7 @@ struct TrackedOrder {
     side: Side,
     constraint: AuctionOrderConstraint,
     leaves: u64,
+    priority_class: AuctionPriorityClass,
     priority_sequence: u64,
 }
 
@@ -982,6 +983,7 @@ impl From<CallAuctionOrderSnapshot> for TrackedOrder {
             side: order.side,
             constraint: order.constraint,
             leaves: order.quantity.lots(),
+            priority_class: order.priority_class,
             priority_sequence: order.priority_sequence,
         }
     }
@@ -1643,6 +1645,7 @@ impl CallAuctionMarketDataPublisher {
             || order.side != submitted.side()
             || order.constraint != submitted.constraint()
             || order.quantity != submitted.quantity()
+            || order.priority_class != submitted.priority_class()
             || order.priority_sequence == 0
             || self.orders.contains_key(&order.order_id)
         {
@@ -1732,6 +1735,7 @@ impl CallAuctionMarketDataPublisher {
             || tracked.account_id != order.account_id
             || tracked.side != order.side
             || tracked.constraint != order.constraint
+            || tracked.priority_class != order.priority_class
             || tracked.priority_sequence != order.priority_sequence
             || tracked.leaves != previous_quantity.lots()
             || order.quantity.lots() >= previous_quantity.lots()

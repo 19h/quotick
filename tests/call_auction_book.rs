@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use quotick::auction::{
     AuctionAllocationPolicy, AuctionLevel, AuctionMarketInterest, AuctionOrderConstraint,
-    AuctionPricePolicy, discover_bounded_clearing_price,
+    AuctionPricePolicy, AuctionPriorityClass, discover_bounded_clearing_price,
 };
 use quotick::auction_book::{
     CallAuctionAdmissionError, CallAuctionAmendError, CallAuctionBook, CallAuctionBookLimits,
@@ -69,6 +69,17 @@ fn order(
     constraint: AuctionOrderConstraint,
     quantity: u64,
 ) -> CallAuctionOrder {
+    order_with_class(id, owner, side, constraint, quantity, 0)
+}
+
+fn order_with_class(
+    id: u64,
+    owner: u64,
+    side: Side,
+    constraint: AuctionOrderConstraint,
+    quantity: u64,
+    priority_class: u16,
+) -> CallAuctionOrder {
     CallAuctionOrder::new(
         OrderId::new(id).unwrap(),
         account(owner),
@@ -77,7 +88,71 @@ fn order(
         side,
         constraint,
         Quantity::new(quantity).unwrap(),
+        AuctionPriorityClass::new(priority_class),
     )
+}
+
+#[test]
+fn authoritative_priority_classes_precede_time_and_bound_pro_rata_tiers() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(8, 4, 16)).unwrap();
+    let price = AuctionOrderConstraint::Limit(Price::from_raw(100));
+    let lower_class = book
+        .admit(order_with_class(1, 1, Side::Buy, price, 100, 1))
+        .unwrap();
+    let first_top_class = book
+        .admit(order_with_class(2, 2, Side::Buy, price, 10, 0))
+        .unwrap();
+    let second_top_class = book
+        .admit(order_with_class(3, 3, Side::Buy, price, 20, 0))
+        .unwrap();
+    book.admit(order_with_class(4, 4, Side::Sell, price, 15, 0))
+        .unwrap();
+
+    assert_eq!(lower_class.priority_class, AuctionPriorityClass::new(1));
+    assert_eq!(first_top_class.priority_class, AuctionPriorityClass::new(0));
+    assert!(lower_class.priority_sequence < first_top_class.priority_sequence);
+
+    let indicative = book
+        .indicative_clearing(
+            book.instrument_price_band(),
+            Price::from_raw(100),
+            AuctionPricePolicy::REFERENCE_THEN_LOWER,
+        )
+        .unwrap()
+        .unwrap();
+    let price_time = book
+        .allocation_plan(indicative, AuctionAllocationPolicy::PriceTime)
+        .unwrap();
+    assert_eq!(
+        price_time
+            .buy_fills()
+            .iter()
+            .map(|fill| (fill.order_id().get(), fill.quantity_lots()))
+            .collect::<Vec<_>>(),
+        vec![(2, 10), (3, 5)]
+    );
+    let pro_rata = book
+        .allocation_plan(indicative, AuctionAllocationPolicy::ProRataTime)
+        .unwrap();
+    assert_eq!(
+        pro_rata
+            .buy_fills()
+            .iter()
+            .map(|fill| (fill.order_id().get(), fill.quantity_lots()))
+            .collect::<Vec<_>>(),
+        vec![(2, 5), (3, 10)]
+    );
+    assert!(
+        pro_rata
+            .buy_fills()
+            .iter()
+            .all(|fill| fill.order_id() != lower_class.order_id)
+    );
+    assert_eq!(
+        book.order(second_top_class.order_id),
+        Some(second_top_class)
+    );
+    book.validate().unwrap();
 }
 
 #[test]
@@ -203,32 +278,42 @@ fn crossed_limit_and_market_interest_clears_and_allocates_without_mutation() {
 fn shard_sequence_enforces_market_price_and_fifo_priority() {
     let mut book = CallAuctionBook::try_with_limits(definition(), limits(16, 8, 32)).unwrap();
     let first = book
-        .admit(order(10, 1, Side::Buy, AuctionOrderConstraint::Market, 2))
+        .admit(order_with_class(
+            10,
+            1,
+            Side::Buy,
+            AuctionOrderConstraint::Market,
+            2,
+            u16::MAX,
+        ))
         .unwrap();
     let second = book
-        .admit(order(
+        .admit(order_with_class(
             11,
             1,
             Side::Buy,
             AuctionOrderConstraint::Limit(Price::from_raw(110)),
             4,
+            u16::MAX,
         ))
         .unwrap();
     let third = book
-        .admit(order(
+        .admit(order_with_class(
             12,
             1,
             Side::Buy,
             AuctionOrderConstraint::Limit(Price::from_raw(110)),
             4,
+            u16::MAX,
         ))
         .unwrap();
-    book.admit(order(
+    book.admit(order_with_class(
         13,
         1,
         Side::Buy,
         AuctionOrderConstraint::Limit(Price::from_raw(100)),
         4,
+        0,
     ))
     .unwrap();
     book.admit(order(14, 2, Side::Sell, AuctionOrderConstraint::Market, 7))
@@ -413,12 +498,13 @@ fn cancellation_checks_owner_unlinks_middle_and_never_reuses_identity() {
 fn quantity_reduction_retains_identity_priority_and_reconciles_indexes() {
     let mut book = CallAuctionBook::try_with_limits(definition(), limits(8, 4, 16)).unwrap();
     let first = book
-        .admit(order(
+        .admit(order_with_class(
             10,
             7,
             Side::Buy,
             AuctionOrderConstraint::Limit(Price::from_raw(100)),
             8,
+            3,
         ))
         .unwrap();
     let second = book
@@ -440,6 +526,7 @@ fn quantity_reduction_retains_identity_priority_and_reconciles_indexes() {
     assert_eq!(amendment.previous(), first);
     assert_eq!(amendment.current().order_id, first.order_id);
     assert_eq!(amendment.current().quantity.lots(), 3);
+    assert_eq!(amendment.current().priority_class, first.priority_class);
     assert_eq!(
         amendment.current().priority_sequence,
         first.priority_sequence
@@ -473,7 +560,7 @@ fn quantity_reduction_retains_identity_priority_and_reconciles_indexes() {
             .iter()
             .map(|fill| (fill.order_id().get(), fill.quantity_lots()))
             .collect::<Vec<_>>(),
-        vec![(10, 3), (20, 5)]
+        vec![(20, 5), (10, 3)]
     );
     assert_eq!(second.priority_sequence, 2);
     book.validate().unwrap();
@@ -653,6 +740,7 @@ fn admission_validates_routing_version_price_and_quantity() {
         Side::Buy,
         AuctionOrderConstraint::Market,
         Quantity::new(1).unwrap(),
+        AuctionPriorityClass::HIGHEST,
     );
     assert_eq!(
         book.admit(wrong_instrument),
@@ -668,6 +756,7 @@ fn admission_validates_routing_version_price_and_quantity() {
         Side::Buy,
         AuctionOrderConstraint::Market,
         Quantity::new(1).unwrap(),
+        AuctionPriorityClass::HIGHEST,
     );
     assert_eq!(
         book.admit(wrong_version),
@@ -775,6 +864,10 @@ fn finite_capacities_fail_before_mutation_and_are_independent_per_side() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one saturated replacement case keeps class, priority, capacity, and atomic-failure evidence contiguous"
+)]
 fn cancel_replace_reuses_full_capacity_loses_priority_and_fails_atomically() {
     let mut book = CallAuctionBook::try_with_limits(definition(), limits(2, 1, 3)).unwrap();
     let first = order(
@@ -795,18 +888,23 @@ fn cancel_replace_reuses_full_capacity_loses_priority_and_fails_atomically() {
     book.admit(second).unwrap();
     let allocation = book.resource_status();
 
-    let replacement = order(
+    let replacement = order_with_class(
         3,
         7,
         Side::Buy,
         AuctionOrderConstraint::Limit(Price::from_raw(100)),
         6,
+        4,
     );
     let replaced = book
         .replace(account(7), first.order_id(), replacement)
         .unwrap();
     assert_eq!(replaced.cancelled().order_id, first.order_id());
     assert_eq!(replaced.accepted().order_id, replacement.order_id());
+    assert_eq!(
+        replaced.accepted().priority_class,
+        AuctionPriorityClass::new(4)
+    );
     assert_eq!(replaced.accepted().priority_sequence, 3);
     assert!(book.order(first.order_id()).is_none());
     assert_eq!(book.order(second.order_id()).unwrap().priority_sequence, 2);
@@ -937,6 +1035,7 @@ struct ModelOrder {
     side: Side,
     constraint: AuctionOrderConstraint,
     quantity: u64,
+    priority_class: AuctionPriorityClass,
     sequence: u64,
 }
 
@@ -970,7 +1069,7 @@ fn expected_fills(
                 },
             ),
         };
-        (kind, price_rank, order.sequence, *id)
+        (kind, price_rank, order.priority_class, order.sequence, *id)
     });
     let mut fills = Vec::new();
     for (id, order) in orders {
@@ -1106,6 +1205,8 @@ fn randomized_mutations_match_independent_aggregate_and_priority_models() {
                 AuctionOrderConstraint::Limit(Price::from_raw(raw))
             };
             let quantity = next_random(&mut rng) % 25 + 1;
+            let priority_class =
+                AuctionPriorityClass::new(u16::try_from(next_random(&mut rng) % 4).unwrap());
             let accepted = book
                 .admit(CallAuctionOrder::new(
                     id,
@@ -1115,6 +1216,7 @@ fn randomized_mutations_match_independent_aggregate_and_priority_models() {
                     side,
                     constraint,
                     Quantity::new(quantity).unwrap(),
+                    priority_class,
                 ))
                 .unwrap();
             model.insert(
@@ -1124,6 +1226,7 @@ fn randomized_mutations_match_independent_aggregate_and_priority_models() {
                     side,
                     constraint,
                     quantity,
+                    priority_class,
                     sequence: accepted.priority_sequence,
                 },
             );

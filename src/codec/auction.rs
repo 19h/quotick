@@ -1,6 +1,6 @@
 use crate::auction::{
     AuctionAllocationPolicy, AuctionClearing, AuctionFinalTieBreak, AuctionOrderConstraint,
-    AuctionPressureRule, AuctionPriceBand, AuctionPricePolicy,
+    AuctionPressureRule, AuctionPriceBand, AuctionPricePolicy, AuctionPriorityClass,
 };
 use crate::auction_book::{
     CallAuctionCancellation, CallAuctionOrder, CallAuctionOrderSnapshot,
@@ -195,6 +195,7 @@ fn encode_order(encoder: &mut Encoder, value: CallAuctionOrder) {
     encode_side(encoder, value.side());
     encode_constraint(encoder, value.constraint());
     encoder.u64(value.quantity().lots());
+    encoder.u16(value.priority_class().get());
 }
 
 fn decode_order(decoder: &mut Decoder<'_>) -> Result<CallAuctionOrder, CodecError> {
@@ -206,6 +207,7 @@ fn decode_order(decoder: &mut Decoder<'_>) -> Result<CallAuctionOrder, CodecErro
         decode_side(decoder)?,
         decode_constraint(decoder)?,
         quantity(decoder)?,
+        AuctionPriorityClass::new(decoder.u16()?),
     ))
 }
 
@@ -215,6 +217,7 @@ fn encode_snapshot(encoder: &mut Encoder, value: CallAuctionOrderSnapshot) {
     encode_side(encoder, value.side);
     encode_constraint(encoder, value.constraint);
     encoder.u64(value.quantity.lots());
+    encoder.u16(value.priority_class.get());
     encoder.u64(value.priority_sequence);
 }
 
@@ -225,6 +228,7 @@ fn decode_snapshot(decoder: &mut Decoder<'_>) -> Result<CallAuctionOrderSnapshot
         side: decode_side(decoder)?,
         constraint: decode_constraint(decoder)?,
         quantity: quantity(decoder)?,
+        priority_class: AuctionPriorityClass::new(decoder.u16()?),
         priority_sequence: decoder.u64()?,
     };
     if value.priority_sequence == 0 {
@@ -927,7 +931,7 @@ impl BinaryCodec for CallAuctionCheckpoint {
             accepted_order_ids.push(order(&mut decoder)?);
         }
 
-        let active_count = decoder.count("auction checkpoint active orders", 34)?;
+        let active_count = decoder.count("auction checkpoint active orders", 36)?;
         let mut active_orders =
             reserve_decoded_vec("auction checkpoint active orders", active_count)?;
         for _ in 0..active_count {

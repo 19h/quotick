@@ -293,8 +293,10 @@ Run any program with `cargo run --example <name>`.
   pro-rata allocation with exact instrument-increment floors and FIFO residual
   quanta. Caller-owned plans fallibly reserve exactly their result fill vectors.
 - A bounded `CallAuctionBook` collecting crossed market/limit interest with
-  never-reusable order identities, owner-checked cancellation, account/side-
-  scoped mass cancellation through a bounded intrusive owner index,
+  never-reusable order identities, an authoritative typed `u16` priority class
+  compared after market/price and before time/ID, owner-checked cancellation,
+  account/side-scoped mass cancellation through a bounded intrusive owner
+  index,
   revision-bound indicative results, atomic new-identity cancel/replace with
   complete priority loss and saturated active/price-level capacity reuse when
   accepted-ID headroom remains, strict retained-priority active-quantity
@@ -388,7 +390,7 @@ Run any program with `cargo run --example <name>`.
 
 ### Durability and recovery
 
-- Versioned CRC-32C WAL frames (format 13) with bounded payloads and
+- Versioned CRC-32C WAL frames (format 14) with bounded payloads and
   contiguous sequences, as a single-file `Journal` or a size-bounded
   `SegmentedJournal` rotating whole frames and batches under one global
   sequence.
@@ -398,7 +400,7 @@ Run any program with `cargo run --example <name>`.
   writer leases with explicit abandoned-writer recovery.
 - Strict corruption detection: only a physically incomplete final frame may be
   repaired, and closed segments are always scanned strictly.
-- Versioned, bounded `QSNP` semantic snapshots (format 13) with monotonic
+- Versioned, bounded `QSNP` semantic snapshots (format 14) with monotonic
   exact-prefix lineage and synchronized atomic replacement.
 - Durable runtimes for matching, coupled risk/matching, call auctions, and
   coupled auction/risk record every command before committing the in-memory
@@ -462,8 +464,9 @@ entitlement layer.
 The matching model is a continuous price-time-priority book with sequenced
 instrument-wide trading-state controls, plus a separate bounded call-auction
 path with banded aggregate discovery, explicit price-time or price/class-tier
-pro-rata allocation with FIFO residual quanta, and a process-local atomic
-uncross. Continuous stop orders require an authoritative external source to
+pro-rata allocation with FIFO residual quanta, authoritative ingress-supplied
+typed priority classes, and a process-local atomic uncross. Continuous stop
+orders require an authoritative external source to
 submit each sequenced reference; matching never infers one
 from local trades or wall time. Source coordinates are validated and retained,
 but source authentication, transport recovery, and raw-feed normalization are
@@ -487,12 +490,12 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 110 tagged assumptions (A1–A110), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 111 tagged assumptions (A1–A111), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
-| [WAL format v13](docs/wal-v13.md) | Current write-ahead-log frame and record schema |
-| [Snapshot format v13](docs/snapshot-v13.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
+| [WAL format v14](docs/wal-v14.md) | Current write-ahead-log frame and record schema |
+| [Snapshot format v14](docs/snapshot-v14.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
 | [Market-data payload v3](docs/market-data-v3.md) | Current continuous market-data update/snapshot payloads |
 | [Auction market-data payload v4](docs/auction-market-data-v4.md) | Current call-auction market-data payloads |
 | [Auction-risk checkpoint payload v1](docs/auction-risk-checkpoint-v1.md) | Current coupled call-auction risk checkpoint payload |
@@ -508,6 +511,7 @@ byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/wal-v10.md](docs/wal-v10.md),
 [docs/wal-v11.md](docs/wal-v11.md),
 [docs/wal-v12.md](docs/wal-v12.md),
+[docs/wal-v13.md](docs/wal-v13.md),
 [docs/snapshot-v2.md](docs/snapshot-v2.md),
 [docs/snapshot-v3.md](docs/snapshot-v3.md),
 [docs/snapshot-v4.md](docs/snapshot-v4.md),
@@ -518,7 +522,8 @@ byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/snapshot-v9.md](docs/snapshot-v9.md),
 [docs/snapshot-v10.md](docs/snapshot-v10.md),
 [docs/snapshot-v11.md](docs/snapshot-v11.md),
-[docs/snapshot-v12.md](docs/snapshot-v12.md), continuous
+[docs/snapshot-v12.md](docs/snapshot-v12.md),
+[docs/snapshot-v13.md](docs/snapshot-v13.md), continuous
 [market-data v2](docs/market-data-v2.md), and call-auction
 [market-data v1](docs/auction-market-data-v1.md) and
 [market-data v2](docs/auction-market-data-v2.md) and
@@ -551,7 +556,9 @@ includes:
 - **Call auctions:** discovery differentially checked against exhaustive
   tick-grid enumeration, price-time allocation against literal order-priority
   walks, pro-rata allocation against direct integer arithmetic and overflowing-
-  product boundary cases, 20,000 mixed book mutations and 10,000 uncross cases
+  product boundary cases, authoritative class-before-time order and pro-rata-
+  tier boundaries, 20,000 four-class mixed book mutations, and 10,000 uncross
+  cases
   against independent
   models, canonical account/side mass cancellation across book, engine, risk,
   public-feed, checkpoint, and WAL recovery, retained-priority amendment across

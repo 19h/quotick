@@ -78,6 +78,7 @@ fn order(
         side,
         constraint,
         Quantity::new(quantity).unwrap(),
+        quotick::auction::AuctionPriorityClass::HIGHEST,
     )
 }
 
@@ -639,6 +640,7 @@ fn randomized_priority_pairing_and_post_state_match_literal_models() {
                 Side::Buy,
                 AuctionOrderConstraint::Market,
                 Quantity::new(model.quantity).unwrap(),
+                quotick::auction::AuctionPriorityClass::HIGHEST,
             ))
             .unwrap();
             buys.push(model);
@@ -658,6 +660,7 @@ fn randomized_priority_pairing_and_post_state_match_literal_models() {
                 Side::Sell,
                 AuctionOrderConstraint::Market,
                 Quantity::new(model.quantity).unwrap(),
+                quotick::auction::AuctionPriorityClass::HIGHEST,
             ))
             .unwrap();
             sells.push(model);

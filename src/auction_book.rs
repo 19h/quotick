@@ -18,8 +18,9 @@ use crate::auction::{
     AuctionAllocationError, AuctionAllocationLimits, AuctionAllocationMethod,
     AuctionAllocationPlan, AuctionAllocationPolicy, AuctionClearing, AuctionError, AuctionLevel,
     AuctionMarketInterest, AuctionOrder, AuctionOrderConstraint, AuctionOrderFill,
-    AuctionPriceBand, AuctionPriceGrid, AuctionPricePolicy, allocate_clearing_reusing,
-    allocate_clearing_with_policy, discover_bounded_clearing_price,
+    AuctionPriceBand, AuctionPriceGrid, AuctionPricePolicy, AuctionPriorityClass,
+    allocate_clearing_reusing, allocate_clearing_with_policy, compare_order_priority,
+    discover_bounded_clearing_price,
 };
 use crate::bounded_hash::BoundedHashMap;
 use crate::domain::{
@@ -282,11 +283,16 @@ pub struct CallAuctionOrder {
     side: Side,
     constraint: AuctionOrderConstraint,
     quantity: Quantity,
+    priority_class: AuctionPriorityClass,
 }
 
 impl CallAuctionOrder {
     /// Constructs one already domain-validated auction order request.
     #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "constructor keeps every immutable auction-order dimension explicit"
+    )]
     pub const fn new(
         order_id: OrderId,
         account_id: AccountId,
@@ -295,6 +301,7 @@ impl CallAuctionOrder {
         side: Side,
         constraint: AuctionOrderConstraint,
         quantity: Quantity,
+        priority_class: AuctionPriorityClass,
     ) -> Self {
         Self {
             order_id,
@@ -304,6 +311,7 @@ impl CallAuctionOrder {
             side,
             constraint,
             quantity,
+            priority_class,
         }
     }
 
@@ -348,6 +356,12 @@ impl CallAuctionOrder {
     pub const fn quantity(self) -> Quantity {
         self.quantity
     }
+
+    /// Returns the authoritative within-price execution-priority tier.
+    #[must_use]
+    pub const fn priority_class(self) -> AuctionPriorityClass {
+        self.priority_class
+    }
 }
 
 /// Visible immutable state of one active call-auction order.
@@ -363,6 +377,8 @@ pub struct CallAuctionOrderSnapshot {
     pub constraint: AuctionOrderConstraint,
     /// Active quantity.
     pub quantity: Quantity,
+    /// Authoritative within-price execution-priority tier.
+    pub priority_class: AuctionPriorityClass,
     /// Shard-assigned strict time-priority sequence.
     pub priority_sequence: u64,
 }
@@ -1417,6 +1433,7 @@ struct RestingAuctionOrder {
     side: Side,
     constraint: AuctionOrderConstraint,
     quantity: Quantity,
+    priority_class: AuctionPriorityClass,
     priority_sequence: u64,
     previous: Option<OrderId>,
     next: Option<OrderId>,
@@ -1432,6 +1449,7 @@ impl From<RestingAuctionOrder> for CallAuctionOrderSnapshot {
             side: order.side,
             constraint: order.constraint,
             quantity: order.quantity,
+            priority_class: order.priority_class,
             priority_sequence: order.priority_sequence,
         }
     }
@@ -1726,6 +1744,7 @@ impl CallAuctionBook {
                 side: snapshot.side,
                 constraint: snapshot.constraint,
                 quantity: snapshot.quantity,
+                priority_class: snapshot.priority_class,
                 priority_sequence: snapshot.priority_sequence,
                 previous: queue.tail,
                 next: None,
@@ -1983,11 +2002,12 @@ impl CallAuctionBook {
         }
     }
 
-    /// Admits one market or limit order at strict shard-assigned time priority.
+    /// Admits one market or limit order at authoritative class/time priority.
     ///
-    /// The current implementation has one priority class (`0`): market orders
-    /// precede limit orders, limit prices are ordered by aggressiveness, and
-    /// admission sequence orders interest within an equal constraint.
+    /// Market orders precede limit orders, limit prices are ordered by
+    /// aggressiveness, lower priority classes precede higher classes within an
+    /// equal constraint, and admission sequence orders interest within one
+    /// class. Class meaning is supplied by the versioned ingress/controller.
     ///
     /// # Errors
     ///
@@ -3240,6 +3260,7 @@ impl CallAuctionBook {
             side: command.side,
             constraint: command.constraint,
             quantity: command.quantity,
+            priority_class: command.priority_class,
             priority_sequence: self.next_priority_sequence,
             previous: queue.tail,
             next: None,
@@ -3520,6 +3541,8 @@ impl CallAuctionBook {
         for (_, queue) in self.bids.iter().rev() {
             append_queue_orders(*queue, &self.orders, &mut self.buy_order_scratch);
         }
+        self.buy_order_scratch
+            .sort_unstable_by(|left, right| compare_order_priority(*left, *right, Side::Buy));
         self.sell_order_scratch.clear();
         append_queue_orders(
             self.market_sells,
@@ -3529,6 +3552,8 @@ impl CallAuctionBook {
         for (_, queue) in self.asks.iter() {
             append_queue_orders(*queue, &self.orders, &mut self.sell_order_scratch);
         }
+        self.sell_order_scratch
+            .sort_unstable_by(|left, right| compare_order_priority(*left, *right, Side::Sell));
     }
 
     fn validate_queue(
@@ -3734,7 +3759,7 @@ fn append_queue_orders(
             order.order_id,
             order.constraint,
             order.quantity,
-            0,
+            order.priority_class,
             order.priority_sequence,
         ));
         appended += 1;
@@ -3798,6 +3823,7 @@ mod tests {
                 Side::Buy,
                 constraint,
                 Quantity::new(1).unwrap(),
+                crate::auction::AuctionPriorityClass::HIGHEST,
             ))
             .unwrap();
         }

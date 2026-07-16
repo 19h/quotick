@@ -134,6 +134,7 @@ fn submit(
             side,
             AuctionOrderConstraint::Limit(Price::from_raw(price)),
             Quantity::new(quantity).unwrap(),
+            quotick::auction::AuctionPriorityClass::HIGHEST,
         ),
         received_at: TimestampNs::from_unix_nanos(command_id),
     })

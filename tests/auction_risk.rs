@@ -142,6 +142,17 @@ fn order(
     constraint: AuctionOrderConstraint,
     quantity: u64,
 ) -> CallAuctionOrder {
+    order_with_class(order_id, owner, side, constraint, quantity, 0)
+}
+
+fn order_with_class(
+    order_id: u64,
+    owner: u64,
+    side: Side,
+    constraint: AuctionOrderConstraint,
+    quantity: u64,
+    priority_class: u16,
+) -> CallAuctionOrder {
     CallAuctionOrder::new(
         OrderId::new(order_id).unwrap(),
         account(owner),
@@ -150,6 +161,7 @@ fn order(
         side,
         constraint,
         Quantity::new(quantity).unwrap(),
+        quotick::auction::AuctionPriorityClass::new(priority_class),
     )
 }
 
@@ -729,9 +741,13 @@ fn uncross_updates_positions_and_retains_only_exact_partial_reservations() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one class-sensitive uncross case keeps trade, position, reservation, retry, and audit evidence contiguous"
+)]
 fn pro_rata_uncross_drives_exact_positions_and_partial_reservations() {
-    let mut engine = managed(3);
-    for owner in 1..=3 {
+    let mut engine = managed(4);
+    for owner in 1..=4 {
         engine
             .register_account(account(owner), broad_profile(AccountRiskState::Active, 0))
             .unwrap();
@@ -742,12 +758,13 @@ fn pro_rata_uncross_drives_exact_positions_and_partial_reservations() {
     for command in [
         submit_command(
             2,
-            order(
+            order_with_class(
                 1,
                 1,
                 Side::Buy,
                 AuctionOrderConstraint::Limit(Price::from_raw(100)),
-                10,
+                100,
+                1,
             ),
         ),
         submit_command(
@@ -757,7 +774,7 @@ fn pro_rata_uncross_drives_exact_positions_and_partial_reservations() {
                 2,
                 Side::Buy,
                 AuctionOrderConstraint::Limit(Price::from_raw(100)),
-                20,
+                10,
             ),
         ),
         submit_command(
@@ -765,6 +782,16 @@ fn pro_rata_uncross_drives_exact_positions_and_partial_reservations() {
             order(
                 3,
                 3,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                20,
+            ),
+        ),
+        submit_command(
+            5,
+            order(
+                4,
+                4,
                 Side::Sell,
                 AuctionOrderConstraint::Limit(Price::from_raw(100)),
                 15,
@@ -774,11 +801,11 @@ fn pro_rata_uncross_drives_exact_positions_and_partial_reservations() {
         engine.submit(command).unwrap();
     }
     engine
-        .submit(phase_command(5, 1, 1, CallAuctionPhase::Frozen))
+        .submit(phase_command(6, 1, 1, CallAuctionPhase::Frozen))
         .unwrap();
     let uncross = uncross_command_with_allocation(
         &engine,
-        6,
+        7,
         AuctionAllocationPolicy::ProRataTime,
         CallAuctionRemainderPolicy::RetainAll,
     );
@@ -787,14 +814,18 @@ fn pro_rata_uncross_drives_exact_positions_and_partial_reservations() {
 
     assert_eq!(
         engine.risk().snapshot(account(1)).unwrap().position_lots(),
-        5
+        0
     );
     assert_eq!(
         engine.risk().snapshot(account(2)).unwrap().position_lots(),
-        10
+        5
     );
     assert_eq!(
         engine.risk().snapshot(account(3)).unwrap().position_lots(),
+        10
+    );
+    assert_eq!(
+        engine.risk().snapshot(account(4)).unwrap().position_lots(),
         -15
     );
     assert_eq!(
@@ -803,7 +834,7 @@ fn pro_rata_uncross_drives_exact_positions_and_partial_reservations() {
             .reservation(OrderId::new(1).unwrap())
             .unwrap()
             .quantity_lots(),
-        5
+        100
     );
     assert_eq!(
         engine
@@ -811,16 +842,24 @@ fn pro_rata_uncross_drives_exact_positions_and_partial_reservations() {
             .reservation(OrderId::new(2).unwrap())
             .unwrap()
             .quantity_lots(),
+        5
+    );
+    assert_eq!(
+        engine
+            .risk()
+            .reservation(OrderId::new(3).unwrap())
+            .unwrap()
+            .quantity_lots(),
         10
     );
     assert!(
         engine
             .risk()
-            .reservation(OrderId::new(3).unwrap())
+            .reservation(OrderId::new(4).unwrap())
             .is_none()
     );
     assert!(engine.submit(uncross).unwrap().replayed);
-    assert_eq!(engine.risk().reservation_count(), 2);
+    assert_eq!(engine.risk().reservation_count(), 3);
     engine.validate().unwrap();
 }
 

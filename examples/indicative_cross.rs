@@ -65,6 +65,7 @@ fn order(
             side,
             constraint,
             Quantity::new(quantity).unwrap(),
+            quotick::auction::AuctionPriorityClass::HIGHEST,
         ),
         received_at: timestamp(command_id),
     })

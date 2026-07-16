@@ -107,6 +107,34 @@ fn submit(
     constraint: AuctionOrderConstraint,
     quantity: u64,
 ) -> CallAuctionCommand {
+    submit_with_class(
+        command_id,
+        auction_id,
+        phase_revision,
+        order_id,
+        account_id,
+        side,
+        constraint,
+        quantity,
+        0,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test command factory keeps every auction identity dimension explicit"
+)]
+fn submit_with_class(
+    command_id: u64,
+    auction_id: u64,
+    phase_revision: u64,
+    order_id: u64,
+    account_id: u64,
+    side: Side,
+    constraint: AuctionOrderConstraint,
+    quantity: u64,
+    priority_class: u16,
+) -> CallAuctionCommand {
     CallAuctionCommand::Submit(CallAuctionSubmitOrder {
         command_id: CommandId::new(command_id).unwrap(),
         auction_id: auction(auction_id),
@@ -119,6 +147,7 @@ fn submit(
             side,
             constraint,
             Quantity::new(quantity).unwrap(),
+            quotick::auction::AuctionPriorityClass::new(priority_class),
         ),
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
@@ -239,6 +268,7 @@ fn replace(
             side,
             constraint,
             Quantity::new(quantity).unwrap(),
+            quotick::auction::AuctionPriorityClass::HIGHEST,
         ),
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
@@ -779,7 +809,7 @@ fn amendment_projects_one_anonymized_delta_and_retained_aggregate_count() {
         &mut engine,
         &mut publisher,
         &mut replica,
-        submit(
+        submit_with_class(
             2,
             1,
             1,
@@ -788,6 +818,7 @@ fn amendment_projects_one_anonymized_delta_and_retained_aggregate_count() {
             Side::Buy,
             AuctionOrderConstraint::Limit(Price::from_raw(100)),
             8,
+            9,
         ),
     );
     let snapshot = publisher.snapshot();
@@ -817,6 +848,14 @@ fn amendment_projects_one_anonymized_delta_and_retained_aggregate_count() {
     ));
     let bytes = update.encode().unwrap();
     assert_eq!(CallAuctionMarketDataUpdate::decode(&bytes).unwrap(), update);
+    assert_eq!(
+        engine
+            .book()
+            .order(OrderId::new(10).unwrap())
+            .unwrap()
+            .priority_class,
+        quotick::auction::AuctionPriorityClass::new(9)
+    );
     single.apply(update).unwrap();
     assert_mirrors(&engine, &single);
     assert_mirrors(&engine, &replica);

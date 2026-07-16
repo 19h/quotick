@@ -135,6 +135,16 @@ fn phase_for(
 }
 
 fn order(order_id: u64, account_id: u64, side: Side, lots: u64) -> CallAuctionOrder {
+    order_with_class(order_id, account_id, side, lots, 0)
+}
+
+fn order_with_class(
+    order_id: u64,
+    account_id: u64,
+    side: Side,
+    lots: u64,
+    priority_class: u16,
+) -> CallAuctionOrder {
     CallAuctionOrder::new(
         OrderId::new(order_id).unwrap(),
         AccountId::new(account_id).unwrap(),
@@ -143,6 +153,7 @@ fn order(order_id: u64, account_id: u64, side: Side, lots: u64) -> CallAuctionOr
         side,
         AuctionOrderConstraint::Limit(Price::from_raw(100)),
         Quantity::new(lots).unwrap(),
+        quotick::auction::AuctionPriorityClass::new(priority_class),
     )
 }
 
@@ -436,7 +447,7 @@ fn amendment_recovers_across_checkpoint_and_wal_suffix_with_exact_retry() {
         .submit(phase(1, 0, CallAuctionPhase::Collecting))
         .unwrap();
     durable
-        .submit(submit(2, order(10, 7, Side::Buy, 8)))
+        .submit(submit(2, order_with_class(10, 7, Side::Buy, 8, 9)))
         .unwrap();
     durable.submit(amend(3, 7, 10, 5)).unwrap();
     durable
@@ -462,6 +473,10 @@ fn amendment_recovers_across_checkpoint_and_wal_suffix_with_exact_retry() {
         .order(OrderId::new(10).unwrap())
         .unwrap();
     assert_eq!(order.quantity.lots(), 3);
+    assert_eq!(
+        order.priority_class,
+        quotick::auction::AuctionPriorityClass::new(9)
+    );
     assert_eq!(order.priority_sequence, 1);
     assert_eq!(recovered.engine().book().state_revision(), 3);
     assert!(recovered.submit(suffix).unwrap().replayed);
@@ -674,22 +689,23 @@ fn pro_rata_uncross_recovers_identically_from_wal_and_snapshot_history() {
     let mut durable = DurableCallAuctionEngine::open(&wal, definition(), options()).unwrap();
     for command in [
         phase(1, 0, CallAuctionPhase::Collecting),
-        submit(2, order(1, 1, Side::Buy, 10)),
-        submit(3, order(2, 2, Side::Buy, 20)),
-        submit(4, order(3, 3, Side::Sell, 15)),
-        phase(5, 1, CallAuctionPhase::Frozen),
+        submit(2, order_with_class(1, 1, Side::Buy, 100, 1)),
+        submit(3, order_with_class(2, 2, Side::Buy, 10, 0)),
+        submit(4, order_with_class(3, 3, Side::Buy, 20, 0)),
+        submit(5, order_with_class(4, 4, Side::Sell, 15, 0)),
+        phase(6, 1, CallAuctionPhase::Frozen),
     ] {
         durable.submit(command).unwrap();
     }
     let command = uncross_for_allocation(
-        6,
+        7,
         auction(),
         2,
         AuctionAllocationPolicy::ProRataTime,
         CallAuctionRemainderPolicy::CancelAll,
     );
     let report = durable.submit(command).unwrap();
-    assert_eq!(trade_triplets(&report), vec![(1, 3, 5), (2, 3, 10)]);
+    assert_eq!(trade_triplets(&report), vec![(2, 4, 5), (3, 4, 10)]);
     let verified = durable
         .capture_checkpoint_candidate()
         .unwrap()
@@ -703,7 +719,7 @@ fn pro_rata_uncross_recovers_identically_from_wal_and_snapshot_history() {
     let mut wal_recovered = DurableCallAuctionEngine::open(&wal, definition(), options()).unwrap();
     let wal_replay = wal_recovered.submit(command).unwrap();
     assert!(wal_replay.replayed);
-    assert_eq!(trade_triplets(&wal_replay), vec![(1, 3, 5), (2, 3, 10)]);
+    assert_eq!(trade_triplets(&wal_replay), vec![(2, 4, 5), (3, 4, 10)]);
     wal_recovered.close().unwrap();
 
     let mut snapshot_recovered = DurableCallAuctionEngine::open_with_checkpoint(
@@ -714,13 +730,13 @@ fn pro_rata_uncross_recovers_identically_from_wal_and_snapshot_history() {
         SnapshotOptions::default(),
     )
     .unwrap();
-    assert_eq!(snapshot_recovered.recovery().checkpointed_commands, 6);
+    assert_eq!(snapshot_recovered.recovery().checkpointed_commands, 7);
     assert_eq!(snapshot_recovered.recovery().replayed_commands, 0);
     let snapshot_replay = snapshot_recovered.submit(command).unwrap();
     assert!(snapshot_replay.replayed);
     assert_eq!(
         trade_triplets(&snapshot_replay),
-        vec![(1, 3, 5), (2, 3, 10)]
+        vec![(2, 4, 5), (3, 4, 10)]
     );
     snapshot_recovered.engine().validate().unwrap();
     snapshot_recovered.close().unwrap();
@@ -1055,7 +1071,7 @@ fn auction_checkpoint_has_stable_kind_codec_and_direct_restore() {
     SnapshotFile::write(&snapshot, &shared, SnapshotOptions::default()).unwrap();
     let bytes = fs::read(snapshot).unwrap();
     assert_eq!(&bytes[0..4], b"QSNP");
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 13);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 14);
     assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 4);
 }
 

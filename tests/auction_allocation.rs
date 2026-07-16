@@ -1,7 +1,7 @@
 use quotick::auction::{
     AuctionAllocationError, AuctionAllocationLimits, AuctionLevel, AuctionOrder,
-    AuctionOrderConstraint, AuctionPriceGrid, AuctionPricePolicy, allocate_clearing_price_time,
-    allocate_clearing_pro_rata_time, discover_clearing_price,
+    AuctionOrderConstraint, AuctionPriceGrid, AuctionPricePolicy, AuctionPriorityClass,
+    allocate_clearing_price_time, allocate_clearing_pro_rata_time, discover_clearing_price,
 };
 use quotick::{OrderId, Price, Quantity, Side};
 
@@ -16,7 +16,7 @@ fn order(
         OrderId::new(id).unwrap(),
         constraint,
         Quantity::new(quantity).unwrap(),
-        priority_class,
+        AuctionPriorityClass::new(priority_class),
         priority_sequence,
     )
 }

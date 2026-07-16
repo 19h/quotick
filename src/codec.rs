@@ -349,6 +349,10 @@ impl Encoder {
         self.u8(u8::from(value));
     }
 
+    fn u16(&mut self, value: u16) {
+        self.write(&value.to_le_bytes());
+    }
+
     fn u32(&mut self, value: u32) {
         self.write(&value.to_le_bytes());
     }
@@ -430,6 +434,10 @@ impl<'a> Decoder<'a> {
             1 => Ok(true),
             value => Err(CodecError::InvalidBoolean(value)),
         }
+    }
+
+    fn u16(&mut self) -> Result<u16, CodecError> {
+        Ok(u16::from_le_bytes(self.take()?))
     }
 
     fn u32(&mut self) -> Result<u32, CodecError> {

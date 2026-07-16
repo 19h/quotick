@@ -50,14 +50,14 @@ fn main() {
             OrderId::new(1).unwrap(),
             AuctionOrderConstraint::Market,
             Quantity::new(2).unwrap(),
-            0,
+            quotick::auction::AuctionPriorityClass::HIGHEST,
             1,
         ),
         AuctionOrder::new(
             OrderId::new(2).unwrap(),
             AuctionOrderConstraint::Limit(Price::from_raw(-5)),
             Quantity::new(8).unwrap(),
-            0,
+            quotick::auction::AuctionPriorityClass::HIGHEST,
             2,
         ),
     ];
@@ -65,7 +65,7 @@ fn main() {
         OrderId::new(3).unwrap(),
         AuctionOrderConstraint::Limit(Price::from_raw(-15)),
         Quantity::new(6).unwrap(),
-        0,
+        quotick::auction::AuctionPriorityClass::HIGHEST,
         1,
     )];
     let allocation = allocate_clearing_price_time(

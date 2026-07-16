@@ -58,6 +58,16 @@ fn phase(command_id: u64, revision: u64, target: CallAuctionPhase) -> CallAuctio
 }
 
 fn auction_order(order_id: u64, account_id: u64, side: Side, lots: u64) -> CallAuctionOrder {
+    auction_order_with_class(order_id, account_id, side, lots, 0)
+}
+
+fn auction_order_with_class(
+    order_id: u64,
+    account_id: u64,
+    side: Side,
+    lots: u64,
+    priority_class: u16,
+) -> CallAuctionOrder {
     CallAuctionOrder::new(
         OrderId::new(order_id).unwrap(),
         AccountId::new(account_id).unwrap(),
@@ -66,6 +76,7 @@ fn auction_order(order_id: u64, account_id: u64, side: Side, lots: u64) -> CallA
         side,
         AuctionOrderConstraint::Limit(Price::from_raw(100)),
         Quantity::new(lots).unwrap(),
+        quotick::auction::AuctionPriorityClass::new(priority_class),
     )
 }
 
@@ -198,6 +209,38 @@ fn every_call_auction_command_variant_round_trips() {
 }
 
 #[test]
+fn call_auction_submit_command_has_a_stable_priority_class_scalar() {
+    let value = submit(2, auction_order_with_class(1, 1, Side::Buy, 5, 0x1234));
+    let encoded = value.encode().unwrap();
+
+    assert_eq!(encoded.len(), 85);
+    assert_eq!(&encoded[75..77], &0x1234_u16.to_le_bytes());
+    assert_eq!(CallAuctionCommand::decode(&encoded).unwrap(), value);
+}
+
+#[test]
+fn call_auction_accept_event_has_a_stable_priority_class_scalar() {
+    let mut engine = CallAuctionEngine::try_new(definition()).unwrap();
+    engine
+        .submit(phase(1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    let report = engine
+        .submit(submit(
+            2,
+            auction_order_with_class(1, 1, Side::Buy, 5, 0x1234),
+        ))
+        .unwrap();
+    let encoded = report.encode().unwrap();
+
+    assert_eq!(encoded.len(), 91);
+    assert_eq!(&encoded[80..82], &0x1234_u16.to_le_bytes());
+    assert_eq!(
+        CallAuctionExecutionReport::decode(&encoded).unwrap(),
+        report
+    );
+}
+
+#[test]
 fn call_auction_uncross_policy_has_stable_explicit_allocation_tags() {
     let price_time = uncross(5).encode().unwrap();
     let pro_rata = uncross_with_allocation(5, AuctionAllocationPolicy::ProRataTime)
@@ -264,7 +307,7 @@ fn call_auction_amend_report_has_a_stable_event_layout() {
     let encoded = report.encode().unwrap();
     let report_prefix = 8 + 8 + 1 + 4;
     let event_prefix = 8 + 8 + 8;
-    assert_eq!(encoded.len(), report_prefix + 83 + 1);
+    assert_eq!(encoded.len(), report_prefix + 85 + 1);
     assert_eq!(encoded[report_prefix + event_prefix], 8);
     assert_eq!(
         CallAuctionExecutionReport::decode(&encoded).unwrap(),

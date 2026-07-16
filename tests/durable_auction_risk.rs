@@ -159,6 +159,7 @@ fn order(
         side,
         constraint,
         Quantity::new(lots).unwrap(),
+        quotick::auction::AuctionPriorityClass::HIGHEST,
     )
 }
 
@@ -395,7 +396,7 @@ fn checkpoint_is_snapshot_kind_five_and_replays_only_the_suffix() {
     durable.close().unwrap();
 
     let bytes = fs::read(&snapshot).unwrap();
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 13);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 14);
     assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 5);
     let mut recovered = DurableCallAuctionRiskEngine::open_with_checkpoint(
         &wal,

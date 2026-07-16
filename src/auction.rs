@@ -14,6 +14,7 @@
 //! time and `O(F_b + F_a)` result space. Neither kernel mutates an order book or
 //! constructs counterparty pairs.
 
+use std::cmp::Ordering;
 use std::fmt;
 
 use crate::{OrderId, Price, Quantity, Side};
@@ -208,13 +209,39 @@ pub enum AuctionOrderConstraint {
     Limit(Price),
 }
 
+/// Authoritative execution-priority tier within one auction price/constraint.
+///
+/// Lower numeric values execute before higher values. The type deliberately
+/// carries no venue meaning: a gateway or controller must map its versioned
+/// order categories to this scalar before admission.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct AuctionPriorityClass(u16);
+
+impl AuctionPriorityClass {
+    /// Highest representable priority class.
+    pub const HIGHEST: Self = Self(0);
+
+    /// Constructs a priority class from its stable wire scalar.
+    #[must_use]
+    pub const fn new(value: u16) -> Self {
+        Self(value)
+    }
+
+    /// Returns the stable wire scalar; lower values execute first.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
 /// One positive order-level quantity supplied to auction allocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuctionOrder {
     order_id: OrderId,
     constraint: AuctionOrderConstraint,
     quantity: Quantity,
-    priority_class: u16,
+    priority_class: AuctionPriorityClass,
     priority_sequence: u64,
 }
 
@@ -229,7 +256,7 @@ impl AuctionOrder {
         order_id: OrderId,
         constraint: AuctionOrderConstraint,
         quantity: Quantity,
-        priority_class: u16,
+        priority_class: AuctionPriorityClass,
         priority_sequence: u64,
     ) -> Self {
         Self {
@@ -261,7 +288,7 @@ impl AuctionOrder {
 
     /// Returns the caller-defined priority class; lower values execute first.
     #[must_use]
-    pub const fn priority_class(self) -> u16 {
+    pub const fn priority_class(self) -> AuctionPriorityClass {
         self.priority_class
     }
 
@@ -1311,26 +1338,34 @@ fn validate_allocation_orders(
 }
 
 fn precedes(previous: AuctionOrder, current: AuctionOrder, side: Side) -> bool {
+    compare_order_priority(previous, current, side) == Ordering::Less
+}
+
+pub(crate) fn compare_order_priority(
+    previous: AuctionOrder,
+    current: AuctionOrder,
+    side: Side,
+) -> Ordering {
     match (previous.constraint, current.constraint) {
-        (AuctionOrderConstraint::Market, AuctionOrderConstraint::Limit(_)) => true,
-        (AuctionOrderConstraint::Limit(_), AuctionOrderConstraint::Market) => false,
+        (AuctionOrderConstraint::Market, AuctionOrderConstraint::Limit(_)) => Ordering::Less,
+        (AuctionOrderConstraint::Limit(_), AuctionOrderConstraint::Market) => Ordering::Greater,
         (AuctionOrderConstraint::Market, AuctionOrderConstraint::Market) => {
-            priority_key(previous) < priority_key(current)
+            priority_key(previous).cmp(&priority_key(current))
         }
         (AuctionOrderConstraint::Limit(previous_price), AuctionOrderConstraint::Limit(price)) => {
             if previous_price == price {
-                priority_key(previous) < priority_key(current)
+                priority_key(previous).cmp(&priority_key(current))
             } else {
                 match side {
-                    Side::Buy => previous_price > price,
-                    Side::Sell => previous_price < price,
+                    Side::Buy => price.cmp(&previous_price),
+                    Side::Sell => previous_price.cmp(&price),
                 }
             }
         }
     }
 }
 
-fn priority_key(order: AuctionOrder) -> (u16, u64, OrderId) {
+fn priority_key(order: AuctionOrder) -> (AuctionPriorityClass, u64, OrderId) {
     (
         order.priority_class,
         order.priority_sequence,
