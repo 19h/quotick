@@ -4579,6 +4579,65 @@ output. Any hidden disclosure, direction error, endpoint loss, unchecked wrap,
 partial result, mutation, allocation, recovery difference, or implied notional,
 VWAP, consolidated, or executable interpretation falsifies A129.
 
+## A130 — poison-aware public-replica BBO and band summaries
+
+**Assumption.** A healthy `MarketDataReplica` has applied one contiguous
+instrument/version source sequence or one non-stale validated repair snapshot.
+`try_best_bid_offer` and `try_depth_range_summary` observe one immutable replica
+state and bind output to its instrument identity, immutable definition version,
+and final applied source sequence. A poisoned replica returns
+`MarketDataError::Poisoned` before inspecting or returning derived state.
+
+Replica `try_best_bid_offer` reuses the exact A128 `BestBidOffer` constructor
+and validation. Empty and one-sided states retain absent sides; present extrema
+must have positive public quantity/count and remain strictly uncrossed. Replica
+`try_depth_range_summary` reuses the exact A129 `DepthSummary` accumulator over
+the existing inclusive market-direction range iterator. It retains caller
+endpoints, treats inversion as empty, and uses checked level, public-order, and
+public-quantity arithmetic.
+
+Every active replica level is public; private order membership and hidden
+liquidity do not exist in this consumer state. Invalid selected aggregates,
+locked/crossed extrema, or cumulative overflow return a typed
+`MarketDataError::SourceDivergence` without poisoning or exposing a partial
+value. These local checks do not replace `MarketDataReplica::validate` or
+source-sequence/snapshot grammar validation.
+
+The replica exposes only explicit-band summaries. Its constructor binds
+instrument identity/version but intentionally owns no `PriceRules`, so it
+cannot label a definition-wide minimum-to-maximum selection without a separate
+versioned definition input. Inventing raw-domain or observed-domain endpoints
+would make otherwise equal source and replica summaries semantically unequal.
+
+Both successful queries allocate nothing and change no active/standby arena,
+scratch index, sequence, trade, trading-state, poison, replay, or snapshot
+state. They do not reserve liquidity, establish clock freshness, consolidate
+venues, or add wire fields. When a healthy replica is caught up to its source,
+its BBO and same-band summary equal the authoritative A128/A129 values exactly.
+Shared human-readable validation detail may allocate only after corruption and
+is discarded when the replica returns its static source-divergence category.
+
+**Dependent results.** [A1, A3, A10, A12, A22, A44, A45, A72, A83, A103,
+A123, A128, A129, A130] Replica BBO is `O(log(P + 1))` time and `O(1)` space
+because each ordered-map extremum descends one bounded AVL path. For `K`
+selected levels among `P` occupied replica prices, a band summary is
+`O(log(P + 1) + K)` time with `O(1)` fixed output/state. Neither allocates
+output. The shared value constructors and accumulator prevent a second
+arithmetic/provenance model; no payload or snapshot wire-version change
+follows.
+
+**Falsification probe.** Compare source and replica BBO plus same-band summaries
+after genesis, every accepted or rejected command class, absolute incremental
+batches, exact retry, snapshot repair, and durable publisher bootstrap. Cover
+both directions, empty/one-sided/two-sided state, signed prices, narrow/outside/
+inverted bands, multiple levels, and sequence-only no-book changes. Require
+exact value equality and nonmutation. Poison a replica; inject zero quantity/
+count, locked/crossed extrema, and multi-level `u128` overflow; require the
+specified typed error without partial output or poison change. Any stale-state
+output while poisoned, provenance mismatch, parity divergence, unchecked wrap,
+allocation, mutation, invented definition bounds, or consolidated/executable
+interpretation falsifies A130.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -4675,6 +4734,17 @@ capability, a remaining risk, or an opportunity.
   materializing depth. Price notional, VWAP, cross-venue consolidation, fees,
   clock alignment, and executable-liquidity modelling remain separate checked
   calculations and sequenced inputs.
+
+- **Medium impact:** healthy continuous public replicas now expose the exact
+  shared provenance-bound BBO and explicit-band cumulative summary values under
+  A130. Repeated incremental, snapshot-repair, and durable-bootstrap tests
+  require equality with the caught-up authoritative book; poisoned or corrupt
+  replica state fails before output.
+
+- **Low impact boundary:** a replica intentionally has no definition-wide
+  summary method because its constructor owns instrument identity/version but
+  not versioned price-rule endpoints. Callers requiring full-definition labels
+  must supply the corresponding definition and request that explicit band.
 
 - **Medium impact risk:** queue position is a state observation, not a fill-
   probability or latency estimate. Subsequent execution, cancellation,

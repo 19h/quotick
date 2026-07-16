@@ -24,10 +24,11 @@ use crate::domain::{
 use crate::indexed_avl::{DirectionalIter, IndexedAvlMap};
 use crate::instrument::TradingState;
 use crate::matching::{
-    AccountAdmissionState, AccountControlAction, AccountControlSnapshot, CancelReason, Command,
-    CommandOutcome, Event, EventKind, ExecutionReport, LevelSnapshot, MassCancelScope, OrderBook,
-    OrderBookLimits, OrderDisplay, OrderType, SelfTradePrevention, StopActivation, StopReference,
-    TimeInForce, Trade, TradingStateControlAction, TradingStateSnapshot,
+    AccountAdmissionState, AccountControlAction, AccountControlSnapshot, BestBidOffer,
+    CancelReason, Command, CommandOutcome, DepthSummary, Event, EventKind, ExecutionReport,
+    LevelSnapshot, MassCancelScope, OrderBook, OrderBookLimits, OrderDisplay, OrderType,
+    SelfTradePrevention, StopActivation, StopReference, TimeInForce, Trade,
+    TradingStateControlAction, TradingStateSnapshot,
 };
 
 mod replay;
@@ -3317,6 +3318,71 @@ impl MarketDataReplica {
         Ok(())
     }
 
+    /// Returns one coherent public best-bid-and-offer observation.
+    ///
+    /// The fixed-size result carries this replica's instrument, immutable
+    /// definition version, and final applied source sequence. It executes in
+    /// `O(log(P + 1))` time for `P` public prices without allocation or
+    /// mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketDataError::Poisoned`] while snapshot repair is required,
+    /// or [`MarketDataError::SourceDivergence`] if the cached extrema have a
+    /// zero aggregate/count or are locked/crossed.
+    pub fn try_best_bid_offer(&self) -> Result<BestBidOffer, MarketDataError> {
+        if self.poisoned {
+            return Err(MarketDataError::Poisoned);
+        }
+        BestBidOffer::try_new(
+            self.instrument_id,
+            self.instrument_version,
+            self.last_sequence,
+            self.best_bid(),
+            self.best_ask(),
+        )
+        .map_err(|_| MarketDataError::SourceDivergence("replica best bid and offer are invalid"))
+    }
+
+    /// Summarizes replica depth inside one inclusive price range.
+    ///
+    /// The allocation-free result retains the exact endpoints, side,
+    /// market-priority best/worst prices, cumulative visible levels/orders/
+    /// lots, and replica provenance. An inverted range is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketDataError::Poisoned`] while snapshot repair is required,
+    /// or [`MarketDataError::SourceDivergence`] if a selected aggregate is zero
+    /// or cumulative arithmetic is not representable.
+    pub fn try_depth_range_summary(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+    ) -> Result<DepthSummary, MarketDataError> {
+        if self.poisoned {
+            return Err(MarketDataError::Poisoned);
+        }
+        let range_start = *range.start();
+        let range_end = *range.end();
+        let mut summary = DepthSummary::empty(
+            self.instrument_id,
+            self.instrument_version,
+            self.last_sequence,
+            side,
+            range_start,
+            range_end,
+        );
+        for level in self.depth_range_iter(side, range) {
+            summary.try_include(level).map_err(|_| {
+                MarketDataError::SourceDivergence(
+                    "replica depth summary encountered invalid aggregates",
+                )
+            })?;
+        }
+        Ok(summary)
+    }
+
     /// Fallibly returns up to `limit` levels in market-priority order.
     ///
     /// # Errors
@@ -4143,6 +4209,81 @@ mod resource_limit_tests {
             reserve_replica_depth_output(usize::MAX, Side::Sell),
             Err(MarketDataError::PreparationAllocationFailed(
                 MarketDataResource::AskPriceLevels
+            ))
+        );
+    }
+
+    #[test]
+    fn replica_fixed_queries_fail_closed_on_poison_and_invalid_aggregates() {
+        let full_range = Price::from_raw(i64::MIN)..=Price::from_raw(i64::MAX);
+
+        let mut poisoned = replica();
+        poisoned.poisoned = true;
+        assert_eq!(
+            poisoned.try_best_bid_offer(),
+            Err(MarketDataError::Poisoned)
+        );
+        assert_eq!(
+            poisoned.try_depth_range_summary(Side::Buy, full_range.clone()),
+            Err(MarketDataError::Poisoned)
+        );
+
+        let mut invalid = replica();
+        invalid.bids.insert(
+            Price::from_raw(100),
+            Aggregate {
+                quantity: 0,
+                order_count: 1,
+            },
+        );
+        assert_eq!(
+            invalid.try_best_bid_offer(),
+            Err(MarketDataError::SourceDivergence(
+                "replica best bid and offer are invalid"
+            ))
+        );
+        assert_eq!(
+            invalid.try_depth_range_summary(Side::Buy, full_range.clone()),
+            Err(MarketDataError::SourceDivergence(
+                "replica depth summary encountered invalid aggregates"
+            ))
+        );
+
+        let mut crossed = replica();
+        for side in [Side::Buy, Side::Sell] {
+            let levels = match side {
+                Side::Buy => &mut crossed.bids,
+                Side::Sell => &mut crossed.asks,
+            };
+            levels.insert(
+                Price::from_raw(100),
+                Aggregate {
+                    quantity: 1,
+                    order_count: 1,
+                },
+            );
+        }
+        assert_eq!(
+            crossed.try_best_bid_offer(),
+            Err(MarketDataError::SourceDivergence(
+                "replica best bid and offer are invalid"
+            ))
+        );
+
+        let mut overflowing = replica();
+        for (price, quantity) in [(100, u128::MAX), (90, 1)] {
+            overflowing.bids.insert(
+                Price::from_raw(price),
+                Aggregate {
+                    quantity,
+                    order_count: 1,
+                },
+            );
+        }
+        assert_eq!(
+            overflowing.try_depth_range_summary(Side::Buy, full_range),
+            Err(MarketDataError::SourceDivergence(
+                "replica depth summary encountered invalid aggregates"
             ))
         );
     }

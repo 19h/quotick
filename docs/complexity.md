@@ -705,6 +705,18 @@ containing `K` occupied prices, `depth_range_iter` costs
 passes, exactly reserves `S` rows, and owns `O(S)` output. An inverted band is
 empty. Both iterator types are double-ended; the full iterator is exact-size.
 
+On a healthy continuous replica, `try_best_bid_offer` descends at most two AVL
+extremum paths and validates one fixed-size shared value in
+`O(log(P + 1))` time and `O(1)` space.
+`try_depth_range_summary` performs one checked fold over the existing band
+iterator in `O(log(P + 1) + K)` time and `O(1)` fixed result/state for `K`
+selected public levels. Neither query allocates output. Poison rejection is
+`O(1)` before traversal. The public corruption category is a static
+`MarketDataError::SourceDivergence`; shared human-readable internal validation
+detail may allocate only after corruption and is then discarded. No error path
+returns a partial summary. The replica exposes no definition-wide summary
+because it retains no price-rule endpoints.
+
 For replay capacity `N`, one `MarketDataReplayBuffer` initializes `N` optional
 typed slots in `O(N)` time and retains `O(N)` state. An `E`-update admission
 preflights identity, contiguity, overlap, and collision in `O(E)` time, then

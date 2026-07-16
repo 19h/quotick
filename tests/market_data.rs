@@ -214,6 +214,19 @@ fn assert_mirrors(book: &OrderBook, replica: &MarketDataReplica) {
         book.depth(Side::Sell, usize::MAX)
     );
     assert_eq!(replica.last_sequence(), book.last_event_sequence());
+    assert_eq!(
+        replica.try_best_bid_offer().unwrap(),
+        book.try_best_bid_offer().unwrap()
+    );
+    for side in [Side::Buy, Side::Sell] {
+        let range = Price::from_raw(-1_000)..=Price::from_raw(1_000);
+        assert_eq!(
+            replica
+                .try_depth_range_summary(side, range.clone())
+                .unwrap(),
+            book.try_depth_range_summary(side, range).unwrap()
+        );
+    }
 }
 
 #[test]
@@ -293,6 +306,13 @@ fn replica_depth_ranges_are_inclusive_market_ordered_and_book_equivalent() {
             Price::from_raw(120)..=Price::from_raw(130),
             usize::MAX,
         )
+    );
+    assert_eq!(
+        replica
+            .try_depth_range_summary(Side::Buy, Price::from_raw(90)..=Price::from_raw(100),)
+            .unwrap(),
+        book.try_depth_range_summary(Side::Buy, Price::from_raw(90)..=Price::from_raw(100),)
+            .unwrap()
     );
     assert!(
         replica

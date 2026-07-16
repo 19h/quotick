@@ -1544,6 +1544,38 @@ pub struct BestBidOffer {
 }
 
 impl BestBidOffer {
+    pub(crate) fn try_new(
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        book_event_sequence: u64,
+        bid: Option<LevelSnapshot>,
+        offer: Option<LevelSnapshot>,
+    ) -> Result<Self, InvariantViolation> {
+        for (side, level) in [(Side::Buy, bid), (Side::Sell, offer)] {
+            if level.is_some_and(|level| level.quantity == 0 || level.order_count == 0) {
+                return Err(InvariantViolation::new(format!(
+                    "cached public {side:?} best has a zero aggregate or order count"
+                )));
+            }
+        }
+        if let (Some(bid), Some(offer)) = (bid, offer) {
+            if bid.price >= offer.price {
+                return Err(InvariantViolation::new(format!(
+                    "locked or crossed public best: bid {} >= offer {}",
+                    bid.price.raw(),
+                    offer.price.raw()
+                )));
+            }
+        }
+        Ok(Self {
+            instrument_id,
+            instrument_version,
+            book_event_sequence,
+            bid,
+            offer,
+        })
+    }
+
     /// Returns the quoted instrument.
     #[must_use]
     pub const fn instrument_id(self) -> InstrumentId {
@@ -1621,6 +1653,29 @@ pub struct DepthSummary {
 }
 
 impl DepthSummary {
+    pub(crate) const fn empty(
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        book_event_sequence: u64,
+        side: Side,
+        range_start: Price,
+        range_end: Price,
+    ) -> Self {
+        Self {
+            instrument_id,
+            instrument_version,
+            book_event_sequence,
+            side,
+            range_start,
+            range_end,
+            best_price: None,
+            worst_price: None,
+            level_count: 0,
+            displayed_order_count: 0,
+            displayed_quantity: 0,
+        }
+    }
+
     /// Returns the summarized instrument.
     #[must_use]
     pub const fn instrument_id(self) -> InstrumentId {
@@ -1687,7 +1742,7 @@ impl DepthSummary {
         self.displayed_quantity
     }
 
-    fn try_include(&mut self, level: LevelSnapshot) -> Result<(), InvariantViolation> {
+    pub(crate) fn try_include(&mut self, level: LevelSnapshot) -> Result<(), InvariantViolation> {
         if level.quantity == 0 || level.order_count == 0 {
             return Err(InvariantViolation::new(format!(
                 "public depth level at {} has a zero aggregate or order count",
@@ -7139,29 +7194,13 @@ impl OrderBook {
     pub fn try_best_bid_offer(&self) -> Result<BestBidOffer, InvariantViolation> {
         let bid = self.best_bid();
         let offer = self.best_ask();
-        for (side, level) in [(Side::Buy, bid), (Side::Sell, offer)] {
-            if level.is_some_and(|level| level.quantity == 0 || level.order_count == 0) {
-                return Err(InvariantViolation::new(format!(
-                    "cached public {side:?} best has a zero aggregate or order count"
-                )));
-            }
-        }
-        if let (Some(bid), Some(offer)) = (bid, offer) {
-            if bid.price >= offer.price {
-                return Err(InvariantViolation::new(format!(
-                    "locked or crossed public best: bid {} >= offer {}",
-                    bid.price.raw(),
-                    offer.price.raw()
-                )));
-            }
-        }
-        Ok(BestBidOffer {
-            instrument_id: self.definition.instrument_id(),
-            instrument_version: self.definition.version(),
-            book_event_sequence: self.last_event_sequence(),
+        BestBidOffer::try_new(
+            self.definition.instrument_id(),
+            self.definition.version(),
+            self.last_event_sequence(),
             bid,
             offer,
-        })
+        )
     }
 
     /// Returns process-local allocation telemetry for one execution-price
@@ -7276,19 +7315,14 @@ impl OrderBook {
     ) -> Result<DepthSummary, InvariantViolation> {
         let range_start = *range.start();
         let range_end = *range.end();
-        let mut summary = DepthSummary {
-            instrument_id: self.definition.instrument_id(),
-            instrument_version: self.definition.version(),
-            book_event_sequence: self.last_event_sequence(),
+        let mut summary = DepthSummary::empty(
+            self.definition.instrument_id(),
+            self.definition.version(),
+            self.last_event_sequence(),
             side,
             range_start,
             range_end,
-            best_price: None,
-            worst_price: None,
-            level_count: 0,
-            displayed_order_count: 0,
-            displayed_quantity: 0,
-        };
+        );
         for (&price, level) in self.price_levels_range_iter(side, range) {
             if level.total_quantity == 0 && level.visible_order_count == 0 {
                 continue;
