@@ -6,9 +6,10 @@ use quotick::auction::{
 };
 use quotick::auction_book::{
     CallAuctionAdmissionError, CallAuctionAmendError, CallAuctionBook, CallAuctionBookLimits,
-    CallAuctionBookLimitsError, CallAuctionBookLimitsSpec, CallAuctionCancelError,
-    CallAuctionCapacity, CallAuctionConstructionError, CallAuctionIndicative,
-    CallAuctionMassCancelError, CallAuctionOrder, CallAuctionPlanError, CallAuctionReplaceError,
+    CallAuctionBookLimitsError, CallAuctionBookLimitsSpec, CallAuctionBookQueryError,
+    CallAuctionBookQueryResource, CallAuctionCancelError, CallAuctionCapacity,
+    CallAuctionConstructionError, CallAuctionIndicative, CallAuctionMassCancelError,
+    CallAuctionOrder, CallAuctionPlanError, CallAuctionReplaceError,
 };
 use quotick::instrument::{
     AdmissionError, InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol,
@@ -610,8 +611,7 @@ fn invalid_quantity_reduction_fails_before_mutation() {
     book.validate().unwrap();
 }
 
-#[test]
-fn account_mass_cancel_is_indexed_canonical_and_revision_atomic() {
+fn populated_account_indexed_book() -> CallAuctionBook {
     let mut book = CallAuctionBook::try_with_limits(definition(), limits(8, 8, 16)).unwrap();
     for command in [
         order(70, 7, Side::Buy, AuctionOrderConstraint::Market, 2),
@@ -641,6 +641,12 @@ fn account_mass_cancel_is_indexed_canonical_and_revision_atomic() {
     ] {
         book.admit(command).unwrap();
     }
+    book
+}
+
+#[test]
+fn account_mass_cancel_is_indexed_canonical_and_revision_atomic() {
+    let mut book = populated_account_indexed_book();
 
     assert_eq!(
         book.account_active_order_count(account(7), MassCancelScope::All),
@@ -694,6 +700,53 @@ fn account_mass_cancel_is_indexed_canonical_and_revision_atomic() {
     assert_eq!(empty.state_revision(), 7);
     assert!(removed.is_empty());
     book.validate().unwrap();
+}
+
+#[test]
+fn account_order_queries_are_canonical_scoped_and_nonmutating() {
+    let book = populated_account_indexed_book();
+    let before = book.resource_status();
+
+    let all = book
+        .try_account_active_order_ids(account(7), MassCancelScope::All)
+        .unwrap();
+    assert_eq!(
+        all.iter()
+            .map(|order_id| order_id.get())
+            .collect::<Vec<_>>(),
+        [10, 40, 50, 70]
+    );
+    assert_eq!(
+        book.try_account_active_order_ids(account(7), MassCancelScope::Side(Side::Sell))
+            .unwrap(),
+        [OrderId::new(40).unwrap(), OrderId::new(50).unwrap()]
+    );
+    assert_eq!(
+        all,
+        book.account_active_order_ids(account(7), MassCancelScope::All)
+    );
+    assert!(
+        book.try_account_active_order_ids(account(99), MassCancelScope::All)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(book.resource_status(), before);
+    book.validate().unwrap();
+}
+
+#[test]
+fn account_order_query_failures_name_the_exact_resource_and_bound() {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<CallAuctionBookQueryError>();
+
+    let error = CallAuctionBookQueryError::ReservationFailed {
+        resource: CallAuctionBookQueryResource::AccountOrderIds,
+        maximum: 250_000,
+    };
+    assert_eq!(
+        error.to_string(),
+        "call-auction book account-order-identifier output could not reserve 250000 entries"
+    );
 }
 
 #[test]

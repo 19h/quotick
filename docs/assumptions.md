@@ -212,11 +212,11 @@ ownership, path/string construction, ledger diagnostic/reconciliation
 collections, failure-detail formatting, caller-owned or cloned generic auction
 allocation plans, and wide ledger magnitudes can still allocate or abort.
 
-Continuous order-book depth, private active-order, and account-order-ID output,
-plus continuous and call-auction market-data batch/snapshot/depth output, has
-explicit fallible APIs. Convenience wrappers can still panic on allocation
-failure; the account-order-ID convenience wrapper can also panic if private
-topology is corrupt.
+Continuous order-book depth and private active-order output, continuous and
+call-auction account-order-ID output, plus continuous and call-auction market-
+data batch/snapshot/depth output, has explicit fallible APIs. Convenience
+wrappers can still panic on allocation failure; the account-order-ID wrappers
+can also panic if private topology is corrupt.
 
 **Dependent results.** Typed failure exists at the enumerated boundaries; no
 end-to-end allocation-failure continuation claim follows. Authoritative bounded
@@ -1502,6 +1502,10 @@ Every active order also belongs to one bounded owner/side intrusive lane with
 exact count and `u128` quantity. Account/side mass cancellation selects only
 that lane, returns snapshots in ascending `OrderId` order, and advances the book
 revision once exactly for a non-empty selection.
+Read-only account/side order-ID extraction reserves the selected lane count,
+validates the same ownership, side, link, count, and quantity state, and returns
+ascending `OrderId` values without mutation. Allocation and topology failures
+remain typed; an unknown account returns an empty vector.
 One retained-priority amendment accepts only a strictly smaller positive,
 lot-aligned active quantity. It preserves identity, owner, side, constraint,
 price, queue links, priority class, and priority sequence; changes queue and
@@ -1525,7 +1529,10 @@ Replacement is `O(log I + log O + log P)` with `O(1)` auxiliary space.
 Amendment is `O(log O + log P)` with `O(1)` auxiliary space. Mass-
 cancel preflight is expected `O(1)`; applying `K` selected orders is
 `O(K(log K + log O + log P))` using caller-owned reserved output and is
-independent of unrelated active orders. No continuous-book state is mutated.
+independent of unrelated active orders. Read-only extraction of those `K`
+identifiers is expected `O(1) + O(K log K)` time and `O(K)` caller-owned
+output, also independent of unrelated active orders. No collection-book state
+is mutated.
 
 **Falsification probe.** Exercise routing/version and every instrument
 boundary; locked/crossed/market-only interest; middle/head/tail cancellation
@@ -1536,6 +1543,8 @@ amendment reduction, immutable fields, retained priority, and aggregate delta;
 empty/all/side mass cancellation, sparse owners in a full book, output-capacity
 and revision exhaustion, account-link corruption, canonical output, one-
 revision commit, and fixed allocation telemetry;
+empty/all/side read-only account queries, unknown owners, typed allocation
+failure, account-link corruption, canonical IDs, and nonmutation;
 foreign/stale indicative results; exact capacity telemetry; 20,000 mixed
 insert/remove/amend/replace/mass-cancel operations against independent
 aggregate and priority models;
@@ -4089,12 +4098,13 @@ capability, a remaining risk, or an opportunity.
   Fee schedules, calculation, authorization, account-role mapping, tax, and
   settlement-date policy remain external lifecycle inputs.
 
-- **Medium impact:** continuous public-depth, complete private resting-order,
-  and account-scoped identifier extraction now has typed fallible output under
-  A117. Bounds and canonical ordering are covered through hidden liquidity,
-  account-list corruption, and large caller-owned results. Target-hardware
-  allocator latency, resident memory, and sustained 250,000-order snapshot
-  cadence remain unknown until measured.
+- **Medium impact:** continuous public-depth and complete private resting-order
+  extraction plus continuous and call-auction account-scoped identifier
+  extraction now have typed fallible output under A117 and A62. Bounds and
+  canonical ordering are covered through hidden liquidity, account-list
+  corruption, and large caller-owned results. Target-hardware allocator
+  latency, resident memory, and sustained 250,000-order snapshot cadence remain
+  unknown until measured.
 
 - **Medium impact:** continuous and call-auction live command/report history
   now supports expected constant-time exact lookup and zero-copy chronological

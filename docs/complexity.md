@@ -201,6 +201,11 @@ orders, and `P` occupied limit prices:
   expected `O(1)`. For `K` selected orders, application traverses only those
   links, sorts snapshots in `O(K log K)`, and removes them in
   `O(K(log O + log P))`; it is independent of unrelated active orders.
+- Read-only account-order extraction performs the same expected `O(1)` lookup,
+  fallibly reserves `K` IDs, validates only those owner/side links and
+  aggregates, and sorts them in `O(K log K)`. Its `O(K)` caller-owned output and
+  runtime are independent of unrelated active orders; failures return no
+  partial vector and mutate no collection state.
 - Aggregate scratch construction and discovery are `O(B + A)`.
 - Canonical order scratch construction is `O(O log O + P)`: intrusive arrival-
   FIFO identities are resolved through a stable AVL, then both caller-owned

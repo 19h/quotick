@@ -312,7 +312,8 @@ Run any program with `cargo run --example <name>`.
   never-reusable order identities, an authoritative typed `u16` priority class
   compared after market/price and before time/ID, owner-checked cancellation,
   account/side-scoped mass cancellation through a bounded intrusive owner
-  index,
+  index, typed fallible canonical account-order-ID extraction over the same
+  owner lanes,
   revision-bound indicative results, atomic new-identity cancel/replace with
   complete priority loss and saturated active/price-level capacity reuse when
   accepted-ID headroom remains, strict retained-priority active-quantity
@@ -643,7 +644,9 @@ includes:
   stable codecs, and durable exact retry. Retained auction-history queries
   cover accepted and rejected rows, exact lookup, zero-copy chronological
   iteration, retry stability, unchanged resource telemetry, and durable
-  recovery. Settlement coverage proves one-entry and multi-entry mappings,
+  recovery. Account-order queries cover canonical all/side selection, unknown
+  owners, typed allocation failure, private-index corruption, and nonmutation.
+  Settlement coverage proves one-entry and multi-entry mappings,
   canonical explicit fee binding, instrument/version
   mismatch, invalid fee and same-account rejection, overflow/capacity
   atomicity, partial-prior-commit detection, one-frame recovery, checkpoint

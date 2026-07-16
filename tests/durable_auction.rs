@@ -468,6 +468,14 @@ fn durable_staged_auction_checkpoint_replays_only_post_capture_suffix() {
     assert_eq!(recovered.recovery().checkpointed_commands, 2);
     assert_eq!(recovered.recovery().replayed_commands, 1);
     assert_eq!(recovered.engine().book().active_order_count(), 2);
+    assert_eq!(
+        recovered
+            .engine()
+            .book()
+            .try_account_active_order_ids(AccountId::new(2).unwrap(), MassCancelScope::All)
+            .unwrap(),
+        [OrderId::new(2).unwrap()]
+    );
     recovered.engine().validate().unwrap();
 }
 
@@ -1275,6 +1283,20 @@ fn auction_checkpoint_projection_is_independent_of_order_identity_order() {
     );
     let restored = CallAuctionEngine::from_checkpoint(&checkpoint).unwrap();
     assert_eq!(restored.book().active_order_count(), 3);
+    assert_eq!(
+        restored
+            .book()
+            .try_account_active_order_ids(AccountId::new(1).unwrap(), MassCancelScope::All)
+            .unwrap(),
+        [OrderId::new(30).unwrap()]
+    );
+    assert_eq!(
+        restored
+            .book()
+            .try_account_active_order_ids(AccountId::new(2).unwrap(), MassCancelScope::All)
+            .unwrap(),
+        [OrderId::new(10).unwrap()]
+    );
     restored.validate().unwrap();
 }
 

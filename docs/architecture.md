@@ -674,6 +674,12 @@ interest for discovery, allocation, and uncross preparation.
      book revision once exactly when `K > 0`. An empty selection is valid and
      leaves the revision unchanged. Output-state, output-capacity, revision, or
      account-index failure precedes mutation.
+   - Read-only account-order extraction performs the same expected `O(1)` owner
+     lookup, reserves the selected count, traverses only those `K` links, and
+     returns IDs in ascending `OrderId` order. It validates ownership, side,
+     previous/tail links, count, quantity, and duplicate identity. Allocation
+     or topology failure is typed and returns no partial output; an unknown
+     account returns an empty vector and no query mutates collection state.
 6. Indicative discovery rebuilds canonical aggregate scratch and invokes the
    A60 kernel with current market totals. Allocation-plan construction rebuilds
    canonical market/price/class/time/ID order scratch under A111 and invokes
@@ -689,6 +695,9 @@ interest for discovery, allocation, and uncross preparation.
    the target's net active slot. Mass-cancel preflight is expected `O(1)`; for
    `K` selected orders, apply is
    `O(K(log K + log O + log P))` and independent of unrelated active orders.
+   Read-only account-ID extraction is expected `O(1) + O(K log K)` time and
+   `O(K)` caller-owned output for `K` selected orders, also independent of
+   unrelated active orders.
    Aggregate scratch plus discovery is `O(B + A)`.
    Order scratch is `O(O log O + P)` because intrusive links contain stable
    order identities resolved through the AVL and the preallocated slices are
@@ -1969,6 +1978,8 @@ removal while auditing after every transition.
 Call-auction book audit tests independently corrupt market and limit FIFO
 cycles, account-index links and aggregates, and remove active orders from every
 queue while exercising the equivalent allocation-free coverage guards. Live
+account-order query tests cover canonical all/side selection, unknown owners,
+typed unrepresentable output, private-index corruption, and nonmutation. Live
 allocation tests invert class and arrival order, place the class boundary at
 price-time and pro-rata marginal tiers, prove amendment retention and
 replacement reassignment, and compare 20,000 four-class mutations with an

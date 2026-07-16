@@ -1415,6 +1415,73 @@ impl fmt::Display for CallAuctionInvariantViolation {
 
 impl std::error::Error for CallAuctionInvariantViolation {}
 
+/// Caller-owned output constructed by one read-only call-auction book query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallAuctionBookQueryResource {
+    /// Canonically ordered active-order identifiers for one account.
+    AccountOrderIds,
+}
+
+impl fmt::Display for CallAuctionBookQueryResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AccountOrderIds => formatter.write_str("account-order-identifier output"),
+        }
+    }
+}
+
+/// Failure while constructing caller-owned read-only call-auction book output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CallAuctionBookQueryError {
+    /// The complete bounded output vector could not be reserved.
+    ReservationFailed {
+        /// Output whose reservation failed.
+        resource: CallAuctionBookQueryResource,
+        /// Maximum number of output entries required by the query.
+        maximum: usize,
+    },
+    /// Private account or active-order state contradicted its invariants.
+    InvariantViolation(CallAuctionInvariantViolation),
+}
+
+impl fmt::Display for CallAuctionBookQueryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReservationFailed { resource, maximum } => write!(
+                formatter,
+                "call-auction book {resource} could not reserve {maximum} entries"
+            ),
+            Self::InvariantViolation(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for CallAuctionBookQueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ReservationFailed { .. } => None,
+            Self::InvariantViolation(error) => Some(error),
+        }
+    }
+}
+
+impl From<CallAuctionInvariantViolation> for CallAuctionBookQueryError {
+    fn from(error: CallAuctionInvariantViolation) -> Self {
+        Self::InvariantViolation(error)
+    }
+}
+
+fn reserve_call_auction_book_query_vec<T>(
+    maximum: usize,
+    resource: CallAuctionBookQueryResource,
+) -> Result<Vec<T>, CallAuctionBookQueryError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(maximum)
+        .map_err(|_| CallAuctionBookQueryError::ReservationFailed { resource, maximum })?;
+    Ok(output)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct AuctionQueue {
     head: Option<OrderId>,
@@ -1904,6 +1971,105 @@ impl CallAuctionBook {
         }
     }
 
+    /// Fallibly returns one account's active order IDs in canonical ascending order.
+    ///
+    /// This allocates `O(K)` output, traverses only the `K` selected orders, and
+    /// sorts them in `O(K log K)` time without auxiliary allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionBookQueryError::ReservationFailed`] before
+    /// traversal if the complete bounded vector cannot be reserved, or
+    /// [`CallAuctionBookQueryError::InvariantViolation`] if the private account
+    /// list contradicts its declared identity, side, quantity, or cardinality.
+    pub fn try_account_active_order_ids(
+        &self,
+        account_id: AccountId,
+        scope: MassCancelScope,
+    ) -> Result<Vec<OrderId>, CallAuctionBookQueryError> {
+        let Some(index) = self.account_orders.get(&account_id).copied() else {
+            return Ok(Vec::new());
+        };
+        let selected_count = match scope {
+            MassCancelScope::All => index
+                .buys
+                .order_count
+                .checked_add(index.sells.order_count)
+                .ok_or_else(|| {
+                    CallAuctionInvariantViolation::new(format!(
+                        "account {account_id} active-order count is exhausted"
+                    ))
+                })?,
+            MassCancelScope::Side(side) => index.side(side).order_count,
+        };
+        if selected_count > self.orders.len() {
+            return Err(CallAuctionInvariantViolation::new(format!(
+                "account {account_id} active-order count exceeds total active orders"
+            ))
+            .into());
+        }
+        let mut selected = reserve_call_auction_book_query_vec(
+            selected_count,
+            CallAuctionBookQueryResource::AccountOrderIds,
+        )?;
+        match scope {
+            MassCancelScope::All => {
+                self.try_append_account_side_values(
+                    index,
+                    account_id,
+                    Side::Buy,
+                    &mut selected,
+                    |order| order.order_id,
+                )?;
+                self.try_append_account_side_values(
+                    index,
+                    account_id,
+                    Side::Sell,
+                    &mut selected,
+                    |order| order.order_id,
+                )?;
+            }
+            MassCancelScope::Side(side) => self.try_append_account_side_values(
+                index,
+                account_id,
+                side,
+                &mut selected,
+                |order| order.order_id,
+            )?,
+        }
+        if selected.len() != selected_count {
+            return Err(CallAuctionInvariantViolation::new(format!(
+                "account {account_id} query output differs from its declared count"
+            ))
+            .into());
+        }
+        selected.sort_unstable();
+        if selected.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(CallAuctionInvariantViolation::new(format!(
+                "account {account_id} query traversed one active order more than once"
+            ))
+            .into());
+        }
+        Ok(selected)
+    }
+
+    /// Returns account order IDs using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if output allocation fails or private account-list state is
+    /// corrupt. Use [`Self::try_account_active_order_ids`] when either failure
+    /// must remain typed.
+    #[must_use]
+    pub fn account_active_order_ids(
+        &self,
+        account_id: AccountId,
+        scope: MassCancelScope,
+    ) -> Vec<OrderId> {
+        self.try_account_active_order_ids(account_id, scope)
+            .expect("call-auction book account-order query failed")
+    }
+
     /// Preflights the aggregate effect of one account-scoped mass cancel.
     ///
     /// The operation performs one expected `O(1)` account lookup. An empty
@@ -1981,13 +2147,29 @@ impl CallAuctionBook {
         };
         let append_result = match scope {
             MassCancelScope::All => self
-                .append_account_side_snapshots(index, account_id, Side::Buy, output)
+                .try_append_account_side_values(
+                    index,
+                    account_id,
+                    Side::Buy,
+                    output,
+                    CallAuctionOrderSnapshot::from,
+                )
                 .and_then(|()| {
-                    self.append_account_side_snapshots(index, account_id, Side::Sell, output)
+                    self.try_append_account_side_values(
+                        index,
+                        account_id,
+                        Side::Sell,
+                        output,
+                        CallAuctionOrderSnapshot::from,
+                    )
                 }),
-            MassCancelScope::Side(side) => {
-                self.append_account_side_snapshots(index, account_id, side, output)
-            }
+            MassCancelScope::Side(side) => self.try_append_account_side_values(
+                index,
+                account_id,
+                side,
+                output,
+                CallAuctionOrderSnapshot::from,
+            ),
         };
         if append_result.is_err() || output.len() != selected_count {
             output.clear();
@@ -3467,34 +3649,45 @@ impl CallAuctionBook {
         }
     }
 
-    fn append_account_side_snapshots(
+    fn try_append_account_side_values<T>(
         &self,
         index: AuctionAccountIndex,
         account_id: AccountId,
         side: Side,
-        output: &mut Vec<CallAuctionOrderSnapshot>,
-    ) -> Result<(), CallAuctionMassCancelError> {
+        output: &mut Vec<T>,
+        map: impl Fn(RestingAuctionOrder) -> T,
+    ) -> Result<(), CallAuctionInvariantViolation> {
         let side_index = index.side(side);
         let mut current = side_index.head;
         let mut previous = None;
         let mut total_quantity = 0_u128;
         for _ in 0..side_index.order_count {
-            let order_id = current.ok_or(CallAuctionMassCancelError::InternalInvariantViolation)?;
-            let order = self
-                .orders
-                .get(&order_id)
-                .copied()
-                .ok_or(CallAuctionMassCancelError::InternalInvariantViolation)?;
+            let order_id = current.ok_or_else(|| {
+                CallAuctionInvariantViolation::new(format!(
+                    "account {account_id} {side:?} list ended before its declared count"
+                ))
+            })?;
+            let order = self.orders.get(&order_id).copied().ok_or_else(|| {
+                CallAuctionInvariantViolation::new(format!(
+                    "account {account_id} list references absent order {order_id}"
+                ))
+            })?;
             if order.account_id != account_id
                 || order.side != side
                 || order.account_previous != previous
             {
-                return Err(CallAuctionMassCancelError::InternalInvariantViolation);
+                return Err(CallAuctionInvariantViolation::new(format!(
+                    "account {account_id} {side:?} list references order {order_id} with inconsistent ownership, side, or previous link"
+                )));
             }
             total_quantity = total_quantity
                 .checked_add(u128::from(order.quantity.lots()))
-                .ok_or(CallAuctionMassCancelError::InternalInvariantViolation)?;
-            output.push(order.into());
+                .ok_or_else(|| {
+                    CallAuctionInvariantViolation::new(format!(
+                        "account {account_id} {side:?} quantity aggregate overflows"
+                    ))
+                })?;
+            output.push(map(order));
             previous = Some(order_id);
             current = order.account_next;
         }
@@ -3502,7 +3695,9 @@ impl CallAuctionBook {
             || previous != side_index.tail
             || total_quantity != side_index.total_quantity
         {
-            return Err(CallAuctionMassCancelError::InternalInvariantViolation);
+            return Err(CallAuctionInvariantViolation::new(format!(
+                "account {account_id} {side:?} list contradicts its tail, count, or quantity aggregate"
+            )));
         }
         Ok(())
     }
@@ -3832,9 +4027,10 @@ fn append_queue_orders(
 mod tests {
     use super::{
         AuctionOrderConstraint, AuctionQueue, CallAuctionBook, CallAuctionBookLimits,
-        CallAuctionBookLimitsSpec, CallAuctionCancellation, CallAuctionCapacity,
-        CallAuctionConstructionError, CallAuctionOrder, CallAuctionTrade, CallAuctionUncrossPool,
-        try_uncross_vector,
+        CallAuctionBookLimitsSpec, CallAuctionBookQueryError, CallAuctionBookQueryResource,
+        CallAuctionCancellation, CallAuctionCapacity, CallAuctionConstructionError,
+        CallAuctionOrder, CallAuctionTrade, CallAuctionUncrossPool,
+        reserve_call_auction_book_query_vec, try_uncross_vector,
     };
     use crate::auction::AuctionOrderFill;
     use crate::domain::{
@@ -3845,6 +4041,7 @@ mod tests {
         InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
         QuantityRules, ReserveOrderRules, TradingState,
     };
+    use crate::matching::MassCancelScope;
 
     fn definition() -> InstrumentDefinition {
         InstrumentDefinition::new(InstrumentSpec {
@@ -3890,6 +4087,20 @@ mod tests {
         }
         book.validate().unwrap();
         book
+    }
+
+    #[test]
+    fn unrepresentable_book_query_is_typed_and_nonpoisoning() {
+        let resource = CallAuctionBookQueryResource::AccountOrderIds;
+        let error =
+            reserve_call_auction_book_query_vec::<OrderId>(usize::MAX, resource).unwrap_err();
+        assert_eq!(
+            error,
+            CallAuctionBookQueryError::ReservationFailed {
+                resource,
+                maximum: usize::MAX,
+            }
+        );
     }
 
     #[test]
@@ -3991,5 +4202,23 @@ mod tests {
                 .detail()
                 .contains("absent from account indexes")
         );
+    }
+
+    #[test]
+    fn account_order_query_reports_private_index_corruption_without_mutation() {
+        let mut book = two_order_book(AuctionOrderConstraint::Market);
+        let head = OrderId::new(10).unwrap();
+        let tail = OrderId::new(20).unwrap();
+        book.orders.get_mut(&tail).unwrap().account_next = Some(head);
+        let before = book.resource_status();
+
+        let error = book
+            .try_account_active_order_ids(AccountId::new(1).unwrap(), MassCancelScope::All)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CallAuctionBookQueryError::InvariantViolation(_)
+        ));
+        assert_eq!(book.resource_status(), before);
     }
 }
