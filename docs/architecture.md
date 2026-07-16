@@ -1658,9 +1658,15 @@ market-data stream and its replicas.
 20. Snapshot application validates identity, staleness, grammar, and both side
     cardinalities before clearing standby arenas. It fills already-owned
     standby slots, swaps both sides atomically, and retains the prior active
-    image as the next reusable standby allocation. `try_snapshot` and
-    `try_depth` keep caller-owned output allocation failure typed; the wire
-    payload contains no process-local limit or allocation metadata.
+    image as the next reusable standby allocation. `depth_iter` exposes
+    double-ended, exact-size market-priority replica traversal without output
+    allocation. `depth_range_iter` restricts that traversal to inclusive
+    endpoints, treats an inverted range as empty, and visits only in-band
+    occupied public prices. `try_depth_range` counts selected rows without
+    allocation and reserves exactly that cardinality before copying.
+    `try_snapshot`, `try_depth`, and `try_depth_range` keep caller-owned output
+    allocation failure typed; the wire payload contains no process-local limit
+    or allocation metadata.
 21. For retained capacity `N`, replay construction initializes exactly `N`
     optional typed slots. Admission and exact-overlap proof are `O(E)` for an
     `E`-update batch, each new write and retained lookup is `O(1)`, range-query
@@ -1750,8 +1756,14 @@ replica contract.
 13. A non-replayed publication rejects a report above its batch bound and
     fallibly reserves the complete output vector before applying its first
     event. Uncross source scratch is cleared on success and every poisoning
-    path. `try_snapshot` and `try_limit_depth` make caller-owned output
-    allocation failure typed; convenience wrappers may panic under A12.
+    path. Replica `limit_depth_iter` exposes double-ended, exact-size
+    best-to-worst limit traversal without output allocation;
+    `limit_depth_range_iter` applies inclusive endpoints, treats an inverted
+    range as empty, and excludes separately reported market interest.
+    `try_limit_depth_range` counts selected rows without allocation and reserves
+    exactly that cardinality before copying. `try_snapshot`, `try_limit_depth`,
+    and `try_limit_depth_range` make caller-owned output allocation failure
+    typed; convenience wrappers may panic under A12.
 14. A replica owns active and standby AVL arenas for both sides plus a fixed
     batch-level scratch hash. It simulates all price-level occupancy transitions
     before mutation and validates aggregate deltas during application.
@@ -2150,6 +2162,9 @@ snapshot atomically; recover through the preallocated standby image; and run
 bucket, and scratch allocations remain fixed. Unit corruption tests deliberately
 discard active-arena and batch-scratch reservations and require the invariant
 auditor to reject both layouts.
+Replica depth-query tests additionally cover allocation-free best-first full
+and inclusive-band traversal, reverse traversal, limits, inverted bands, and
+authoritative-book parity on both sides.
 Continuous replay tests reject zero/unrepresentable capacities, identity/version drift,
 gaps, collisions, evicted overlap, future/zero-limit queries, and oversized
 batches without mutation; prove exact retry, recovered boundaries, pagination,
@@ -2171,6 +2186,10 @@ They run 1,000 different order/price identities with periodic source audit and
 snapshot repair while publisher/replica AVL, dense, bucket, and scratch
 allocations remain fixed; unit corruption tests discard arena and scratch
 reservations and require structural rejection.
+Replica limit-depth query tests additionally cover allocation-free
+best-to-worst full and inclusive-band traversal, reverse traversal, limits,
+inverted bands, separate market interest, and authoritative-book parity on
+both sides.
 
 Ledger-capacity tests independently exhaust balance, transaction, reversal,
 record, per-entry, per-record, and retained-posting resources; verify exact
@@ -2427,7 +2446,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Snapshots and compaction | single-file and segmented matching/risk/ledger/call-auction WAL cutover plus off-thread direct and WAL-synchronized plain/coupled continuous-matching and call-auction replay verification are implemented; verified matching/risk/auction handles can retire an older prefix by cursor-streaming only its synchronized suffix. Remaining evidence is bounded checkpoint memory and writer audit-copy/projection/direct-reconstruction pause, bounded suffix-copy pause, semantic generation rollover, and externally retained audit/idempotency proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
-| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, sourced explicit-reference stop-market/stop-limit activation with durable source identity/version/sequence and gap/reset validation, native reserve and fully hidden continuous queue classes, atomic minimum-quantity IOC, atomic FOK under all four continuous self-trade policies, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, authoritative typed priority classes, account/side mass cancellation, atomic new-identity replacement with full priority loss, full and inclusive price-band aggregate depth queries, banded discovery, sequenced nullable indicative publication, explicit price-time and price/class-tier pro-rata-time allocation, deterministic pairing/atomic uncross with fail-closed self-trade abort, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, plain/coupled-risk full-WAL plus cutover recovery, instrument-bound atomic DVP settlement of complete accepted uncross reports, and explicit trade-bound fee transfers in the same atomic ledger event are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authenticated external stop-reference acquisition/normalization and missed-reference recovery, auction reference and dynamic-band derivation, authenticated venue-category-to-class and beneficial-owner mapping, venue-specific display/allocation policies, venue-specific call-auction self-trade cancellation/decrement and alternative-pairing policies, clearing lifecycle authorization, fee calculation/authorization, settlement-date derivation, volatility/interruption auctions, pegged, discretionary, venue-specific in-place amendment/uncross/publication cadence/filtering semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
+| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, sourced explicit-reference stop-market/stop-limit activation with durable source identity/version/sequence and gap/reset validation, native reserve and fully hidden continuous queue classes, atomic minimum-quantity IOC, atomic FOK under all four continuous self-trade policies, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, authoritative typed priority classes, account/side mass cancellation, atomic new-identity replacement with full priority loss, full and inclusive price-band aggregate depth queries on authoritative books and public replicas, banded discovery, sequenced nullable indicative publication, explicit price-time and price/class-tier pro-rata-time allocation, deterministic pairing/atomic uncross with fail-closed self-trade abort, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, plain/coupled-risk full-WAL plus cutover recovery, instrument-bound atomic DVP settlement of complete accepted uncross reports, and explicit trade-bound fee transfers in the same atomic ledger event are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authenticated external stop-reference acquisition/normalization and missed-reference recovery, auction reference and dynamic-band derivation, authenticated venue-category-to-class and beneficial-owner mapping, venue-specific display/allocation policies, venue-specific call-auction self-trade cancellation/decrement and alternative-pairing policies, clearing lifecycle authorization, fee calculation/authorization, settlement-date derivation, volatility/interruption auctions, pegged, discretionary, venue-specific in-place amendment/uncross/publication cadence/filtering semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
 | High | Instrument lifecycle expansion | authoritative calendar ingestion/distribution/activation, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |

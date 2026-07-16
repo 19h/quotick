@@ -343,6 +343,134 @@ fn assert_mirrors(engine: &CallAuctionEngine, replica: &CallAuctionMarketDataRep
     );
 }
 
+fn populate_replica_limit_depth(
+    engine: &mut CallAuctionEngine,
+    publisher: &mut CallAuctionMarketDataPublisher,
+    replica: &mut CallAuctionMarketDataReplica,
+) {
+    execute(
+        engine,
+        publisher,
+        replica,
+        phase(1, 1, 0, CallAuctionPhase::Collecting),
+    );
+    for (index, (side, constraint)) in [
+        (
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(80)),
+        ),
+        (
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+        ),
+        (
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(90)),
+        ),
+        (
+            Side::Sell,
+            AuctionOrderConstraint::Limit(Price::from_raw(140)),
+        ),
+        (
+            Side::Sell,
+            AuctionOrderConstraint::Limit(Price::from_raw(120)),
+        ),
+        (
+            Side::Sell,
+            AuctionOrderConstraint::Limit(Price::from_raw(130)),
+        ),
+        (Side::Buy, AuctionOrderConstraint::Market),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let identity = u64::try_from(index).unwrap() + 2;
+        execute(
+            engine,
+            publisher,
+            replica,
+            submit(
+                identity, 1, 1, identity, identity, side, constraint, identity,
+            ),
+        );
+    }
+}
+
+#[test]
+fn replica_limit_depth_ranges_are_inclusive_ordered_and_market_exclusive() {
+    let mut engine = engine();
+    let mut publisher = CallAuctionMarketDataPublisher::from_engine(&engine).unwrap();
+    let mut replica = CallAuctionMarketDataReplica::new(definition());
+    replica.apply_snapshot(&publisher.snapshot()).unwrap();
+    populate_replica_limit_depth(&mut engine, &mut publisher, &mut replica);
+
+    assert_eq!(replica.market_order_count(Side::Buy), 1);
+    assert_eq!(
+        replica
+            .limit_depth_iter(Side::Buy)
+            .map(|level| level.price().raw())
+            .collect::<Vec<_>>(),
+        [100, 90, 80]
+    );
+    assert_eq!(replica.limit_depth_iter(Side::Buy).len(), 3);
+    assert_eq!(
+        replica
+            .limit_depth_range_iter(Side::Buy, Price::from_raw(90)..=Price::from_raw(100),)
+            .map(|level| level.price().raw())
+            .collect::<Vec<_>>(),
+        [100, 90]
+    );
+    assert_eq!(
+        replica
+            .limit_depth_range_iter(Side::Buy, Price::from_raw(90)..=Price::from_raw(100),)
+            .rev()
+            .map(|level| level.price().raw())
+            .collect::<Vec<_>>(),
+        [90, 100]
+    );
+    assert_eq!(
+        replica
+            .try_limit_depth_range(Side::Buy, Price::from_raw(90)..=Price::from_raw(100), 1,)
+            .unwrap()
+            .iter()
+            .map(|level| level.price().raw())
+            .collect::<Vec<_>>(),
+        [100]
+    );
+    assert_eq!(
+        replica.limit_depth_range(
+            Side::Sell,
+            Price::from_raw(120)..=Price::from_raw(130),
+            usize::MAX,
+        ),
+        engine.book().limit_depth_range(
+            Side::Sell,
+            Price::from_raw(120)..=Price::from_raw(130),
+            usize::MAX,
+        )
+    );
+    assert!(
+        replica
+            .limit_depth_range_iter(Side::Sell, Price::from_raw(135)..=Price::from_raw(115),)
+            .next()
+            .is_none()
+    );
+    assert!(
+        replica
+            .try_limit_depth_range(Side::Buy, Price::from_raw(90)..=Price::from_raw(100), 0,)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        replica.limit_depth_iter(Side::Sell).collect::<Vec<_>>(),
+        engine
+            .book()
+            .limit_depth_iter(Side::Sell)
+            .collect::<Vec<_>>()
+    );
+    replica.validate().unwrap();
+}
+
 #[test]
 fn indicative_updates_round_trip_replay_snapshot_and_invalidate_on_book_change() {
     let mut engine = engine();

@@ -14,13 +14,14 @@
 use std::cmp::Reverse;
 use std::fmt;
 use std::hash::Hash;
+use std::ops::RangeInclusive;
 
 use crate::bounded_hash::{BoundedHashError, BoundedHashMap};
 use crate::domain::{
     AccountId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
     TimestampNs, TradeId,
 };
-use crate::indexed_avl::IndexedAvlMap;
+use crate::indexed_avl::{DirectionalIter, IndexedAvlMap};
 use crate::instrument::TradingState;
 use crate::matching::{
     AccountAdmissionState, AccountControlAction, AccountControlSnapshot, CancelReason, Command,
@@ -3328,33 +3329,34 @@ impl MarketDataReplica {
         limit: usize,
     ) -> Result<Vec<LevelSnapshot>, MarketDataError> {
         let output_len = self.levels(side).len().min(limit);
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(output_len)
-            .map_err(|_| MarketDataError::PreparationAllocationFailed(side_resource(side)))?;
-        match side {
-            Side::Buy => {
-                output.extend(self.bids.iter().rev().take(limit).map(|(&price, level)| {
-                    LevelSnapshot {
-                        price,
-                        quantity: level.quantity,
-                        order_count: level.order_count,
-                    }
-                }));
-            }
-            Side::Sell => {
-                output.extend(
-                    self.asks
-                        .iter()
-                        .take(limit)
-                        .map(|(&price, level)| LevelSnapshot {
-                            price,
-                            quantity: level.quantity,
-                            order_count: level.order_count,
-                        }),
-                );
-            }
-        }
+        let mut output = reserve_replica_depth_output(output_len, side)?;
+        output.extend(self.depth_iter(side).take(limit));
+        Ok(output)
+    }
+
+    /// Fallibly returns public levels inside an inclusive price range in
+    /// market-priority order.
+    ///
+    /// An inverted range is empty. The query counts selected levels without
+    /// allocation, then reserves that exact semantic cardinality before the
+    /// first level is copied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketDataError::PreparationAllocationFailed`] without partial
+    /// output if the caller-owned result vector cannot be reserved.
+    pub fn try_depth_range(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+        limit: usize,
+    ) -> Result<Vec<LevelSnapshot>, MarketDataError> {
+        let output_len = self
+            .depth_range_iter(side, range.clone())
+            .take(limit)
+            .count();
+        let mut output = reserve_replica_depth_output(output_len, side)?;
+        output.extend(self.depth_range_iter(side, range).take(limit));
         Ok(output)
     }
 
@@ -3368,6 +3370,82 @@ impl MarketDataReplica {
     pub fn depth(&self, side: Side, limit: usize) -> Vec<LevelSnapshot> {
         self.try_depth(side, limit)
             .expect("market-data depth output allocation failed")
+    }
+
+    /// Returns public levels inside an inclusive price range using the
+    /// fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if result-vector allocation fails. Use
+    /// [`Self::try_depth_range`] when allocation failure must remain typed.
+    #[must_use]
+    pub fn depth_range(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+        limit: usize,
+    ) -> Vec<LevelSnapshot> {
+        self.try_depth_range(side, range, limit)
+            .expect("market-data price-range depth output allocation failed")
+    }
+
+    /// Iterates public aggregate levels in market-priority order without
+    /// allocating.
+    ///
+    /// Bids are descending and asks are ascending. The iterator is
+    /// double-ended and exact-sized. Creating it is `O(log(P + 1))`; consuming
+    /// it is `O(P)` time for `P` occupied public prices and `O(1)` auxiliary
+    /// space.
+    #[must_use]
+    pub fn depth_iter(
+        &self,
+        side: Side,
+    ) -> impl DoubleEndedIterator<Item = LevelSnapshot> + ExactSizeIterator + '_ {
+        DirectionalIter::new(self.depth_levels(side), side == Side::Buy)
+    }
+
+    /// Iterates public aggregate levels inside an inclusive price range without
+    /// allocating.
+    ///
+    /// Bids are descending and asks are ascending. An inverted range is empty.
+    /// Creating the iterator and consuming `K` selected levels takes
+    /// `O(log(P + 1) + K)` total time for `P` occupied public prices, with
+    /// `O(1)` auxiliary space.
+    #[must_use]
+    pub fn depth_range_iter(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+    ) -> impl DoubleEndedIterator<Item = LevelSnapshot> + '_ {
+        DirectionalIter::new(self.depth_levels_range(side, range), side == Side::Buy)
+    }
+
+    fn depth_levels(
+        &self,
+        side: Side,
+    ) -> impl DoubleEndedIterator<Item = LevelSnapshot> + ExactSizeIterator + '_ {
+        self.levels(side)
+            .iter()
+            .map(|(&price, &level)| Self::level_snapshot(price, level))
+    }
+
+    fn depth_levels_range(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+    ) -> impl DoubleEndedIterator<Item = LevelSnapshot> + '_ {
+        self.levels(side)
+            .range(range)
+            .map(|(&price, &level)| Self::level_snapshot(price, level))
+    }
+
+    const fn level_snapshot(price: Price, level: Aggregate) -> LevelSnapshot {
+        LevelSnapshot {
+            price,
+            quantity: level.quantity,
+            order_count: level.order_count,
+        }
     }
 
     /// Applies one decoded incremental update.
@@ -3769,6 +3847,17 @@ const fn side_resource(side: Side) -> MarketDataResource {
     }
 }
 
+fn reserve_replica_depth_output(
+    maximum: usize,
+    side: Side,
+) -> Result<Vec<LevelSnapshot>, MarketDataError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(maximum)
+        .map_err(|_| MarketDataError::PreparationAllocationFailed(side_resource(side)))?;
+    Ok(output)
+}
+
 const fn update_level(update: MarketDataUpdate) -> Option<MarketDataLevel> {
     match update.kind {
         MarketDataKind::Level(level) => Some(level),
@@ -4038,6 +4127,22 @@ mod resource_limit_tests {
             lost_scratch.validate(),
             Err(MarketDataError::SourceDivergence(
                 "replica batch scratch contradicts its fixed empty layout"
+            ))
+        );
+    }
+
+    #[test]
+    fn replica_depth_output_reservation_failure_names_the_side_resource() {
+        assert_eq!(
+            reserve_replica_depth_output(usize::MAX, Side::Buy),
+            Err(MarketDataError::PreparationAllocationFailed(
+                MarketDataResource::BidPriceLevels
+            ))
+        );
+        assert_eq!(
+            reserve_replica_depth_output(usize::MAX, Side::Sell),
+            Err(MarketDataError::PreparationAllocationFailed(
+                MarketDataResource::AskPriceLevels
             ))
         );
     }

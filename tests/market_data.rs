@@ -217,6 +217,103 @@ fn assert_mirrors(book: &OrderBook, replica: &MarketDataReplica) {
 }
 
 #[test]
+fn replica_depth_ranges_are_inclusive_market_ordered_and_book_equivalent() {
+    let mut book = OrderBook::new(definition());
+    let mut publisher = MarketDataPublisher::from_book(&book).unwrap();
+    let mut replica = MarketDataReplica::new(instrument(), version(), TradingState::Open);
+    replica.apply_snapshot(&publisher.snapshot()).unwrap();
+
+    for (index, (side, price)) in [
+        (Side::Buy, 80),
+        (Side::Buy, 100),
+        (Side::Buy, 90),
+        (Side::Sell, 140),
+        (Side::Sell, 120),
+        (Side::Sell, 130),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let identity = u64::try_from(index).unwrap() + 1;
+        let command = order(
+            identity,
+            identity,
+            identity,
+            side,
+            identity,
+            price,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        );
+        replica
+            .apply_batch(&publish(&mut book, &mut publisher, command))
+            .unwrap();
+    }
+
+    assert_eq!(
+        replica
+            .depth_iter(Side::Buy)
+            .map(|level| level.price.raw())
+            .collect::<Vec<_>>(),
+        [100, 90, 80]
+    );
+    assert_eq!(replica.depth_iter(Side::Buy).len(), 3);
+    assert_eq!(
+        replica
+            .depth_range_iter(Side::Buy, Price::from_raw(90)..=Price::from_raw(100))
+            .map(|level| level.price.raw())
+            .collect::<Vec<_>>(),
+        [100, 90]
+    );
+    assert_eq!(
+        replica
+            .depth_range_iter(Side::Buy, Price::from_raw(90)..=Price::from_raw(100))
+            .rev()
+            .map(|level| level.price.raw())
+            .collect::<Vec<_>>(),
+        [90, 100]
+    );
+    assert_eq!(
+        replica
+            .try_depth_range(Side::Buy, Price::from_raw(90)..=Price::from_raw(100), 1)
+            .unwrap()
+            .iter()
+            .map(|level| level.price.raw())
+            .collect::<Vec<_>>(),
+        [100]
+    );
+    assert_eq!(
+        replica.depth_range(
+            Side::Sell,
+            Price::from_raw(120)..=Price::from_raw(130),
+            usize::MAX,
+        ),
+        book.depth_range(
+            Side::Sell,
+            Price::from_raw(120)..=Price::from_raw(130),
+            usize::MAX,
+        )
+    );
+    assert!(
+        replica
+            .depth_range_iter(Side::Buy, Price::from_raw(101)..=Price::from_raw(99))
+            .next()
+            .is_none()
+    );
+    assert!(
+        replica
+            .try_depth_range(Side::Buy, Price::from_raw(90)..=Price::from_raw(100), 0)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        replica.depth_iter(Side::Sell).collect::<Vec<_>>(),
+        book.depth_iter(Side::Sell).collect::<Vec<_>>()
+    );
+    replica.validate().unwrap();
+}
+
+#[test]
 fn incremental_updates_reconstruct_trades_replacements_and_cancellations() {
     let mut book = OrderBook::new(definition());
     let mut publisher = MarketDataPublisher::from_book(&book).expect("publisher bootstraps");

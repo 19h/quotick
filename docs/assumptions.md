@@ -216,12 +216,12 @@ Continuous order-book depth and private active-order output, call-auction limit
 depth, continuous and call-auction account-order-ID output, plus continuous and
 call-auction market-data batch/snapshot/depth outputs have explicit fallible
 APIs. Continuous and call-auction authoritative books also expose
-allocation-free market-priority depth iterators. Borrowed ledger-record lookup,
-history iteration, per-record transaction iteration, and point-in-time balance
-reconstruction allocate no output and return typed journal/index or
-reconstruction contradictions. Convenience wrappers can still panic on
-allocation failure; the account-order-ID wrappers can also panic if private
-topology is corrupt.
+allocation-free market-priority depth iterators, as do continuous and
+call-auction public replicas. Borrowed ledger-record lookup, history iteration,
+per-record transaction iteration, and point-in-time balance reconstruction
+allocate no output and return typed journal/index or reconstruction
+contradictions. Convenience wrappers can still panic on allocation failure;
+the account-order-ID wrappers can also panic if private topology is corrupt.
 
 **Dependent results.** Typed failure exists at the enumerated boundaries; no
 end-to-end allocation-failure continuation claim follows. Authoritative bounded
@@ -1865,7 +1865,13 @@ mutation/audit work.
 Replica batch cardinality simulation is expected `O(E + U)` before `O(E log P)`
 application. Snapshot cardinality failure is nonmutating; accepted snapshot
 application fills preallocated standby trees in `O(P log P)` and swaps both
-sides atomically. Direct book and replica depth output is `O(min(P,L))`;
+sides atomically. Direct book and replica depth output is `O(min(P,L))`.
+Replica full-depth iteration has `O(log(P + 1))` setup, `O(P)` complete
+traversal, and `O(1)` auxiliary space. For `K` occupied limit prices in an
+inclusive band and `S` selected by the requested limit, replica range iteration
+is `O(log(P + 1) + K)` time and `O(1)` auxiliary space; fallible
+materialization counts and copies in two passes and owns `O(S)` output after
+exact reservation. Market interest remains separate;
 publisher bootstrap/cross-audit is expected `O(O + P)`; an uncross report is
 expected `O(T + C)` over prints and cancellations, while replacement has
 `E = 2`, amendment and indicative publication have `E = 1`, and mass
@@ -2057,6 +2063,13 @@ cardinality failure is nonmutating, while accepted snapshot application fills
 preallocated standby trees in `O(P log P)` and swaps both sides atomically.
 Structural failure after an incremental mutation still poisons state by design;
 capacity preflight failure does not.
+
+Replica full-depth iteration has `O(log(P + 1))` setup, `O(P)` complete
+traversal, and `O(1)` auxiliary space. For `K` occupied public prices in an
+inclusive band and `S` selected by the requested limit, range iteration is
+`O(log(P + 1) + K)` time and `O(1)` auxiliary space; fallible materialization
+counts and copies in two passes and owns `O(S)` output after exact reservation.
+The inverted range is empty.
 
 **Falsification probe.** Reject zero, contradictory, undersized-source, and
 unrepresentable layouts; assert exact resource identity. Fill a replica side,
@@ -4224,38 +4237,42 @@ recovery difference falsifies A122.
 
 **Assumption.** The caller's `RangeInclusive<Price>` endpoints are exact and
 inclusive. A lower endpoint greater than its upper endpoint denotes an empty
-band. One immutable continuous or call-auction book borrow remains stable for
-the complete query. Both books compose one A55 stable-slot AVL range
-primitive, which initializes independent forward and reverse fixed stacks and
-does not linearly traverse occupied keys outside the band.
+band. One immutable continuous or call-auction book or public-replica borrow
+remains stable for the complete query. Both books and both replica types
+compose one A55 stable-slot AVL range primitive, which initializes independent
+forward and reverse fixed stacks and does not linearly traverse occupied keys
+outside the band.
 
 Bid results remain descending and ask results ascending. Continuous output
 contains only non-zero public displayed aggregates, so an in-band hidden-only
-execution price is inspected but omitted. Call-auction output contains only
-limit-constrained aggregates; market-constrained interest remains separate.
-Iterator construction and traversal allocate no output or auxiliary heap
-storage. Each fallible materializer first counts selected rows without
-allocation, reserves exactly that semantic cardinality, and copies through a
-second equivalent traversal; no partial vector is returned.
+execution price is inspected but omitted by the authoritative book and remains
+absent from its public replica. Call-auction output contains only
+limit-constrained aggregates; market-constrained interest remains separate in
+the authoritative book and replica. Iterator construction and traversal
+allocate no output or auxiliary heap storage. Each fallible materializer first
+counts selected rows without allocation, reserves exactly that semantic
+cardinality, and copies through a second equivalent traversal; no partial
+vector is returned.
 
-**Dependent results.** [A1, A3, A12, A55, A62, A72, A74, A117, A123] For
-`P` occupied side prices, `K` in-band occupied prices inspected, and `V <= K`
-selected output rows, iterator work is `O(log(P + 1) + K)` time and `O(1)`
-auxiliary space. Fallible materialization makes two traversals with the same
-asymptotic bound, requests exactly `V` output slots, and owns `O(V)` result
-space. The two fixed 128-index stacks retain A55's
+**Dependent results.** [A1, A3, A12, A55, A62, A67, A70, A72, A74, A117,
+A123] For `P` occupied side prices, `K` in-band occupied prices inspected, and
+`V <= K` selected output rows, iterator work is `O(log(P + 1) + K)` time and
+`O(1)` auxiliary space. Fallible materialization makes two traversals with the
+same asymptotic bound, requests exactly `V` output slots, and owns `O(V)`
+result space. The two fixed 128-index stacks retain A55's
 `256 × size_of::<usize>()` traversal bound. The query changes no matching,
-auction, WAL, snapshot, or wire state.
+auction, replica, WAL, snapshot, or wire state.
 
 **Falsification probe.** Exercise empty, singleton, full, outside, absent-
 endpoint, and inverted bands after every rotation and deletion shape. Consume
 forward, reverse, and mixed ends through exhaustion and require fused empty
 behavior without duplicates. Bound ordered comparisons for a narrow band in a
 1,023-key tree and differentially compare at least 20,000 generated mutation/
-range steps with `BTreeMap`. At both public APIs, test both sides, limits `0`,
-`1`, and `usize::MAX`, hidden-only continuous levels, separate auction market
-interest, exact fallible/convenience parity, typed reservation failure,
-unchanged resource telemetry, and complete post-query validation. Any
+range steps with `BTreeMap`. At all four public book/replica APIs, test both
+sides, limits `0`, `1`, and `usize::MAX`, hidden-only continuous levels,
+separate auction market interest, exact fallible/convenience parity, replica/
+authoritative parity, typed reservation failure, unchanged resource telemetry,
+and complete post-query validation. Any
 out-of-band row, missed inclusive endpoint, duplicate, non-market ordering,
 outside-band linear scan, output/traversal allocation, partial failure output,
 state mutation, or model divergence falsifies A123.
@@ -4284,16 +4301,17 @@ capability, a remaining risk, or an opportunity.
 - **Medium impact:** continuous public-depth and complete private resting-order
   extraction, call-auction aggregate limit depth, plus continuous and
   call-auction account-scoped identifier extraction now have typed fallible
-  output under A117 and A62. Both authoritative books also expose
-  allocation-free full and inclusive price-band market-priority aggregate
-  iterators under A123; the call-auction book exposes direct and best
+  output under A117 and A62. Both authoritative books and both public replicas
+  also expose allocation-free full and inclusive price-band market-priority
+  aggregate iterators under A123; the call-auction book exposes direct and best
   aggregate-level lookup. A localized heatmap or surveillance window can now
   replace repeated point queries or a full-depth traversal with one logarithmic
   band descent plus linear in-band work. Bounds and canonical ordering are
-  covered through hidden/market interest, account-list corruption, typed
-  allocation failure, and large caller-owned results. Target-hardware narrow-
-  band latency, allocator latency for materialized results, resident memory,
-  and sustained 250,000-order snapshot cadence remain unknown until measured.
+  covered through hidden/market interest, account-list corruption,
+  replica/authoritative parity, typed allocation failure, and large caller-
+  owned results. Target-hardware narrow-band latency, allocator latency for
+  materialized results, resident memory, and sustained 250,000-order snapshot
+  cadence remain unknown until measured.
 
 - **Medium impact:** continuous and call-auction live command/report history
   now supports expected constant-time exact lookup and zero-copy chronological

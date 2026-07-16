@@ -637,6 +637,15 @@ private dormant-stop map and two trigger arenas, and
 `O(P_max + E_max)` for one replica, with the replica reserving four per-side
 depth arenas in total (active and standby for bids and asks).
 
+For `P` occupied public prices on one replica side and requested limit `L`,
+`depth_iter` has `O(log(P + 1))` setup, `O(P)` complete traversal, and `O(1)`
+auxiliary space; `try_depth` owns `O(min(P, L))` output. For an inclusive band
+containing `K` occupied prices, `depth_range_iter` costs
+`O(log(P + 1) + K)` total time and `O(1)` auxiliary space. For
+`S = min(K, L)` selected rows, `try_depth_range` counts and copies in two
+passes, exactly reserves `S` rows, and owns `O(S)` output. An inverted band is
+empty. Both iterator types are double-ended; the full iterator is exact-size.
+
 For replay capacity `N`, one `MarketDataReplayBuffer` initializes `N` optional
 typed slots in `O(N)` time and retains `O(N)` state. An `E`-update admission
 preflights identity, contiguity, overlap, and collision in `O(E)` time, then
@@ -679,6 +688,17 @@ Publisher fixed state is `O(O_max + P_max)` and replica fixed state is
 `O(P_max + E_max)`, including four active/standby side arenas in total.
 Default maxima are 4,096 active orders, 4,096 limit prices per side, and
 8,193 updates per command.
+
+For `P` occupied limit prices on one replica side and requested limit `L`,
+`limit_depth_iter` has `O(log(P + 1))` setup, `O(P)` complete traversal, and
+`O(1)` auxiliary space; `try_limit_depth` owns `O(min(P, L))` output. For an
+inclusive band containing `K` occupied limit prices,
+`limit_depth_range_iter` costs `O(log(P + 1) + K)` total time and `O(1)`
+auxiliary space. For `S = min(K, L)` selected rows,
+`try_limit_depth_range` counts and copies in two passes, exactly reserves `S`
+rows, and owns `O(S)` output. An inverted band is empty, and
+market-constrained interest remains separate. Both iterator types are double-
+ended; the full iterator is exact-size.
 
 For call-auction replay capacity `N`, one
 `CallAuctionMarketDataReplayBuffer` initializes `N` typed slots in `O(N)`

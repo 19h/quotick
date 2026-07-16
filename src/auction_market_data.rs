@@ -12,6 +12,7 @@
 
 use std::fmt;
 use std::hash::Hash;
+use std::ops::RangeInclusive;
 
 use crate::auction::{AuctionClearing, AuctionOrderConstraint, AuctionPriorityClass};
 use crate::auction_book::{
@@ -28,7 +29,7 @@ use crate::domain::{
     AccountId, AuctionId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
     TimestampNs, TradeId,
 };
-use crate::indexed_avl::IndexedAvlMap;
+use crate::indexed_avl::{DirectionalIter, IndexedAvlMap};
 use crate::instrument::InstrumentDefinition;
 pub use crate::market_data::{CallAuctionMarketDataReplay, CallAuctionMarketDataReplayBatch};
 use crate::matching::MassCancelScope;
@@ -2610,51 +2611,47 @@ impl CallAuctionMarketDataReplica {
     ///
     /// Returns [`CallAuctionMarketDataError::PreparationAllocationFailed`]
     /// before partial output if the result vector cannot be reserved.
+    /// Returns [`CallAuctionMarketDataError::SourceDivergence`] if an occupied
+    /// replica level violates its non-zero aggregate invariant.
     pub fn try_limit_depth(
         &self,
         side: Side,
         limit: usize,
     ) -> Result<Vec<CallAuctionLevelSnapshot>, CallAuctionMarketDataError> {
         let output_len = self.levels(side).len().min(limit);
-        let mut output = Vec::new();
-        output.try_reserve_exact(output_len).map_err(|_| {
-            CallAuctionMarketDataError::PreparationAllocationFailed(side_resource(side))
-        })?;
-        match side {
-            Side::Buy => {
-                for (&price, aggregate) in self.bids.iter().rev().take(limit) {
-                    output.push(
-                        CallAuctionLevelSnapshot::from_parts(
-                            side,
-                            price,
-                            aggregate.quantity,
-                            aggregate.order_count,
-                        )
-                        .ok_or(
-                            CallAuctionMarketDataError::SourceDivergence(
-                                "auction replica bid output contains an empty level",
-                            ),
-                        )?,
-                    );
-                }
-            }
-            Side::Sell => {
-                for (&price, aggregate) in self.asks.iter().take(limit) {
-                    output.push(
-                        CallAuctionLevelSnapshot::from_parts(
-                            side,
-                            price,
-                            aggregate.quantity,
-                            aggregate.order_count,
-                        )
-                        .ok_or(
-                            CallAuctionMarketDataError::SourceDivergence(
-                                "auction replica ask output contains an empty level",
-                            ),
-                        )?,
-                    );
-                }
-            }
+        let mut output = reserve_auction_replica_depth_output(output_len, side)?;
+        for (price, aggregate) in self.limit_depth_entries(side).take(limit) {
+            output.push(Self::try_limit_level_snapshot(side, price, aggregate)?);
+        }
+        Ok(output)
+    }
+
+    /// Fallibly returns limit depth inside an inclusive price range in
+    /// best-to-worst order.
+    ///
+    /// An inverted range is empty. Market-constrained interest remains
+    /// separate. The query counts selected levels without allocation, then
+    /// reserves that exact semantic cardinality before the first copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionMarketDataError::PreparationAllocationFailed`]
+    /// without partial output if the result vector cannot be reserved.
+    /// Returns [`CallAuctionMarketDataError::SourceDivergence`] if an occupied
+    /// replica level violates its non-zero aggregate invariant.
+    pub fn try_limit_depth_range(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+        limit: usize,
+    ) -> Result<Vec<CallAuctionLevelSnapshot>, CallAuctionMarketDataError> {
+        let output_len = self
+            .limit_depth_entries_range(side, range.clone())
+            .take(limit)
+            .count();
+        let mut output = reserve_auction_replica_depth_output(output_len, side)?;
+        for (price, aggregate) in self.limit_depth_entries_range(side, range).take(limit) {
+            output.push(Self::try_limit_level_snapshot(side, price, aggregate)?);
         }
         Ok(output)
     }
@@ -2663,12 +2660,118 @@ impl CallAuctionMarketDataReplica {
     ///
     /// # Panics
     ///
-    /// Panics only if result-vector allocation fails. Use
-    /// [`Self::try_limit_depth`] when allocation failure must remain typed.
+    /// Panics if result-vector allocation fails or an internal replica level
+    /// violates its occupied aggregate invariant. Use [`Self::try_limit_depth`]
+    /// when either failure must remain typed.
     #[must_use]
     pub fn limit_depth(&self, side: Side, limit: usize) -> Vec<CallAuctionLevelSnapshot> {
         self.try_limit_depth(side, limit)
             .expect("call-auction market-data depth output allocation failed")
+    }
+
+    /// Returns limit depth inside an inclusive price range using the fallible
+    /// production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if result-vector allocation fails or an internal replica level
+    /// violates its occupied aggregate invariant. Use
+    /// [`Self::try_limit_depth_range`] when either failure must remain typed.
+    #[must_use]
+    pub fn limit_depth_range(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+        limit: usize,
+    ) -> Vec<CallAuctionLevelSnapshot> {
+        self.try_limit_depth_range(side, range, limit)
+            .expect("call-auction market-data price-range depth output allocation failed")
+    }
+
+    /// Iterates aggregate limit depth in market-priority order without
+    /// allocating.
+    ///
+    /// Bids are descending and asks are ascending. Market-constrained interest
+    /// is excluded. The iterator is double-ended and exact-sized. Creating it
+    /// is `O(log(P + 1))`; consuming it is `O(P)` time for `P` occupied limit
+    /// prices and `O(1)` auxiliary space.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an internal replica level violates its occupied aggregate
+    /// invariant. Snapshot and incremental admission reject that state.
+    #[must_use]
+    pub fn limit_depth_iter(
+        &self,
+        side: Side,
+    ) -> impl DoubleEndedIterator<Item = CallAuctionLevelSnapshot> + ExactSizeIterator + '_ {
+        self.limit_depth_entries(side)
+            .map(move |(price, aggregate)| {
+                Self::try_limit_level_snapshot(side, price, aggregate)
+                    .expect("validated auction replica levels must be occupied")
+            })
+    }
+
+    /// Iterates aggregate limit depth inside an inclusive price range without
+    /// allocating.
+    ///
+    /// Bids are descending and asks are ascending. Market-constrained interest
+    /// is excluded, and an inverted range is empty. Creating the iterator and
+    /// consuming `K` selected levels takes `O(log(P + 1) + K)` total time for
+    /// `P` occupied limit prices, with `O(1)` auxiliary space.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an internal replica level violates its occupied aggregate
+    /// invariant. Snapshot and incremental admission reject that state.
+    #[must_use]
+    pub fn limit_depth_range_iter(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+    ) -> impl DoubleEndedIterator<Item = CallAuctionLevelSnapshot> + '_ {
+        self.limit_depth_entries_range(side, range)
+            .map(move |(price, aggregate)| {
+                Self::try_limit_level_snapshot(side, price, aggregate)
+                    .expect("validated auction replica levels must be occupied")
+            })
+    }
+
+    fn limit_depth_entries(
+        &self,
+        side: Side,
+    ) -> impl DoubleEndedIterator<Item = (Price, Aggregate)> + ExactSizeIterator + '_ {
+        DirectionalIter::new(
+            self.levels(side)
+                .iter()
+                .map(|(&price, &aggregate)| (price, aggregate)),
+            side == Side::Buy,
+        )
+    }
+
+    fn limit_depth_entries_range(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+    ) -> impl DoubleEndedIterator<Item = (Price, Aggregate)> + '_ {
+        DirectionalIter::new(
+            self.levels(side)
+                .range(range)
+                .map(|(&price, &aggregate)| (price, aggregate)),
+            side == Side::Buy,
+        )
+    }
+
+    fn try_limit_level_snapshot(
+        side: Side,
+        price: Price,
+        aggregate: Aggregate,
+    ) -> Result<CallAuctionLevelSnapshot, CallAuctionMarketDataError> {
+        CallAuctionLevelSnapshot::from_parts(side, price, aggregate.quantity, aggregate.order_count)
+            .ok_or(CallAuctionMarketDataError::SourceDivergence(match side {
+                Side::Buy => "auction replica bid output contains an empty level",
+                Side::Sell => "auction replica ask output contains an empty level",
+            }))
     }
 
     /// Returns active market-constrained quantity on one side in lots.
@@ -3797,6 +3900,17 @@ const fn side_resource(side: Side) -> CallAuctionMarketDataResource {
     }
 }
 
+fn reserve_auction_replica_depth_output(
+    maximum: usize,
+    side: Side,
+) -> Result<Vec<CallAuctionLevelSnapshot>, CallAuctionMarketDataError> {
+    let mut output = Vec::new();
+    output.try_reserve_exact(maximum).map_err(|_| {
+        CallAuctionMarketDataError::PreparationAllocationFailed(side_resource(side))
+    })?;
+    Ok(output)
+}
+
 fn set_bounded_limit_level(
     levels: &mut AuctionDepthMap,
     side: Side,
@@ -3993,6 +4107,22 @@ mod tests {
             lost_scratch.validate(),
             Err(CallAuctionMarketDataError::SourceDivergence(
                 "auction replica batch scratch contradicts its fixed empty layout"
+            ))
+        ));
+    }
+
+    #[test]
+    fn replica_depth_output_reservation_failure_names_the_side_resource() {
+        assert!(matches!(
+            reserve_auction_replica_depth_output(usize::MAX, Side::Buy),
+            Err(CallAuctionMarketDataError::PreparationAllocationFailed(
+                CallAuctionMarketDataResource::BidPriceLevels
+            ))
+        ));
+        assert!(matches!(
+            reserve_auction_replica_depth_output(usize::MAX, Side::Sell),
+            Err(CallAuctionMarketDataError::PreparationAllocationFailed(
+                CallAuctionMarketDataResource::AskPriceLevels
             ))
         ));
     }
