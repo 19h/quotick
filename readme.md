@@ -267,7 +267,10 @@ Run any program with `cargo run --example <name>`.
   optionally cancelling every resting order in the same report when entering
   an entry-closing state; effective state and revision survive recovery.
 - Cancel-aggressor, cancel-resting, cancel-both, and decrement-and-cancel
-  self-trade prevention; atomic allocation-free FOK preflight.
+  self-trade prevention. Atomic allocation-free FOK preflight supports all four
+  policies: decrement-and-cancel requires a complete external fill before the
+  first priority-reachable self barrier and otherwise changes no maker or STP
+  state.
 - Exact-command idempotency: retries replay the cached report without
   consuming capacity, and `CommandId` reuse with different content is a typed
   collision error; event and trade sequences are strictly monotonic.
@@ -400,7 +403,7 @@ Run any program with `cargo run --example <name>`.
 
 ### Durability and recovery
 
-- Versioned CRC-32C WAL frames (format 16) with bounded payloads and
+- Versioned CRC-32C WAL frames (format 17) with bounded payloads and
   contiguous sequences, as a single-file `Journal` or a size-bounded
   `SegmentedJournal` rotating whole frames and batches under one global
   sequence.
@@ -410,7 +413,7 @@ Run any program with `cargo run --example <name>`.
   writer leases with explicit abandoned-writer recovery.
 - Strict corruption detection: only a physically incomplete final frame may be
   repaired, and closed segments are always scanned strictly.
-- Versioned, bounded `QSNP` semantic snapshots (format 16) with monotonic
+- Versioned, bounded `QSNP` semantic snapshots (format 17) with monotonic
   exact-prefix lineage and synchronized atomic replacement.
 - Durable runtimes for matching, coupled risk/matching, call auctions, and
   coupled auction/risk record every command before committing the in-memory
@@ -501,12 +504,12 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 113 tagged assumptions (A1–A113), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 114 tagged assumptions (A1–A114), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
-| [WAL format v16](docs/wal-v16.md) | Current write-ahead-log frame and record schema |
-| [Snapshot format v16](docs/snapshot-v16.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
+| [WAL format v17](docs/wal-v17.md) | Current write-ahead-log frame and record schema |
+| [Snapshot format v17](docs/snapshot-v17.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
 | [Market-data payload v3](docs/market-data-v3.md) | Current continuous market-data update/snapshot payloads |
 | [Auction market-data payload v5](docs/auction-market-data-v5.md) | Current call-auction market-data payloads |
 | [Auction-risk checkpoint payload v1](docs/auction-risk-checkpoint-v1.md) | Current coupled call-auction risk checkpoint payload |
@@ -525,6 +528,7 @@ byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/wal-v13.md](docs/wal-v13.md),
 [docs/wal-v14.md](docs/wal-v14.md),
 [docs/wal-v15.md](docs/wal-v15.md),
+[docs/wal-v16.md](docs/wal-v16.md),
 [docs/snapshot-v2.md](docs/snapshot-v2.md),
 [docs/snapshot-v3.md](docs/snapshot-v3.md),
 [docs/snapshot-v4.md](docs/snapshot-v4.md),
@@ -538,7 +542,8 @@ byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/snapshot-v12.md](docs/snapshot-v12.md),
 [docs/snapshot-v13.md](docs/snapshot-v13.md),
 [docs/snapshot-v14.md](docs/snapshot-v14.md),
-[docs/snapshot-v15.md](docs/snapshot-v15.md), continuous
+[docs/snapshot-v15.md](docs/snapshot-v15.md),
+[docs/snapshot-v16.md](docs/snapshot-v16.md), continuous
 [market-data v2](docs/market-data-v2.md), and call-auction
 [market-data v1](docs/auction-market-data-v1.md) and
 [market-data v2](docs/auction-market-data-v2.md) and
@@ -563,8 +568,9 @@ includes:
   admission and replenishment, GTD intake and canonical expiry sweeps, dormant
   stop intake, canonical bounded trigger sweeps, activation-time failures,
   mass cancellation, account and trading-state controls, every self-trade
-  policy, risk rejection and reservation release, and capacity behavior at
-  every configured bound.
+  policy, atomic FOK decrement-and-cancel barriers through direct and dormant
+  execution, coupled-risk checkpoints, durable recovery, risk rejection and
+  reservation release, and capacity behavior at every configured bound.
 - **Trading calendars:** schedule chronology and identity validation, exact
   half-open entry boundaries, multi-session trading dates, day/session TIF
   normalization, boundary-checked expiry controls, malformed payload rejection,

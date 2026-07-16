@@ -1,4 +1,8 @@
-# Semantic Snapshot Format Version 16
+# Expired Semantic Snapshot Format Version 16
+
+This is a historical byte-level record. The runtime rejects version 16. The
+authoritative current schema is
+[semantic snapshot format version 17](snapshot-v17.md).
 
 `SnapshotFile` stores one complete typed semantic value in a bounded,
 versioned CRC-32C envelope. Version 16 preserves the version-15 kind registry

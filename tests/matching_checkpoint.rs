@@ -16,9 +16,10 @@ use quotick::journal::{
     SegmentedJournalOptions, SegmentedJournalReader,
 };
 use quotick::matching::{
-    AccountAdmissionState, AccountControl, AccountControlAction, CancelReason, Command, EventKind,
-    NewOrder, OrderBook, OrderBookCheckpoint, OrderBookCheckpointCapture, OrderDisplay, OrderType,
-    ReplaceOrder, SelfTradePrevention, TimeInForce,
+    AccountAdmissionState, AccountControl, AccountControlAction, CancelReason, Command,
+    CommandOutcome, EventKind, NewOrder, OrderBook, OrderBookCheckpoint,
+    OrderBookCheckpointCapture, OrderDisplay, OrderType, RejectReason, ReplaceOrder,
+    SelfTradePrevention, TimeInForce,
 };
 use quotick::snapshot::{CheckpointSlot, SnapshotFile, SnapshotOptions};
 use quotick::{
@@ -172,6 +173,82 @@ fn immutable_matching_checkpoint_clones_share_row_and_event_storage() {
     let retry = restored.submit(command).unwrap();
     assert!(retry.replayed);
     assert_eq!(retry.events, clone.history()[0].report().events);
+}
+
+#[test]
+fn fok_decrement_and_cancel_checkpoint_restores_atomic_reports_and_retries() {
+    let external = order(
+        1,
+        1,
+        12,
+        Side::Sell,
+        2,
+        OrderDisplay::FullyDisplayed,
+        OrderType::Limit(Price::from_raw(99)),
+        TimeInForce::GoodTilCancelled,
+        SelfTradePrevention::CancelAggressor,
+    );
+    let own = order(
+        2,
+        2,
+        11,
+        Side::Sell,
+        1,
+        OrderDisplay::FullyDisplayed,
+        OrderType::Limit(Price::from_raw(100)),
+        TimeInForce::GoodTilCancelled,
+        SelfTradePrevention::CancelAggressor,
+    );
+    let rejected_command = order(
+        3,
+        3,
+        11,
+        Side::Buy,
+        3,
+        OrderDisplay::FullyDisplayed,
+        OrderType::Limit(Price::from_raw(100)),
+        TimeInForce::FillOrKill,
+        SelfTradePrevention::DecrementAndCancel,
+    );
+    let accepted_command = order(
+        4,
+        4,
+        11,
+        Side::Buy,
+        2,
+        OrderDisplay::FullyDisplayed,
+        OrderType::Limit(Price::from_raw(100)),
+        TimeInForce::FillOrKill,
+        SelfTradePrevention::DecrementAndCancel,
+    );
+
+    let mut book = OrderBook::new(definition());
+    book.submit(external).unwrap();
+    book.submit(own).unwrap();
+    let rejected = book.submit(rejected_command).unwrap();
+    assert_eq!(
+        rejected.outcome,
+        CommandOutcome::Rejected(RejectReason::InsufficientLiquidity)
+    );
+    let accepted = book.submit(accepted_command).unwrap();
+    assert_eq!(accepted.outcome, CommandOutcome::Accepted);
+
+    let area = TestArea::new("fok-decrement-and-cancel");
+    let snapshot = area.join("matching.qsnp");
+    let checkpoint = book.checkpoint(1, 9).unwrap();
+    let decoded = OrderBookCheckpoint::decode(&checkpoint.encode().unwrap()).unwrap();
+    SnapshotFile::write(&snapshot, &decoded, SnapshotOptions::default()).unwrap();
+    let persisted = SnapshotFile::read(&snapshot, SnapshotOptions::default()).unwrap();
+    let mut restored = OrderBook::from_checkpoint(&persisted).unwrap();
+
+    let rejected_retry = restored.submit(rejected_command).unwrap();
+    assert!(rejected_retry.replayed);
+    assert_eq!(rejected_retry.events, rejected.events);
+    let accepted_retry = restored.submit(accepted_command).unwrap();
+    assert!(accepted_retry.replayed);
+    assert_eq!(accepted_retry.events, accepted.events);
+    assert!(restored.order(OrderId::new(2).unwrap()).is_some());
+    restored.validate().unwrap();
 }
 
 #[test]

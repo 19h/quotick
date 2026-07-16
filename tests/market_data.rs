@@ -13,9 +13,9 @@ use quotick::market_data::{
 };
 use quotick::matching::{
     AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
-    Command, EventKind, ExecutionReport, ExpirySweep, NewOrder, OrderBook, OrderType, ReplaceOrder,
-    SelfTradePrevention, StopActivation, StopReference, StopReferenceCursor, StopTriggerSweep,
-    TimeInForce,
+    Command, CommandOutcome, EventKind, ExecutionReport, ExpirySweep, NewOrder, OrderBook,
+    OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, StopActivation, StopReference,
+    StopReferenceCursor, StopTriggerSweep, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -720,6 +720,92 @@ fn decrement_and_cancel_stp_publishes_the_changed_resting_level() {
     }));
     replica.apply_batch(&batch).expect("STP update applies");
     assert_mirrors(&book, &replica);
+}
+
+#[test]
+fn fok_decrement_and_cancel_publishes_only_committed_external_execution() {
+    let mut book = OrderBook::new(definition());
+    let mut publisher = MarketDataPublisher::from_book(&book).unwrap();
+    let mut replica = MarketDataReplica::new(instrument(), version(), TradingState::Open);
+    replica.apply_snapshot(&publisher.snapshot()).unwrap();
+
+    for command in [
+        order(
+            1,
+            1,
+            12,
+            Side::Sell,
+            2,
+            99,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ),
+        order(
+            2,
+            2,
+            11,
+            Side::Sell,
+            1,
+            100,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ),
+    ] {
+        replica
+            .apply_batch(&publish(&mut book, &mut publisher, command))
+            .unwrap();
+    }
+
+    let rejected_command = order(
+        3,
+        3,
+        11,
+        Side::Buy,
+        3,
+        100,
+        TimeInForce::FillOrKill,
+        SelfTradePrevention::DecrementAndCancel,
+    );
+    let rejected_report = book.submit(rejected_command).unwrap();
+    assert_eq!(
+        rejected_report.outcome,
+        CommandOutcome::Rejected(RejectReason::InsufficientLiquidity)
+    );
+    let rejected_batch = publisher
+        .publish(rejected_command, &rejected_report, &book)
+        .unwrap();
+    assert_eq!(rejected_batch.updates().len(), 1);
+    assert!(matches!(
+        rejected_batch.updates()[0].kind(),
+        MarketDataKind::NoBookChange
+    ));
+    replica.apply_batch(&rejected_batch).unwrap();
+
+    let accepted_command = order(
+        4,
+        4,
+        11,
+        Side::Buy,
+        2,
+        100,
+        TimeInForce::FillOrKill,
+        SelfTradePrevention::DecrementAndCancel,
+    );
+    let accepted_batch = publish(&mut book, &mut publisher, accepted_command);
+    assert!(
+        accepted_batch
+            .updates()
+            .iter()
+            .any(|update| matches!(update.kind(), MarketDataKind::Trade { .. }))
+    );
+    assert!(!accepted_batch.updates().iter().any(|update| matches!(
+        update.kind(),
+        MarketDataKind::Level(level) if level.price == Price::from_raw(100)
+    )));
+    replica.apply_batch(&accepted_batch).unwrap();
+    assert_mirrors(&book, &replica);
+    assert!(book.order(OrderId::new(2).unwrap()).is_some());
+    publisher.validate_against(&book).unwrap();
 }
 
 #[test]

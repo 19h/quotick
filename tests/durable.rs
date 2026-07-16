@@ -11,9 +11,9 @@ use quotick::journal::{
     Durability, Journal, JournalError, JournalOptions, JournalReader, RecordKind, RecoveryMode,
 };
 use quotick::matching::{
-    CancelReason, Command, EventKind, ExpirySweep, MatchingError, NewOrder, OrderBook, OrderType,
-    SelfTradePrevention, StopActivation, StopReference, StopReferenceCursor, StopTriggerSweep,
-    TimeInForce,
+    CancelReason, Command, CommandOutcome, EventKind, ExpirySweep, MatchingError, NewOrder,
+    OrderBook, OrderType, RejectReason, SelfTradePrevention, StopActivation, StopReference,
+    StopReferenceCursor, StopTriggerSweep, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -97,6 +97,31 @@ fn command(command_id: u64, order_id: u64, quantity: u64) -> Command {
         self_trade_prevention: SelfTradePrevention::CancelAggressor,
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "durable FOK fixtures keep priority and self-trade dimensions explicit"
+)]
+fn limit_command(
+    command_id: u64,
+    order_id: u64,
+    account_id: u64,
+    side: Side,
+    quantity: u64,
+    price: i64,
+    time_in_force: TimeInForce,
+    self_trade_prevention: SelfTradePrevention,
+) -> Command {
+    let Command::New(mut value) = command(command_id, order_id, quantity) else {
+        unreachable!("command fixture is always new")
+    };
+    value.account_id = AccountId::new(account_id).unwrap();
+    value.side = side;
+    value.order_type = OrderType::Limit(Price::from_raw(price));
+    value.time_in_force = time_in_force;
+    value.self_trade_prevention = self_trade_prevention;
+    Command::New(value)
 }
 
 fn gtd_command(command_id: u64, order_id: u64, quantity: u64, expires_at: u64) -> Command {
@@ -197,6 +222,87 @@ fn submit_writes_command_then_report_and_reopen_reconstructs_state() {
         5
     );
     reopened.book().validate().expect("restored book validates");
+}
+
+#[test]
+fn durable_fok_decrement_and_cancel_recovers_atomic_decisions_and_retry() {
+    let file = TestFile::new("fok-decrement-and-cancel");
+    let external = limit_command(
+        1,
+        1,
+        12,
+        Side::Sell,
+        2,
+        99,
+        TimeInForce::GoodTilCancelled,
+        SelfTradePrevention::CancelAggressor,
+    );
+    let own = limit_command(
+        2,
+        2,
+        11,
+        Side::Sell,
+        1,
+        100,
+        TimeInForce::GoodTilCancelled,
+        SelfTradePrevention::CancelAggressor,
+    );
+    let rejected_command = limit_command(
+        3,
+        3,
+        11,
+        Side::Buy,
+        3,
+        100,
+        TimeInForce::FillOrKill,
+        SelfTradePrevention::DecrementAndCancel,
+    );
+    let accepted_command = limit_command(
+        4,
+        4,
+        11,
+        Side::Buy,
+        2,
+        100,
+        TimeInForce::FillOrKill,
+        SelfTradePrevention::DecrementAndCancel,
+    );
+
+    let mut durable = DurableOrderBook::open(file.path(), definition(), options()).unwrap();
+    durable.submit(external).unwrap();
+    durable.submit(own).unwrap();
+    let rejected = durable.submit(rejected_command).unwrap();
+    assert_eq!(
+        rejected.outcome,
+        CommandOutcome::Rejected(RejectReason::InsufficientLiquidity)
+    );
+    let accepted = durable.submit(accepted_command).unwrap();
+    assert_eq!(accepted.outcome, CommandOutcome::Accepted);
+    assert_eq!(
+        accepted
+            .events
+            .iter()
+            .filter_map(|event| match event.kind {
+                EventKind::Trade(trade) => Some(trade.quantity.lots()),
+                _ => None,
+            })
+            .sum::<u64>(),
+        2
+    );
+    durable.sync_all().unwrap();
+    drop(durable);
+
+    let mut recovered = DurableOrderBook::open(file.path(), definition(), options()).unwrap();
+    assert_eq!(recovered.recovery().replayed_commands, 4);
+    assert!(recovered.book().order(OrderId::new(1).unwrap()).is_none());
+    assert!(recovered.book().order(OrderId::new(2).unwrap()).is_some());
+    let rejected_retry = recovered.submit(rejected_command).unwrap();
+    assert!(rejected_retry.replayed);
+    assert_eq!(rejected_retry.events, rejected.events);
+    let accepted_retry = recovered.submit(accepted_command).unwrap();
+    assert!(accepted_retry.replayed);
+    assert_eq!(accepted_retry.events, accepted.events);
+    recovered.book().validate().unwrap();
 }
 
 #[test]

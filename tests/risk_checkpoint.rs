@@ -135,6 +135,14 @@ fn order(
     })
 }
 
+fn with_stp(mut command: Command, policy: SelfTradePrevention) -> Command {
+    let Command::New(ref mut order) = command else {
+        unreachable!("self-trade policy fixture must be a new order")
+    };
+    order.self_trade_prevention = policy;
+    command
+}
+
 fn resting(command_id: u64, order_id: u64, owner: u64, quantity: u64) -> Command {
     order(
         command_id,
@@ -146,6 +154,105 @@ fn resting(command_id: u64, order_id: u64, owner: u64, quantity: u64) -> Command
         90,
         TimeInForce::GoodTilCancelled,
     )
+}
+
+#[test]
+fn fok_decrement_and_cancel_coupled_checkpoint_preserves_risk_and_retries() {
+    let external = order(
+        1,
+        1,
+        12,
+        Side::Sell,
+        2,
+        OrderDisplay::FullyDisplayed,
+        99,
+        TimeInForce::GoodTilCancelled,
+    );
+    let own = order(
+        2,
+        2,
+        11,
+        Side::Sell,
+        1,
+        OrderDisplay::FullyDisplayed,
+        100,
+        TimeInForce::GoodTilCancelled,
+    );
+    let rejected_command = with_stp(
+        order(
+            3,
+            3,
+            11,
+            Side::Buy,
+            3,
+            OrderDisplay::FullyDisplayed,
+            100,
+            TimeInForce::FillOrKill,
+        ),
+        SelfTradePrevention::DecrementAndCancel,
+    );
+    let accepted_command = with_stp(
+        order(
+            4,
+            4,
+            11,
+            Side::Buy,
+            2,
+            OrderDisplay::FullyDisplayed,
+            100,
+            TimeInForce::FillOrKill,
+        ),
+        SelfTradePrevention::DecrementAndCancel,
+    );
+
+    let mut managed = RiskManagedOrderBook::new(definition());
+    for value in profiles(100) {
+        managed
+            .register_account(value.account_id(), value.profile())
+            .unwrap();
+    }
+    managed.submit(external).unwrap();
+    managed.submit(own).unwrap();
+    let rejected = managed.submit(rejected_command).unwrap();
+    let accepted = managed.submit(accepted_command).unwrap();
+    assert_eq!(
+        rejected.outcome,
+        CommandOutcome::Rejected(RejectReason::InsufficientLiquidity)
+    );
+    assert_eq!(accepted.outcome, CommandOutcome::Accepted);
+
+    let area = TestArea::new("fok-decrement-and-cancel");
+    let snapshot = area.join("risk.qsnp");
+    let checkpoint = managed.checkpoint(1, 3, 11).unwrap();
+    SnapshotFile::write(&snapshot, &checkpoint, SnapshotOptions::default()).unwrap();
+    let persisted = SnapshotFile::read(&snapshot, SnapshotOptions::default()).unwrap();
+    let mut restored = RiskManagedOrderBook::from_checkpoint(&persisted).unwrap();
+
+    assert_eq!(
+        restored
+            .risk()
+            .snapshot(account(11))
+            .unwrap()
+            .position_lots(),
+        2
+    );
+    assert_eq!(
+        restored
+            .risk()
+            .snapshot(account(12))
+            .unwrap()
+            .position_lots(),
+        -2
+    );
+    assert!(restored.submit(rejected_command).unwrap().replayed);
+    assert!(restored.submit(accepted_command).unwrap().replayed);
+    assert!(
+        restored
+            .risk()
+            .reservation(OrderId::new(2).unwrap())
+            .is_some()
+    );
+    restored.validate().unwrap();
 }
 
 fn journal_options() -> JournalOptions {

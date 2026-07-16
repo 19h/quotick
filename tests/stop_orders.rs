@@ -59,6 +59,14 @@ fn order(
     })
 }
 
+fn with_stp(mut command: Command, policy: SelfTradePrevention) -> Command {
+    let Command::New(ref mut order) = command else {
+        unreachable!("self-trade policy fixture must be a new order")
+    };
+    order.self_trade_prevention = policy;
+    command
+}
+
 fn stop_market(trigger_price: i64) -> OrderType {
     OrderType::Stop {
         trigger_price: Price::from_raw(trigger_price),
@@ -598,6 +606,108 @@ fn triggered_fok_and_post_only_fail_atomically_with_typed_reasons() {
         .outcome,
         CommandOutcome::Rejected(RejectReason::StopMarketCannotPost)
     );
+    book.validate().unwrap();
+}
+
+#[test]
+fn dormant_fok_decrement_and_cancel_checks_external_fill_at_activation() {
+    let mut book = OrderBook::new(definition());
+    book.submit(trigger(1, 1, 100, 1)).unwrap();
+    book.submit(order(
+        2,
+        1,
+        21,
+        Side::Sell,
+        2,
+        OrderType::Limit(Price::from_raw(105)),
+        TimeInForce::GoodTilCancelled,
+    ))
+    .unwrap();
+    book.submit(order(
+        3,
+        2,
+        11,
+        Side::Sell,
+        1,
+        OrderType::Limit(Price::from_raw(106)),
+        TimeInForce::GoodTilCancelled,
+    ))
+    .unwrap();
+
+    let rejected_stop = with_stp(
+        order(
+            4,
+            3,
+            11,
+            Side::Buy,
+            3,
+            stop_limit(110, 110),
+            TimeInForce::FillOrKill,
+        ),
+        SelfTradePrevention::DecrementAndCancel,
+    );
+    assert_eq!(
+        book.submit(rejected_stop).unwrap().outcome,
+        CommandOutcome::Accepted
+    );
+    let rejected_activation = book.submit(trigger(5, 2, 110, 1)).unwrap();
+    assert!(rejected_activation.events.iter().any(|event| matches!(
+        event.kind,
+        EventKind::OrderCancelled {
+            order_id,
+            quantity,
+            reason: CancelReason::TriggeredFokUnfilled,
+        } if order_id == OrderId::new(3).unwrap() && quantity.lots() == 3
+    )));
+    assert!(!rejected_activation.events.iter().any(|event| matches!(
+        event.kind,
+        EventKind::Trade(_) | EventKind::SelfTradePrevented { .. }
+    )));
+    for (order_id, leaves) in [(1, 2), (2, 1)] {
+        assert_eq!(
+            book.order(OrderId::new(order_id).unwrap())
+                .unwrap()
+                .leaves_quantity
+                .lots(),
+            leaves
+        );
+    }
+
+    let accepted_stop = with_stp(
+        order(
+            6,
+            4,
+            11,
+            Side::Buy,
+            2,
+            stop_limit(120, 110),
+            TimeInForce::FillOrKill,
+        ),
+        SelfTradePrevention::DecrementAndCancel,
+    );
+    assert_eq!(
+        book.submit(accepted_stop).unwrap().outcome,
+        CommandOutcome::Accepted
+    );
+    let accepted_activation = book.submit(trigger(7, 3, 120, 1)).unwrap();
+    assert_eq!(
+        accepted_activation
+            .events
+            .iter()
+            .filter_map(|event| match event.kind {
+                EventKind::Trade(trade) => Some(trade.quantity.lots()),
+                _ => None,
+            })
+            .sum::<u64>(),
+        2
+    );
+    assert!(
+        !accepted_activation
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::SelfTradePrevented { .. }))
+    );
+    assert!(book.order(OrderId::new(2).unwrap()).is_some());
     book.validate().unwrap();
 }
 

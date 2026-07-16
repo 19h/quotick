@@ -422,8 +422,7 @@ fn hidden_liquidity_is_crossing_and_fok_eligible_despite_zero_depth() {
     book.validate().unwrap();
 }
 
-#[test]
-fn fok_reaches_all_displayed_reserve_leaves_before_a_hidden_self_barrier() {
+fn assert_fok_reaches_displayed_reserve_before_hidden_self(policy: SelfTradePrevention) {
     let mut book = OrderBook::new(definition(true));
     book.submit(order(
         1,
@@ -449,15 +448,18 @@ fn fok_reaches_all_displayed_reserve_leaves_before_a_hidden_self_barrier() {
     .unwrap();
 
     let rejected = book
-        .submit(order(
-            3,
-            3,
-            12,
-            Side::Buy,
-            7,
-            100,
-            OrderDisplay::FullyDisplayed,
-            TimeInForce::FillOrKill,
+        .submit(with_stp(
+            order(
+                3,
+                3,
+                12,
+                Side::Buy,
+                7,
+                100,
+                OrderDisplay::FullyDisplayed,
+                TimeInForce::FillOrKill,
+            ),
+            policy,
         ))
         .unwrap();
     assert_eq!(
@@ -467,15 +469,18 @@ fn fok_reaches_all_displayed_reserve_leaves_before_a_hidden_self_barrier() {
     assert!(maker_trades(&rejected).is_empty());
 
     let accepted = book
-        .submit(order(
-            4,
-            4,
-            12,
-            Side::Buy,
-            6,
-            100,
-            OrderDisplay::FullyDisplayed,
-            TimeInForce::FillOrKill,
+        .submit(with_stp(
+            order(
+                4,
+                4,
+                12,
+                Side::Buy,
+                6,
+                100,
+                OrderDisplay::FullyDisplayed,
+                TimeInForce::FillOrKill,
+            ),
+            policy,
         ))
         .unwrap();
     assert_eq!(accepted.outcome, CommandOutcome::Accepted);
@@ -483,6 +488,17 @@ fn fok_reaches_all_displayed_reserve_leaves_before_a_hidden_self_barrier() {
     assert!(book.best_ask().is_none());
     assert!(book.order(OrderId::new(2).unwrap()).is_some());
     book.validate().unwrap();
+}
+
+#[test]
+fn fok_reaches_all_displayed_reserve_leaves_before_a_hidden_self_barrier() {
+    for policy in [
+        SelfTradePrevention::CancelAggressor,
+        SelfTradePrevention::CancelBoth,
+        SelfTradePrevention::DecrementAndCancel,
+    ] {
+        assert_fok_reaches_displayed_reserve_before_hidden_self(policy);
+    }
 }
 
 #[test]

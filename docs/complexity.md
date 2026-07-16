@@ -118,8 +118,9 @@ activations cause `E` maker-slice interactions and exhaust `L` price levels,
 commit is bounded by
 `O(K log(O + 1) + E + (L + K) log(P + 1))`; this includes trigger-index
 removal and possible stop-limit residual insertion. FOK or minimum-quantity IOC
-activation can add its ordinary crossed-order inspection. Counting retained
-eligible backlog is
+activation can add its ordinary crossed-order inspection; FOK decrement-and-
+cancel uses the same nonmutating self-barrier scan as direct entry. Counting
+retained eligible backlog is
 `O(R + 1)` for `R` stops remaining at the committed reference. A sweep with no
 eligible stop is `O(1)` and still records the reference; a partial sweep
 requires exact-reference continuation before cursor advancement. Source-ID,
@@ -312,7 +313,10 @@ visited at most once; complexity is independent of the number of reserve
 slices that subsequent execution emits. A displayed-class self barrier admits
 only preceding working slices; a hidden-class self barrier admits the total
 leaves of the preceding displayed class and earlier hidden leaves. FOK scans
-for original quantity; minimum-quantity IOC scans for its explicit threshold.
+for original external-trade quantity and applies the barrier to cancel-
+aggressor, cancel-both, and decrement-and-cancel. Minimum-quantity IOC scans
+for its explicit threshold and rejects decrement-and-cancel at admission. The
+new FOK policy changes no asymptotic time, space, or allocation bound.
 
 ## Default matching limits and memory
 

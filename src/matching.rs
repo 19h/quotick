@@ -661,7 +661,7 @@ pub enum RejectReason {
     MarketOrderCannotRest,
     /// A market order used post-only behavior.
     MarketOrderCannotPost,
-    /// Fill-or-kill with decrement-and-cancel has ambiguous full-fill semantics.
+    /// Legacy rejection retained for stable decoding of historical reports.
     UnsupportedFokSelfTradePolicy,
     /// A minimum quantity was off grid or exceeded the order quantity.
     InvalidMinimumQuantity,
@@ -5263,11 +5263,6 @@ impl OrderBook {
                     return Err(RejectReason::HiddenOrderCannotBeImmediate);
                 }
                 if command.order_type.stop().is_some() {
-                    if command.time_in_force == TimeInForce::FillOrKill
-                        && command.self_trade_prevention == SelfTradePrevention::DecrementAndCancel
-                    {
-                        return Err(RejectReason::UnsupportedFokSelfTradePolicy);
-                    }
                     return Ok(());
                 }
                 match (active_order_type, command.time_in_force) {
@@ -5281,11 +5276,6 @@ impl OrderBook {
                         return Err(RejectReason::MarketOrderCannotPost);
                     }
                     _ => {}
-                }
-                if command.time_in_force == TimeInForce::FillOrKill
-                    && command.self_trade_prevention == SelfTradePrevention::DecrementAndCancel
-                {
-                    return Err(RejectReason::UnsupportedFokSelfTradePolicy);
                 }
                 if command.time_in_force == TimeInForce::PostOnly
                     && self.would_cross(command.side, active_order_type)
@@ -8439,15 +8429,13 @@ impl OrderBook {
 
     /// Returns whether the required external quantity can execute immediately.
     ///
-    /// The caller rejects decrement-and-cancel before this non-mutating scan:
-    /// prevented self quantity is not executed quantity, and reserve refresh
-    /// makes the distinction priority-sensitive.
+    /// Decrement-and-cancel uses the same barrier theorem as cancel-aggressor:
+    /// a FOK can execute its original quantity only when external liquidity
+    /// completes the order before the first priority-reachable self encounter.
+    /// Minimum-quantity IOC is rejected separately because its threshold can be
+    /// met after a self decrement and requires a two-counter virtual-queue scan.
     fn can_execute_quantity(&self, incoming: IncomingPreview, required: u64) -> bool {
         debug_assert!(required > 0 && required <= incoming.leaves);
-        debug_assert_ne!(
-            incoming.self_trade_prevention,
-            SelfTradePrevention::DecrementAndCancel
-        );
         let mut remaining = required;
         let mut price = self.best_price(incoming.side.opposite());
         while let Some(current_price) = price {
@@ -8496,10 +8484,11 @@ impl OrderBook {
             SelfTradePrevention::CancelResting => {
                 self.cancel_resting_liquidity(incoming.account_id, head, remaining)
             }
-            SelfTradePrevention::CancelAggressor | SelfTradePrevention::CancelBoth => {
+            SelfTradePrevention::CancelAggressor
+            | SelfTradePrevention::CancelBoth
+            | SelfTradePrevention::DecrementAndCancel => {
                 self.blocking_liquidity(incoming.account_id, head, remaining)
             }
-            SelfTradePrevention::DecrementAndCancel => LevelLiquidity::BlockedBySelfTrade,
         }
     }
 
@@ -9425,10 +9414,11 @@ mod price_level_index_tests {
                 next_order_id += 1;
             }
         }
-        let policy = match generator.bounded(3) {
+        let policy = match generator.bounded(4) {
             0 => SelfTradePrevention::CancelAggressor,
             1 => SelfTradePrevention::CancelResting,
-            _ => SelfTradePrevention::CancelBoth,
+            2 => SelfTradePrevention::CancelBoth,
+            _ => SelfTradePrevention::DecrementAndCancel,
         };
         let incoming = NewOrder {
             command_id: CommandId::new(1).unwrap(),

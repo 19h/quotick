@@ -419,6 +419,88 @@ fn fill_or_kill_rejection_is_atomic() {
 }
 
 #[test]
+fn fill_or_kill_decrement_and_cancel_requires_full_external_fill_before_self() {
+    let mut book = OrderBook::new(definition());
+    for command in [
+        limit_order(
+            1,
+            1,
+            11,
+            Side::Sell,
+            2,
+            99,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ),
+        limit_order(
+            2,
+            2,
+            12,
+            Side::Sell,
+            1,
+            100,
+            TimeInForce::GoodTilCancelled,
+            SelfTradePrevention::CancelAggressor,
+        ),
+    ] {
+        book.submit(command).expect("resting ask accepted");
+    }
+
+    let rejected_command = limit_order(
+        3,
+        3,
+        12,
+        Side::Buy,
+        3,
+        100,
+        TimeInForce::FillOrKill,
+        SelfTradePrevention::DecrementAndCancel,
+    );
+    let rejected = book
+        .submit(rejected_command)
+        .expect("FOK business rejection is sequenced");
+    assert_eq!(
+        rejected.outcome,
+        CommandOutcome::Rejected(RejectReason::InsufficientLiquidity)
+    );
+    assert_eq!(rejected.events.len(), 1);
+    assert!(trades(&rejected).is_empty());
+    assert_eq!(book.best_ask().expect("asks remain").quantity, 2);
+    assert_eq!(book.active_order_count(), 2);
+
+    let replay = book.submit(rejected_command).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.events, rejected.events);
+
+    let accepted = book
+        .submit(limit_order(
+            4,
+            4,
+            12,
+            Side::Buy,
+            2,
+            100,
+            TimeInForce::FillOrKill,
+            SelfTradePrevention::DecrementAndCancel,
+        ))
+        .expect("external quantity ahead of self liquidity fills atomically");
+    assert_eq!(accepted.outcome, CommandOutcome::Accepted);
+    assert_eq!(trades(&accepted).len(), 1);
+    assert_eq!(
+        trades(&accepted)[0].maker_order_id,
+        OrderId::new(1).unwrap()
+    );
+    assert!(
+        !accepted
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::SelfTradePrevented { .. }))
+    );
+    assert!(book.order(OrderId::new(2).unwrap()).is_some());
+    book.validate().unwrap();
+}
+
+#[test]
 fn post_only_cross_is_rejected_without_consuming_order_identifier() {
     let mut book = OrderBook::new(definition());
     book.submit(limit_order(

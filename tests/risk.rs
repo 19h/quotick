@@ -1316,6 +1316,93 @@ fn decrement_and_cancel_stp_releases_prevented_resting_quantity() {
 }
 
 #[test]
+fn fok_decrement_and_cancel_is_atomic_across_matching_and_risk() {
+    let mut book = RiskManagedOrderBook::new(definition());
+    for owner in [11, 12] {
+        book.register_account(account(owner), profile(AccountRiskState::Active, 0))
+            .unwrap();
+    }
+    book.submit(limit_order(
+        1,
+        1,
+        12,
+        Side::Sell,
+        2,
+        99,
+        TimeInForce::GoodTilCancelled,
+    ))
+    .unwrap();
+    book.submit(limit_order(
+        2,
+        2,
+        11,
+        Side::Sell,
+        1,
+        100,
+        TimeInForce::GoodTilCancelled,
+    ))
+    .unwrap();
+
+    let rejected = book
+        .submit(order(
+            3,
+            3,
+            11,
+            Side::Buy,
+            3,
+            OrderType::Limit(Price::from_raw(100)),
+            TimeInForce::FillOrKill,
+            SelfTradePrevention::DecrementAndCancel,
+        ))
+        .unwrap();
+    assert_eq!(
+        rejected.outcome,
+        CommandOutcome::Rejected(RejectReason::InsufficientLiquidity)
+    );
+    assert_eq!(
+        book.risk().snapshot(account(11)).unwrap().position_lots(),
+        0
+    );
+    assert_eq!(
+        book.risk().snapshot(account(12)).unwrap().position_lots(),
+        0
+    );
+    assert_eq!(book.risk().reservation_count(), 2);
+    assert_eq!(
+        book.risk()
+            .reservation(OrderId::new(2).unwrap())
+            .unwrap()
+            .quantity_lots(),
+        1
+    );
+
+    let accepted = book
+        .submit(order(
+            4,
+            4,
+            11,
+            Side::Buy,
+            2,
+            OrderType::Limit(Price::from_raw(100)),
+            TimeInForce::FillOrKill,
+            SelfTradePrevention::DecrementAndCancel,
+        ))
+        .unwrap();
+    assert_eq!(accepted.outcome, CommandOutcome::Accepted);
+    assert_eq!(
+        book.risk().snapshot(account(11)).unwrap().position_lots(),
+        2
+    );
+    assert_eq!(
+        book.risk().snapshot(account(12)).unwrap().position_lots(),
+        -2
+    );
+    assert_eq!(book.risk().reservation_count(), 1);
+    assert!(book.risk().reservation(OrderId::new(2).unwrap()).is_some());
+    book.validate().unwrap();
+}
+
+#[test]
 fn profile_registration_and_notional_accumulation_fail_closed() {
     let extreme_limits = RiskLimits::new(RiskLimitSpec {
         max_order_quantity_lots: u64::MAX,

@@ -504,6 +504,7 @@ fn fok_exhausts_hidden_liquidity_at_a_better_price_before_a_worse_self_barrier()
     for policy in [
         SelfTradePrevention::CancelAggressor,
         SelfTradePrevention::CancelBoth,
+        SelfTradePrevention::DecrementAndCancel,
     ] {
         let mut book = OrderBook::new(definition(ReserveOrderRules::new(16).unwrap()));
         book.submit(new_order(
