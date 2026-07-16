@@ -374,6 +374,7 @@ impl CallAuctionRiskEngine {
             CallAuctionCommand::PhaseControl(_)
             | CallAuctionCommand::Cancel(_)
             | CallAuctionCommand::MassCancel(_)
+            | CallAuctionCommand::Amend(_)
             | CallAuctionCommand::Uncross(_) => Ok(()),
         }
     }
@@ -426,6 +427,17 @@ impl CallAuctionRiskEngine {
                 CallAuctionEventKind::OrderAccepted(order) => self.insert_reservation(order),
                 CallAuctionEventKind::OrderCancelled { order, .. } => {
                     self.remove_reservation(order.order_id);
+                }
+                CallAuctionEventKind::OrderAmended {
+                    order,
+                    previous_quantity,
+                    ..
+                } => {
+                    let delta_lots = previous_quantity
+                        .lots()
+                        .checked_sub(order.quantity.lots())
+                        .expect("accepted amendment must strictly reduce quantity");
+                    self.decrement_reservation(order.order_id, delta_lots);
                 }
                 CallAuctionEventKind::Trade(trade) => {
                     self.decrement_reservation(trade.buy_order_id(), trade.quantity().lots());

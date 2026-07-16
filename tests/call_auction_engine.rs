@@ -4,12 +4,12 @@ use quotick::auction_book::{
     CallAuctionRemainderPolicy, CallAuctionSelfTradePolicy, CallAuctionUncrossPolicy,
 };
 use quotick::auction_engine::{
-    CallAuctionAction, CallAuctionCancelOrder, CallAuctionCommand, CallAuctionCommandOutcome,
-    CallAuctionEngine, CallAuctionEngineCapacity, CallAuctionEngineConstructionError,
-    CallAuctionEngineError, CallAuctionEngineLimits, CallAuctionEngineLimitsError,
-    CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionMassCancel, CallAuctionPhase,
-    CallAuctionPhaseControl, CallAuctionRejectReason, CallAuctionReplaceOrder,
-    CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionAction, CallAuctionAmendOrder, CallAuctionCancelOrder, CallAuctionCommand,
+    CallAuctionCommandOutcome, CallAuctionEngine, CallAuctionEngineCapacity,
+    CallAuctionEngineConstructionError, CallAuctionEngineError, CallAuctionEngineLimits,
+    CallAuctionEngineLimitsError, CallAuctionEngineLimitsSpec, CallAuctionEventKind,
+    CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl, CallAuctionRejectReason,
+    CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use quotick::instrument::{
     InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -151,6 +151,27 @@ fn mass_cancel_command(command_id: u64, owner: u64, scope: MassCancelScope) -> C
         instrument_version: version(),
         account_id: account(owner),
         scope,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+fn amend_command(
+    command_id: u64,
+    auction_id: u64,
+    expected_revision: u64,
+    owner: u64,
+    order_id: u64,
+    quantity: u64,
+) -> CallAuctionCommand {
+    CallAuctionCommand::Amend(CallAuctionAmendOrder {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        auction_id: auction(auction_id),
+        expected_phase_revision: expected_revision,
+        account_id: account(owner),
+        order_id: OrderId::new(order_id).unwrap(),
+        new_quantity: Quantity::new(quantity).unwrap(),
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
@@ -436,6 +457,73 @@ fn cancel_replace_is_one_idempotent_command_with_two_order_events() {
     assert!(replay.replayed);
     assert_eq!(replay.events, report.events);
     assert_eq!(engine.next_command_sequence(), 5);
+    engine.validate().unwrap();
+}
+
+#[test]
+fn retained_priority_amendment_is_sequenced_idempotent_and_collection_only() {
+    let mut engine =
+        CallAuctionEngine::try_with_limits(definition(), engine_limits(4, 12, 24)).unwrap();
+    engine
+        .submit(phase_command(1, 1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            2,
+            order(
+                10,
+                7,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                8,
+            ),
+        ))
+        .unwrap();
+    let before = engine.book().order(OrderId::new(10).unwrap()).unwrap();
+    let command = amend_command(3, 1, 1, 7, 10, 3);
+    let report = engine.submit(command).unwrap();
+    assert_eq!(report.outcome, CallAuctionCommandOutcome::Accepted);
+    assert_eq!(report.events.len(), 1);
+    assert!(matches!(
+        report.events[0].kind,
+        CallAuctionEventKind::OrderAmended {
+            order,
+            previous_quantity,
+            book_revision: 2,
+        } if order.order_id == before.order_id
+            && order.quantity.lots() == 3
+            && order.priority_sequence == before.priority_sequence
+            && previous_quantity.lots() == 8
+    ));
+    let replay = engine.submit(command).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.events, report.events);
+
+    let not_reduced = engine.submit(amend_command(4, 1, 1, 7, 10, 3)).unwrap();
+    assert_eq!(
+        not_reduced.outcome,
+        CallAuctionCommandOutcome::Rejected(CallAuctionRejectReason::AmendQuantityNotReduced)
+    );
+    engine
+        .submit(phase_command(5, 1, 1, CallAuctionPhase::Frozen))
+        .unwrap();
+    let frozen = engine.submit(amend_command(6, 1, 2, 7, 10, 2)).unwrap();
+    assert_eq!(
+        frozen.outcome,
+        CallAuctionCommandOutcome::Rejected(CallAuctionRejectReason::ActionNotAllowed {
+            action: CallAuctionAction::Amend,
+            phase: CallAuctionPhase::Frozen,
+        })
+    );
+    assert_eq!(
+        engine
+            .book()
+            .order(OrderId::new(10).unwrap())
+            .unwrap()
+            .quantity
+            .lots(),
+        3
+    );
     engine.validate().unwrap();
 }
 

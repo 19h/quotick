@@ -17,12 +17,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::auction::{AuctionClearing, AuctionError, AuctionPriceBand, AuctionPricePolicy};
 use crate::auction_book::{
-    CallAuctionAdmissionError, CallAuctionBook, CallAuctionBookLimits, CallAuctionCancelError,
-    CallAuctionCancellation, CallAuctionCommitError, CallAuctionConstructionError,
-    CallAuctionIndicative, CallAuctionInvariantViolation, CallAuctionMassCancelError,
-    CallAuctionMassCancelResult, CallAuctionOrder, CallAuctionOrderSnapshot,
-    CallAuctionPrepareError, CallAuctionReplaceError, CallAuctionTrade, CallAuctionUncrossPolicy,
-    PreparedCallAuctionUncross,
+    CallAuctionAdmissionError, CallAuctionAmendError, CallAuctionBook, CallAuctionBookLimits,
+    CallAuctionCancelError, CallAuctionCancellation, CallAuctionCommitError,
+    CallAuctionConstructionError, CallAuctionIndicative, CallAuctionInvariantViolation,
+    CallAuctionMassCancelError, CallAuctionMassCancelResult, CallAuctionOrder,
+    CallAuctionOrderSnapshot, CallAuctionPrepareError, CallAuctionReplaceError, CallAuctionTrade,
+    CallAuctionUncrossPolicy, PreparedCallAuctionUncross,
 };
 use crate::bounded_hash::{BoundedHashMap, BoundedHashSet};
 use crate::instrument::{AdmissionError, InstrumentDefinition};
@@ -502,6 +502,29 @@ pub struct CallAuctionMassCancel {
     pub received_at: TimestampNs,
 }
 
+/// Sequenced retained-priority quantity reduction during active collection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionAmendOrder {
+    /// Idempotency key.
+    pub command_id: CommandId,
+    /// Routed instrument.
+    pub instrument_id: InstrumentId,
+    /// Immutable instrument version.
+    pub instrument_version: InstrumentVersion,
+    /// Collection cycle to which the amendment belongs.
+    pub auction_id: AuctionId,
+    /// Current phase revision observed by the submitter.
+    pub expected_phase_revision: u64,
+    /// Authorizing owner account.
+    pub account_id: AccountId,
+    /// Active order whose quantity is reduced.
+    pub order_id: OrderId,
+    /// Strictly smaller positive active leaves quantity.
+    pub new_quantity: Quantity,
+    /// Gateway receive time.
+    pub received_at: TimestampNs,
+}
+
 /// Sequenced new-identity cancel/replace during active collection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CallAuctionReplaceOrder {
@@ -557,6 +580,8 @@ pub enum CallAuctionCommand {
     Cancel(CallAuctionCancelOrder),
     /// Cancel a canonical account-scoped set of active interest.
     MassCancel(CallAuctionMassCancel),
+    /// Reduce active quantity without changing identity or priority.
+    Amend(CallAuctionAmendOrder),
     /// Atomically cancel active interest and admit a new-identity replacement.
     Replace(CallAuctionReplaceOrder),
     /// Discover, allocate, pair, and consume one frozen auction.
@@ -572,6 +597,7 @@ impl CallAuctionCommand {
             Self::Submit(command) => command.command_id,
             Self::Cancel(command) => command.command_id,
             Self::MassCancel(command) => command.command_id,
+            Self::Amend(command) => command.command_id,
             Self::Replace(command) => command.command_id,
             Self::Uncross(command) => command.command_id,
         }
@@ -585,6 +611,7 @@ impl CallAuctionCommand {
             Self::Submit(command) => command.received_at,
             Self::Cancel(command) => command.received_at,
             Self::MassCancel(command) => command.received_at,
+            Self::Amend(command) => command.received_at,
             Self::Replace(command) => command.received_at,
             Self::Uncross(command) => command.received_at,
         }
@@ -602,6 +629,8 @@ pub enum CallAuctionAction {
     Cancel,
     /// Account-scoped owner mass cancellation.
     MassCancel,
+    /// Retained-priority active-quantity reduction.
+    Amend,
     /// New-identity cancel/replace.
     Replace,
     /// Final uncross.
@@ -658,6 +687,8 @@ pub enum CallAuctionRejectReason {
     UnknownOrder,
     /// Cancellation account did not own the order.
     NotOrderOwner,
+    /// Proposed amended quantity was not strictly below active leaves.
+    AmendQuantityNotReduced,
     /// Frozen interest had no executable clearing state.
     NoExecutableInterest,
     /// Submitted account has no immutable risk profile.
@@ -729,6 +760,15 @@ pub enum CallAuctionEventKind {
         /// Sum of cancelled active quantity in instrument-defined lots.
         cancelled_quantity_lots: u128,
         /// Collection-book revision after the command.
+        book_revision: u64,
+    },
+    /// Active quantity was reduced without changing identity or priority.
+    OrderAmended {
+        /// Complete active order state after the reduction.
+        order: CallAuctionOrderSnapshot,
+        /// Active quantity immediately before the reduction.
+        previous_quantity: Quantity,
+        /// Collection-book revision after the reduction.
         book_revision: u64,
     },
     /// One deterministic auction counterparty pair executed.
@@ -1758,6 +1798,55 @@ impl CallAuctionCheckpoint {
                                 )
                             })?;
                     }
+                    CallAuctionCommand::Amend(amend) => {
+                        let Some(CallAuctionEvent {
+                            kind:
+                                CallAuctionEventKind::OrderAmended {
+                                    order,
+                                    previous_quantity,
+                                    book_revision,
+                                },
+                            ..
+                        }) = entry.report.events.first()
+                        else {
+                            return Err(CallAuctionCheckpointError::new(
+                                "auction checkpoint accepted amendment trace is invalid",
+                            ));
+                        };
+                        let Some(previous) = projected.get(&amend.order_id).copied() else {
+                            return Err(CallAuctionCheckpointError::new(
+                                "auction checkpoint amendment target is not active",
+                            ));
+                        };
+                        expected_book_revision =
+                            expected_book_revision.checked_add(1).ok_or_else(|| {
+                                CallAuctionCheckpointError::new(
+                                    "auction checkpoint book revision is exhausted",
+                                )
+                            })?;
+                        if entry.report.events.len() != 1
+                            || previous.order_id != order.order_id
+                            || previous.account_id != amend.account_id
+                            || previous.account_id != order.account_id
+                            || previous.side != order.side
+                            || previous.constraint != order.constraint
+                            || previous.priority_sequence != order.priority_sequence
+                            || previous.quantity != *previous_quantity
+                            || order.quantity != amend.new_quantity
+                            || order.quantity.lots() >= previous.quantity.lots()
+                            || *book_revision != expected_book_revision
+                            || self
+                                .definition
+                                .quantity_rules()
+                                .validate_leaves(order.quantity)
+                                .is_err()
+                            || projected.insert(order.order_id, *order) != Some(previous)
+                        {
+                            return Err(CallAuctionCheckpointError::new(
+                                "auction checkpoint amendment contradicts projected state",
+                            ));
+                        }
+                    }
                     CallAuctionCommand::Replace(replace) => {
                         let Some(CallAuctionEvent {
                             kind:
@@ -2247,6 +2336,17 @@ fn decoded_accepted_event_grammar_is_valid(events: &[CallAuctionEvent]) -> bool 
         [
             CallAuctionEvent {
                 kind:
+                    CallAuctionEventKind::OrderAmended {
+                        order,
+                        previous_quantity,
+                        book_revision,
+                    },
+                ..
+            },
+        ] => previous_quantity.lots() > order.quantity.lots() && *book_revision != 0,
+        [
+            CallAuctionEvent {
+                kind:
                     CallAuctionEventKind::OrderCancelled {
                         order: cancelled,
                         reason: CallAuctionCancellationReason::Replaced,
@@ -2362,6 +2462,8 @@ pub enum CallAuctionEngineError {
     BookAdmission(CallAuctionAdmissionError),
     /// Collection cancellation encountered an operational failure.
     BookCancellation(CallAuctionCancelError),
+    /// Collection quantity reduction encountered an operational failure.
+    BookAmendment(CallAuctionAmendError),
     /// Collection mass cancellation encountered an operational failure.
     BookMassCancellation(CallAuctionMassCancelError),
     /// Collection cancel/replace encountered an operational failure.
@@ -2405,6 +2507,9 @@ impl fmt::Display for CallAuctionEngineError {
             Self::BookAdmission(error) => write!(formatter, "call-auction admission: {error}"),
             Self::BookCancellation(error) => {
                 write!(formatter, "call-auction cancellation: {error}")
+            }
+            Self::BookAmendment(error) => {
+                write!(formatter, "call-auction amendment: {error}")
             }
             Self::BookMassCancellation(error) => {
                 write!(formatter, "call-auction mass cancellation: {error}")
@@ -2457,6 +2562,11 @@ enum PreparedCallAuctionAction {
         scope: MassCancelScope,
         preflight: CallAuctionMassCancelResult,
     },
+    Amend {
+        account_id: AccountId,
+        order_id: OrderId,
+        new_quantity: Quantity,
+    },
     Replace {
         account_id: AccountId,
         target_order_id: OrderId,
@@ -2487,7 +2597,8 @@ impl PreparedCallAuctionAction {
             Self::Rejected(_)
             | Self::PhaseTransition { .. }
             | Self::Submit(_)
-            | Self::Cancel { .. } => Ok(1),
+            | Self::Cancel { .. }
+            | Self::Amend { .. } => Ok(1),
             Self::Replace { .. } => Ok(2),
         }
     }
@@ -3172,30 +3283,16 @@ impl CallAuctionEngine {
                 scope,
                 preflight,
             } => self.apply_mass_cancel(command, account_id, scope, preflight, events)?,
+            PreparedCallAuctionAction::Amend {
+                account_id,
+                order_id,
+                new_quantity,
+            } => self.apply_amend(command, account_id, order_id, new_quantity, events)?,
             PreparedCallAuctionAction::Replace {
                 account_id,
                 target_order_id,
                 replacement,
-            } => {
-                let replaced = self
-                    .book
-                    .replace(account_id, target_order_id, replacement)
-                    .map_err(|_| CallAuctionEngineError::InternalInvariantViolation)?;
-                self.push_event(
-                    command,
-                    CallAuctionEventKind::OrderCancelled {
-                        order: replaced.cancelled(),
-                        reason: CallAuctionCancellationReason::Replaced,
-                    },
-                    events,
-                );
-                self.push_event(
-                    command,
-                    CallAuctionEventKind::OrderAccepted(replaced.accepted()),
-                    events,
-                );
-                CallAuctionCommandOutcome::Accepted
-            }
+            } => self.apply_replace(command, account_id, target_order_id, replacement, events)?,
             PreparedCallAuctionAction::Uncross {
                 auction_id,
                 phase_revision,
@@ -3204,6 +3301,58 @@ impl CallAuctionEngine {
                 self.apply_prepared_uncross(command, auction_id, phase_revision, prepared, events)?
             }
         })
+    }
+
+    fn apply_amend(
+        &mut self,
+        command: CallAuctionCommand,
+        account_id: AccountId,
+        order_id: OrderId,
+        new_quantity: Quantity,
+        events: &mut CallAuctionEventTraceBuilder,
+    ) -> Result<CallAuctionCommandOutcome, CallAuctionEngineError> {
+        let amended = self
+            .book
+            .amend(account_id, order_id, new_quantity)
+            .map_err(|_| CallAuctionEngineError::InternalInvariantViolation)?;
+        self.push_event(
+            command,
+            CallAuctionEventKind::OrderAmended {
+                order: amended.current(),
+                previous_quantity: amended.previous().quantity,
+                book_revision: amended.state_revision(),
+            },
+            events,
+        );
+        Ok(CallAuctionCommandOutcome::Accepted)
+    }
+
+    fn apply_replace(
+        &mut self,
+        command: CallAuctionCommand,
+        account_id: AccountId,
+        target_order_id: OrderId,
+        replacement: CallAuctionOrder,
+        events: &mut CallAuctionEventTraceBuilder,
+    ) -> Result<CallAuctionCommandOutcome, CallAuctionEngineError> {
+        let replaced = self
+            .book
+            .replace(account_id, target_order_id, replacement)
+            .map_err(|_| CallAuctionEngineError::InternalInvariantViolation)?;
+        self.push_event(
+            command,
+            CallAuctionEventKind::OrderCancelled {
+                order: replaced.cancelled(),
+                reason: CallAuctionCancellationReason::Replaced,
+            },
+            events,
+        );
+        self.push_event(
+            command,
+            CallAuctionEventKind::OrderAccepted(replaced.accepted()),
+            events,
+        );
+        Ok(CallAuctionCommandOutcome::Accepted)
     }
 
     fn apply_mass_cancel(
@@ -3375,7 +3524,49 @@ impl CallAuctionEngine {
                     preflight,
                 })
             }
+            CallAuctionCommand::Amend(amend) => self.prepare_amend(amend),
             CallAuctionCommand::Uncross(uncross) => self.prepare_uncross_command(uncross),
+        }
+    }
+
+    fn prepare_amend(
+        &self,
+        amend: CallAuctionAmendOrder,
+    ) -> Result<PreparedCallAuctionAction, CallAuctionEngineError> {
+        if let Some(reason) = self.route_rejection(amend.instrument_id, amend.instrument_version) {
+            return Ok(PreparedCallAuctionAction::Rejected(reason));
+        }
+        if let Some(reason) = self.collection_rejection(
+            amend.expected_phase_revision,
+            amend.auction_id,
+            CallAuctionAction::Amend,
+        ) {
+            return Ok(PreparedCallAuctionAction::Rejected(reason));
+        }
+        match self
+            .book
+            .preflight_amend(amend.account_id, amend.order_id, amend.new_quantity)
+        {
+            Ok(_) => Ok(PreparedCallAuctionAction::Amend {
+                account_id: amend.account_id,
+                order_id: amend.order_id,
+                new_quantity: amend.new_quantity,
+            }),
+            Err(CallAuctionAmendError::UnknownOrder) => Ok(PreparedCallAuctionAction::Rejected(
+                CallAuctionRejectReason::UnknownOrder,
+            )),
+            Err(CallAuctionAmendError::AccountMismatch) => Ok(PreparedCallAuctionAction::Rejected(
+                CallAuctionRejectReason::NotOrderOwner,
+            )),
+            Err(CallAuctionAmendError::Instrument(error)) => Ok(
+                PreparedCallAuctionAction::Rejected(CallAuctionRejectReason::Instrument(error)),
+            ),
+            Err(CallAuctionAmendError::QuantityNotReduced) => {
+                Ok(PreparedCallAuctionAction::Rejected(
+                    CallAuctionRejectReason::AmendQuantityNotReduced,
+                ))
+            }
+            Err(error) => Err(CallAuctionEngineError::BookAmendment(error)),
         }
     }
 
@@ -3916,6 +4107,7 @@ fn cached_report_grammar_is_valid(cached: &CachedCallAuctionReport) -> bool {
                 report.events.iter(),
                 Some((mass_cancel.account_id, mass_cancel.scope)),
             ),
+            CallAuctionCommand::Amend(amend) => cached_amend_grammar_is_valid(report, amend),
             CallAuctionCommand::Replace(replace) => {
                 report.events.len() == 2
                     && matches!(
@@ -3947,6 +4139,29 @@ fn cached_report_grammar_is_valid(cached: &CachedCallAuctionReport) -> bool {
             }
         },
     }
+}
+
+fn cached_amend_grammar_is_valid(
+    report: &CallAuctionExecutionReport,
+    amend: CallAuctionAmendOrder,
+) -> bool {
+    report.events.len() == 1
+        && matches!(
+            report.events.first(),
+            Some(CallAuctionEvent {
+                kind:
+                    CallAuctionEventKind::OrderAmended {
+                        order,
+                        previous_quantity,
+                        book_revision,
+                    },
+                ..
+            }) if order.order_id == amend.order_id
+                && order.account_id == amend.account_id
+                && order.quantity == amend.new_quantity
+                && previous_quantity.lots() > order.quantity.lots()
+                && *book_revision != 0
+        )
 }
 
 fn mass_cancel_event_grammar_is_valid<'a>(
@@ -4124,6 +4339,12 @@ impl CallAuctionPhaseAudit {
                             CallAuctionRejectReason::UnknownOrder
                                 | CallAuctionRejectReason::NotOrderOwner
                         ) | (
+                            CallAuctionCommand::Amend(_),
+                            CallAuctionRejectReason::Instrument(_)
+                                | CallAuctionRejectReason::UnknownOrder
+                                | CallAuctionRejectReason::NotOrderOwner
+                                | CallAuctionRejectReason::AmendQuantityNotReduced
+                        ) | (
                             CallAuctionCommand::Replace(_),
                             CallAuctionRejectReason::Instrument(_)
                                 | CallAuctionRejectReason::DuplicateOrder
@@ -4166,6 +4387,7 @@ impl CallAuctionPhaseAudit {
             CallAuctionCommand::MassCancel(mass_cancel) => {
                 (mass_cancel.instrument_id, mass_cancel.instrument_version)
             }
+            CallAuctionCommand::Amend(amend) => (amend.instrument_id, amend.instrument_version),
             CallAuctionCommand::Replace(replace) => (
                 replace.replacement.instrument_id(),
                 replace.replacement.instrument_version(),
@@ -4190,6 +4412,11 @@ impl CallAuctionPhaseAudit {
                 submit.expected_phase_revision,
                 submit.auction_id,
                 CallAuctionAction::Submit,
+            ),
+            CallAuctionCommand::Amend(amend) => self.preflight_collection(
+                amend.expected_phase_revision,
+                amend.auction_id,
+                CallAuctionAction::Amend,
             ),
             CallAuctionCommand::Replace(replace) => self.preflight_collection(
                 replace.expected_phase_revision,
@@ -4374,6 +4601,7 @@ impl CallAuctionPhaseAudit {
             CallAuctionCommand::Submit(_)
             | CallAuctionCommand::Cancel(_)
             | CallAuctionCommand::MassCancel(_)
+            | CallAuctionCommand::Amend(_)
             | CallAuctionCommand::Replace(_) => true,
         }
     }

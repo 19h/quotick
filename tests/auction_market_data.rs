@@ -4,9 +4,10 @@ use quotick::auction_book::{
     CallAuctionSelfTradePolicy, CallAuctionUncrossPolicy,
 };
 use quotick::auction_engine::{
-    CallAuctionCancelOrder, CallAuctionCommand, CallAuctionEngine, CallAuctionEngineLimits,
-    CallAuctionEngineLimitsSpec, CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl,
-    CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionAmendOrder, CallAuctionCancelOrder, CallAuctionCommand, CallAuctionEngine,
+    CallAuctionEngineLimits, CallAuctionEngineLimitsSpec, CallAuctionMassCancel, CallAuctionPhase,
+    CallAuctionPhaseControl, CallAuctionReplaceOrder, CallAuctionSubmitOrder,
+    CallAuctionUncrossCommand,
 };
 use quotick::auction_market_data::{
     CallAuctionBookChangeReason, CallAuctionMarketDataBatch, CallAuctionMarketDataError,
@@ -165,6 +166,27 @@ fn mass_cancel(command_id: u64, account_id: u64, scope: MassCancelScope) -> Call
         instrument_version: version(),
         account_id: AccountId::new(account_id).unwrap(),
         scope,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+fn amend(
+    command_id: u64,
+    auction_id: u64,
+    phase_revision: u64,
+    account_id: u64,
+    order_id: u64,
+    quantity: u64,
+) -> CallAuctionCommand {
+    CallAuctionCommand::Amend(CallAuctionAmendOrder {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        auction_id: auction(auction_id),
+        expected_phase_revision: phase_revision,
+        account_id: AccountId::new(account_id).unwrap(),
+        order_id: OrderId::new(order_id).unwrap(),
+        new_quantity: Quantity::new(quantity).unwrap(),
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
@@ -630,6 +652,77 @@ fn cancel_replace_projects_two_updates_but_one_command_boundary() {
         Some(Price::from_raw(105))
     );
     assert_mirrors(&engine, &replica);
+}
+
+#[test]
+fn amendment_projects_one_anonymized_delta_and_retained_aggregate_count() {
+    let mut engine = engine();
+    let mut publisher = CallAuctionMarketDataPublisher::from_engine(&engine).unwrap();
+    let mut replica = CallAuctionMarketDataReplica::new(definition());
+    execute(
+        &mut engine,
+        &mut publisher,
+        &mut replica,
+        phase(1, 1, 0, CallAuctionPhase::Collecting),
+    );
+    execute(
+        &mut engine,
+        &mut publisher,
+        &mut replica,
+        submit(
+            2,
+            1,
+            1,
+            10,
+            7,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+            8,
+        ),
+    );
+    let snapshot = publisher.snapshot();
+    let mut single = CallAuctionMarketDataReplica::new(definition());
+    single.apply_snapshot(&snapshot).unwrap();
+
+    let batch = execute(
+        &mut engine,
+        &mut publisher,
+        &mut replica,
+        amend(3, 1, 1, 7, 10, 3),
+    );
+    assert_eq!(batch.updates().len(), 1);
+    let update = batch.updates()[0];
+    assert!(matches!(
+        update.kind(),
+        CallAuctionMarketDataKind::Book {
+            reason: CallAuctionBookChangeReason::Amended,
+            quantity,
+            level,
+        } if quantity.lots() == 5
+            && level.side() == Side::Buy
+            && level.constraint()
+                == AuctionOrderConstraint::Limit(Price::from_raw(100))
+            && level.quantity() == 3
+            && level.order_count() == 1
+    ));
+    let bytes = update.encode().unwrap();
+    assert_eq!(CallAuctionMarketDataUpdate::decode(&bytes).unwrap(), update);
+    single.apply(update).unwrap();
+    assert_mirrors(&engine, &single);
+    assert_mirrors(&engine, &replica);
+
+    let mut count_drift = bytes;
+    let count_offset = count_drift.len() - std::mem::size_of::<u64>();
+    count_drift[count_offset..].copy_from_slice(&2_u64.to_le_bytes());
+    let count_drift = CallAuctionMarketDataUpdate::decode(&count_drift).unwrap();
+    let mut corrupted = CallAuctionMarketDataReplica::new(definition());
+    corrupted.apply_snapshot(&snapshot).unwrap();
+    assert!(matches!(
+        corrupted.apply(count_drift),
+        Err(CallAuctionMarketDataError::InvalidUpdate(
+            "auction book change does not reconcile to its quantity and absolute aggregate"
+        ))
+    ));
 }
 
 #[test]

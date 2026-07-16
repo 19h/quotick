@@ -4,9 +4,9 @@ use quotick::auction_book::{
     CallAuctionUncrossPolicy,
 };
 use quotick::auction_engine::{
-    CallAuctionCancelOrder, CallAuctionCommand, CallAuctionEngine, CallAuctionExecutionReport,
-    CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl, CallAuctionReplaceOrder,
-    CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionAmendOrder, CallAuctionCancelOrder, CallAuctionCommand, CallAuctionEngine,
+    CallAuctionExecutionReport, CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl,
+    CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use quotick::codec::{BinaryCodec, CodecError};
 use quotick::instrument::{
@@ -99,6 +99,20 @@ fn mass_cancel(command_id: u64, account_id: u64, scope: MassCancelScope) -> Call
     })
 }
 
+fn amend(command_id: u64, account_id: u64, order_id: u64, lots: u64) -> CallAuctionCommand {
+    CallAuctionCommand::Amend(CallAuctionAmendOrder {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: InstrumentId::new(7).unwrap(),
+        instrument_version: InstrumentVersion::new(2).unwrap(),
+        auction_id: auction_id(),
+        expected_phase_revision: 1,
+        account_id: AccountId::new(account_id).unwrap(),
+        order_id: OrderId::new(order_id).unwrap(),
+        new_quantity: Quantity::new(lots).unwrap(),
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
 fn replace(
     command_id: u64,
     target_order_id: u64,
@@ -164,11 +178,39 @@ fn every_call_auction_command_variant_round_trips() {
         replace(4, 1, auction_order(2, 1, Side::Sell, 3)),
         uncross(5),
         mass_cancel(6, 1, MassCancelScope::Side(Side::Buy)),
+        amend(7, 1, 1, 4),
     ];
     for command in commands {
         let encoded = command.encode().unwrap();
         assert_eq!(CallAuctionCommand::decode(&encoded).unwrap(), command);
     }
+}
+
+#[test]
+fn call_auction_amend_command_has_a_stable_little_endian_layout() {
+    let value = amend(9, 11, 13, 17);
+    let encoded = value.encode().unwrap();
+    let mut expected = vec![6];
+    for field in [9_u64, 7, 2, 1, 1, 11, 13, 17, 9] {
+        expected.extend_from_slice(&field.to_le_bytes());
+    }
+    assert_eq!(encoded.len(), 73);
+    assert_eq!(encoded, expected);
+    assert_eq!(CallAuctionCommand::decode(&encoded).unwrap(), value);
+}
+
+#[test]
+fn call_auction_amend_report_has_a_stable_event_layout() {
+    let report = representative_reports().remove(2);
+    let encoded = report.encode().unwrap();
+    let report_prefix = 8 + 8 + 1 + 4;
+    let event_prefix = 8 + 8 + 8;
+    assert_eq!(encoded.len(), report_prefix + 83 + 1);
+    assert_eq!(encoded[report_prefix + event_prefix], 8);
+    assert_eq!(
+        CallAuctionExecutionReport::decode(&encoded).unwrap(),
+        report
+    );
 }
 
 fn representative_reports() -> Vec<CallAuctionExecutionReport> {
@@ -180,6 +222,8 @@ fn representative_reports() -> Vec<CallAuctionExecutionReport> {
         engine
             .submit(submit(2, auction_order(1, 1, Side::Buy, 5)))
             .unwrap(),
+        engine.submit(amend(12, 1, 1, 4)).unwrap(),
+        engine.submit(amend(13, 1, 1, 4)).unwrap(),
         engine
             .submit(replace(3, 1, auction_order(10, 1, Side::Buy, 5)))
             .unwrap(),
@@ -304,7 +348,7 @@ fn call_auction_codecs_reject_invalid_tags_lengths_bands_and_report_grammar() {
         ))
     );
 
-    let uncross = representative_reports().remove(9).encode().unwrap();
+    let uncross = representative_reports().remove(11).encode().unwrap();
     let mut self_pair = uncross.clone();
     self_pair[70..78].copy_from_slice(&uncross[54..62]);
     assert_eq!(

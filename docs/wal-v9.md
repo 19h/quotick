@@ -1,6 +1,6 @@
 # Expired WAL Format Version 9
 
-The current runtime writes and accepts only [WAL version 11](wal-v11.md).
+The current runtime writes and accepts only [WAL version 12](wal-v12.md).
 This document remains the authoritative historical schema for version 9;
 version-9 frames are rejected before payload interpretation.
 

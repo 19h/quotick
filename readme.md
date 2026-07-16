@@ -296,14 +296,16 @@ Run any program with `cargo run --example <name>`.
   scoped mass cancellation through a bounded intrusive owner index,
   revision-bound indicative results, atomic new-identity cancel/replace with
   complete priority loss and saturated active/price-level capacity reuse when
-  accepted-ID headroom remains, and a two-phase prepare/commit uncross over
-  constructor-owned leased buffers with explicit remainder policies
+  accepted-ID headroom remains, strict retained-priority active-quantity
+  reduction with exact aggregate reconciliation, and a two-phase prepare/commit
+  uncross over constructor-owned leased buffers with explicit remainder policies
   (`RetainAll`, `CancelMarket`, `CancelAll`); the only represented self-trade
   policy is explicit `Permit`.
 - A sequenced `CallAuctionEngine` with explicit `Closed`/`Collecting`/`Frozen`
   phases, contiguous `AuctionId` cycles, revision-checked controls, exact
-  command idempotency, exact two-event replacement reports, canonical
-  mass-cancel reports with aggregate completion, and a protected terminal lane
+  command idempotency, exact one-event amendment and two-event replacement
+  reports, canonical mass-cancel reports with aggregate completion, and a
+  protected terminal lane
   guaranteeing that currently valid individual/non-empty mass cancellation,
   freeze/close, and uncross commands remain possible for a full book even at
   exhausted ordinary capacity.
@@ -328,7 +330,8 @@ Run any program with `cargo run --example <name>`.
   reserve against their activation constraint without appearing in depth.
   Auction uncross releases both paired reservations and nets buys against sells
   once per account. Auction replacement nets out the target reservation before
-  authorizing the replacement and preserves the target on rejection.
+  authorizing the replacement and preserves the target on rejection. Auction
+  amendment releases the exact quantity/notional delta without a new risk gate.
 - Full cross-audits between active orders, reservations, aggregates, and
   positions.
 
@@ -354,6 +357,7 @@ Run any program with `cargo run --example <name>`.
   `Replaced` removal then `Accepted` addition while the book revision advances
   once. Mass cancellation publishes only anonymized aggregate removals and one
   count/quantity/revision completion; account and scope remain private.
+  Amendment publishes one anonymous aggregate delta with unchanged order count.
 - Continuous publishers mirror dormant stop identities, trigger indices, and
   the committed reference privately to validate canonical activation. Stop-only
   state changes publish `NoBookChange`; triggered execution publishes ordinary
@@ -383,7 +387,7 @@ Run any program with `cargo run --example <name>`.
 
 ### Durability and recovery
 
-- Versioned CRC-32C WAL frames (format 11) with bounded payloads and
+- Versioned CRC-32C WAL frames (format 12) with bounded payloads and
   contiguous sequences, as a single-file `Journal` or a size-bounded
   `SegmentedJournal` rotating whole frames and batches under one global
   sequence.
@@ -393,7 +397,7 @@ Run any program with `cargo run --example <name>`.
   writer leases with explicit abandoned-writer recovery.
 - Strict corruption detection: only a physically incomplete final frame may be
   repaired, and closed segments are always scanned strictly.
-- Versioned, bounded `QSNP` semantic snapshots (format 11) with monotonic
+- Versioned, bounded `QSNP` semantic snapshots (format 12) with monotonic
   exact-prefix lineage and synchronized atomic replacement.
 - Durable runtimes for matching, coupled risk/matching, call auctions, and
   coupled auction/risk record every command before committing the in-memory
@@ -481,14 +485,14 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 108 tagged assumptions (A1–A108), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 109 tagged assumptions (A1–A109), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
-| [WAL format v11](docs/wal-v11.md) | Current write-ahead-log frame and record schema |
-| [Snapshot format v11](docs/snapshot-v11.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
+| [WAL format v12](docs/wal-v12.md) | Current write-ahead-log frame and record schema |
+| [Snapshot format v12](docs/snapshot-v12.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
 | [Market-data payload v3](docs/market-data-v3.md) | Current continuous market-data update/snapshot payloads |
-| [Auction market-data payload v3](docs/auction-market-data-v3.md) | Current call-auction market-data payloads |
+| [Auction market-data payload v4](docs/auction-market-data-v4.md) | Current call-auction market-data payloads |
 | [Auction-risk checkpoint payload v1](docs/auction-risk-checkpoint-v1.md) | Current coupled call-auction risk checkpoint payload |
 
 Historical formats whose envelopes the runtime rejects are retained as
@@ -500,6 +504,7 @@ byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/wal-v8.md](docs/wal-v8.md),
 [docs/wal-v9.md](docs/wal-v9.md),
 [docs/wal-v10.md](docs/wal-v10.md),
+[docs/wal-v11.md](docs/wal-v11.md),
 [docs/snapshot-v2.md](docs/snapshot-v2.md),
 [docs/snapshot-v3.md](docs/snapshot-v3.md),
 [docs/snapshot-v4.md](docs/snapshot-v4.md),
@@ -508,10 +513,12 @@ byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/snapshot-v7.md](docs/snapshot-v7.md),
 [docs/snapshot-v8.md](docs/snapshot-v8.md),
 [docs/snapshot-v9.md](docs/snapshot-v9.md),
-[docs/snapshot-v10.md](docs/snapshot-v10.md), continuous
+[docs/snapshot-v10.md](docs/snapshot-v10.md),
+[docs/snapshot-v11.md](docs/snapshot-v11.md), continuous
 [market-data v2](docs/market-data-v2.md), and call-auction
 [market-data v1](docs/auction-market-data-v1.md) and
-[market-data v2](docs/auction-market-data-v2.md).
+[market-data v2](docs/auction-market-data-v2.md) and
+[market-data v3](docs/auction-market-data-v3.md).
 
 ## Build and verify
 
@@ -541,7 +548,8 @@ includes:
   tick-grid enumeration, allocation against literal order-priority walks,
   20,000 mixed book mutations and 10,000 uncross cases against independent
   models, canonical account/side mass cancellation across book, engine, risk,
-  public-feed, checkpoint, and WAL recovery, and a 10,000-command engine phase-
+  public-feed, checkpoint, and WAL recovery, retained-priority amendment across
+  the same paths, and a 10,000-command engine phase-
   model run.
 - **Market data and accounting:** continuous and complete-batch auction depth
   reconstruction, replay-first gap repair, snapshot fallback,

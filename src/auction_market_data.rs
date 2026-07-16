@@ -407,6 +407,8 @@ pub enum CallAuctionBookChangeReason {
     Replaced,
     /// Active interest was removed by an account-scoped mass cancel.
     MassCancelled,
+    /// Active quantity was reduced without changing its order count.
+    Amended,
     /// Unexecuted interest was removed by the final uncross policy.
     UncrossRemainder,
 }
@@ -1553,6 +1555,11 @@ impl CallAuctionMarketDataPublisher {
                 book_revision,
                 mass_cancel,
             ),
+            CallAuctionEventKind::OrderAmended {
+                order,
+                previous_quantity,
+                book_revision,
+            } => self.apply_amend(command, order, previous_quantity, book_revision),
             CallAuctionEventKind::CommandRejected(_) => {
                 Ok(CallAuctionMarketDataKind::NoPublicChange)
             }
@@ -1693,6 +1700,57 @@ impl CallAuctionMarketDataPublisher {
         Ok(CallAuctionMarketDataKind::Book {
             reason: CallAuctionBookChangeReason::UserCancelled,
             quantity: order.quantity,
+            level,
+        })
+    }
+
+    fn apply_amend(
+        &mut self,
+        command: CallAuctionCommand,
+        order: CallAuctionOrderSnapshot,
+        previous_quantity: Quantity,
+        book_revision: u64,
+    ) -> Result<CallAuctionMarketDataKind, CallAuctionMarketDataError> {
+        let CallAuctionCommand::Amend(source) = command else {
+            return Err(CallAuctionMarketDataError::TraceMismatch(
+                "non-amend command emitted an amended order",
+            ));
+        };
+        let tracked = self.orders.get(&order.order_id).copied().ok_or(
+            CallAuctionMarketDataError::TraceMismatch("amended auction order is absent"),
+        )?;
+        let expected_revision = self
+            .book_revision
+            .checked_add(1)
+            .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
+        if self.phase.phase() != CallAuctionPhase::Collecting
+            || self.phase.active_auction_id() != Some(source.auction_id)
+            || self.phase.revision() != source.expected_phase_revision
+            || source.account_id != order.account_id
+            || source.order_id != order.order_id
+            || source.new_quantity != order.quantity
+            || tracked.account_id != order.account_id
+            || tracked.side != order.side
+            || tracked.constraint != order.constraint
+            || tracked.priority_sequence != order.priority_sequence
+            || tracked.leaves != previous_quantity.lots()
+            || order.quantity.lots() >= previous_quantity.lots()
+            || book_revision != expected_revision
+        {
+            return Err(CallAuctionMarketDataError::TraceMismatch(
+                "amended order contradicts its command, event, or tracked state",
+            ));
+        }
+        let delta_lots = previous_quantity
+            .lots()
+            .checked_sub(order.quantity.lots())
+            .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
+        let level = self.decrement_order(order.order_id, delta_lots)?;
+        self.book_revision = book_revision;
+        Ok(CallAuctionMarketDataKind::Book {
+            reason: CallAuctionBookChangeReason::Amended,
+            quantity: Quantity::new(delta_lots)
+                .expect("strict amendment reduction produces a positive delta"),
             level,
         })
     }
@@ -2722,6 +2780,17 @@ impl CallAuctionMarketDataReplica {
                         }
                     }
                     CallAuctionBookChangeReason::MassCancelled => {}
+                    CallAuctionBookChangeReason::Amended => {
+                        if self.phase.phase() != CallAuctionPhase::Collecting {
+                            return Err(CallAuctionMarketDataError::InvalidUpdate(
+                                "auction amendment occurred outside collection",
+                            ));
+                        }
+                        self.book_revision = self
+                            .book_revision
+                            .checked_add(1)
+                            .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
+                    }
                     CallAuctionBookChangeReason::UncrossRemainder => {
                         if self.phase.phase() != CallAuctionPhase::Frozen {
                             return Err(CallAuctionMarketDataError::InvalidUpdate(
@@ -2920,6 +2989,14 @@ impl CallAuctionMarketDataReplica {
                         "auction book removal references an empty public aggregate",
                     ),
                 )?,
+            ),
+            CallAuctionBookChangeReason::Amended => (
+                previous.quantity.checked_sub(changed).ok_or(
+                    CallAuctionMarketDataError::InvalidUpdate(
+                        "auction amendment exceeds its public aggregate",
+                    ),
+                )?,
+                previous.order_count,
             ),
         };
         if next.quantity != expected_quantity || next.order_count != expected_count {
@@ -3144,6 +3221,7 @@ where
                         .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
                 }
                 CallAuctionBookChangeReason::UserCancelled
+                | CallAuctionBookChangeReason::Amended
                 | CallAuctionBookChangeReason::UncrossRemainder => {}
             }
         }
@@ -3438,6 +3516,7 @@ fn command_instrument(command: CallAuctionCommand) -> InstrumentId {
         CallAuctionCommand::Submit(value) => value.order.instrument_id(),
         CallAuctionCommand::Cancel(value) => value.instrument_id,
         CallAuctionCommand::MassCancel(value) => value.instrument_id,
+        CallAuctionCommand::Amend(value) => value.instrument_id,
         CallAuctionCommand::Replace(value) => value.replacement.instrument_id(),
         CallAuctionCommand::Uncross(value) => value.instrument_id,
     }
@@ -3449,6 +3528,7 @@ fn command_version(command: CallAuctionCommand) -> InstrumentVersion {
         CallAuctionCommand::Submit(value) => value.order.instrument_version(),
         CallAuctionCommand::Cancel(value) => value.instrument_version,
         CallAuctionCommand::MassCancel(value) => value.instrument_version,
+        CallAuctionCommand::Amend(value) => value.instrument_version,
         CallAuctionCommand::Replace(value) => value.replacement.instrument_version(),
         CallAuctionCommand::Uncross(value) => value.instrument_version,
     }

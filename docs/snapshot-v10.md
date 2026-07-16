@@ -1,7 +1,7 @@
 # Expired Semantic Snapshot Format Version 10
 
 The current runtime writes and accepts only
-[snapshot version 11](snapshot-v11.md). This document remains the
+[snapshot version 12](snapshot-v12.md). This document remains the
 authoritative historical schema for version 10; version-10 envelopes are
 rejected before payload interpretation.
 

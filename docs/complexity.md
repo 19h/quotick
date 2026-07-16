@@ -166,8 +166,10 @@ orders, and `P` occupied limit prices:
 
 - Admission and new-identity replacement are
   `O(log I + log O + log P)`; owner-checked cancellation is
-  `O(log O + log P)`. Replacement uses `O(1)` auxiliary space and accounts for
-  the released target slot and singleton price level during preflight.
+  `O(log O + log P)`. A retained-priority active-quantity reduction is
+  `O(log O + log P)` and changes neither identity nor queue links. Replacement
+  and amendment use `O(1)` auxiliary space; replacement accounts for the
+  released target slot and singleton price level during preflight.
 - A bounded account index maintains separate intrusive buy/sell lanes with
   exact counts and `u128` quantities. Account/scope mass-cancel preflight is
   expected `O(1)`. For `K` selected orders, application traverses only those
@@ -198,11 +200,12 @@ may allocate after corruption is detected.
 
 For `H` retained sequenced auction reports, phase controls, business
 rejection, and monotonic idempotency lookup are expected `O(1)`; submit,
-replace, and cancel inherit the collection-book bounds above. An accepted
-replacement emits exactly two events in `O(1)` additional time and space.
-Uncross preparation has the preceding book bound plus `O(T + C)` exact
-report-capacity derivation, and commit adds `O(T + C)` event emission into the
-already reserved trace without vector growth.
+replace, amend, and cancel inherit the collection-book bounds above. An
+accepted replacement emits exactly two events; an accepted amendment emits
+exactly one event. Both add `O(1)` event-construction time and space. Uncross
+preparation has the preceding book bound plus `O(T + C)` exact report-capacity
+derivation, and commit adds `O(T + C)` event emission into the already reserved
+trace without vector growth.
 
 Mass-cancel preflight inherits the expected `O(1)` account lookup. Commit adds
 the collection-book `O(K(log K + log O + log P))` work plus `O(K)` event
@@ -233,6 +236,12 @@ Replacement authorization subtracts the target reservation and checks the
 replacement in expected `O(1)` time and `O(1)` auxiliary space before the
 underlying book transition. Applying the two-event trace performs one expected
 `O(1)` removal and one expected `O(1)` insertion.
+
+Amendment authorization requires no new exposure gate because a valid command
+strictly reduces active leaves. Applying its one-event trace decreases the
+reservation quantity, notional, and account exposure by the exact delta in
+expected `O(1)` time and `O(1)` auxiliary space while retaining reservation
+cardinality.
 
 An accepted mass cancel applies `K` ordinary reservation removals in expected
 `O(K)` risk time. Its aggregate completion has no second risk-state effect.
@@ -544,6 +553,9 @@ updates and `U` unique affected limit identities:
   mutation.
 - An accepted replacement fixes `E = 2`; projection and replica application
   therefore retain the ordinary bounds while advancing the book revision once.
+- An accepted retained-priority amendment fixes `E = 1`; it subtracts one
+  anonymous aggregate quantity delta, preserves level order count, and advances
+  the book revision once.
 - A mass cancel with `K` selected orders fixes `E = K + 1`. Publisher and
   replica work is expected `O(E + U log P)` for `U` affected limit identities;
   the complete batch advances book revision once exactly when `K > 0`.
@@ -569,7 +581,7 @@ The page never splits a batch. Diagnosing an evicted partial oldest batch can
 scan up to `N` slots to report the earliest later complete boundary. Applying
 each replay batch has the ordinary replica `O(E + U)` capacity-preflight and
 `O(E log P)` mutation bounds. Typed slot bytes, allocator rounding, and page
-residency are target-dependent; version-3 payload bytes are unchanged by the
+residency are target-dependent; version-4 payload bytes are unchanged by the
 process-local replay ring.
 
 ## WAL and journal

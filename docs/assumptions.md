@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A108 are stable and are referenced from code comments and other
+identifiers A1-A109 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -267,19 +267,17 @@ integrity; concern about the second requires authenticated records.
 
 ## A15 — format version immutability
 
-**Assumption.** WAL format version 11, snapshot format version 11, continuous
-market-data payload version 3, call-auction market-data payload version 3, and
+**Assumption.** WAL format version 12, snapshot format version 12, continuous
+market-data payload version 3, call-auction market-data payload version 4, and
 trading-calendar payload version 1 are immutable. WAL and snapshot versions
-`1` through `10` are expired and rejected explicitly rather than inferred or
-migrated. WAL v11 preserves the v10 frame, registry, definition, continuous
-values, and existing auction values; it adds call-auction command/action tag
-`5` for account-scoped mass cancellation, cancellation-reason tag `3` for
-`MassCancel`, and event-kind tag `7` for `MassCancelCompleted`. Snapshot v11
-preserves v10 direct rows and embeds WAL-v11 values in chronological histories.
+`1` through `11` are expired and rejected explicitly rather than inferred or
+migrated. WAL v12 preserves v11 values and adds call-auction command/action tag
+`6` for retained-priority amendment, rejection tag `22` for a non-reduction,
+and event-kind tag `8` for `OrderAmended`. Snapshot v12 preserves v11 direct
+rows and embeds WAL-v12 values in chronological histories.
 Continuous market-data v3 preserves v2 bytes but adds the absent-public-maker
 trade interpretation required for fully hidden execution. Call-auction market-
-data v3 preserves v2 layouts and adds book-reason tag `4`, `MassCancelled`, and
-update-kind tag `5`, `MassCancelCompleted`.
+data v4 preserves v3 layouts and adds book-reason tag `5`, `Amended`.
 Trading-calendar v1 is a complete value with no self-describing schema field;
 an enclosing protocol selects it explicitly, while its encoded
 `CalendarVersion` identifies schedule content rather than wire
@@ -292,12 +290,12 @@ authoritative predecessors exist.
 recovery, anchor interpretation, stable auction records/images, stable calendar
 images, and fail-closed format boundaries.
 
-**Falsification probe.** Byte-compare golden WAL-v11, snapshot-v11,
-market-data-v3, auction-market-data-v3, and trading-calendar-v1 fixtures through
+**Falsification probe.** Byte-compare golden WAL-v12, snapshot-v12,
+market-data-v3, auction-market-data-v4, and trading-calendar-v1 fixtures through
 every supported release; mutate valid WAL frames and images to versions `1`
-through `10`; verify definition booleans, every display, TIF, rejection, and
+through `11`; verify definition booleans, every display, TIF, rejection, and
 cancellation tag, continuous expiry/stop/source tags, raw auction record tags
-`9`/`10`, replacement and mass-cancel command/action/reason/event tags,
+`9`/`10`, replacement, mass-cancel, and amendment tags,
 snapshot kinds `1` through `5`, hidden-maker trade application, auction
 replacement and mass-cancel projection, and every calendar scalar/row offset.
 Any changed supported bytes/interpretation or acceptance across an expired
@@ -525,7 +523,7 @@ A28.
 
 **Assumption.** A ledger checkpoint and its recovery WAL represent one
 immutable ledger-record history; numeric generation is never treated as lineage
-without exact prefix equality or an exact version-11 checkpoint anchor. An
+without exact prefix equality or an exact version-12 checkpoint anchor. An
 anchored WAL separately binds semantic record count and physical retired-prefix
 sequence. Capture/audit resource or replay-constructor failure under A89 occurs
 before snapshot/cutover mutation and leaves the durable ledger unpoisoned; live
@@ -631,12 +629,12 @@ environment.
 **Assumption.** The dated 47 B fixed ledger-entry payload, ledger-correction
 WAL kind `6`, ledger-batch WAL kind `7`, and tagged record-based checkpoint
 schema first defined under version 3 are retained byte-for-byte by the
-deployable version-11 WAL/version-11 snapshot accounting formats; no earlier
+deployable version-12 WAL/version-12 snapshot accounting formats; no earlier
 undated or flat-entry expired `QWAL`/`QSNP` ledger artifact requires
 compatibility. Older development envelopes fail before payload interpretation
 rather than receiving inferred dates, times, or grouping.
 
-**Dependent results.** A version-11 WAL/version-11 snapshot dated atomic
+**Dependent results.** A version-12 WAL/version-12 snapshot dated atomic
 grouped-event accounting schema with an explicit rejection boundary for expired
 artifacts.
 
@@ -667,7 +665,7 @@ effect, accepted partial state, or incorrect final balance falsifies A36.
 
 **Assumption.** The reserve-, mass-cancel-, account-control-, GTD-, stop-, fully
 hidden, and minimum-quantity command/report variants defined through version 8
-remain explicit variants inside deployable WAL version 11. Version 9 added
+remain explicit variants inside deployable WAL version 12. Version 9 added
 durable stop-reference source identity, source version, source sequence, and
 typed discontinuity/collision outcomes; it does not infer them from WAL version
 8. No earlier matching WAL requires runtime compatibility. Expired envelopes
@@ -678,10 +676,10 @@ minimum-quantity, or anchor semantics.
 **Dependent results.** Explicit fully displayed/reserve/fully hidden/GTD/stop
 state, refresh, expiry, and trigger events, canonical mass cancellation,
 revisioned account fencing, and anchored cutover under WAL envelope version
-`11`.
+`12`.
 
 **Falsification probe.** Inventory every persisted matching WAL and decode
-golden version-11 fixtures before deployment. Reject version-10 artifacts with
+golden version-12 fixtures before deployment. Reject version-11 artifacts with
 and without re-labelled headers, and mutate every hidden/minimum-quantity/
 expiry/stop/source tag, definition flag, threshold, deadline, watermark,
 reference, trigger, activation, aggregate, and ordering relation.
@@ -1284,8 +1282,8 @@ risk profiles remain immutable under A18. Authentication and authorization of
 the controller are external inputs; coupled risk requires the target profile to
 exist.
 
-**Dependent results.** Deterministic, idempotent, version-11
-WAL/version-11-checkpoint-recoverable local admission control; no active order
+**Dependent results.** Deterministic, idempotent, version-12
+WAL/version-12-checkpoint-recoverable local admission control; no active order
 survives an accepted block; blocked new/replacement admission fails while
 cancellation remains available. For `K` selected orders, block is `O(K(log K +
 log P))` time and `O(K)` constructor-leased scratch under A87; enable is
@@ -1353,7 +1351,7 @@ session identifiers, controller authentication, and venue transition graphs are
 external and currently unrepresented.
 
 **Dependent results.** Deterministic entry gating with cancel/control
-availability in every state; exact retry; version-11 WAL and version-11
+availability in every state; exact retry; version-12 WAL and version-12
 checkpoint reconstruction; account-independent risk bypass with
 cancellation-derived reservation release; public market-data state/revision
 recovery. For `O` active orders, transition-and-cancel is `O(O log O + O log
@@ -1460,21 +1458,26 @@ Every active order also belongs to one bounded owner/side intrusive lane with
 exact count and `u128` quantity. Account/side mass cancellation selects only
 that lane, returns snapshots in ascending `OrderId` order, and advances the book
 revision once exactly for a non-empty selection.
+One retained-priority amendment accepts only a strictly smaller positive,
+lot-aligned active quantity. It preserves identity, owner, side, constraint,
+price, queue links, and priority sequence; changes queue and owner aggregates
+by the exact delta; changes no count; and advances the book revision once.
 
 **Dependent results.** [A41, A52, A62] Constructor-reserved stable-slot AVL
 arenas bound active orders, accepted identities, and per-side prices; one
-bounded account hash owns the complete owner index. Admission, replacement,
-cancellation, and mass cancellation allocate no heap storage under arbitrary
-bounded identity churn. Replacement preflight includes the target's released
-active slot and singleton price-level slot, while accepted-ID headroom remains
-monotonic.
+bounded account hash owns the complete owner index. Admission, amendment,
+replacement, cancellation, and mass cancellation allocate no heap storage
+under arbitrary bounded identity churn. Replacement preflight includes the
+target's released active slot and singleton price-level slot, while
+accepted-ID headroom remains monotonic.
 Market then price then FIFO input is reconstructed deterministically for
 A60/A61. Every indicative result is bound to a process-local book identity and
 exact mutation revision; foreign/stale allocation is rejected before order
 reconstruction. Admission is `O(log I + log O + log P)`, cancellation is `O(log
 O + log P)`, indicative discovery is `O(B + A)`, and allocation-input
 construction is `O(O log O + P)` because intrusive links name orders by ID.
-Replacement is `O(log I + log O + log P)` with `O(1)` auxiliary space. Mass-
+Replacement is `O(log I + log O + log P)` with `O(1)` auxiliary space.
+Amendment is `O(log O + log P)` with `O(1)` auxiliary space. Mass-
 cancel preflight is expected `O(1)`; applying `K` selected orders is
 `O(K(log K + log O + log P))` using caller-owned reserved output and is
 independent of unrelated active orders. No continuous-book state is mutated.
@@ -1483,19 +1486,22 @@ independent of unrelated active orders. No continuous-book state is mutated.
 boundary; locked/crossed/market-only interest; middle/head/tail cancellation
 and owner mismatch; per-side level, active, and accepted-ID exhaustion; ID
 reuse; saturated same-level and singleton-level replacement; account mismatch;
-invalid replacement route/quantity; priority loss; atomic rejection;
+invalid replacement route/quantity; priority loss; atomic rejection; strict
+amendment reduction, immutable fields, retained priority, and aggregate delta;
 empty/all/side mass cancellation, sparse owners in a full book, output-capacity
 and revision exhaustion, account-link corruption, canonical output, one-
 revision commit, and fixed allocation telemetry;
 foreign/stale indicative results; exact capacity telemetry; 20,000 mixed
-insert/remove/replace/mass-cancel operations against independent aggregate and
-priority models;
+insert/remove/amend/replace/mass-cancel operations against independent
+aggregate and priority models;
 allocator observation under churn; audit every AVL, queue, link, aggregate, and
 sequence. Any accepted invalid command, reused ID, lost FIFO relation, model
 divergence, accepted foreign/stale plan, heap growth in collection
-mutation/scratch, partial replacement, priority retention, or retained-order
+mutation/scratch, partial replacement, unintended replacement priority
+retention, amendment priority loss, or retained-order
 mutation by analysis falsifies A62. A venue with multiple priority categories,
-reserve/display semantics, in-place amendments, or pro-rata allocation requires
+reserve/display semantics, price/side amendments, quantity increases, or
+pro-rata allocation requires
 a new versioned policy/state machine.
 
 ## A63 — process-local uncross
@@ -1547,14 +1553,17 @@ separate versioned semantics.
 own one A62/A63 book, one never-evicted command cache, and the exact phase
 graph `Closed -> Collecting <-> Frozen -> Closed`, including explicit
 `Collecting -> Closed`. `AuctionId` starts at `1` and advances contiguously
-when a cycle starts. Every control, new entry, and replacement presents the
-exact phase revision; entry and replacement also present the active
-`AuctionId`. Submit and replacement are valid only while collecting. An
+when a cycle starts. Every control, new entry, amendment, and replacement
+presents the exact phase revision; entry, amendment, and replacement also
+present the active `AuctionId`. Submit, amendment, and replacement are valid
+only while collecting. An
 accepted replacement emits exactly target `OrderCancelled(Replaced)` then
 replacement `OrderAccepted` with contiguous event sequences and one book
-revision. Owner cancellation is cycle/revision-independent and valid in every
-phase. Account-scoped mass cancellation is also cycle/revision-independent and
-valid in every phase; it emits `K` ascending-`OrderId`
+revision. An accepted amendment emits exactly one `OrderAmended` event with
+post-state, previous quantity, and successor book revision, and it uses the
+ordinary history lane. Owner cancellation is cycle/revision-independent and
+valid in every phase. Account-scoped mass cancellation is also cycle/revision-
+independent and valid in every phase; it emits `K` ascending-`OrderId`
 `OrderCancelled(MassCancel)` events and one exact aggregate completion,
 including the completion for `K = 0`. Uncross requires the exact frozen cycle/
 revision; successful uncross closes, an unsuccessful uncross remains frozen,
@@ -1575,7 +1584,8 @@ Preparation is move-only and semantically nonmutating, although pre-reserved
 analytical scratch may be rebuilt; constructor-owned event storage, one
 `O_max` mass-cancel snapshot vector, and `P` isolated uncross buffer sets exist
 before commit. Phase/rejection/cache work is expected `O(1)`; admission/
-replacement/cancellation/uncross inherit A62/A63 plus `O(T + C)` trace work.
+amendment/replacement/cancellation/uncross inherit A62/A63 plus `O(T + C)`
+trace work.
 Accepted replacement adds exactly two-event construction; mass cancellation
 adds `K + 1` event construction. State is
 `O(H_max + E_max + I_max + P O_max + P_max)`. Stable
@@ -1585,7 +1595,8 @@ controller authentication, reference/dynamic-band derivation, and venue
 conformance do not follow.
 
 **Falsification probe.** Exercise every phase edge and invalid edge,
-exact/stale revisions, delayed prior-cycle/reopen submissions and replacements,
+exact/stale revisions, delayed prior-cycle/reopen submissions, amendments, and
+replacements,
 skipped/reused/exhausted `AuctionId`, exact retry/content collision,
 foreign/stale prepared tokens, ordinary/terminal history boundaries, malformed
 terminal attempts, report-capacity and sequence exhaustion, prepared-uncross
@@ -1595,18 +1606,18 @@ ordinary/terminal-lane selection, empty and non-executable uncross at
 and event/cache audit corruption. Differentially compare at least 10,000 generated controller
 commands with a literal phase model.
 
-Any mutation on rejection, cross-cycle entry or replacement, sequence gap/wrap, second retry
-effect, consumed reserve from an invalid command, sequencing or WAL append on
-pool exhaustion, stranded retained interest, accepted foreign/stale token,
-phase/book partial commit, trace grammar mismatch, or audit divergence
-falsifies A64. Multi-process ownership or venue session semantics require an
-external fenced/versioned authority; local restart continuity is bounded by
-A65/A66.
+Any mutation on rejection, cross-cycle entry, amendment, or replacement,
+sequence gap/wrap, second retry effect, consumed reserve from an invalid
+command, sequencing or WAL append on pool exhaustion, stranded retained
+interest, accepted foreign/stale token, phase/book partial commit, trace grammar
+mismatch, or audit divergence falsifies A64. Multi-process ownership or venue
+session semantics require an external fenced/versioned authority; local restart
+continuity is bounded by A65/A66.
 
 ## A65 — durable auction WAL grammar
 
 **Assumption.** One `DurableCallAuctionEngine` owns the only writer lease for
-one WAL-version-11 single-file or marker-selected segmented auction shard. Its
+one WAL-version-12 single-file or marker-selected segmented auction shard. Its
 uncut grammar is one immutable definition followed by command/report pairs and
 at most one final dangling command. Submission prepares before command append,
 commits the same token, then appends the exact report; acknowledgement strength
@@ -1619,7 +1630,8 @@ consecutive commands, divergence, capacity failure, and invariant failure.
 **Dependent results.** [A15, A65] Stable little-endian auction record kinds
 `9`/`10`; replacement command/action tag `4` and `Replaced` cancellation tag
 `2`; mass-cancel command/action tag `5`, cancellation tag `3`, and completion
-event tag `7`; deterministic restart continuity and exact-retry cache reconstruction
+event tag `7`; amendment command/action tag `6`, rejection tag `22`, and event
+tag `8`; deterministic restart continuity and exact-retry cache reconstruction
 in both physical layouts; no silent second effect or request-attempt logging.
 For `C` commands, `E` report events, `B` bytes, and `S` segments, full-WAL open
 costs `O(B + S)` framing plus the sum of `C` A64 command costs and `O(E)`
@@ -1636,15 +1648,16 @@ before/after reopen and prove zero frame growth. Inject definition drift,
 unexpected records, consecutive/dangling duplicates, persisted `replayed =
 true`, report mutation, replacement trace reordering/identity reuse/priority
 retention, mass-cancel account/scope/order/count/quantity/revision corruption,
+amendment owner/quantity/immutable-field/priority/revision corruption,
 segment corruption, insufficient limits, and frame versions
-`1`/`2`/`3`/`4`/`5`/`6`/`7`/`8`/`9`/`10`. Any accepted
+`1`/`2`/`3`/`4`/`5`/`6`/`7`/`8`/`9`/`10`/`11`. Any accepted
 divergent/noncanonical history,
 duplicate transition, retry frame, cross-layout semantic difference, or
 unaudited dangling completion falsifies A65.
 
 ## A66 — auction checkpoint lineage
 
-**Assumption.** A snapshot-version-11 call-auction checkpoint and its recovery
+**Assumption.** A snapshot-version-12 call-auction checkpoint and its recovery
 WAL represent one immutable A65 command/report lineage. The image retains the
 definition/WAL origin, completed report boundary, phase/cycle, book revision,
 next priority/trade counters, canonical accepted identities and active orders,
@@ -1652,7 +1665,7 @@ and complete exact-retry history. A completed checkpoint is released only after
 independent replay requires exact direct-state equality; A97/A98 separate
 non-replaying capture from that proof. Numeric generation is never accepted
 without exact uncut prefix equality or a kind/checksum/generation/slot-bound
-version-11 anchor. Capture/validation resource or temporary-constructor failure
+version-12 anchor. Capture/validation resource or temporary-constructor failure
 under A78 occurs before snapshot/cutover mutation and leaves the durable shard
 unpoisoned; semantic contradiction poisons it.
 
@@ -1669,6 +1682,7 @@ rollover.
 **Falsification probe.** Mutate every direct field, history
 command/report/event, replacement grammar and priority, mass-cancel account/
 scope/order/totals/revision grammar, phase/cycle, counter,
+amendment target/owner/previous-current quantity/priority/revision grammar,
 accepted/active identity, uncut
 prefix frame, metadata origin, definition, and A/B anchor identity. Force every
 A78 direct/coupled resource and constructor failure; use a checkpoint ahead of
@@ -1704,6 +1718,10 @@ exposes exact `u64` count, `u128` quantity, and resulting book revision but no
 account or scope. All batch timestamps agree. Replica book revision advances
 at completion exactly when `K > 0`; `K = 0` emits only a completion and leaves
 the revision unchanged.
+One accepted amendment projects exactly one anonymous `Amended` removal with
+the positive leaves delta and absolute post-state aggregate. The aggregate
+order count is retained, and the replica advances book revision once. The
+single-update API accepts this complete one-event command boundary.
 
 **Dependent results.** [A67] Publisher bid/ask stable-slot AVL arenas,
 active-order dense hash, and uncross-source dense-hash scratch own complete
@@ -1722,15 +1740,17 @@ application fills preallocated standby trees in `O(P log P)` and swaps both
 sides atomically. Direct book and replica depth output is `O(min(P,L))`;
 publisher bootstrap/cross-audit is expected `O(O + P)`; an uncross report is
 expected `O(T + C)` over prints and cancellations, while replacement has
-`E = 2` and mass cancellation has `E = K + 1`. Structural failure after
-incremental mutation poisons state; capacity preflight failure does not. Stable
-payload version 3 contains no process-local limit metadata.
+`E = 2`, amendment has `E = 1`, and mass cancellation has `E = K + 1`.
+Structural failure after incremental mutation poisons state; capacity preflight
+failure does not. Stable payload version 4 contains no process-local limit
+metadata.
 
 No transport, entitlement, conflation, indicative publication, or
 information-hiding guarantee follows.
 
 **Falsification probe.** Exercise market/limit acceptance, user removal,
 replacement across sides/constraints/prices at saturated capacity,
+retained-priority amendment across market/limit aggregates,
 empty/all/side mass cancellation in every phase, anonymized removals, exact
 completion totals, timestamp equality, conditional revision, split and
 malformed complete batches,
@@ -1751,6 +1771,7 @@ aggregate mismatch, same-cycle multi-price print,
 completion-volume/count/revision mismatch, split/reordered replacement batch,
 replacement revision mismatch, split/reordered/miscounted mass-cancel batch,
 private account/scope disclosure, crossed-depth rejection, accepted
+amendment identity/priority disclosure, amended-count drift,
 undersized publisher, post-construction state growth, capacity-masked mutation,
 scratch residue, non-atomic snapshot replacement, changed wire bytes, or
 recovery divergence falsifies A67. A venue feed requiring indicative imbalance,
@@ -1776,12 +1797,15 @@ An accepted replacement trace removes the target reservation before inserting
 the replacement reservation. An accepted mass cancel releases each selected
 reservation exactly once from its canonical removal events; its completion has
 no second risk-state effect and undergoes no numerical entry authorization.
+An accepted amendment undergoes no new numerical entry authorization and
+reduces its reservation quantity, conservative notional, and account exposure
+by the exact positive leaves delta without changing reservation count.
 
 **Dependent results.** [A68, A99, A100] Missing/blocked/reduce-only/numerical
 failures are sequenced stable rejection tags `12`--`21`; exact retries have no
 second exposure effect. Profile, reservation, uncross-netting, and
 auction-history indexes own complete fixed dense/bucket storage before state
-exists. Expected risk work is `O(1)` per submit/replace/cancel event,
+exists. Expected risk work is `O(1)` per submit/amend/replace/cancel event,
 `O(K)` for a mass cancel with `K` selected reservations, and `O(T + C)` for
 an uncross with `T` pairs and `C` remainder cancellations.
 `CallAuctionRiskCheckpoint` canonically retains profiles/exposures plus the
@@ -1789,7 +1813,7 @@ A66-style auction image, reconstructs reservations from active orders, and is
 released only after full history replay through the coupled gate; A99/A100
 stage that proof.
 
-Snapshot-v11 kind `5` and `DurableCallAuctionRiskEngine` bind a canonical
+Snapshot-v12 kind `5` and `DurableCallAuctionRiskEngine` bind a canonical
 definition/profile prefix, risk-aware command/report replay, one
 dangling-command completion, exact uncut prefix proof, and
 single-file/segmented A/B cutover. Dynamic profile/control mutation,
@@ -1800,6 +1824,7 @@ authenticated controller authority do not follow.
 limit sides, every risk rejection, core-versus-risk precedence, net
 replacement at saturated one-order capacity, rejected larger replacement,
 empty and populated all/side mass cancellation with exact once-only release,
+strict amendment with exact reservation/notional/exposure release,
 partial/full
 fills, all remainder policies, close/cancel, retained multi-cycle interest,
 same-account pairs near signed position bounds, reduce-only aggregate sides,
@@ -2085,14 +2110,14 @@ order without `O(H log H)` sorting; owned checkpoint payload allocation remains
 under A12/A66. Failure-detail construction can allocate.
 
 **Falsification probe.** Audit empty history and every
-phase/rejection/submit/replace/cancel/mass-cancel/uncross grammar; run at least 10,000 model
-commands; restore full-WAL and checkpoint histories; mutate cache keys,
-command/event sequences, timestamps, grammar, and phase state. Deliberately
-remove and reinsert an early bounded-cache entry and require chronology
-rejection. Any supported report removal/eviction, insertion outside exact
-command order, successful audit of reordered dense history, successful-path
-audit allocation, checkpoint order drift, or dependence on hash bucket order
-falsifies A75.
+phase/rejection/submit/amend/replace/cancel/mass-cancel/uncross grammar; run at
+least 10,000 model commands; restore full-WAL and checkpoint histories; mutate
+cache keys, command/event sequences, timestamps, grammar, and phase state.
+Deliberately remove and reinsert an early bounded-cache entry and require
+chronology rejection. Any supported report removal/eviction, insertion outside
+exact command order, successful audit of reordered dense history,
+successful-path audit allocation, checkpoint order drift, or dependence on
+hash bucket order falsifies A75.
 
 ## A76 — intrusive auction reservation lists
 
@@ -2105,15 +2130,15 @@ account identity is immutable in a reservation, cross-account duplicate
 membership contradicts the owner, while repetition within one account list is a
 cycle or link/count contradiction.
 
-**Dependent results.** [A76] Reservation append, partial-fill replacement, and
-removal remain expected `O(1)` and allocation-free in constructor-owned bounded
-hashes. A successful risk audit validates hash resources, valuation/notional,
-intrusive membership, exact account aggregates, position limits, quiescent
-netting scratch, and active-book parity with expected `O(A + O)` risk work and
-`O(1)` auxiliary space for `A` accounts and `O` reservations. The complete
-coupled audit adds A74/A75; a full adversarial collision cluster can produce
-bounded quadratic hash work. Failure-detail and checkpoint/replay diagnostics
-remain under A12/A68.
+**Dependent results.** [A76] Reservation append, partial-fill or amendment
+replacement, and removal remain expected `O(1)` and allocation-free in
+constructor-owned bounded hashes. A successful risk audit validates hash
+resources, valuation/notional, intrusive membership, exact account aggregates,
+position limits, quiescent netting scratch, and active-book parity with
+expected `O(A + O)` risk work and `O(1)` auxiliary space for `A` accounts and
+`O` reservations. The complete coupled audit adds A74/A75; a full adversarial
+collision cluster can produce bounded quadratic hash work. Failure-detail and
+checkpoint/replay diagnostics remain under A12/A68.
 
 **Falsification probe.** Insert multiple same/different-account market and
 limit reservations; partially fill and remove head/middle/tail/final members;
@@ -2912,8 +2937,8 @@ projects once more. Candidate clones are `O(1)` and share all three row images
 and nested event ranges.
 
 **Falsification probe.** Capture collecting/frozen/closed cycles, accepted and
-rejected submissions and replacements, individual and mass cancellations,
-executable/non-executable uncrosses,
+rejected submissions, amendments, and replacements, individual and mass
+cancellations, executable/non-executable uncrosses,
 retained remainders, risk-gated reports, and counter boundaries; clone, advance
 the source, verify off-thread, and require exact
 old-generation/synchronous-path equality, `Send + Sync`, and shared rows.
@@ -2974,6 +2999,7 @@ auction/account images in `O(1)`.
 **Falsification probe.** Capture core and every risk rejection, market/limit
 reservations, signed collar valuation, frozen phase, full/partial uncross
 positions, retained remainders, individual/mass cancellation release,
+quantity-amendment reservation release,
 same-account netting, and multiple cycles;
 advance through an uncross suffix during worker verification and require exact
 old positions/reservations plus current suffix state. Corrupt profile,
@@ -3103,7 +3129,7 @@ interaction are not inferred.
 **Dependent results.** [A1, A15, A20, A21, A22, A44, A45, A47, A50, A55,
 A70, A72, A83, A88, A103] Deterministic displayed-before-hidden execution,
 hidden FIFO, reserve refresh priority, hidden-aware FOK/STP barriers, total-
-leaves risk, version-11 WAL/snapshot recovery, and version-3 public projection.
+leaves risk, version-12 WAL/snapshot recovery, and version-3 public projection.
 A hidden-only price can be the private execution best while being absent from
 public best/depth. A hidden-maker trade prints at its execution price with a
 canonical absent public maker level when no visible same-price level exists.
@@ -3191,7 +3217,7 @@ specific rules.
 **Dependent results.** [A1, A5, A9, A15, A20, A21, A22, A37, A39, A45, A50,
 A70, A83, A88, A102, A103, A105] Allocation-free `O(1)`-space threshold
 inspection, atomic failure, reserve/hidden-aware eligibility, stop activation,
-no-change public projection, risk release, stable WAL-v11/snapshot-v11 bytes,
+no-change public projection, risk release, stable WAL-v12/snapshot-v12 bytes,
 checkpoint/WAL recovery, and exact retry are deterministic.
 
 **Falsification probe.** Exercise thresholds below, equal to, and above
@@ -3317,11 +3343,12 @@ slots. `CallAuctionMarketDataReplica::apply_replay_batch` reuses the live batch
 identity, sequence, capacity, transition, poisoning, and command-counter path,
 so recovery advances event and command boundaries together. Snapshot fallback
 remains authoritative when a complete required batch is unavailable or the
-replica is poisoned. Version-3 payload bytes do not change.
+replica is poisoned. Version-4 payload bytes do not change.
 
 **Falsification probe.** Reject zero and unrepresentable capacities; admit
-single-update phase/order batches, a two-update replacement, empty/non-empty
-mass-cancel batches, and a multi-update uncross. Inject identity, version,
+single-update phase/order/amendment batches, a two-update replacement,
+empty/non-empty mass-cancel batches, and a multi-update
+uncross. Inject identity, version,
 sequence, content, boundary, capacity, and evicted-overlap faults;
 repeat exact batches; wrap the ring without allocation growth; paginate without
 splitting a batch; reject zero limits, future cursors, inside-batch cursors, and
@@ -3331,7 +3358,39 @@ boundary. Repair a skipped replica and compare source event sequence, command
 sequence, phase, revision,
 and both depth sides. Any partial mutation on failure, split batch, stale value,
 lost command boundary, allocation growth, duplicate transition grammar,
-changed version-3 payload byte, or recovery divergence falsifies A108.
+changed version-4 payload byte, or recovery divergence falsifies A108.
+
+## A109 — retained-priority call-auction quantity reduction
+
+**Assumption.** A call-auction amendment is a strict reduction of one active
+order's positive lot-aligned leaves during the exact `Collecting` cycle and
+phase revision. The authenticated account owns the target. Order identity,
+account, side, market/limit constraint, limit price, queue position, and
+priority sequence are immutable. Equal quantity, increased quantity, price or
+side change, and zero leaves are not amendment semantics. Price/side changes
+continue to require A62 new-identity replacement with priority loss.
+
+**Dependent results.** [A15, A41, A52, A62, A64, A65, A66, A67, A68, A74,
+A75, A76, A78, A97, A99, A108, A109] One accepted amendment performs
+allocation-free `O(log O + log P)` book mutation with `O(1)` auxiliary space,
+one book revision, no accepted-ID/count/level change, and exact queue/account
+aggregate reduction. It emits one replayable `OrderAmended` event in the
+ordinary history lane. Coupled risk removes the exact quantity and conservative
+notional delta without a new entry gate. Public payload v4 emits one anonymous
+`Amended` aggregate delta with unchanged order count. WAL/snapshot v12 preserve
+exact retry and checkpoint-plus-suffix recovery.
+
+**Falsification probe.** Exercise market and limit orders at head, middle, and
+tail priority; owner, route, cycle, phase-revision, unknown-order, equal,
+increased, off-grid, below-entry-minimum but valid-leaves, and revision-
+exhaustion cases. Compare pre/post identity, priority, links, counts, accepted
+IDs, queue/account quantities, indicative allocation order, risk reservation,
+notional/exposure, public aggregate/count, codec bytes, checkpoint projection,
+WAL suffix recovery, and exact retry. Inject event changes to owner, side,
+constraint, price, priority, previous quantity, new quantity, or book revision.
+Any accepted non-reduction, priority/identity change, new risk rejection,
+private public-field disclosure, count drift, duplicate retry effect,
+allocation growth, or recovery divergence falsifies A109.
 
 ## Bounded scope expansion
 
@@ -3357,15 +3416,16 @@ capability, a remaining risk, or an opportunity.
   replacement with full priority loss, saturated active/price-level capacity
   reuse subject to fresh accepted-ID headroom, risk reservation substitution,
   WAL/snapshot recovery, exact retry, and one two-update public batch.
-  Venue-specific in-place quantity/price amendments, retained-priority
-  reductions, and protocol adapter semantics remain outside this state machine
-  and require an explicit versioned policy.
+  It also supports strict retained-priority quantity reduction with exact
+  aggregate/risk release and one anonymous public delta. Venue-specific price/
+  side amendment, quantity increase, and protocol-adapter semantics remain
+  outside this state machine and require an explicit versioned policy.
 - **High impact:** call-auction collection and sequencing now support bounded
   account/side mass cancellation through an intrusive owner index. One accepted
   command selects `K` orders independently of unrelated active interest, emits
   canonical ascending removals plus one aggregate completion, increments the
   book revision exactly once when `K > 0`, releases each risk reservation, and
-  recovers under WAL/snapshot version 11. Public payload version 3 projects the
+  recovers under WAL/snapshot version 12. Public payload version 4 projects the
   same complete batch without account or scope identity. Authenticated firm,
   session, or cross-shard scope and completion aggregation remain external.
 - **High impact risk:** the auction writer lease is local ownership, not a

@@ -10,10 +10,10 @@ use quotick::auction_book::{
     CallAuctionSelfTradePolicy, CallAuctionUncrossPolicy,
 };
 use quotick::auction_engine::{
-    CallAuctionCheckpoint, CallAuctionCheckpointCapture, CallAuctionCommand, CallAuctionEngine,
-    CallAuctionEngineError, CallAuctionEngineLimits, CallAuctionEngineLimitsSpec,
-    CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl, CallAuctionReplaceOrder,
-    CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionAmendOrder, CallAuctionCheckpoint, CallAuctionCheckpointCapture, CallAuctionCommand,
+    CallAuctionEngine, CallAuctionEngineError, CallAuctionEngineLimits,
+    CallAuctionEngineLimitsSpec, CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl,
+    CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use quotick::codec::{BinaryCodec, CodecError};
 use quotick::durable_auction::{
@@ -171,6 +171,20 @@ fn mass_cancel(command_id: u64, account_id: u64, scope: MassCancelScope) -> Call
         instrument_version: InstrumentVersion::new(1).unwrap(),
         account_id: AccountId::new(account_id).unwrap(),
         scope,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+fn amend(command_id: u64, account_id: u64, order_id: u64, lots: u64) -> CallAuctionCommand {
+    CallAuctionCommand::Amend(CallAuctionAmendOrder {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: InstrumentId::new(71).unwrap(),
+        instrument_version: InstrumentVersion::new(1).unwrap(),
+        auction_id: auction(),
+        expected_phase_revision: 1,
+        account_id: AccountId::new(account_id).unwrap(),
+        order_id: OrderId::new(order_id).unwrap(),
+        new_quantity: Quantity::new(lots).unwrap(),
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
@@ -373,6 +387,50 @@ fn mass_cancel_recovers_across_checkpoint_and_wal_suffix() {
     );
     let replay = recovered.submit(suffix).unwrap();
     assert!(replay.replayed);
+    recovered.engine().validate().unwrap();
+    recovered.close().unwrap();
+}
+
+#[test]
+fn amendment_recovers_across_checkpoint_and_wal_suffix_with_exact_retry() {
+    let area = TestPath::directory("amend-recovery");
+    fs::create_dir_all(area.path()).unwrap();
+    let wal = area.join("auction.wal");
+    let snapshot = area.join("auction.qsnp");
+    let mut durable = DurableCallAuctionEngine::open(&wal, definition(), options()).unwrap();
+    durable
+        .submit(phase(1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    durable
+        .submit(submit(2, order(10, 7, Side::Buy, 8)))
+        .unwrap();
+    durable.submit(amend(3, 7, 10, 5)).unwrap();
+    durable
+        .write_checkpoint(&snapshot, SnapshotOptions::default())
+        .unwrap();
+    let suffix = amend(4, 7, 10, 3);
+    durable.submit(suffix).unwrap();
+    durable.close().unwrap();
+
+    let mut recovered = DurableCallAuctionEngine::open_with_checkpoint(
+        &wal,
+        &snapshot,
+        definition(),
+        options(),
+        SnapshotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.recovery().checkpointed_commands, 3);
+    assert_eq!(recovered.recovery().replayed_commands, 1);
+    let order = recovered
+        .engine()
+        .book()
+        .order(OrderId::new(10).unwrap())
+        .unwrap();
+    assert_eq!(order.quantity.lots(), 3);
+    assert_eq!(order.priority_sequence, 1);
+    assert_eq!(recovered.engine().book().state_revision(), 3);
+    assert!(recovered.submit(suffix).unwrap().replayed);
     recovered.engine().validate().unwrap();
     recovered.close().unwrap();
 }
@@ -902,7 +960,7 @@ fn auction_checkpoint_has_stable_kind_codec_and_direct_restore() {
     SnapshotFile::write(&snapshot, &shared, SnapshotOptions::default()).unwrap();
     let bytes = fs::read(snapshot).unwrap();
     assert_eq!(&bytes[0..4], b"QSNP");
-    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 11);
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 12);
     assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 4);
 }
 

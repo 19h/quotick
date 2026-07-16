@@ -4,10 +4,10 @@ use quotick::auction_book::{
     CallAuctionSelfTradePolicy, CallAuctionUncrossPolicy,
 };
 use quotick::auction_engine::{
-    CallAuctionCommand, CallAuctionCommandOutcome, CallAuctionEngineError, CallAuctionEngineLimits,
-    CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionMassCancel, CallAuctionPhase,
-    CallAuctionPhaseControl, CallAuctionRejectReason, CallAuctionReplaceOrder,
-    CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionAmendOrder, CallAuctionCommand, CallAuctionCommandOutcome, CallAuctionEngineError,
+    CallAuctionEngineLimits, CallAuctionEngineLimitsSpec, CallAuctionEventKind,
+    CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl, CallAuctionRejectReason,
+    CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use quotick::auction_risk::{
     CallAuctionRiskLimits, CallAuctionRiskLimitsSpec, CallAuctionRiskManagedEngine,
@@ -190,6 +190,20 @@ fn mass_cancel_command(command_id: u64, owner: u64, scope: MassCancelScope) -> C
         instrument_version: version(),
         account_id: account(owner),
         scope,
+        received_at: TimestampNs::from_unix_nanos(command_id),
+    })
+}
+
+fn amend_command(command_id: u64, owner: u64, order_id: u64, quantity: u64) -> CallAuctionCommand {
+    CallAuctionCommand::Amend(CallAuctionAmendOrder {
+        command_id: CommandId::new(command_id).unwrap(),
+        instrument_id: instrument(),
+        instrument_version: version(),
+        auction_id: auction(1),
+        expected_phase_revision: 1,
+        account_id: account(owner),
+        order_id: OrderId::new(order_id).unwrap(),
+        new_quantity: Quantity::new(quantity).unwrap(),
         received_at: TimestampNs::from_unix_nanos(command_id),
     })
 }
@@ -466,6 +480,59 @@ fn mass_cancel_releases_every_selected_reservation_once() {
     let replay = engine.submit(command).unwrap();
     assert!(replay.replayed);
     assert_eq!(engine.risk().reservation_count(), 1);
+    engine.validate().unwrap();
+}
+
+#[test]
+fn amendment_reduces_reservation_and_exposure_by_the_exact_delta() {
+    let mut engine = managed(1);
+    engine
+        .register_account(account(1), broad_profile(AccountRiskState::Active, 0))
+        .unwrap();
+    engine
+        .submit(phase_command(1, 1, 0, CallAuctionPhase::Collecting))
+        .unwrap();
+    engine
+        .submit(submit_command(
+            2,
+            order(
+                10,
+                1,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                8,
+            ),
+        ))
+        .unwrap();
+    let capacity = engine
+        .risk()
+        .hash_index_status(RiskHashIndex::ActiveReservations);
+
+    let command = amend_command(3, 1, 10, 3);
+    let report = engine.submit(command).unwrap();
+    assert_eq!(report.outcome, CallAuctionCommandOutcome::Accepted);
+    let reservation = engine
+        .risk()
+        .reservation(OrderId::new(10).unwrap())
+        .unwrap();
+    assert_eq!(reservation.quantity_lots(), 3);
+    assert_eq!(reservation.valuation_per_lot(), 100);
+    assert_eq!(reservation.notional(), 300);
+    let exposure = engine.risk().snapshot(account(1)).unwrap();
+    assert_eq!(exposure.open_buy_lots(), 3);
+    assert_eq!(exposure.open_sell_lots(), 0);
+    assert_eq!(exposure.open_notional(), 300);
+    assert_eq!(exposure.open_orders(), 1);
+    assert_eq!(
+        engine
+            .risk()
+            .hash_index_status(RiskHashIndex::ActiveReservations)
+            .allocated_entries,
+        capacity.allocated_entries
+    );
+
+    assert!(engine.submit(command).unwrap().replayed);
+    assert_eq!(engine.risk().snapshot(account(1)).unwrap(), exposure);
     engine.validate().unwrap();
 }
 

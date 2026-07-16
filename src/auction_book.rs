@@ -490,6 +490,72 @@ impl fmt::Display for CallAuctionCancelError {
 
 impl std::error::Error for CallAuctionCancelError {}
 
+/// Retained-priority quantity-reduction failure for one active order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallAuctionAmendError {
+    /// No active order had the supplied identifier.
+    UnknownOrder,
+    /// The supplied account did not own the active order.
+    AccountMismatch,
+    /// The proposed leaves quantity violated immutable instrument rules.
+    Instrument(AdmissionError),
+    /// The proposed quantity was equal to or greater than active leaves.
+    QuantityNotReduced,
+    /// The mutation revision was exhausted.
+    StateRevisionExhausted,
+}
+
+impl fmt::Display for CallAuctionAmendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownOrder => formatter.write_str("unknown active call-auction order"),
+            Self::AccountMismatch => formatter.write_str("call-auction amendment account mismatch"),
+            Self::Instrument(error) => {
+                write!(
+                    formatter,
+                    "call-auction amendment instrument rule: {error:?}"
+                )
+            }
+            Self::QuantityNotReduced => {
+                formatter.write_str("call-auction amendment quantity was not reduced")
+            }
+            Self::StateRevisionExhausted => {
+                formatter.write_str("call-auction state revision exhausted")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CallAuctionAmendError {}
+
+/// One retained-priority active-quantity reduction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionAmendment {
+    previous: CallAuctionOrderSnapshot,
+    current: CallAuctionOrderSnapshot,
+    state_revision: u64,
+}
+
+impl CallAuctionAmendment {
+    /// Returns the complete active state before the reduction.
+    #[must_use]
+    pub const fn previous(self) -> CallAuctionOrderSnapshot {
+        self.previous
+    }
+
+    /// Returns the complete active state after the reduction.
+    #[must_use]
+    pub const fn current(self) -> CallAuctionOrderSnapshot {
+        self.current
+    }
+
+    /// Returns the collection-book revision after the reduction.
+    #[must_use]
+    pub const fn state_revision(self) -> u64 {
+        self.state_revision
+    }
+}
+
 /// Failure while selecting or applying one account-scoped mass cancel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CallAuctionMassCancelError {
@@ -2044,6 +2110,100 @@ impl CallAuctionBook {
         self.state_revision
             .checked_add(1)
             .ok_or(CallAuctionCancelError::StateRevisionExhausted)?;
+        Ok(order.into())
+    }
+
+    /// Reduces one owned active order's quantity without changing priority.
+    ///
+    /// Identity, account, side, constraint, queue links, and priority sequence
+    /// remain unchanged. The queue and account aggregates decrease by the exact
+    /// quantity delta. The operation is `O(log O + log P)` for `O` active
+    /// orders and `P` occupied prices, uses `O(1)` auxiliary space, and does not
+    /// allocate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionAmendError`] before mutation when the order is
+    /// absent, ownership differs, the proposed leaves violate instrument rules,
+    /// quantity is not strictly reduced, or the book revision is exhausted.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if internal queue, account, or active-order indexes already
+    /// contradict a target that passed preflight. Safe public operations
+    /// preserve those invariants.
+    pub fn amend(
+        &mut self,
+        account_id: AccountId,
+        order_id: OrderId,
+        new_quantity: Quantity,
+    ) -> Result<CallAuctionAmendment, CallAuctionAmendError> {
+        let previous = self.preflight_amend(account_id, order_id, new_quantity)?;
+        let state_revision = self
+            .state_revision
+            .checked_add(1)
+            .ok_or(CallAuctionAmendError::StateRevisionExhausted)?;
+        let delta_lots = previous
+            .quantity
+            .lots()
+            .checked_sub(new_quantity.lots())
+            .expect("preflighted amendment must strictly reduce quantity");
+
+        let mut queue = self.queue_snapshot(previous.side, previous.constraint);
+        queue.total_quantity = queue
+            .total_quantity
+            .checked_sub(u128::from(delta_lots))
+            .expect("active order quantity must be represented in its queue");
+        self.replace_queue(previous.side, previous.constraint, queue);
+
+        let account_side = self
+            .account_orders
+            .get_mut(&previous.account_id)
+            .expect("active order account index must exist")
+            .side_mut(previous.side);
+        account_side.total_quantity = account_side
+            .total_quantity
+            .checked_sub(u128::from(delta_lots))
+            .expect("active order quantity must be represented in its account index");
+
+        let active = self
+            .orders
+            .get_mut(&order_id)
+            .expect("preflighted amendment target must remain active");
+        active.quantity = new_quantity;
+        let current = (*active).into();
+        self.state_revision = state_revision;
+        Ok(CallAuctionAmendment {
+            previous,
+            current,
+            state_revision,
+        })
+    }
+
+    pub(crate) fn preflight_amend(
+        &self,
+        account_id: AccountId,
+        order_id: OrderId,
+        new_quantity: Quantity,
+    ) -> Result<CallAuctionOrderSnapshot, CallAuctionAmendError> {
+        let order = self
+            .orders
+            .get(&order_id)
+            .copied()
+            .ok_or(CallAuctionAmendError::UnknownOrder)?;
+        if order.account_id != account_id {
+            return Err(CallAuctionAmendError::AccountMismatch);
+        }
+        self.definition
+            .quantity_rules()
+            .validate_leaves(new_quantity)
+            .map_err(CallAuctionAmendError::Instrument)?;
+        if new_quantity.lots() >= order.quantity.lots() {
+            return Err(CallAuctionAmendError::QuantityNotReduced);
+        }
+        self.state_revision
+            .checked_add(1)
+            .ok_or(CallAuctionAmendError::StateRevisionExhausted)?;
         Ok(order.into())
     }
 

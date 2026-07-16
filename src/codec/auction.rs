@@ -8,12 +8,12 @@ use crate::auction_book::{
     CallAuctionUncrossPolicy,
 };
 use crate::auction_engine::{
-    CallAuctionAction, CallAuctionCancelOrder, CallAuctionCancellationReason,
-    CallAuctionCheckpoint, CallAuctionCommand, CallAuctionCommandOutcome,
-    CallAuctionCommandReportCheckpoint, CallAuctionEvent, CallAuctionEventKind,
-    CallAuctionExecutionReport, CallAuctionMassCancel, CallAuctionPhase, CallAuctionPhaseControl,
-    CallAuctionPhaseSnapshot, CallAuctionRejectReason, CallAuctionReplaceOrder,
-    CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionAction, CallAuctionAmendOrder, CallAuctionCancelOrder,
+    CallAuctionCancellationReason, CallAuctionCheckpoint, CallAuctionCommand,
+    CallAuctionCommandOutcome, CallAuctionCommandReportCheckpoint, CallAuctionEvent,
+    CallAuctionEventKind, CallAuctionExecutionReport, CallAuctionMassCancel, CallAuctionPhase,
+    CallAuctionPhaseControl, CallAuctionPhaseSnapshot, CallAuctionRejectReason,
+    CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use crate::instrument::{AdmissionError, InstrumentDefinition};
 use crate::{AuctionId, Price, TimestampNs};
@@ -56,6 +56,7 @@ fn encode_action(encoder: &mut Encoder, action: CallAuctionAction) {
         CallAuctionAction::Uncross => 3,
         CallAuctionAction::Replace => 4,
         CallAuctionAction::MassCancel => 5,
+        CallAuctionAction::Amend => 6,
     });
 }
 
@@ -67,6 +68,7 @@ fn decode_action(decoder: &mut Decoder<'_>) -> Result<CallAuctionAction, CodecEr
         3 => Ok(CallAuctionAction::Uncross),
         4 => Ok(CallAuctionAction::Replace),
         5 => Ok(CallAuctionAction::MassCancel),
+        6 => Ok(CallAuctionAction::Amend),
         tag => Err(CodecError::InvalidTag {
             type_name: "CallAuctionAction",
             tag,
@@ -305,6 +307,7 @@ fn encode_reject_reason(encoder: &mut Encoder, reason: CallAuctionRejectReason) 
         CallAuctionRejectReason::RiskOpenNotionalLimit => encoder.u8(19),
         CallAuctionRejectReason::RiskPositionLimit => encoder.u8(20),
         CallAuctionRejectReason::RiskArithmeticOverflow => encoder.u8(21),
+        CallAuctionRejectReason::AmendQuantityNotReduced => encoder.u8(22),
     }
 }
 
@@ -354,6 +357,7 @@ fn decode_reject_reason(decoder: &mut Decoder<'_>) -> Result<CallAuctionRejectRe
         19 => Ok(CallAuctionRejectReason::RiskOpenNotionalLimit),
         20 => Ok(CallAuctionRejectReason::RiskPositionLimit),
         21 => Ok(CallAuctionRejectReason::RiskArithmeticOverflow),
+        22 => Ok(CallAuctionRejectReason::AmendQuantityNotReduced),
         tag => Err(CodecError::InvalidTag {
             type_name: "CallAuctionRejectReason",
             tag,
@@ -421,6 +425,18 @@ fn encode_command(encoder: &mut Encoder, command: CallAuctionCommand) {
             encoder.u64(value.instrument_version.get());
             encoder.u64(value.account_id.get());
             encode_mass_cancel_scope(encoder, value.scope);
+            encoder.u64(value.received_at.as_unix_nanos());
+        }
+        CallAuctionCommand::Amend(value) => {
+            encoder.u8(6);
+            encoder.u64(value.command_id.get());
+            encoder.u64(value.instrument_id.get());
+            encoder.u64(value.instrument_version.get());
+            encoder.u64(value.auction_id.get());
+            encoder.u64(value.expected_phase_revision);
+            encoder.u64(value.account_id.get());
+            encoder.u64(value.order_id.get());
+            encoder.u64(value.new_quantity.lots());
             encoder.u64(value.received_at.as_unix_nanos());
         }
     }
@@ -491,6 +507,17 @@ fn decode_command(decoder: &mut Decoder<'_>) -> Result<CallAuctionCommand, Codec
             instrument_version: instrument_version(decoder)?,
             account_id: account(decoder)?,
             scope: decode_mass_cancel_scope(decoder)?,
+            received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
+        })),
+        6 => Ok(CallAuctionCommand::Amend(CallAuctionAmendOrder {
+            command_id: command_id(decoder)?,
+            instrument_id: instrument(decoder)?,
+            instrument_version: instrument_version(decoder)?,
+            auction_id: auction_id(decoder)?,
+            expected_phase_revision: decoder.u64()?,
+            account_id: account(decoder)?,
+            order_id: order(decoder)?,
+            new_quantity: quantity(decoder)?,
             received_at: TimestampNs::from_unix_nanos(decoder.u64()?),
         })),
         tag => Err(CodecError::InvalidTag {
@@ -683,6 +710,16 @@ fn encode_event_kind(encoder: &mut Encoder, kind: CallAuctionEventKind) {
             encoder.u128(cancelled_quantity_lots);
             encoder.u64(book_revision);
         }
+        CallAuctionEventKind::OrderAmended {
+            order,
+            previous_quantity,
+            book_revision,
+        } => {
+            encoder.u8(8);
+            encode_snapshot(encoder, order);
+            encoder.u64(previous_quantity.lots());
+            encoder.u64(book_revision);
+        }
     }
 }
 
@@ -722,6 +759,11 @@ fn decode_event_kind(decoder: &mut Decoder<'_>) -> Result<CallAuctionEventKind, 
             scope: decode_mass_cancel_scope(decoder)?,
             cancelled_order_count: decoder.u64()?,
             cancelled_quantity_lots: decoder.u128()?,
+            book_revision: decoder.u64()?,
+        }),
+        8 => Ok(CallAuctionEventKind::OrderAmended {
+            order: decode_snapshot(decoder)?,
+            previous_quantity: quantity(decoder)?,
             book_revision: decoder.u64()?,
         }),
         tag => Err(CodecError::InvalidTag {

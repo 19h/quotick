@@ -5,10 +5,10 @@ use quotick::auction::{
     discover_bounded_clearing_price,
 };
 use quotick::auction_book::{
-    CallAuctionAdmissionError, CallAuctionBook, CallAuctionBookLimits, CallAuctionBookLimitsError,
-    CallAuctionBookLimitsSpec, CallAuctionCancelError, CallAuctionCapacity,
-    CallAuctionConstructionError, CallAuctionIndicative, CallAuctionMassCancelError,
-    CallAuctionOrder, CallAuctionPlanError, CallAuctionReplaceError,
+    CallAuctionAdmissionError, CallAuctionAmendError, CallAuctionBook, CallAuctionBookLimits,
+    CallAuctionBookLimitsError, CallAuctionBookLimitsSpec, CallAuctionCancelError,
+    CallAuctionCapacity, CallAuctionConstructionError, CallAuctionIndicative,
+    CallAuctionMassCancelError, CallAuctionOrder, CallAuctionPlanError, CallAuctionReplaceError,
 };
 use quotick::instrument::{
     AdmissionError, InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol,
@@ -339,6 +339,118 @@ fn cancellation_checks_owner_unlinks_middle_and_never_reuses_identity() {
             .lots(),
         3
     );
+    book.validate().unwrap();
+}
+
+#[test]
+fn quantity_reduction_retains_identity_priority_and_reconciles_indexes() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(8, 4, 16)).unwrap();
+    let first = book
+        .admit(order(
+            10,
+            7,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+            8,
+        ))
+        .unwrap();
+    let second = book
+        .admit(order(
+            20,
+            7,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+            5,
+        ))
+        .unwrap();
+    book.admit(order(30, 8, Side::Sell, AuctionOrderConstraint::Market, 9))
+        .unwrap();
+    let allocation = book.resource_status();
+
+    let amendment = book
+        .amend(account(7), first.order_id, Quantity::new(3).unwrap())
+        .unwrap();
+    assert_eq!(amendment.previous(), first);
+    assert_eq!(amendment.current().order_id, first.order_id);
+    assert_eq!(amendment.current().quantity.lots(), 3);
+    assert_eq!(
+        amendment.current().priority_sequence,
+        first.priority_sequence
+    );
+    assert_eq!(amendment.state_revision(), 4);
+    assert_eq!(book.accepted_order_id_count(), 3);
+    assert_eq!(book.active_order_count(), 3);
+    assert_eq!(book.limit_depth(Side::Buy, 1)[0].quantity(), 8);
+    assert_eq!(
+        book.resource_status().allocated_active_orders,
+        allocation.allocated_active_orders
+    );
+    assert_eq!(
+        book.resource_status().allocated_active_accounts,
+        allocation.allocated_active_accounts
+    );
+
+    let indicative = book
+        .indicative_clearing(
+            book.instrument_price_band(),
+            Price::from_raw(100),
+            AuctionPricePolicy::REFERENCE_THEN_LOWER,
+        )
+        .unwrap()
+        .unwrap();
+    let plan = book.allocation_plan(indicative).unwrap();
+    assert_eq!(
+        plan.buy_fills()
+            .iter()
+            .map(|fill| (fill.order_id().get(), fill.quantity_lots()))
+            .collect::<Vec<_>>(),
+        vec![(10, 3), (20, 5)]
+    );
+    assert_eq!(second.priority_sequence, 2);
+    book.validate().unwrap();
+}
+
+#[test]
+fn invalid_quantity_reduction_fails_before_mutation() {
+    let mut book = CallAuctionBook::try_with_limits(definition(), limits(4, 4, 8)).unwrap();
+    let admitted = book
+        .admit(order(1, 7, Side::Sell, AuctionOrderConstraint::Market, 5))
+        .unwrap();
+    let before = book.resource_status();
+
+    for (owner, order_id, quantity, expected) in [
+        (
+            account(8),
+            admitted.order_id,
+            4,
+            CallAuctionAmendError::AccountMismatch,
+        ),
+        (
+            account(7),
+            OrderId::new(99).unwrap(),
+            4,
+            CallAuctionAmendError::UnknownOrder,
+        ),
+        (
+            account(7),
+            admitted.order_id,
+            5,
+            CallAuctionAmendError::QuantityNotReduced,
+        ),
+        (
+            account(7),
+            admitted.order_id,
+            6,
+            CallAuctionAmendError::QuantityNotReduced,
+        ),
+    ] {
+        assert_eq!(
+            book.amend(owner, order_id, Quantity::new(quantity).unwrap()),
+            Err(expected)
+        );
+        assert_eq!(book.order(admitted.order_id), Some(admitted));
+        assert_eq!(book.resource_status(), before);
+    }
     book.validate().unwrap();
 }
 

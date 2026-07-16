@@ -1,6 +1,7 @@
 # Expired Call-auction market-data payload format version 1
 
-The current API emits [call-auction market-data version 3](auction-market-data-v3.md).
+The current API emits
+[call-auction market-data version 4](auction-market-data-v4.md).
 This document remains the authoritative historical schema for version 1;
 transports must not decode current payloads under this registry.
 
