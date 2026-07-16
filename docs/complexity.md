@@ -208,6 +208,15 @@ across the complete signed `i64` price domain; exact midpoint numerator
 perform the same bounded work. Human-readable invariant detail may allocate
 only after a zero aggregate/count or locked/crossed pair is detected.
 
+`try_public_level` performs the authoritative `O(1)` coherent-extrema check,
+one `O(log(P + 1))` execution-level lookup, and one
+`O(log(P + 1))` redundant public-membership lookup at the exact key. Constant
+factors combine into `O(log(P + 1))` time and `O(1)` fixed output/state.
+Present and absent results have the same bound. A target candidate adds one
+constant key/aggregate validation. Fully hidden-only levels are returned as
+absence. The successful path allocates no output and performs no mutation;
+human-readable invariant detail can allocate after target-key corruption.
+
 For a displayed-liquidity request, let `K` be the occupied opposite-side
 execution prices inspected through filled, price-limit, or public-book-
 exhausted termination among `P` occupied prices. Hidden-only prices can be
@@ -757,6 +766,14 @@ selected public levels. Neither query allocates output. Poison rejection is
 detail may allocate only after corruption and is then discarded. No error path
 returns a partial summary. The replica exposes no definition-wide summary
 because it retains no price-rule endpoints.
+
+Replica `try_public_level` composes the `O(log(P + 1))` shared coherent-state
+gate with one exact `O(log(P + 1))` public-AVL lookup, retaining
+`O(log(P + 1))` total time and `O(1)` fixed output/state. A present target adds
+one constant shared key/aggregate validation. Poison fails in `O(1)` before
+tree access; target corruption maps to static source divergence. Neither the
+fallible query nor its successful convenience wrapper allocates or mutates
+replica state.
 
 For `B` public bid levels, `A` public ask levels, and one independently applied
 limit `N`, replica `try_public_depth_imbalance` costs

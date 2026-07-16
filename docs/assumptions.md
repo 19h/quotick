@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A133 are stable and are referenced from code comments and other
+identifiers A1-A134 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -4711,26 +4711,27 @@ strictly below a present offer. Failure is `MarketDataError::Poisoned` or the
 static `MarketDataError::SourceDivergence` category before an output or
 iterator is exposed.
 
-The boundary includes BBO, separate best bid/ask, trading state, explicit-band
-summary, top-N public-depth imbalance, displayed-liquidity quote, full/range
-depth materialization, and fallible full/range depth iterators. Each iterator
-item independently requires positive quantity and order count at the exact row
-encountered. A stream may therefore yield a valid selected row before a later
-corrupt non-extremum row returns `SourceDivergence`; it never skips that row.
-`try_depth` validates only the requested market-priority prefix.
+The boundary includes BBO, separate best bid/ask, exact-price public levels,
+trading state, explicit-band summary, top-N public-depth imbalance, displayed-
+liquidity quote, full/range depth materialization, and fallible full/range depth
+iterators. Each iterator item independently requires positive quantity and
+order count at the exact row encountered. A stream may therefore yield a valid
+selected row before a later corrupt non-extremum row returns
+`SourceDivergence`; it never skips that row. `try_depth` validates only the
+requested market-priority prefix.
 `try_depth_range` first validates and counts the exact selected range/limit,
 reserves that complete cardinality, and copies through a second identical pass
 while the same immutable borrow prevents drift. Neither materializer returns a
 partial owned vector.
 
-The convenience depth, range, iterator, best-side, and trading-state methods
-delegate to the fallible boundary and panic on typed failure rather than return
-partially advanced state. `last_sequence`, `is_poisoned`, resource limits, and
-arena/index telemetry remain readable because they diagnose and size repair;
-they are not economic observations. Applying one valid non-stale authoritative
-snapshot atomically replaces the depth/state boundary and clears poison under
-A23/A70. No query mutates state, allocates successful iterator output, or
-changes payload, snapshot, WAL, or checkpoint bytes.
+The convenience level, depth, range, iterator, best-side, and trading-state
+methods delegate to the fallible boundary and panic on typed failure rather
+than return partially advanced state. `last_sequence`, `is_poisoned`, resource
+limits, and arena/index telemetry remain readable because they diagnose and
+size repair; they are not economic observations. Applying one valid non-stale
+authoritative snapshot atomically replaces the depth/state boundary and clears
+poison under A23/A70. No query mutates state, allocates successful iterator
+output, or changes payload, snapshot, WAL, or checkpoint bytes.
 
 **Dependent results.** [A1, A3, A10, A12, A23, A44, A55, A70, A72, A83,
 A103, A123, A128, A129, A130, A131, A132] Poison rejection is `O(1)` before
@@ -4749,9 +4750,10 @@ retain exact authoritative parity.
 **Falsification probe.** Cause an actual incremental trade-reconciliation
 failure after at least one replica mutation and require poison from every
 fallible economic observation. Apply the current valid publisher snapshot and
-require exact depth, iterator, best-side, BBO, trading-state, summary, quote,
-and imbalance parity. In white-box state, inject zero quantity/count at an
-extremum and at a deeper row, locked/crossed extrema, and invalid rows reached
+require exact depth, iterator, exact-price level, best-side, BBO, trading-state,
+summary, quote, and imbalance parity. In white-box state, inject zero
+quantity/count at an extremum and at a deeper row, locked/crossed extrema, and
+invalid rows reached
 first from either iterator end and inside an inclusive range. Require outer-
 gate failure for poison/extremum corruption, exact per-item failure for deeper
 corruption, success when the invalid deeper row is outside the selected limit/
@@ -4834,10 +4836,98 @@ unchecked wrap, stale poisoned output, provenance/parity/recovery divergence,
 mutation, successful-path allocation, predictive interpretation, or wire-byte
 change falsifies A133.
 
+## A134 — exact-price provenance-bound public-level observation
+
+**Assumption.** One `try_public_level(side, price)` call observes one immutable
+continuous `OrderBook` or healthy `MarketDataReplica` borrow. The supplied
+`(Side, Price)` is an exact lookup key. It need not be on the instrument tick
+grid or inside its admission collar: an off-grid, outside-collar, unoccupied,
+or opposite-side key ordinarily returns absent displayed state rather than an
+admission error.
+
+`PublicLevelObservation` binds the exact queried side and price plus an optional
+`LevelSnapshot` to instrument identity, immutable definition version, and the
+final observed book-event/source sequence. A present snapshot repeats the exact
+queried price and carries positive displayed quantity and displayed-order
+count. A fully hidden-only execution price is absent. A reserve order
+contributes only its current displayed slice; reserve-hidden leaves and private
+order identities are absent. A state-bound absent result makes no claim that
+another side, price, source, version, or later sequence is absent.
+
+The authoritative query first applies A128 coherent-extrema validation. At the
+requested key it then requires execution-level visibility and redundant public-
+price AVL membership to agree. A candidate with one zero aggregate dimension,
+a key/snapshot mismatch, or a membership contradiction returns typed
+`InvariantViolation`. Both-zero execution aggregates denote no displayed
+liquidity at this local observation boundary; A45 remains the complete private
+topology and redundant-index audit. The legacy `level` convenience method now
+composes this fallible path and panics on detected corruption rather than
+returning an ambiguous absence.
+
+The replica query first applies the A132 poison/coherent-extrema gate, performs
+one exact lookup in public-only depth, and reuses the same key/aggregate/value
+constructor. Target corruption maps to static
+`MarketDataError::SourceDivergence`; poison or incoherent extrema fail before
+target lookup. Its new `level` convenience method also composes the typed path.
+A deeper corrupt non-extremum row outside the exact key is not inspected.
+Publisher affected-level reconciliation uses the typed authoritative query and
+clears its fixed scratch before returning source divergence, so corruption
+cannot convert that internal comparison into a panic or leave scratch residue.
+
+Neither successful query allocates or mutates order, level, replica, sequence,
+history, risk, WAL, checkpoint, snapshot, replay, or publisher state. The value
+is a process-local state observation, not an authenticated entitlement,
+consolidated quote, liquidity reservation, remote freshness proof, or transport
+message.
+
+**Dependent results.** [A1, A3, A10, A12, A22, A44, A45, A55, A70, A72, A83,
+A103, A117, A123, A128, A130, A132, A134] The authoritative query performs an
+`O(1)` coherent-extrema check plus two exact AVL lookups and is therefore
+`O(log(P + 1))` time with `O(1)` fixed output/state for `P` occupied execution
+prices. The replica gate plus exact public-AVL lookup has the same asymptotic
+bound. Present and absent observations allocate no output. Direct checkpoint
+restoration and caught-up incremental, exact-retry, repaired-snapshot, and
+durable-bootstrap replicas reproduce the same value. No wire-version change
+follows.
+
+**Falsification probe.** Exercise both sides; empty, one-sided, and two-sided
+books; best and non-best displayed levels; unoccupied, opposite-side,
+hidden-only, reserve, signed, zero, off-grid, and outside-collar prices; multiple
+orders at one key; and exact source-sequence advances with and without a target
+change. Require exact key/provenance, current displayed aggregate, state-bound
+absence, convenience/fallible parity, unchanged state, and checkpoint/source/
+replica equality. Corrupt target quantity, count, embedded price, and redundant
+public membership; corrupt an extremum and a deeper unselected row; lock/cross
+the extrema; poison a replica and repair it with a valid snapshot. Require gate
+failure for poison/extremum corruption, target failure only when the exact key
+is selected, success through unrelated deeper corruption, typed publisher
+divergence with empty scratch, and no partial value. Any hidden or reserve-
+hidden disclosure, off-grid admission inference, key/provenance drift, stale
+poisoned output, unchecked contradiction, panic in the typed path, mutation,
+successful-path allocation, recovery/parity difference, or wire-byte change
+falsifies A134.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **Medium impact:** authoritative books and healthy continuous public replicas
+  now expose fixed-size exact-price observations whose present or absent state
+  is bound to side, price, instrument, definition version, and source sequence.
+  One shared constructor validates the selected key and aggregate; the source
+  additionally proves redundant public-index membership locally.
+
+- **Medium impact risk:** repeated exact-price lookups over a dense numeric
+  range cost `O(R log(P + 1))` for `R` requested prices, including absent keys.
+  Existing inclusive depth-range iterators provide `O(log(P + 1) + K)` sparse
+  traversal for `K` occupied in-band prices and remain the bounded interface for
+  complete heatmap or ladder capture.
+
+- **Medium impact opportunity:** state-bound absence and exact source sequence
+  support deterministic ladder cells, alert conditions, visualization, and
+  source/replica reconciliation without materializing complete depth. Remote
+  subscriptions still require authenticated transport and freshness contracts.
 
 - **Medium impact:** authoritative continuous books and healthy public replicas
   now expose one exact fixed-size top-N displayed-depth imbalance with common

@@ -27,9 +27,9 @@ use crate::matching::{
     AccountAdmissionState, AccountControlAction, AccountControlSnapshot, BestBidOffer,
     CancelReason, Command, CommandOutcome, DepthSummary, DisplayedLiquidityQuote,
     DisplayedLiquidityRequest, Event, EventKind, ExecutionReport, LevelSnapshot, MassCancelScope,
-    OrderBook, OrderBookLimits, OrderDisplay, OrderType, PublicDepthImbalance, SelfTradePrevention,
-    StopActivation, StopReference, TimeInForce, Trade, TradingStateControlAction,
-    TradingStateSnapshot,
+    OrderBook, OrderBookLimits, OrderDisplay, OrderType, PublicDepthImbalance,
+    PublicLevelObservation, SelfTradePrevention, StopActivation, StopReference, TimeInForce, Trade,
+    TradingStateControlAction, TradingStateSnapshot,
 };
 
 mod replay;
@@ -3038,7 +3038,10 @@ impl MarketDataPublisher {
         let mut diverged = false;
         for &(side, price) in self.affected_levels.keys() {
             let published = self.level(side, price);
-            if published != book.level(side, price) {
+            if !matches!(
+                book.try_public_level(side, price),
+                Ok(observation) if published == observation.level()
+            ) {
                 diverged = true;
                 break;
             }
@@ -3347,6 +3350,53 @@ impl MarketDataReplica {
             self.raw_best_ask(),
         )
         .map_err(|_| MarketDataError::SourceDivergence("replica best bid and offer are invalid"))
+    }
+
+    /// Returns one exact-price displayed public-level observation.
+    ///
+    /// The fixed-size result binds present or absent public liquidity to side,
+    /// exact price, replica instrument, immutable definition version, and final
+    /// applied source sequence. The coherent-state gate and exact lookup cost
+    /// `O(log(P + 1))` time and `O(1)` space without allocation or mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketDataError::Poisoned`] while snapshot repair is required,
+    /// or [`MarketDataError::SourceDivergence`] if public extrema are invalid
+    /// or locked/crossed, or the exact selected aggregate is invalid.
+    pub fn try_public_level(
+        &self,
+        side: Side,
+        price: Price,
+    ) -> Result<PublicLevelObservation, MarketDataError> {
+        self.try_observation_state()?;
+        let level = self
+            .levels(side)
+            .get(&price)
+            .copied()
+            .map(|level| Self::level_snapshot(price, level));
+        PublicLevelObservation::try_new(
+            self.instrument_id,
+            self.instrument_version,
+            self.last_sequence,
+            side,
+            price,
+            level,
+        )
+        .map_err(|_| MarketDataError::SourceDivergence("replica public level is invalid"))
+    }
+
+    /// Returns exact-price public state using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica is poisoned or public state is incoherent. Use
+    /// [`Self::try_public_level`] when failure must remain typed.
+    #[must_use]
+    pub fn level(&self, side: Side, price: Price) -> Option<LevelSnapshot> {
+        self.try_public_level(side, price)
+            .expect("market-data replica public level is not queryable")
+            .level()
     }
 
     /// Returns exact top-N displayed public-depth imbalance.
@@ -3670,7 +3720,7 @@ impl MarketDataReplica {
     }
 
     fn validate_depth_level(level: LevelSnapshot) -> Result<LevelSnapshot, MarketDataError> {
-        if level.quantity == 0 || level.order_count == 0 {
+        if !level.has_valid_public_aggregate() {
             return Err(MarketDataError::SourceDivergence(
                 "replica depth contains invalid aggregates",
             ));
@@ -4481,6 +4531,10 @@ mod resource_limit_tests {
         assert_eq!(poisoned.try_best_bid(), Err(MarketDataError::Poisoned));
         assert_eq!(poisoned.try_best_ask(), Err(MarketDataError::Poisoned));
         assert_eq!(poisoned.try_trading_state(), Err(MarketDataError::Poisoned));
+        assert_eq!(
+            poisoned.try_public_level(Side::Buy, Price::from_raw(100)),
+            Err(MarketDataError::Poisoned)
+        );
     }
 
     #[test]
@@ -4536,6 +4590,12 @@ mod resource_limit_tests {
                 "replica best bid and offer are invalid"
             ))
         );
+        assert_eq!(
+            invalid.try_public_level(Side::Buy, Price::from_raw(100)),
+            Err(MarketDataError::SourceDivergence(
+                "replica best bid and offer are invalid"
+            ))
+        );
 
         let mut crossed = replica();
         for side in [Side::Buy, Side::Sell] {
@@ -4565,6 +4625,12 @@ mod resource_limit_tests {
         ));
         assert_eq!(
             crossed.try_trading_state(),
+            Err(MarketDataError::SourceDivergence(
+                "replica best bid and offer are invalid"
+            ))
+        );
+        assert_eq!(
+            crossed.try_public_level(Side::Buy, Price::from_raw(80)),
             Err(MarketDataError::SourceDivergence(
                 "replica best bid and offer are invalid"
             ))
@@ -4666,6 +4732,38 @@ mod resource_limit_tests {
             overflowing.try_depth_range_summary(Side::Buy, full_range),
             Err(MarketDataError::SourceDivergence(
                 "replica depth summary encountered invalid aggregates"
+            ))
+        );
+    }
+
+    #[test]
+    fn replica_public_level_rejects_only_selected_non_extremum_corruption() {
+        let mut invalid_non_best = replica();
+        for (price, quantity) in [(100, 1), (90, 0)] {
+            invalid_non_best.bids.insert(
+                Price::from_raw(price),
+                Aggregate {
+                    quantity,
+                    order_count: 1,
+                },
+            );
+        }
+        assert!(
+            invalid_non_best
+                .try_public_level(Side::Buy, Price::from_raw(100))
+                .is_ok()
+        );
+        assert_eq!(
+            invalid_non_best
+                .try_public_level(Side::Buy, Price::from_raw(80))
+                .unwrap()
+                .level(),
+            None
+        );
+        assert_eq!(
+            invalid_non_best.try_public_level(Side::Buy, Price::from_raw(90)),
+            Err(MarketDataError::SourceDivergence(
+                "replica public level is invalid"
             ))
         );
     }

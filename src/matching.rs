@@ -1529,6 +1529,100 @@ pub struct LevelSnapshot {
     pub order_count: u64,
 }
 
+impl LevelSnapshot {
+    pub(crate) const fn has_valid_public_aggregate(self) -> bool {
+        self.quantity != 0 && self.order_count != 0
+    }
+}
+
+/// One exact-price displayed public-level observation.
+///
+/// The optional level distinguishes displayed occupancy from absence at the
+/// exact instrument, immutable definition version, and book event sequence.
+/// Fully hidden-only liquidity is represented as absence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublicLevelObservation {
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    book_event_sequence: u64,
+    side: Side,
+    price: Price,
+    level: Option<LevelSnapshot>,
+}
+
+impl PublicLevelObservation {
+    pub(crate) fn try_new(
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        book_event_sequence: u64,
+        side: Side,
+        price: Price,
+        level: Option<LevelSnapshot>,
+    ) -> Result<Self, InvariantViolation> {
+        if let Some(level) = level {
+            if level.price != price {
+                return Err(InvariantViolation::new(format!(
+                    "public {side:?} level key {} differs from snapshot price {}",
+                    price.raw(),
+                    level.price.raw()
+                )));
+            }
+            if !level.has_valid_public_aggregate() {
+                return Err(InvariantViolation::new(format!(
+                    "public {side:?} level at {} has a zero aggregate or order count",
+                    price.raw()
+                )));
+            }
+        }
+        Ok(Self {
+            instrument_id,
+            instrument_version,
+            book_event_sequence,
+            side,
+            price,
+            level,
+        })
+    }
+
+    /// Returns the observed instrument.
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version observed.
+    #[must_use]
+    pub const fn instrument_version(self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the final source event sequence observed.
+    #[must_use]
+    pub const fn book_event_sequence(self) -> u64 {
+        self.book_event_sequence
+    }
+
+    /// Returns the queried side.
+    #[must_use]
+    pub const fn side(self) -> Side {
+        self.side
+    }
+
+    /// Returns the exact queried price.
+    #[must_use]
+    pub const fn price(self) -> Price {
+        self.price
+    }
+
+    /// Returns displayed aggregate state at the exact key.
+    ///
+    /// `None` denotes no displayed liquidity, including a hidden-only price.
+    #[must_use]
+    pub const fn level(self) -> Option<LevelSnapshot> {
+        self.level
+    }
+}
+
 /// Coherent public best bid and offer from one immutable book state.
 ///
 /// Both sides carry only displayed aggregate liquidity. Instrument identity,
@@ -1552,7 +1646,7 @@ impl BestBidOffer {
         offer: Option<LevelSnapshot>,
     ) -> Result<Self, InvariantViolation> {
         for (side, level) in [(Side::Buy, bid), (Side::Sell, offer)] {
-            if level.is_some_and(|level| level.quantity == 0 || level.order_count == 0) {
+            if level.is_some_and(|level| !level.has_valid_public_aggregate()) {
                 return Err(InvariantViolation::new(format!(
                     "cached public {side:?} best has a zero aggregate or order count"
                 )));
@@ -1655,7 +1749,7 @@ impl DepthAggregateTotals {
     }
 
     fn try_include(&mut self, level: LevelSnapshot) -> Result<(), InvariantViolation> {
-        if level.quantity == 0 || level.order_count == 0 {
+        if !level.has_valid_public_aggregate() {
             return Err(InvariantViolation::new(format!(
                 "public depth level at {} has a zero aggregate or order count",
                 level.price.raw()
@@ -2077,7 +2171,7 @@ impl DisplayedLiquidityQuote {
         let mut totals = ExecutionQuoteTotals::new(request.quantity.lots());
         let mut contributing_level_count = 0_usize;
         for level in depth {
-            if level.quantity == 0 || level.order_count == 0 {
+            if !level.has_valid_public_aggregate() {
                 return Err(InvariantViolation::new(format!(
                     "public depth level at {} has a zero aggregate or order count",
                     level.price.raw()
@@ -5299,6 +5393,20 @@ impl PriceLevels {
         self.by_price.get(&price)
     }
 
+    fn try_public_level(&self, price: Price) -> Result<Option<PriceLevel>, InvariantViolation> {
+        let level = self.by_price.get(&price).copied();
+        let indexed = self.visible_by_price.get(&price).is_some();
+        let visibly_occupied = level.is_some_and(|level| level.total_quantity != 0);
+        if indexed != visibly_occupied {
+            return Err(InvariantViolation::new(format!(
+                "{:?} public-price membership at {} differs from its visible aggregate",
+                self.side,
+                price.raw()
+            )));
+        }
+        Ok(level.filter(|level| level.total_quantity != 0 || level.visible_order_count != 0))
+    }
+
     fn iter(&self) -> impl DoubleEndedIterator<Item = (&Price, &PriceLevel)> + ExactSizeIterator {
         self.by_price.iter()
     }
@@ -7693,6 +7801,40 @@ impl OrderBook {
         )
     }
 
+    /// Returns one exact-price displayed public-level observation.
+    ///
+    /// The fixed-size result binds present or absent displayed liquidity to
+    /// side, exact price, instrument, immutable definition version, and final
+    /// book event sequence. Fully hidden-only prices are absent. The coherent
+    /// public-extrema check is `O(1)` and exact AVL lookup is
+    /// `O(log(P + 1))`; the successful path uses `O(1)` space without
+    /// allocation or mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] if public extrema are invalid or locked/
+    /// crossed, or the exact selected public row has a zero aggregate/count or
+    /// contradicts its requested key.
+    pub fn try_public_level(
+        &self,
+        side: Side,
+        price: Price,
+    ) -> Result<PublicLevelObservation, InvariantViolation> {
+        self.try_best_bid_offer()?;
+        let level = self
+            .levels(side)
+            .try_public_level(price)?
+            .map(|level| Self::level_snapshot(price, &level));
+        PublicLevelObservation::try_new(
+            self.definition.instrument_id(),
+            self.definition.version(),
+            self.last_event_sequence(),
+            side,
+            price,
+            level,
+        )
+    }
+
     /// Returns exact top-N displayed public-depth imbalance.
     ///
     /// The same visible-level limit is applied independently to bids and asks
@@ -7996,12 +8138,16 @@ impl OrderBook {
 
     /// Returns one public aggregate level, or `None` when the price has no
     /// displayed liquidity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if coherent public extrema or the selected aggregate are
+    /// invalid. Use [`Self::try_public_level`] when failure must remain typed.
     #[must_use]
     pub fn level(&self, side: Side, price: Price) -> Option<LevelSnapshot> {
-        self.levels(side)
-            .get(price)
-            .filter(|level| level.total_quantity != 0)
-            .map(|level| Self::level_snapshot(price, level))
+        self.try_public_level(side, price)
+            .expect("order-book public level is not queryable")
+            .level()
     }
 
     /// Validates and iterates private resting orders at one price.
@@ -11426,11 +11572,11 @@ mod price_level_index_tests {
         BuyStopKey, Command, CommandOutcome, CommandPreparation, DisplayedLiquidityQuote,
         DisplayedLiquidityRequest, DisplayedLiquidityTermination, EventTraceBuilder,
         ImmediateExecutionQuote, ImmediateExecutionRequest, ImmediateExecutionTermination,
-        IncomingPreview, InvariantViolation, MassCancel, MassCancelScope, MatchingCapacity,
-        MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsSpec,
+        IncomingPreview, InvariantViolation, LevelSnapshot, MassCancel, MassCancelScope,
+        MatchingCapacity, MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsSpec,
         OrderBookQueryError, OrderDisplay, OrderQueueClass, OrderSelectionPool, OrderType,
-        PriceLevel, PriceLevels, RejectReason, ReplaceOrder, RestingOrder, SelfTradePrevention,
-        StopActivation, TimeInForce, try_event_arena,
+        PriceLevel, PriceLevels, PublicLevelObservation, RejectReason, ReplaceOrder, RestingOrder,
+        SelfTradePrevention, StopActivation, TimeInForce, try_event_arena,
     };
     use crate::instrument::{
         InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -12164,6 +12310,78 @@ mod price_level_index_tests {
                 .detail()
                 .contains("combined public depth quantity exceeds u128")
         );
+    }
+
+    #[test]
+    fn public_level_observation_rejects_target_and_extrema_corruption() {
+        let error = PublicLevelObservation::try_new(
+            InstrumentId::new(1).unwrap(),
+            InstrumentVersion::new(1).unwrap(),
+            0,
+            Side::Buy,
+            Price::from_raw(100),
+            Some(LevelSnapshot {
+                price: Price::from_raw(101),
+                quantity: 1,
+                order_count: 1,
+            }),
+        )
+        .unwrap_err();
+        assert!(error.detail().contains("differs from snapshot price"));
+
+        let mut book = OrderBook::new(reserve_definition());
+        book.bids.insert(Price::from_raw(100), level(1));
+        book.bids.insert(Price::from_raw(90), level(2));
+        book.asks.insert(Price::from_raw(120), level(3));
+
+        book.bids.visible_by_price.remove(&Price::from_raw(100));
+        let error = book
+            .try_public_level(Side::Buy, Price::from_raw(100))
+            .unwrap_err();
+        assert!(error.detail().contains("public-price membership"));
+        book.bids.visible_by_price.insert(Price::from_raw(100), ());
+
+        book.bids
+            .update(Price::from_raw(90), |level| {
+                level.visible_order_count = 0;
+            })
+            .unwrap();
+        assert!(
+            book.try_public_level(Side::Buy, Price::from_raw(100))
+                .is_ok()
+        );
+        assert_eq!(
+            book.try_public_level(Side::Buy, Price::from_raw(80))
+                .unwrap()
+                .level(),
+            None
+        );
+        let error = book
+            .try_public_level(Side::Buy, Price::from_raw(90))
+            .unwrap_err();
+        assert!(error.detail().contains("zero aggregate or order count"));
+
+        book.bids
+            .update(Price::from_raw(90), |level| {
+                level.total_quantity = 0;
+            })
+            .unwrap();
+        assert_eq!(
+            book.try_public_level(Side::Buy, Price::from_raw(90))
+                .unwrap()
+                .level(),
+            None
+        );
+
+        book.asks
+            .update(Price::from_raw(120), |level| {
+                level.visible_order_count = 0;
+            })
+            .unwrap();
+        let error = book
+            .try_public_level(Side::Buy, Price::from_raw(80))
+            .unwrap_err();
+        assert!(error.detail().contains("zero aggregate or order count"));
     }
 
     #[test]

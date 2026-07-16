@@ -7,8 +7,8 @@ use quotick::matching::{
     DisplayedLiquidityTermination, EventKind, ImmediateExecutionRequest,
     ImmediateExecutionTermination, MassCancelScope, MatchingHashIndex, NewOrder, OrderBook,
     OrderBookQueryError, OrderBookQueryResource, OrderDisplay, OrderQueueClass, OrderType,
-    PriceLevelOrders, PublicDepthImbalance, RejectReason, SelfTradePrevention, StopActivation,
-    TimeInForce,
+    PriceLevelOrders, PublicDepthImbalance, PublicLevelObservation, RejectReason,
+    SelfTradePrevention, StopActivation, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -753,6 +753,72 @@ fn best_bid_offer_is_coherent_provenanced_and_exact_at_signed_extremes() {
     assert_eq!(widest.spread_raw(), Some(u64::MAX));
     assert_eq!(widest.midpoint_raw_numerator(), Some(-1));
     extreme.validate().unwrap();
+}
+
+#[test]
+fn public_level_observations_bind_exact_present_and_absent_state() {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<PublicLevelObservation>();
+
+    let book = populated_book();
+    let before_commands = book.retained_command_count();
+    let present = book
+        .try_public_level(Side::Buy, Price::from_raw(100))
+        .unwrap();
+    assert_eq!(present.instrument_id(), InstrumentId::new(1).unwrap());
+    assert_eq!(
+        present.instrument_version(),
+        InstrumentVersion::new(1).unwrap()
+    );
+    assert_eq!(present.book_event_sequence(), book.last_event_sequence());
+    assert_eq!(present.side(), Side::Buy);
+    assert_eq!(present.price(), Price::from_raw(100));
+    assert_eq!(present.level(), book.level(Side::Buy, Price::from_raw(100)));
+    assert_eq!(present.level().unwrap().quantity, 5);
+    assert_eq!(present.level().unwrap().order_count, 1);
+
+    let hidden_only = book
+        .try_public_level(Side::Buy, Price::from_raw(110))
+        .unwrap();
+    assert_eq!(hidden_only.level(), None);
+    assert_eq!(hidden_only.price(), Price::from_raw(110));
+    let wrong_side = book
+        .try_public_level(Side::Sell, Price::from_raw(100))
+        .unwrap();
+    assert_eq!(wrong_side.level(), None);
+    let unoccupied = book
+        .try_public_level(Side::Buy, Price::from_raw(-17))
+        .unwrap();
+    assert_eq!(unoccupied.level(), None);
+    let outside_collar = book
+        .try_public_level(Side::Buy, Price::from_raw(2_000))
+        .unwrap();
+    assert_eq!(outside_collar.level(), None);
+
+    let reserve_book = execution_quote_book();
+    let reserve = reserve_book
+        .try_public_level(Side::Sell, Price::from_raw(100))
+        .unwrap()
+        .level()
+        .unwrap();
+    assert_eq!(reserve.quantity, 5);
+    assert_eq!(reserve.order_count, 2);
+
+    let restored = OrderBook::from_checkpoint(&book.checkpoint(1, 11).unwrap()).unwrap();
+    assert_eq!(
+        restored
+            .try_public_level(Side::Buy, Price::from_raw(100))
+            .unwrap(),
+        present
+    );
+    assert_eq!(
+        restored
+            .try_public_level(Side::Buy, Price::from_raw(110))
+            .unwrap(),
+        hidden_only
+    );
+    assert_eq!(book.retained_command_count(), before_commands);
+    book.validate().unwrap();
 }
 
 #[test]

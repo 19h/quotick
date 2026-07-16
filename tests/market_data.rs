@@ -221,6 +221,24 @@ fn assert_mirrors(book: &OrderBook, replica: &MarketDataReplica) {
     );
     assert_eq!(replica.try_best_bid().unwrap(), book.best_bid());
     assert_eq!(replica.try_best_ask().unwrap(), book.best_ask());
+    for side in [Side::Buy, Side::Sell] {
+        for raw_price in [-1_000, -100, 0, 90, 100, 120, 1_000] {
+            let price = Price::from_raw(raw_price);
+            assert_eq!(
+                replica.try_public_level(side, price).unwrap(),
+                book.try_public_level(side, price).unwrap()
+            );
+            assert_eq!(replica.level(side, price), book.level(side, price));
+        }
+    }
+    for level in [book.best_bid(), book.best_ask()].into_iter().flatten() {
+        for side in [Side::Buy, Side::Sell] {
+            assert_eq!(
+                replica.try_public_level(side, level.price).unwrap(),
+                book.try_public_level(side, level.price).unwrap()
+            );
+        }
+    }
     for level_limit in [0, 1, usize::MAX] {
         assert_eq!(
             replica.try_public_depth_imbalance(level_limit).unwrap(),
@@ -1212,6 +1230,10 @@ fn replica_rejects_a_trade_that_does_not_reconcile_to_the_maker_level() {
     ));
     assert_eq!(replica.try_best_ask(), Err(MarketDataError::Poisoned));
     assert_eq!(replica.try_trading_state(), Err(MarketDataError::Poisoned));
+    assert_eq!(
+        replica.try_public_level(Side::Sell, Price::from_raw(100)),
+        Err(MarketDataError::Poisoned)
+    );
     assert_eq!(
         replica.try_public_depth_imbalance(usize::MAX),
         Err(MarketDataError::Poisoned)
