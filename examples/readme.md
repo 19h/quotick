@@ -9,7 +9,7 @@ services, and print a compact result only after their cross-checks succeed.
 | [`venue_session.rs`](venue_session.rs) | `calendar`, `risk`, `matching`, `market_data`, and `ledger` |
 | [`versioned_universe.rs`](versioned_universe.rs) | `instrument` effective-time histories and version-bound matching |
 | [`order_lifecycle.rs`](order_lifecycle.rs) | Reserve, hidden, sourced stop-reference, GTD, account-control, and trading-state transitions |
-| [`indicative_cross.rs`](indicative_cross.rs) | `auction_engine`, `auction_risk`, and `auction_market_data` |
+| [`indicative_cross.rs`](indicative_cross.rs) | `auction_engine`, `auction_risk`, `auction_market_data`, and complete-batch replay |
 | [`signed_price_discovery.rs`](signed_price_discovery.rs) | Signed-price auction discovery and price-time allocation kernels |
 | [`feed_repair.rs`](feed_repair.rs) | Continuous market-data publication, retained short-gap replay, and snapshot fallback |
 | [`clearing_ledger.rs`](clearing_ledger.rs) | Batches, DVP settlement, corrections, period controls, and reconciliation |

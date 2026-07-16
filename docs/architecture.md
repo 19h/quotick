@@ -1411,6 +1411,29 @@ replica contract.
     sides; the prior active image becomes the next reusable standby allocation.
     Process-local limits and allocation telemetry are absent from version-1
     payload bytes.
+16. A separate `CallAuctionMarketDataReplayBuffer` may retain one exact bounded
+    suffix before snapshot recovery.
+    - Construction binds one instrument/version, one already-published event
+      sequence, and a positive retained-update maximum. Every slot is reserved
+      before the buffer exists and no admission or query grows storage.
+    - Non-replayed batch admission proves identity, internal continuity,
+      retained overlap, capacity, content, and exact batch boundaries before
+      overwriting a slot. Exact retained duplicates are no-ops.
+    - `replay_batches_after` accepts only an exclusive cursor at a complete
+      batch boundary and a positive update limit. It returns zero-copy complete
+      batches in source order across physical wrap and never splits an uncross
+      trace. A cursor inside a batch, an oversized next batch, a future cursor,
+      and an evicted required sequence are distinct typed failures.
+    - `CallAuctionMarketDataReplica::apply_replay_batch` uses the same identity,
+      gap, level-capacity, transition, poisoning, and command-counter path as
+      live batch application. Replay therefore advances event and command
+      boundaries together.
+17. For replay capacity `N`, construction initializes `N` typed slots in
+    `O(N)` time. Admission of an `E`-update batch is `O(E)` and allocation-free.
+    Successful page selection and iteration are each `O(R)` for `R` returned
+    updates with `O(1)` iterator state; an unavailable partial-oldest-batch
+    diagnostic can scan `O(N)` retained slots. The ring is volatile and changes
+    no version-1 payload byte or external transport boundary.
 
 ## Journal and recovery invariants
 
@@ -1607,8 +1630,9 @@ operations.
 
 Matching state, risk reservations/positions, and ledger balances
 can be reconstructed from verified local WALs. Public depth can bootstrap from
-that recovered matching state; consumers repair an incremental gap with a
-newer full-depth snapshot.
+that recovered matching state; consumers first repair an incremental gap from
+the applicable bounded local replay ring, then use a newer full-depth snapshot
+when the required suffix or complete auction batch is unavailable.
 
 Forced-process-termination, concurrent-writer,
 abandoned/malformed-lease, injected-write/barrier, exact-boundary/batch rotation,
@@ -1739,11 +1763,17 @@ snapshot atomically; recover through the preallocated standby image; and run
 bucket, and scratch allocations remain fixed. Unit corruption tests deliberately
 discard active-arena and batch-scratch reservations and require the invariant
 auditor to reject both layouts.
-Replay tests reject zero/unrepresentable capacities, identity/version drift,
+Continuous replay tests reject zero/unrepresentable capacities, identity/version drift,
 gaps, collisions, evicted overlap, future/zero-limit queries, and oversized
 batches without mutation; prove exact retry, recovered boundaries, pagination,
 10,000 allocation-stable wraps, and `u64::MAX`; and reconstruct a skipped
 replica suffix before exercising snapshot fallback beyond retention.
+
+Call-auction replay tests additionally preserve command boundaries across
+pagination and ring wrap, refuse to split a multi-update uncross batch, reject
+an inside-batch cursor and an undersized page, expose partial-oldest-batch
+eviction, and reconstruct event sequence, command sequence, and crossed depth
+without a snapshot.
 
 Call-auction market-data capacity tests apply the equivalent source-envelope,
 constructor-failure, full-replica, oversized-batch, and double-buffered snapshot
@@ -1944,7 +1974,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Clearing lifecycle | novation/allocation, fees, settlement dates, fails, corrections, busts, and reconciliation |
 | High | Security boundary | authenticated principals, authorization policy, secret management, audit export, and abuse controls |
 | Medium | Gateways and schemas | versioned binary protocol, FIX adapter, backpressure, session recovery, and conformance fixtures |
-| Medium | Market-data distribution | constructor-reserved per-instrument short-gap replay with typed gap/collision/eviction handling and snapshot fallback is implemented; remaining work is authenticated transport framing, entitlement, fanout, remote retransmission sessions, bandwidth control, and conformance fixtures |
+| Medium | Market-data distribution | constructor-reserved per-instrument short-gap replay for continuous updates and complete call-auction command batches, with typed gap/collision/eviction/boundary handling and snapshot fallback, is implemented; remaining work is authenticated transport framing, entitlement, fanout, remote retransmission sessions, bandwidth control, and conformance fixtures |
 | Medium | Operations | metrics, traces, structured logs, health, capacity limits, alert rules, and runbooks |
 | Medium | Performance evidence | pinned-hardware benchmarks, allocation counts, tail latency, saturation, and regression thresholds |
 | Medium | Verification expansion | model-based/property tests, fuzzing, crash simulation, concurrency model checking, and long soak tests |

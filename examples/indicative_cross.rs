@@ -14,7 +14,7 @@ use quotick::auction_engine::{
 };
 use quotick::auction_market_data::{
     CallAuctionMarketDataBatch, CallAuctionMarketDataLimits, CallAuctionMarketDataPublisher,
-    CallAuctionMarketDataReplica,
+    CallAuctionMarketDataReplayBuffer, CallAuctionMarketDataReplica,
 };
 use quotick::auction_risk::CallAuctionRiskManagedEngine;
 use quotick::{AuctionId, CommandId, OrderId, Price, Quantity, Side};
@@ -74,12 +74,14 @@ fn execute(
     managed: &mut CallAuctionRiskManagedEngine,
     publisher: &mut CallAuctionMarketDataPublisher,
     replica: &mut CallAuctionMarketDataReplica,
+    replay: &mut CallAuctionMarketDataReplayBuffer,
     command: CallAuctionCommand,
 ) -> (CallAuctionExecutionReport, CallAuctionMarketDataBatch) {
     let report = managed.submit(command).unwrap();
     let batch = publisher
         .publish(command, &report, managed.engine())
         .unwrap();
+    replay.push_batch(&batch).unwrap();
     replica.apply_batch(&batch).unwrap();
     (report, batch)
 }
@@ -106,12 +108,21 @@ fn main() {
     let replica_limits = CallAuctionMarketDataLimits::from_engine(managed.engine().limits()).spec();
     let mut replica =
         CallAuctionMarketDataReplica::try_with_limits(definition, replica_limits).unwrap();
-    replica.apply_snapshot(&publisher.snapshot()).unwrap();
+    let initial = publisher.snapshot();
+    replica.apply_snapshot(&initial).unwrap();
+    let mut replay = CallAuctionMarketDataReplayBuffer::try_new(
+        definition.instrument_id(),
+        definition.version(),
+        initial.as_of_sequence(),
+        replica_limits.max_batch_updates,
+    )
+    .unwrap();
 
     execute(
         &mut managed,
         &mut publisher,
         &mut replica,
+        &mut replay,
         phase(definition, 1, auction_id, 0, CallAuctionPhase::Collecting),
     );
     for command in [
@@ -156,13 +167,20 @@ fn main() {
             8,
         ),
     ] {
-        execute(&mut managed, &mut publisher, &mut replica, command);
+        execute(
+            &mut managed,
+            &mut publisher,
+            &mut replica,
+            &mut replay,
+            command,
+        );
     }
 
     let (risk_rejection, _) = execute(
         &mut managed,
         &mut publisher,
         &mut replica,
+        &mut replay,
         order(
             definition,
             6,
@@ -183,6 +201,7 @@ fn main() {
         &mut managed,
         &mut publisher,
         &mut replica,
+        &mut replay,
         phase(definition, 7, auction_id, 1, CallAuctionPhase::Frozen),
     );
     let uncross = CallAuctionCommand::Uncross(CallAuctionUncrossCommand {
@@ -200,7 +219,13 @@ fn main() {
         ),
         received_at: timestamp(8),
     });
-    let (report, _) = execute(&mut managed, &mut publisher, &mut replica, uncross);
+    let (report, _) = execute(
+        &mut managed,
+        &mut publisher,
+        &mut replica,
+        &mut replay,
+        uncross,
+    );
 
     let trades: Vec<_> = report
         .events
@@ -280,11 +305,38 @@ fn main() {
     publisher.validate_against(managed.engine()).unwrap();
     replica.validate().unwrap();
 
+    let replay_page = replay
+        .replay_batches_after(initial.as_of_sequence(), replay.maximum_updates())
+        .unwrap();
+    let replayed_batches = replay_page.len();
+    let mut repaired =
+        CallAuctionMarketDataReplica::try_with_limits(definition, replica_limits).unwrap();
+    repaired.apply_snapshot(&initial).unwrap();
+    for batch in replay_page {
+        repaired.apply_replay_batch(&batch).unwrap();
+    }
+    assert_eq!(repaired.last_sequence(), replica.last_sequence());
+    assert_eq!(
+        repaired.last_command_sequence(),
+        replica.last_command_sequence()
+    );
+    assert_eq!(
+        repaired.limit_depth(Side::Buy, usize::MAX),
+        replica.limit_depth(Side::Buy, usize::MAX)
+    );
+    assert_eq!(
+        repaired.limit_depth(Side::Sell, usize::MAX),
+        replica.limit_depth(Side::Sell, usize::MAX)
+    );
+    replay.validate().unwrap();
+    repaired.validate().unwrap();
+
     println!(
-        "clearing_price={} executed_lots={} trade_pairs={} retained_orders={}",
+        "clearing_price={} executed_lots={} trade_pairs={} retained_orders={} replayed_batches={}",
         clearing.price().raw(),
         clearing.executable_quantity(),
         trades.len(),
-        managed.engine().book().active_order_count()
+        managed.engine().book().active_order_count(),
+        replayed_batches
     );
 }

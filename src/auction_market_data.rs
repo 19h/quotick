@@ -30,6 +30,17 @@ use crate::domain::{
 };
 use crate::indexed_avl::IndexedAvlMap;
 use crate::instrument::InstrumentDefinition;
+pub use crate::market_data::{CallAuctionMarketDataReplay, CallAuctionMarketDataReplayBatch};
+
+/// Failure before a call-auction replay buffer owns usable storage.
+pub type CallAuctionMarketDataReplayConstructionError =
+    crate::market_data::MarketDataReplayConstructionError;
+
+/// Deterministic call-auction replay admission or range-query failure.
+pub type CallAuctionMarketDataReplayError = crate::market_data::MarketDataReplayError;
+
+/// Allocation and retained-range telemetry for one call-auction replay ring.
+pub type CallAuctionMarketDataReplayStatus = crate::market_data::MarketDataReplayStatus;
 
 type AuctionDepthMap = IndexedAvlMap<Price, Aggregate>;
 
@@ -589,6 +600,107 @@ impl CallAuctionMarketDataBatch {
     #[must_use]
     pub fn last_sequence(&self) -> Option<u64> {
         self.updates.last().map(|update| update.sequence)
+    }
+}
+
+/// Fixed-capacity, batch-preserving retransmission storage for one auction.
+#[derive(Debug)]
+pub struct CallAuctionMarketDataReplayBuffer {
+    inner: crate::market_data::SequencedMarketDataReplayBuffer<CallAuctionMarketDataUpdate>,
+}
+
+impl CallAuctionMarketDataReplayBuffer {
+    /// Constructs an empty replay window after an already-published boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionMarketDataReplayConstructionError`] before state
+    /// exists when `maximum_updates` is zero or ring storage cannot be reserved.
+    pub fn try_new(
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        initial_sequence: u64,
+        maximum_updates: usize,
+    ) -> Result<Self, CallAuctionMarketDataReplayConstructionError> {
+        Ok(Self {
+            inner: crate::market_data::SequencedMarketDataReplayBuffer::try_new(
+                instrument_id,
+                instrument_version,
+                initial_sequence,
+                maximum_updates,
+            )?,
+        })
+    }
+
+    /// Returns this ring's immutable identity and allocation telemetry.
+    #[must_use]
+    pub fn status(&self) -> CallAuctionMarketDataReplayStatus {
+        self.inner.status()
+    }
+
+    /// Returns the first retained sequence, including a partial oldest batch.
+    #[must_use]
+    pub fn earliest_sequence(&self) -> Option<u64> {
+        self.inner.earliest_sequence()
+    }
+
+    /// Returns the latest published sequence observed by the ring.
+    #[must_use]
+    pub const fn latest_sequence(&self) -> u64 {
+        self.inner.latest_sequence()
+    }
+
+    /// Returns the number of retained updates.
+    #[must_use]
+    pub const fn retained_len(&self) -> usize {
+        self.inner.retained_len()
+    }
+
+    /// Returns the fixed semantic retained-update maximum.
+    #[must_use]
+    pub fn maximum_updates(&self) -> usize {
+        self.inner.maximum_updates()
+    }
+
+    /// Atomically admits one auction publisher command batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionMarketDataReplayError`] before mutation for invalid
+    /// shape, identity drift, capacity, gaps, collisions, or evicted overlap.
+    pub fn push_batch(
+        &mut self,
+        batch: &CallAuctionMarketDataBatch,
+    ) -> Result<usize, CallAuctionMarketDataReplayError> {
+        self.inner.push_auction_batch(batch)
+    }
+
+    /// Returns complete batches strictly after `after_sequence` without copy.
+    ///
+    /// `maximum_updates` bounds total updates and never splits a batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionMarketDataReplayError`] for an invalid limit,
+    /// unavailable or non-boundary cursor, future cursor, or oversized next
+    /// batch.
+    pub fn replay_batches_after(
+        &self,
+        after_sequence: u64,
+        maximum_updates: usize,
+    ) -> Result<CallAuctionMarketDataReplay<'_>, CallAuctionMarketDataReplayError> {
+        self.inner
+            .replay_auction_batches_after(after_sequence, maximum_updates)
+    }
+
+    /// Audits allocation, occupancy, identity, sequences, and batch boundaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionMarketDataReplayError::CorruptState`] on the first
+    /// internal contradiction.
+    pub fn validate(&self) -> Result<(), CallAuctionMarketDataReplayError> {
+        self.inner.validate()
     }
 }
 
@@ -2089,44 +2201,28 @@ impl CallAuctionMarketDataReplica {
                 "non-replayed auction batch is empty",
             ));
         }
-        if batch.updates.len() > self.limits.max_batch_updates() {
-            return Err(CallAuctionMarketDataError::CapacityExceeded {
-                resource: CallAuctionMarketDataResource::BatchUpdates,
-                maximum: self.limits.max_batch_updates(),
-                attempted: batch.updates.len(),
-            });
+        self.apply_complete_batch(batch.updates.iter().copied())
+    }
+
+    /// Applies one complete zero-copy batch returned by retained replay.
+    ///
+    /// The same identity, continuity, capacity, transition, poisoning, and
+    /// command-boundary rules as [`Self::apply_batch`] apply. The replay view is
+    /// reusable because this method iterates an independent clone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionMarketDataError`] for gaps, identity mismatch,
+    /// capacity exhaustion, or an invalid transition. A structural failure
+    /// after mutation poisons the replica.
+    pub fn apply_replay_batch(
+        &mut self,
+        batch: &CallAuctionMarketDataReplayBatch<'_>,
+    ) -> Result<(), CallAuctionMarketDataError> {
+        if self.poisoned {
+            return Err(CallAuctionMarketDataError::Poisoned);
         }
-        let next_command_sequence = self
-            .last_command_sequence
-            .checked_add(1)
-            .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
-        let mut expected = self
-            .last_event_sequence
-            .checked_add(1)
-            .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
-        for (index, update) in batch.updates.iter().enumerate() {
-            self.preflight_identity(*update)?;
-            if update.sequence != expected {
-                return Err(CallAuctionMarketDataError::SequenceGap {
-                    expected,
-                    actual: update.sequence,
-                });
-            }
-            if index + 1 < batch.updates.len() {
-                expected = expected
-                    .checked_add(1)
-                    .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
-            }
-        }
-        self.preflight_batch_level_capacity(&batch.updates)?;
-        for update in &batch.updates {
-            if let Err(error) = self.apply_verified(*update) {
-                self.poisoned = true;
-                return Err(error);
-            }
-        }
-        self.last_command_sequence = next_command_sequence;
-        Ok(())
+        self.apply_complete_batch(batch.complete_iter())
     }
 
     /// Applies one decoded update without a command-boundary counter.
@@ -2154,7 +2250,7 @@ impl CallAuctionMarketDataReplica {
                 actual: update.sequence,
             });
         }
-        self.preflight_batch_level_capacity(std::slice::from_ref(&update))?;
+        self.preflight_batch_level_capacity(std::iter::once(update))?;
         if let Err(error) = self.apply_verified(update) {
             self.poisoned = true;
             return Err(error);
@@ -2635,10 +2731,63 @@ impl CallAuctionMarketDataReplica {
         Ok(())
     }
 
-    fn preflight_batch_level_capacity(
+    fn apply_complete_batch<I>(&mut self, updates: I) -> Result<(), CallAuctionMarketDataError>
+    where
+        I: Clone + ExactSizeIterator<Item = CallAuctionMarketDataUpdate>,
+    {
+        let update_count = updates.len();
+        if update_count == 0 {
+            return Err(CallAuctionMarketDataError::InvalidUpdate(
+                "complete auction batch is empty",
+            ));
+        }
+        if update_count > self.limits.max_batch_updates() {
+            return Err(CallAuctionMarketDataError::CapacityExceeded {
+                resource: CallAuctionMarketDataResource::BatchUpdates,
+                maximum: self.limits.max_batch_updates(),
+                attempted: update_count,
+            });
+        }
+        let next_command_sequence = self
+            .last_command_sequence
+            .checked_add(1)
+            .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
+        let mut expected = self
+            .last_event_sequence
+            .checked_add(1)
+            .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
+        for (index, update) in updates.clone().enumerate() {
+            self.preflight_identity(update)?;
+            if update.sequence != expected {
+                return Err(CallAuctionMarketDataError::SequenceGap {
+                    expected,
+                    actual: update.sequence,
+                });
+            }
+            if index + 1 < update_count {
+                expected = expected
+                    .checked_add(1)
+                    .ok_or(CallAuctionMarketDataError::ArithmeticOverflow)?;
+            }
+        }
+        self.preflight_batch_level_capacity(updates.clone())?;
+        for update in updates {
+            if let Err(error) = self.apply_verified(update) {
+                self.poisoned = true;
+                return Err(error);
+            }
+        }
+        self.last_command_sequence = next_command_sequence;
+        Ok(())
+    }
+
+    fn preflight_batch_level_capacity<I>(
         &mut self,
-        updates: &[CallAuctionMarketDataUpdate],
-    ) -> Result<(), CallAuctionMarketDataError> {
+        updates: I,
+    ) -> Result<(), CallAuctionMarketDataError>
+    where
+        I: IntoIterator<Item = CallAuctionMarketDataUpdate>,
+    {
         let result = preflight_replica_level_capacity(
             &mut self.batch_levels,
             &self.bids,
@@ -3097,11 +3246,11 @@ fn preflight_replica_level_capacity(
     bids: &AuctionDepthMap,
     asks: &AuctionDepthMap,
     maximum: usize,
-    updates: &[CallAuctionMarketDataUpdate],
+    updates: impl IntoIterator<Item = CallAuctionMarketDataUpdate>,
 ) -> Result<(), CallAuctionMarketDataError> {
     let mut bid_count = bids.len();
     let mut ask_count = asks.len();
-    for &update in updates {
+    for update in updates {
         for level in update_levels(update).into_iter().flatten() {
             let AuctionOrderConstraint::Limit(price) = level.constraint else {
                 continue;

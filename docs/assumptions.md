@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A107 are stable and are referenced from code comments and other
+identifiers A1-A108 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -3187,6 +3187,48 @@ snapshot recovery. Any partial mutation on failure, stale value returned,
 sequence reordering, allocation growth, duplicated depth grammar, changed
 version-3 payload byte, or recovery divergence falsifies A107.
 
+## A108 — bounded call-auction batch replay
+
+**Assumption.** One `CallAuctionMarketDataReplayBuffer` retains an exact finite
+suffix of the public A67 update stream for one instrument/version. Construction
+binds an already-published event sequence and a non-zero retained-update
+maximum `N`. Each admitted non-replayed command batch contains `E <= N`
+contiguous updates; its exact first and final positions are retained with every
+value. Exact overlap requires both value and boundary equality. Conflicting
+content or boundaries, gaps, identity/version drift, oversized batches, and
+unprovable evicted overlap fail before mutation.
+
+`replay_batches_after(s, L)` requires a positive update limit `L` and an
+exclusive cursor at a complete command-batch boundary. It returns only complete
+batches in source order, never splits a multi-update uncross trace, and reports
+a cursor inside a batch or a next batch larger than `L` distinctly. Update-wise
+eviction can leave an incomplete oldest batch; that partial batch is
+unavailable and the first later complete boundary is reported. The ring is
+process-local volatile state, not durable history, transport framing,
+authentication, entitlement, fanout, or a remote retransmission session.
+
+**Dependent results.** [A12, A23, A67, A108] Construction is `O(N)` time and
+typed slot space. Admission is `O(E)` time and allocation-free. Successful page
+selection and complete iteration are each `O(R)` for `R` returned updates and
+use `O(1)` iterator state; diagnosing a partial oldest batch can scan `O(N)`
+slots. `CallAuctionMarketDataReplica::apply_replay_batch` reuses the live batch
+identity, sequence, capacity, transition, poisoning, and command-counter path,
+so recovery advances event and command boundaries together. Snapshot fallback
+remains authoritative when a complete required batch is unavailable or the
+replica is poisoned. Version-1 payload bytes do not change.
+
+**Falsification probe.** Reject zero and unrepresentable capacities; admit
+single-update phase/order batches and a multi-update uncross; inject identity,
+version, sequence, content, boundary, capacity, and evicted-overlap faults;
+repeat exact batches; wrap the ring without allocation growth; paginate without
+splitting a batch; reject zero limits, future cursors, inside-batch cursors, and
+limits below the next batch. Evict only the first update of an uncross and
+require typed unavailability with the next complete boundary. Repair a skipped
+replica and compare source event sequence, command sequence, phase, revision,
+and both depth sides. Any partial mutation on failure, split batch, stale value,
+lost command boundary, allocation growth, duplicate transition grammar,
+changed version-1 payload byte, or recovery divergence falsifies A108.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -3213,13 +3255,15 @@ capability, a remaining risk, or an opportunity.
   monotonic epochs and proves command ownership across restart.
 - **Medium impact:** stable auction command/report traces now project to
   versioned anonymized phase, aggregate-depth, trade, final-clearing, and
-  snapshot payloads without account/order/command identity. Indicative
-  publication remains absent until authoritative reference, band, ranking, and
-  venue disclosure policy are carried explicitly.
+  snapshot payloads without account/order/command identity. A bounded local
+  replay ring now preserves complete command batches for short-gap repair.
+  Indicative publication remains absent until authoritative reference, band,
+  ranking, and venue disclosure policy are carried explicitly.
 - **High impact risk:** the auction payload layer has no authenticated framing,
-  entitlement, multicast/fanout, retransmission window, bandwidth control, or
-  externally qualified conformance fixtures. A local replica proves semantic
-  continuity, not remote sender identity or delivery availability.
+  entitlement, multicast/fanout, remote retransmission session, bandwidth
+  control, or externally qualified conformance fixtures. Its local replay ring
+  and replica prove semantic continuity, not remote sender identity or delivery
+  availability.
 - **High impact:** local command/event recovery, canonical-path writer exclusion,
   directory-entry synchronization, explicit abandoned-owner recovery, and
   deterministic storage-fault injection, automatic segment rotation, and
@@ -3296,8 +3340,9 @@ capability, a remaining risk, or an opportunity.
   idempotency, and protected terminal history. Stable auction wire schemas,
   semantic checkpoints, exact prefix proof, full-WAL plus cutover
   single/segmented recovery, aggregate-depth queries, and anonymized
-  phase/trade/final-clearing publication with gap-repair snapshots are
-  implemented. Reference/dynamic-band construction, indicative publication,
+  phase/trade/final-clearing publication with retained complete-batch replay
+  and gap-repair snapshots are implemented. Reference/dynamic-band
+  construction, indicative publication,
   auction display and pro-rata/size/venue allocation policies, preventive
   self-trade policies, auction-ledger integration, settlement, authenticated
   public/private transport, market-on-auction and imbalance-only order types,
@@ -3484,11 +3529,12 @@ capability, a remaining risk, or an opportunity.
   or transporting the token itself is outside the contract.
 - **Medium impact:** formal state-machine/model-based tests are required for the
   combinatorial interaction of TIF, replacement, and self-trade policies.
-- **Medium impact:** local level-2 incrementals, full-depth images, stable
-  payloads, gap detection, constructor-reserved per-instrument suffix replay,
-  typed eviction/collision handling, and snapshot fallback are implemented.
-  Authenticated network framing, entitlements, fanout, remote retransmission
-  sessions, and bandwidth controls remain outside the boundary.
+- **Medium impact:** local continuous and call-auction level-2 incrementals,
+  full-depth images, stable payloads, gap detection, constructor-reserved
+  per-instrument suffix replay, typed eviction/collision/batch-boundary
+  handling, and snapshot fallback are implemented. Authenticated network
+  framing, entitlements, fanout, remote retransmission sessions, and bandwidth
+  controls remain outside the boundary.
 - **Medium impact risk:** public refresh updates necessarily reveal that hidden
   leaves survived the preceding displayed-slice depletion; the final partial
   slice can also bound prior hidden quantity. Quantifying this information

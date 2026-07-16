@@ -224,7 +224,8 @@ fn recovered_boundary_accepts_individual_updates_and_rejects_unprovable_history(
 
     assert_eq!(replay.push(batches[1].updates()[0]).unwrap(), 1);
     assert_eq!(replay.push(batches[1].updates()[0]).unwrap(), 0);
-    assert_eq!(replay.push(batches[1].updates()[1]).unwrap(), 1);
+    assert_eq!(replay.push_batch(&batches[1]).unwrap(), 1);
+    assert_eq!(replay.push(batches[1].updates()[1]).unwrap(), 0);
     assert_eq!(replay.push(batches[1].updates()[0]).unwrap(), 0);
     assert_eq!(
         replay

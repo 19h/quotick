@@ -155,13 +155,31 @@ Structural constraints:
 This section defines the consumer procedure for recovering from a sequence
 gap and the replica behavior that supports it.
 
-1. Begin buffering version-matched incrementals.
-2. Obtain a snapshot from the same authoritative instrument-version shard.
-3. Validate and atomically replace replica state; discard buffered updates at
+1. Retain the final sequence of the last completely applied command batch and
+   begin buffering version-matched live incrementals.
+2. Query `CallAuctionMarketDataReplayBuffer::replay_batches_after` on the same
+   authoritative instrument-version shard with that exclusive cursor and a
+   positive update limit.
+3. Apply each returned `CallAuctionMarketDataReplayBatch` through
+   `CallAuctionMarketDataReplica::apply_replay_batch`. A page never splits a
+   command batch, so event and command boundaries advance together.
+4. If `has_more` is true, continue from the page's final sequence.
+5. If the required sequence or complete batch is unavailable, the cursor is
+   not a command boundary, the next batch exceeds the page limit, or
+   incremental state is poisoned, obtain a snapshot from the same shard.
+6. Validate and atomically replace replica state; discard buffered updates at
    or before the snapshot event sequence.
-4. Require the first retained sequence to equal snapshot sequence plus one and
-   require strict continuity thereafter.
-5. On any gap or structural failure, discard the incremental buffer and repeat.
+7. Require the first retained sequence to equal snapshot sequence plus one and
+   require strict continuity thereafter. On another gap or structural failure,
+   discard the incremental buffer and repeat.
+
+The replay buffer reserves a caller-selected non-zero update count at
+construction. It retains exact update values plus batch starts and ends,
+allocates nothing during admission or replay, and can evict only by update
+count. Eviction can leave an incomplete oldest batch; that partial batch is not
+replayable, and the first later complete batch is reported as the earliest
+available boundary. This process-local mechanism changes no version-1 payload
+bytes and defines no remote request or session protocol.
 
 `CallAuctionMarketDataReplica` performs non-mutating identity/gap preflight and
 simulates batch limit-level cardinality in constructor-owned scratch before

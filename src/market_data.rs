@@ -31,9 +31,11 @@ use crate::matching::{
 
 mod replay;
 
+pub(crate) use replay::SequencedMarketDataReplayBuffer;
 pub use replay::{
-    MarketDataReplay, MarketDataReplayBuffer, MarketDataReplayConstructionError,
-    MarketDataReplayError, MarketDataReplayStatus,
+    CallAuctionMarketDataReplay, CallAuctionMarketDataReplayBatch, MarketDataReplay,
+    MarketDataReplayBuffer, MarketDataReplayConstructionError, MarketDataReplayError,
+    MarketDataReplayStatus,
 };
 
 /// One finite market-data state or preparation resource.

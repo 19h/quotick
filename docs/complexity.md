@@ -523,6 +523,22 @@ Publisher fixed state is `O(O_max + P_max)` and replica fixed state is
 Default maxima are 4,096 active orders, 4,096 limit prices per side, and
 8,193 updates per command.
 
+For call-auction replay capacity `N`, one
+`CallAuctionMarketDataReplayBuffer` initializes `N` typed slots in `O(N)`
+time and retains `O(N)` state. Each slot includes one update and its original
+batch-start/batch-end flags. Admission of an `E`-update batch validates its
+identity, sequence, overlap, content, and boundary flags in `O(E)` time, then
+writes its new suffix with `O(1)` work per update and no allocation.
+
+A successful `replay_batches_after` page selects `R` updates in `O(R)` time
+and returns `B` complete zero-copy batches. Iterating the outer batches and all
+inner updates is another `O(B + R) = O(R)` time with `O(1)` iterator state.
+The page never splits a batch. Diagnosing an evicted partial oldest batch can
+scan up to `N` slots to report the earliest later complete boundary. Applying
+each replay batch has the ordinary replica `O(E + U)` capacity-preflight and
+`O(E log P)` mutation bounds. Typed slot bytes, allocator rounding, and page
+residency are target-dependent; version-1 payload bytes are unchanged.
+
 ## WAL and journal
 
 WAL scanning is `O(B + S)` for `B` persisted bytes across `S` physical

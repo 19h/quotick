@@ -193,10 +193,10 @@ printing a summary.
 | [`venue_session`](examples/venue_session.rs) | Calendar-relative admission through pre-trade risk, matching, level-2 publication, DVP settlement, and expiry |
 | [`versioned_universe`](examples/versioned_universe.rs) | Effective-time instrument selection and version-bound shard routing |
 | [`order_lifecycle`](examples/order_lifecycle.rs) | Reserve priority, hidden liquidity, sourced stop activation, GTD expiry, account fences, and instrument controls |
-| [`indicative_cross`](examples/indicative_cross.rs) | Risk-managed call-auction collection, public depth, deterministic uncross, and retained remainders |
+| [`indicative_cross`](examples/indicative_cross.rs) | Risk-managed call-auction collection, deterministic uncross, retained remainders, and complete-batch public replay |
 | [`auction_restart`](examples/auction_restart.rs) | Durable auction checkpoint cutover, phase-transition suffix replay, and exact retry |
 | [`signed_price_discovery`](examples/signed_price_discovery.rs) | Banded negative-price discovery, pressure policy, and exact order allocation |
-| [`feed_repair`](examples/feed_repair.rs) | Sequence-gap detection, nonmutating rejection, full-depth repair, and incremental continuation |
+| [`feed_repair`](examples/feed_repair.rs) | Sequence-gap detection, retained replay, snapshot fallback, and incremental continuation |
 | [`clearing_ledger`](examples/clearing_ledger.rs) | Atomic funding, trade settlement, correction, period controls, trial balance, and reconciliation |
 | [`durable_accounting`](examples/durable_accounting.rs) | Atomic batch and correction recovery across ledger checkpoint cutover and suffix replay |
 | [`wal_recovery`](examples/wal_recovery.rs) | Durable coupled matching/risk recovery from an off-thread checkpoint and WAL suffix |
@@ -340,6 +340,10 @@ Run any program with `cargo run --example <name>`.
   per-instrument replay ring repairs retained short gaps without allocation;
   older gaps recover by atomically swapping double-buffered, pre-reserved
   snapshot arenas.
+- Call-auction replay retains exact batch starts and ends, never splits a
+  multi-update uncross trace across pages, and advances replica event and
+  command boundaries through the same preflight/application path as live
+  batches.
 - Continuous publishers mirror dormant stop identities, trigger indices, and
   the committed reference privately to validate canonical activation. Stop-only
   state changes publish `NoBookChange`; triggered execution publishes ordinary
@@ -436,8 +440,9 @@ for single-instrument execution shards and a multi-asset ledger. It does not
 implement gateways, authentication, distributed sequencing, replication or
 consensus, portfolio collateral and margin, clearing lifecycle, network
 market-data transport, administrative interfaces, or reporting systems.
-Continuous market data includes a process-local bounded suffix replay ring,
-but no remote request/session, authentication, fanout, or entitlement layer.
+Continuous and call-auction market data include process-local bounded suffix
+replay rings, but no remote request/session, authentication, fanout, or
+entitlement layer.
 
 The matching model is a continuous price-time-priority book with sequenced
 instrument-wide trading-state controls, plus a separate bounded call-auction
@@ -466,7 +471,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 107 tagged assumptions (A1–A107), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 108 tagged assumptions (A1–A108), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -520,10 +525,10 @@ includes:
   tick-grid enumeration, allocation against literal order-priority walks,
   20,000 mixed book mutations and 10,000 uncross cases against independent
   models, and a 10,000-command engine phase-model run.
-- **Market data and accounting:** depth reconstruction, replay-first gap repair,
-  snapshot fallback, allocation-stable ring wrap, settlement, reversals,
-  corrections, batches, period controls, reconciliation, and signed `i128`
-  boundaries.
+- **Market data and accounting:** continuous and complete-batch auction depth
+  reconstruction, replay-first gap repair, snapshot fallback,
+  allocation-stable ring wrap, settlement, reversals, corrections, batches,
+  period controls, reconciliation, and signed `i128` boundaries.
 - **Storage, recovery, and checkpoints:** stable wire layouts, segment
   rotation, corruption and torn-tail handling, injected write/sync/cutover
   failures, concurrent-writer exclusion, replay-divergence detection,
