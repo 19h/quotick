@@ -182,6 +182,16 @@ all rows is `O(C)` time. Neither path allocates output, clones a command or
 report, copies an event trace, or mutates the book. An adversarial full hash
 collision cluster can make exact lookup `O(C)` without changing storage.
 
+For one resting target with `K` predecessor orders at its price,
+`try_order_queue_position` performs one expected `O(1)` active-order lookup,
+one `O(log(P + 1))` price-level lookup, and `K` expected `O(1)` predecessor
+resolutions. Total expected work is `O(log(P + 1) + K)` with `O(1)` auxiliary
+space and one fixed-size, allocation-free result. A displayed target sums
+predecessor working slices; a hidden target sums predecessor total leaves. A
+full adversarial active-order hash collision cluster can increase traversal to
+`O(K O)` for `O` active orders without growing storage. Human-readable
+invariant detail may allocate only after relevant path corruption is detected.
+
 ## Call-auction discovery and allocation
 
 For `B` canonical aggregate bid levels and `A` canonical aggregate ask

@@ -1591,6 +1591,81 @@ impl From<InvariantViolation> for OrderBookQueryError {
     }
 }
 
+/// Execution-priority class of one continuous resting order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderQueueClass {
+    /// Fully displayed and reserve orders share the first execution class.
+    Displayed,
+    /// Fully hidden orders execute only after the displayed class.
+    Hidden,
+}
+
+impl OrderQueueClass {
+    const fn from_display(display: OrderDisplay) -> Self {
+        if display.is_hidden() {
+            Self::Hidden
+        } else {
+            Self::Displayed
+        }
+    }
+}
+
+/// Exact private priority ahead of one resting order's current executable slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OrderQueuePosition {
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    book_event_sequence: u64,
+    order: OrderSnapshot,
+    queue_class: OrderQueueClass,
+    order_count_ahead: u64,
+    executable_quantity_ahead_lots: u128,
+}
+
+impl OrderQueuePosition {
+    /// Returns the quoted instrument.
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version used by the query.
+    #[must_use]
+    pub const fn instrument_version(self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the last committed event sequence visible to the query.
+    #[must_use]
+    pub const fn book_event_sequence(self) -> u64 {
+        self.book_event_sequence
+    }
+
+    /// Returns the complete resting-order snapshot.
+    #[must_use]
+    pub const fn order(self) -> OrderSnapshot {
+        self.order
+    }
+
+    /// Returns the order's displayed-priority or hidden execution class.
+    #[must_use]
+    pub const fn queue_class(self) -> OrderQueueClass {
+        self.queue_class
+    }
+
+    /// Returns the number of distinct resting orders ahead of the target.
+    #[must_use]
+    pub const fn order_count_ahead(self) -> u64 {
+        self.order_count_ahead
+    }
+
+    /// Returns exact lots that must execute before the target's current slice.
+    #[must_use]
+    pub const fn executable_quantity_ahead_lots(self) -> u128 {
+        self.executable_quantity_ahead_lots
+    }
+}
+
 /// One immutable private-book immediate-execution query.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImmediateExecutionRequest {
@@ -4261,6 +4336,61 @@ struct SellStopKey {
 impl Eq for RestingOrder {}
 
 impl RestingOrder {
+    fn order_snapshot(self) -> Result<Option<OrderSnapshot>, InvariantViolation> {
+        if self.is_dormant_stop() {
+            return Ok(None);
+        }
+        let leaves_quantity = Quantity::new(self.leaves).map_err(|_| {
+            InvariantViolation::new(format!(
+                "active order {} has zero leaves quantity",
+                self.order_id
+            ))
+        })?;
+        let working_quantity = Quantity::new(self.displayed).map_err(|_| {
+            InvariantViolation::new(format!(
+                "active order {} has zero working quantity",
+                self.order_id
+            ))
+        })?;
+        if self.displayed > self.leaves {
+            return Err(InvariantViolation::new(format!(
+                "active order {} has working quantity above total leaves",
+                self.order_id
+            )));
+        }
+        match self.display {
+            OrderDisplay::FullyDisplayed if self.displayed != self.leaves => {
+                return Err(InvariantViolation::new(format!(
+                    "fully displayed order {} hides leaves",
+                    self.order_id
+                )));
+            }
+            OrderDisplay::Reserve { peak } if self.displayed > peak.lots() => {
+                return Err(InvariantViolation::new(format!(
+                    "reserve order {} exceeds its display peak",
+                    self.order_id
+                )));
+            }
+            OrderDisplay::Hidden if self.displayed != self.leaves => {
+                return Err(InvariantViolation::new(format!(
+                    "hidden order {} has a partial working quantity",
+                    self.order_id
+                )));
+            }
+            _ => {}
+        }
+        Ok(Some(OrderSnapshot {
+            order_id: self.order_id,
+            account_id: self.account_id,
+            side: self.side,
+            price: self.price,
+            leaves_quantity,
+            working_quantity,
+            display: self.display,
+            expires_at: self.expires_at,
+        }))
+    }
+
     fn remaining_event_units(self) -> u128 {
         if self.stop.is_some() {
             return 0;
@@ -6918,27 +7048,184 @@ impl OrderBook {
     /// Returns a resting order by identifier.
     #[must_use]
     pub fn order(&self, order_id: OrderId) -> Option<OrderSnapshot> {
-        self.orders.get(&order_id).and_then(|order| {
-            if order.is_dormant_stop() {
-                return None;
+        self.orders
+            .get(&order_id)
+            .copied()
+            .and_then(|order| order.order_snapshot().ok().flatten())
+    }
+
+    /// Returns exact private execution priority ahead of one resting order.
+    ///
+    /// For a displayed-class target, quantity ahead is the sum of current
+    /// executable slices of earlier displayed-class orders: later reserve
+    /// refreshes requeue behind the target. For a hidden target, every total
+    /// leaf of the displayed class plus earlier hidden leaves executes first.
+    /// The result describes priority before the target's current executable
+    /// slice; it does not predict priority after that slice refreshes.
+    ///
+    /// The successful path performs no allocation or mutation. Human-readable
+    /// invariant details may allocate only after relevant FIFO corruption is
+    /// detected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] if the target or its predecessor path
+    /// contradicts the price, side, display-class, or bidirectional FIFO
+    /// topology required to calculate the position.
+    pub fn try_order_queue_position(
+        &self,
+        order_id: OrderId,
+    ) -> Result<Option<OrderQueuePosition>, InvariantViolation> {
+        let Some(target) = self.orders.get(&order_id).copied() else {
+            return Ok(None);
+        };
+        if target.order_id != order_id {
+            return Err(InvariantViolation::new(format!(
+                "order index key {order_id} resolves to order {}",
+                target.order_id
+            )));
+        }
+        let Some(order) = target.order_snapshot()? else {
+            return Ok(None);
+        };
+        let level = self.levels(target.side).get(target.price).ok_or_else(|| {
+            InvariantViolation::new(format!(
+                "active order {order_id} has no price level at {}",
+                target.price.raw()
+            ))
+        })?;
+        if level.order_count == 0 {
+            return Err(InvariantViolation::new(format!(
+                "active order {order_id} belongs to an empty price level"
+            )));
+        }
+
+        let queue_class = OrderQueueClass::from_display(target.display);
+        let (order_count_ahead, executable_quantity_ahead_lots) =
+            self.queue_priority_ahead(order_id, target, level, queue_class)?;
+
+        Ok(Some(OrderQueuePosition {
+            instrument_id: self.definition.instrument_id(),
+            instrument_version: self.definition.version(),
+            book_event_sequence: self.last_event_sequence(),
+            order,
+            queue_class,
+            order_count_ahead,
+            executable_quantity_ahead_lots,
+        }))
+    }
+
+    fn queue_priority_ahead(
+        &self,
+        order_id: OrderId,
+        target: RestingOrder,
+        level: &PriceLevel,
+        queue_class: OrderQueueClass,
+    ) -> Result<(u64, u128), InvariantViolation> {
+        let mut order_count_ahead = 0_u64;
+        let mut executable_quantity_ahead_lots = 0_u128;
+        let mut predecessor = target.previous;
+        let mut successor = order_id;
+        let mut observed_head = order_id;
+        let mut reached_displayed_class = false;
+        while let Some(predecessor_id) = predecessor {
+            if order_count_ahead >= level.order_count {
+                return Err(InvariantViolation::new(format!(
+                    "order {order_id} predecessor path exceeds its price-level count"
+                )));
             }
-            Quantity::new(order.leaves)
-                .ok()
-                .and_then(|leaves_quantity| {
-                    Quantity::new(order.displayed)
-                        .ok()
-                        .map(|working_quantity| OrderSnapshot {
-                            order_id,
-                            account_id: order.account_id,
-                            side: order.side,
-                            price: order.price,
-                            leaves_quantity,
-                            working_quantity,
-                            display: order.display,
-                            expires_at: order.expires_at,
-                        })
-                })
-        })
+            let (previous, previous_snapshot) =
+                self.queue_predecessor(order_id, target, predecessor_id, successor)?;
+
+            let previous_hidden = previous.display.is_hidden();
+            match queue_class {
+                OrderQueueClass::Displayed if previous_hidden => {
+                    return Err(InvariantViolation::new(format!(
+                        "displayed-priority order {order_id} follows hidden order {predecessor_id}"
+                    )));
+                }
+                OrderQueueClass::Hidden if previous_hidden && reached_displayed_class => {
+                    return Err(InvariantViolation::new(format!(
+                        "hidden order {predecessor_id} precedes the displayed class"
+                    )));
+                }
+                OrderQueueClass::Hidden if !previous_hidden => {
+                    reached_displayed_class = true;
+                }
+                OrderQueueClass::Displayed | OrderQueueClass::Hidden => {}
+            }
+
+            let quantity = match queue_class {
+                OrderQueueClass::Displayed => previous_snapshot.working_quantity.lots(),
+                OrderQueueClass::Hidden => previous_snapshot.leaves_quantity.lots(),
+            };
+            executable_quantity_ahead_lots = executable_quantity_ahead_lots
+                .checked_add(u128::from(quantity))
+                .ok_or_else(|| {
+                    InvariantViolation::new(format!(
+                        "order {order_id} executable quantity ahead exceeds u128"
+                    ))
+                })?;
+            order_count_ahead = order_count_ahead.checked_add(1).ok_or_else(|| {
+                InvariantViolation::new(format!("order {order_id} predecessor count exceeds u64"))
+            })?;
+            predecessor = previous.previous;
+            successor = predecessor_id;
+            observed_head = predecessor_id;
+        }
+        if observed_head != level.head {
+            return Err(InvariantViolation::new(format!(
+                "order {order_id} predecessor path reaches {observed_head} instead of level head {}",
+                level.head
+            )));
+        }
+        if order_count_ahead >= level.order_count {
+            return Err(InvariantViolation::new(format!(
+                "order {order_id} position is outside its price-level count"
+            )));
+        }
+        if queue_class == OrderQueueClass::Displayed && level.displayed_tail.is_none() {
+            return Err(InvariantViolation::new(format!(
+                "displayed-priority order {order_id} belongs to a hidden-only level"
+            )));
+        }
+        Ok((order_count_ahead, executable_quantity_ahead_lots))
+    }
+
+    fn queue_predecessor(
+        &self,
+        order_id: OrderId,
+        target: RestingOrder,
+        predecessor_id: OrderId,
+        successor: OrderId,
+    ) -> Result<(RestingOrder, OrderSnapshot), InvariantViolation> {
+        let previous = self.orders.get(&predecessor_id).copied().ok_or_else(|| {
+            InvariantViolation::new(format!(
+                "order {order_id} references missing predecessor {predecessor_id}"
+            ))
+        })?;
+        if previous.order_id != predecessor_id {
+            return Err(InvariantViolation::new(format!(
+                "order index key {predecessor_id} resolves to order {}",
+                previous.order_id
+            )));
+        }
+        let Some(previous_snapshot) = previous.order_snapshot()? else {
+            return Err(InvariantViolation::new(format!(
+                "order {order_id} follows dormant stop {predecessor_id}"
+            )));
+        };
+        if previous.side != target.side || previous.price != target.price {
+            return Err(InvariantViolation::new(format!(
+                "order {order_id} predecessor {predecessor_id} has another side or price"
+            )));
+        }
+        if previous.next != Some(successor) {
+            return Err(InvariantViolation::new(format!(
+                "order {order_id} predecessor {predecessor_id} has a broken next FIFO link"
+            )));
+        }
+        Ok((previous, previous_snapshot))
     }
 
     /// Fallibly returns every active resting order in ascending identifier order.
@@ -6952,7 +7239,7 @@ impl OrderBook {
     /// Returns [`OrderBookQueryError::ReservationFailed`] before copying output
     /// if the complete bounded vector cannot be reserved, or
     /// [`OrderBookQueryError::InvariantViolation`] if a resting order contains
-    /// an impossible zero total or displayed leaves quantity.
+    /// invalid total, working, or display-policy quantity state.
     pub fn try_active_orders(&self) -> Result<Vec<OrderSnapshot>, OrderBookQueryError> {
         let maximum = self.resting_order_count();
         let mut orders =
@@ -7004,27 +7291,11 @@ impl OrderBook {
             .values()
             .filter(|order| !order.is_dormant_stop())
             .map(|order| {
-                let leaves_quantity = Quantity::new(order.leaves).map_err(|_| {
+                order.order_snapshot()?.ok_or_else(|| {
                     InvariantViolation::new(format!(
-                        "active order {} has zero leaves quantity",
+                        "dormant stop {} entered resting-order iteration",
                         order.order_id
                     ))
-                })?;
-                let working_quantity = Quantity::new(order.displayed).map_err(|_| {
-                    InvariantViolation::new(format!(
-                        "active order {} has zero working quantity",
-                        order.order_id
-                    ))
-                })?;
-                Ok(OrderSnapshot {
-                    order_id: order.order_id,
-                    account_id: order.account_id,
-                    side: order.side,
-                    price: order.price,
-                    leaves_quantity,
-                    working_quantity,
-                    display: order.display,
-                    expires_at: order.expires_at,
                 })
             })
     }
@@ -10169,9 +10440,9 @@ mod price_level_index_tests {
         ImmediateExecutionQuote, ImmediateExecutionRequest, ImmediateExecutionTermination,
         IncomingPreview, InvariantViolation, MassCancel, MassCancelScope, MatchingCapacity,
         MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsSpec,
-        OrderBookQueryError, OrderDisplay, OrderSelectionPool, OrderType, PriceLevel, PriceLevels,
-        RejectReason, ReplaceOrder, RestingOrder, SelfTradePrevention, StopActivation, TimeInForce,
-        try_event_arena,
+        OrderBookQueryError, OrderDisplay, OrderQueueClass, OrderSelectionPool, OrderType,
+        PriceLevel, PriceLevels, RejectReason, ReplaceOrder, RestingOrder, SelfTradePrevention,
+        StopActivation, TimeInForce, try_event_arena,
     };
     use crate::instrument::{
         InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -10493,6 +10764,36 @@ mod price_level_index_tests {
             worst_execution_price,
             termination,
         }
+    }
+
+    fn reference_order_queue_position(
+        book: &OrderBook,
+        order_id: OrderId,
+    ) -> (OrderQueueClass, u64, u128) {
+        let target = book.orders.get(&order_id).copied().unwrap();
+        let queue_class = OrderQueueClass::from_display(target.display);
+        let level = book.levels(target.side).get(target.price).unwrap();
+        let mut current = Some(level.head);
+        let mut order_count_ahead = 0_u64;
+        let mut executable_quantity_ahead_lots = 0_u128;
+        while let Some(current_id) = current {
+            if current_id == order_id {
+                return (
+                    queue_class,
+                    order_count_ahead,
+                    executable_quantity_ahead_lots,
+                );
+            }
+            let order = book.orders.get(&current_id).copied().unwrap();
+            let quantity = match queue_class {
+                OrderQueueClass::Displayed => order.displayed,
+                OrderQueueClass::Hidden => order.leaves,
+            };
+            executable_quantity_ahead_lots += u128::from(quantity);
+            order_count_ahead += 1;
+            current = order.next;
+        }
+        panic!("target order must occur in its price FIFO")
     }
 
     fn generated_book_and_fok(generator: &mut Generator) -> (OrderBook, NewOrder) {
@@ -11260,6 +11561,92 @@ mod price_level_index_tests {
             );
             assert_eq!(quote.termination(), ImmediateExecutionTermination::Filled);
         }
+    }
+
+    #[test]
+    fn queue_position_matches_independent_forward_fifo_reference() {
+        let mut generator = Generator(0x3f20_efb8_714a_9cd5);
+        for case in 0..20_000 {
+            let (book, _) = generated_book_and_fok(&mut generator);
+            for order in book.active_order_states() {
+                let order = order.unwrap();
+                let actual = book
+                    .try_order_queue_position(order.order_id)
+                    .unwrap()
+                    .unwrap();
+                let expected = reference_order_queue_position(&book, order.order_id);
+                assert_eq!(
+                    (
+                        actual.queue_class(),
+                        actual.order_count_ahead(),
+                        actual.executable_quantity_ahead_lots(),
+                    ),
+                    expected,
+                    "queue position diverged in generated case {case} for order {}",
+                    order.order_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn queue_position_rejects_a_broken_predecessor_path() {
+        let mut generator = Generator(0xb721_9d8a_45ec_06f3);
+        let (mut book, target) = loop {
+            let (book, _) = generated_book_and_fok(&mut generator);
+            let target = {
+                book.orders
+                    .values()
+                    .find(|order| order.previous.is_some())
+                    .copied()
+            };
+            if let Some(target) = target {
+                break (book, target);
+            }
+        };
+        let predecessor_id = target.previous.unwrap();
+        book.orders.get_mut(&predecessor_id).unwrap().next = None;
+
+        let error = book.try_order_queue_position(target.order_id).unwrap_err();
+        assert!(error.detail().contains("broken next FIFO link"));
+    }
+
+    #[test]
+    fn hidden_queue_position_accumulates_above_u64() {
+        let mut book = OrderBook::new(reserve_definition());
+        for (raw_id, display, quantity) in [
+            (1, OrderDisplay::FullyDisplayed, u64::MAX),
+            (2, OrderDisplay::FullyDisplayed, u64::MAX),
+            (3, OrderDisplay::Hidden, 1),
+        ] {
+            let order_id = OrderId::new(raw_id).unwrap();
+            book.append_order(RestingOrder {
+                order_id,
+                account_id: AccountId::new(raw_id).unwrap(),
+                side: Side::Sell,
+                price: Price::from_raw(10),
+                leaves: quantity,
+                displayed: quantity,
+                display,
+                self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                expires_at: None,
+                stop: None,
+                previous: None,
+                next: None,
+                account_previous: None,
+                account_next: None,
+            });
+        }
+
+        let position = book
+            .try_order_queue_position(OrderId::new(3).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.order_count_ahead(), 2);
+        assert_eq!(
+            position.executable_quantity_ahead_lots(),
+            2 * u128::from(u64::MAX)
+        );
     }
 
     #[test]

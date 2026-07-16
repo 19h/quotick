@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A124 are stable and are referenced from code comments and other
+identifiers A1-A125 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -217,13 +217,13 @@ depth, continuous and call-auction account-order-ID output, plus continuous and
 call-auction market-data batch/snapshot/depth outputs have explicit fallible
 APIs. Continuous and call-auction authoritative books also expose
 allocation-free market-priority depth iterators, as do continuous and
-call-auction public replicas. Continuous private immediate-execution quotes
-return fixed-size values without allocation. Borrowed ledger-record lookup,
-history iteration, per-record transaction iteration, and point-in-time balance
-reconstruction allocate no output and return typed journal/index or
-reconstruction contradictions. Convenience wrappers can still panic on
-allocation failure; the account-order-ID wrappers can also panic if private
-topology is corrupt.
+call-auction public replicas. Continuous private immediate-execution quotes and
+resting-order queue-position queries return fixed-size values without
+successful-path allocation. Borrowed ledger-record lookup, history iteration,
+per-record transaction iteration, and point-in-time balance reconstruction
+allocate no output and return typed journal/index or reconstruction
+contradictions. Convenience wrappers can still panic on allocation failure;
+the account-order-ID wrappers can also panic if private topology is corrupt.
 
 **Dependent results.** Typed failure exists at the enumerated boundaries; no
 end-to-end allocation-failure continuation claim follows. Authoritative bounded
@@ -4332,6 +4332,55 @@ credited as execution, incorrect termination or notional, overflow, mutation,
 allocation, stale provenance at the observed boundary, or implied execution
 commitment falsifies A124.
 
+## A125 — exact current-slice queue position
+
+**Assumption.** One `try_order_queue_position` query binds one `OrderId` to one
+immutable continuous `OrderBook` borrow. An unknown identity or accepted
+dormant stop has no resting queue position and returns absence. A resting
+target returns its complete private snapshot and displayed-priority or hidden
+queue class. For a displayed-class target, executable quantity ahead is the
+sum of current positive working slices of earlier displayed-class orders;
+reserve quantity behind those slices is excluded because each refresh rejoins
+the class tail behind the target. For a hidden target, quantity ahead is the
+total leaves of every displayed-class order plus every earlier hidden order;
+all displayed reserve refreshes remain ahead of the hidden class.
+
+The result counts distinct predecessor orders and exact lots before the
+target's current executable slice. It binds instrument ID, immutable definition
+version, and last visible book event sequence. It does not predict the target's
+position after its current reserve slice refreshes, execution probability,
+elapsed wait, future arrivals/cancellations, STP behavior of an unknown
+aggressor, or remote quote validity. The query walks the existing predecessor
+links and relevant price-level metadata; it creates no second queue or owned
+output. Relevant identity, side, price, display-class, working/leaves, level-
+head/count, and reciprocal-next contradictions are typed failures. Formatting
+failure detail after detection remains an A12 allocation boundary.
+
+**Dependent results.** [A1, A3, A10, A12, A22, A44, A45, A47, A72, A83,
+A103, A125] For `K` distinct predecessors at one price among `O` active orders
+and `P` occupied prices, target lookup is expected `O(1)`, level lookup is
+`O(log(P + 1))`, and predecessor traversal is expected `O(K)`. Total expected
+time is `O(log(P + 1) + K)`, auxiliary space is `O(1)`, and successful output
+allocation is zero. A full adversarial active-order hash collision cluster can
+increase predecessor resolution to `O(K O)` without storage growth. Checked
+`u128` quantity accumulation and checked `u64` predecessor counting fail closed
+on an unrepresentable result. No matching, risk, reservation, sequence, WAL,
+snapshot, or public state changes, so no wire-version change follows.
+
+**Falsification probe.** Place fully displayed, reserve, and fully hidden
+targets at head, middle, and tail on both sides and multiple prices. Exercise
+partial current slices, repeated reserve refresh, hidden-only levels, unknown
+identities, dormant stops, and quantities above `u64::MAX` in aggregate.
+Compare every resting order in at least 20,000 generated books with an
+independent forward FIFO model. Corrupt index identity, predecessor/reciprocal
+links, cycles, side, price, working/leaves relationships, class order, level
+head, and level count and require a typed failure before output. Require exact
+order/class/count/quantity/provenance, unchanged book telemetry/state, and zero
+successful-path allocations. Any refresh counted ahead of a displayed target,
+reserve leaves omitted ahead of a hidden target, priority divergence, silent
+relevant corruption, mutation, allocation, or implied fill prediction
+falsifies A125.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -4388,6 +4437,25 @@ capability, a remaining risk, or an opportunity.
   collar, minimum-quantity, and venue-routing analysis without materializing
   private depth. Cross-venue comparison still requires synchronized provenance,
   normalized units, fee/risk inputs, and independently specified queue rules.
+
+- **High impact:** exact current-slice queue position now exposes one resting
+  order's displayed/hidden class, distinct predecessors, executable lots ahead,
+  complete order snapshot, and instrument/version/event-sequence provenance
+  without output allocation under A125. Reserve refresh and hidden-class
+  semantics are checked against every order in 20,000 generated books.
+
+- **Medium impact risk:** queue position is a state observation, not a fill-
+  probability or latency estimate. Subsequent execution, cancellation,
+  replacement, reserve refresh, and other committed commands can change it;
+  unknown aggressor identity also prevents STP forecasting. Remote validity,
+  event-driven position updates, and venue-calibrated fill models require
+  separately sequenced inputs and explicit model assumptions.
+
+- **Medium impact opportunity:** provenance-bound position changes can support
+  deterministic queue-depletion, maker-performance, cancellation-response, and
+  fill-model feature series without exporting private FIFO links. Statistical
+  inference still requires synchronized market events and independently
+  validated venue rules.
 
 - **Medium impact:** continuous and call-auction live command/report history
   now supports expected constant-time exact lookup and zero-copy chronological

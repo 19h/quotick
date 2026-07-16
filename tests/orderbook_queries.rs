@@ -5,8 +5,8 @@ use quotick::instrument::{
 use quotick::matching::{
     Command, CommandOutcome, EventKind, ImmediateExecutionRequest, ImmediateExecutionTermination,
     MassCancelScope, MatchingHashIndex, NewOrder, OrderBook, OrderBookQueryError,
-    OrderBookQueryResource, OrderDisplay, OrderType, RejectReason, SelfTradePrevention,
-    StopActivation, TimeInForce,
+    OrderBookQueryResource, OrderDisplay, OrderQueueClass, OrderType, RejectReason,
+    SelfTradePrevention, StopActivation, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -93,6 +93,43 @@ fn execution_quote_book() -> OrderBook {
         order(2, 2, 7, Side::Sell, 100, 2, OrderDisplay::FullyDisplayed),
         order(3, 3, 9, Side::Sell, 100, 5, OrderDisplay::Hidden),
         order(4, 4, 10, Side::Sell, 101, 7, OrderDisplay::FullyDisplayed),
+    ] {
+        assert_eq!(
+            book.submit(command).unwrap().outcome,
+            CommandOutcome::Accepted
+        );
+    }
+    book
+}
+
+fn queue_position_book() -> OrderBook {
+    let mut book = OrderBook::new(definition());
+    for command in [
+        order(
+            1,
+            1,
+            1,
+            Side::Sell,
+            100,
+            10,
+            OrderDisplay::Reserve {
+                peak: Quantity::new(3).unwrap(),
+            },
+        ),
+        order(2, 2, 2, Side::Sell, 100, 2, OrderDisplay::FullyDisplayed),
+        order(
+            3,
+            3,
+            3,
+            Side::Sell,
+            100,
+            8,
+            OrderDisplay::Reserve {
+                peak: Quantity::new(2).unwrap(),
+            },
+        ),
+        order(4, 4, 4, Side::Sell, 100, 5, OrderDisplay::Hidden),
+        order(5, 5, 5, Side::Sell, 100, 4, OrderDisplay::Hidden),
     ] {
         assert_eq!(
             book.submit(command).unwrap().outcome,
@@ -281,6 +318,80 @@ fn immediate_execution_quotes_distinguish_limits_exhaustion_and_signed_notional(
     assert_eq!(signed.worst_execution_price(), Some(Price::from_raw(-20)));
     assert_eq!(signed.termination(), ImmediateExecutionTermination::Filled);
     negative.validate().unwrap();
+}
+
+#[test]
+fn queue_positions_model_current_slices_reserve_refresh_and_hidden_priority() {
+    let mut book = queue_position_book();
+    let before_commands = book.retained_command_count();
+    let before_depth = book.depth_iter(Side::Sell).collect::<Vec<_>>();
+
+    let displayed = book
+        .try_order_queue_position(OrderId::new(3).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(displayed.instrument_id(), InstrumentId::new(1).unwrap());
+    assert_eq!(
+        displayed.instrument_version(),
+        InstrumentVersion::new(1).unwrap()
+    );
+    assert_eq!(displayed.book_event_sequence(), book.last_event_sequence());
+    assert_eq!(displayed.order().order_id, OrderId::new(3).unwrap());
+    assert_eq!(displayed.queue_class(), OrderQueueClass::Displayed);
+    assert_eq!(displayed.order_count_ahead(), 2);
+    assert_eq!(displayed.executable_quantity_ahead_lots(), 5);
+
+    let hidden = book
+        .try_order_queue_position(OrderId::new(5).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(hidden.queue_class(), OrderQueueClass::Hidden);
+    assert_eq!(hidden.order_count_ahead(), 4);
+    assert_eq!(hidden.executable_quantity_ahead_lots(), 25);
+    assert!(
+        book.try_order_queue_position(OrderId::new(99).unwrap())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(book.retained_command_count(), before_commands);
+    assert_eq!(
+        book.depth_iter(Side::Sell).collect::<Vec<_>>(),
+        before_depth
+    );
+
+    let take = Command::New(NewOrder {
+        command_id: CommandId::new(6).unwrap(),
+        order_id: OrderId::new(100).unwrap(),
+        account_id: AccountId::new(99).unwrap(),
+        instrument_id: InstrumentId::new(1).unwrap(),
+        instrument_version: InstrumentVersion::new(1).unwrap(),
+        side: Side::Buy,
+        quantity: Quantity::new(3).unwrap(),
+        display: OrderDisplay::FullyDisplayed,
+        order_type: OrderType::Market,
+        time_in_force: TimeInForce::ImmediateOrCancel,
+        self_trade_prevention: SelfTradePrevention::CancelAggressor,
+        received_at: TimestampNs::from_unix_nanos(6),
+    });
+    assert_eq!(book.submit(take).unwrap().outcome, CommandOutcome::Accepted);
+
+    let refreshed = book
+        .try_order_queue_position(OrderId::new(1).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(refreshed.queue_class(), OrderQueueClass::Displayed);
+    assert_eq!(refreshed.order_count_ahead(), 2);
+    assert_eq!(refreshed.executable_quantity_ahead_lots(), 4);
+    assert_eq!(refreshed.order().leaves_quantity.lots(), 7);
+    assert_eq!(refreshed.order().working_quantity.lots(), 3);
+
+    let hidden_after_refresh = book
+        .try_order_queue_position(OrderId::new(4).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(hidden_after_refresh.order_count_ahead(), 3);
+    assert_eq!(hidden_after_refresh.executable_quantity_ahead_lots(), 17);
+    book.validate().unwrap();
 }
 
 #[test]
