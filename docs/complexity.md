@@ -828,6 +828,18 @@ preparation. Otherwise batch construction adds expected `O(N)` time and
 `O(N + U)` commit. Durable settlement adds one entry or batch frame; exact
 replay is resolved without frame growth.
 
+For a correction over `N` original settlement entries with `L_o` posting legs
+and a replacement of `M` entries with `L_r` posting legs, let
+`K = N + M`, `L = L_o + L_r`, and `U` be the affected balance-key count.
+Constructing the exact inverses costs `O(N + L_o)` time and storage; collecting
+the complete correction fallibly reserves exactly `K` entry handles. A bust
+with `N = 1` and `M = 0` uses ordinary entry preparation. Every other
+correction uses the batch path: expected `O(K)` identity construction,
+`O(L log L)` preparation, `O(K + L + U)` auxiliary storage, and expected
+`O(K + U)` commit. Exact original entry/batch grouping is checked before
+mutation. Durable correction adds one ordinary entry or kind-`7` batch frame
+and has no intermediate balance image.
+
 For `A` internal non-zero balances, `V` asset denominations, and `W` spilled
 `u64` magnitude limbs, fallible trial-balance construction reserves one flat
 `A`-term arena, sorts it in `O(A log A)`, and emits an exactly reserved

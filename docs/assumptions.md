@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A118 are stable and are referenced from code comments and other
+identifiers A1-A119 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -164,8 +164,9 @@ falsifies A10.
 supplied globally unique transaction ID and the definition-correlated path. A
 complete accepted call-auction uncross instead supplies exactly one such ID per
 trade in report order and, under A118, one per explicit fee transfer. It settles
-as one entry or atomic batch under A116/A118. The lower-level convention API is
-not an authorization boundary.
+as one entry or atomic batch under A116/A118. A119 can later reverse that exact
+complete settlement and optionally append one replacement settlement as one
+event. The lower-level convention API is not an authorization boundary.
 
 **Dependent results.** Delivery-versus-payment balances, WAL reconstruction,
 and retry behavior.
@@ -199,9 +200,9 @@ reserves its derived session-ID index before publication.
 Successful continuous-book/risk, call-auction-book/engine/risk, and indexed-AVL
 structural audits allocate no scratch; continuous matching/risk,
 call-auction/risk, and ledger checkpoint capture/semantic/capacity resources,
-call-auction settlement-entry and per-fee posting construction, codec
-collections/output, and WAL frame/batch/read buffers reserve fallibly with
-typed resource identity. Arc
+call-auction settlement/correction-entry and per-fee/reversal posting
+construction, codec collections/output, and WAL frame/batch/read buffers
+reserve fallibly with typed resource identity. Arc
 control blocks, caller-owned command/entry
 objects, decoded/caller-built event traces and checkpoints, snapshot-file
 ownership, path/string construction, ledger diagnostic/reconciliation
@@ -1591,8 +1592,9 @@ cross-lease contamination, lost lease, or post-state/audit divergence falsifies
 A63.
 
 Venue-specific cancel/decrement STP, authenticated beneficial-owner mapping,
-alternative pairing, allocation adjustments, or bust/correction semantics
-require separate versioned behavior.
+alternative pairing, allocation adjustments, or rewinding this matching state
+after a bust/correction require separate versioned behavior. A119 supplies only
+the downstream ledger correction.
 
 ## A64 — sequenced auction phase graph
 
@@ -3970,10 +3972,72 @@ bound to another trade, sign/direction ambiguity, partial DVP or fee effect,
 second retry effect, frame split, recovery divergence, or inferred external fee
 policy falsifies A118.
 
+## A119 — atomic full-settlement call-auction correction
+
+**Assumption.** One correction is an authoritative, already-authorized
+instruction over one exact A116/A118 settlement previously committed through
+`settle_call_auction`. The caller supplies exactly one new globally unique
+reversal `TransactionId` per original DVP and fee entry in canonical settlement
+order, one explicit A33 effective date, one A34 booking timestamp, and one
+reference. A bust contains those exact inverses. A replacement correction
+appends one separately validated complete settlement after every inverse; it
+does not select a trade subset, amend an entry in place, or infer replacement
+fees.
+
+Application requires identical original entry content and the exact original
+entry/batch grouping. It does not rewind the A64 engine, auction-risk state,
+private/public market data, or an external position system. Correction reason,
+authorization, external lifecycle coordination, and statement evidence are
+authoritative upstream inputs.
+
+**Dependent results.** [A1, A7, A11, A12, A17, A29, A33, A34, A42, A43,
+A64, A65, A66, A69, A79, A89, A90, A116, A118, A119] For `N` original
+entries, `M` replacement entries, `K = N + M` correction entries,
+`L_o` original posting legs, `L_r` replacement posting legs,
+`L = L_o + L_r`, and `U` affected balance keys, construction is
+`O(K + L_o)` time and owns `O(K + L_o)` new entry-handle and reversal-posting
+storage. It fallibly reserves exactly `K` correction handles and exactly each
+original entry's posting count for its inverse. Except when `N = 1, M = 0`,
+A42 batch construction adds expected `O(K)` identity work and `O(K)` storage;
+A79 preparation is `O(L log L)` with `O(K + L + U)` auxiliary storage, and
+commit is expected `O(K + U)`.
+
+The original event's content and grouping are proved before mutation. One-entry
+busts use an ordinary entry; every other correction is one ordered batch. The
+standard entry/kind-`7` batch encoding therefore yields one WAL frame, one
+checkpoint record, one final balance image, exact retry without frame growth,
+and unchanged WAL/snapshot version 19.
+
+**Falsification probe.** Exercise fee-free and fee-enriched one/multi-trade
+busts; replacement settlements with different trades and fees; zero, duplicate,
+colliding, too few, and too many correction identities; absent, content-
+colliding, separately committed, differently ordered, and differently grouped
+originals; already-reversed and non-reversible targets; closed effective dates;
+timestamp regression; final-balance overflow; and every reversal, transaction,
+posting, record, and per-record capacity boundary. Require every inverse before
+every replacement and compare the final balances with an independent literal
+inverse-plus-replacement model.
+
+Terminate durable correction at every frame-write/barrier/commit boundary,
+repair a torn tail, recover from uncut WAL and both A/B checkpoint slots, apply
+a suffix, and retry before and after reopen. Any accepted original-group
+contradiction, partial inverse/replacement effect, matching/risk state mutation,
+second retry effect, split frame/checkpoint record, recovery divergence, or
+inferred authorization/reason/external synchronization falsifies A119.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** full call-auction settlement busts now reverse every DVP and
+  fee entry in canonical order, and replacement corrections append one complete
+  validated settlement in the same atomic event under A119. Exact original
+  grouping, one-frame durability, checkpoint recovery, capacity failure, and
+  exact retry reuse the bounded ledger paths. Authorization, correction reason,
+  partial allocation/trade amendments, and coordinated matching, risk,
+  market-data, and external-position correction remain separate lifecycle
+  inputs or state machines.
 
 - **High impact:** explicit positive fee transfers now bind to call-auction
   trades and commit atomically with their DVP entries under A118. Multiple fees,
@@ -4100,6 +4164,8 @@ capability, a remaining risk, or an opportunity.
   external balance comparison, dated financial entries, monotonic booking time,
   durable close/reopen fences, and single-frame atomic reversal-plus-replacement
   corrections plus generalized ordered multi-entry batches are implemented.
+  A119 additionally composes those primitives into complete call-auction
+  DVP/fee busts and replacement corrections with exact original-group proof.
   Batch final-balance netting, in-batch period/reversal sequencing, exact grouped
   replay, torn-tail repair, segmented rotation, and checkpoint suffix recovery
   are covered, as is anchored prefix retirement in both physical layouts. Controller
@@ -4171,9 +4237,9 @@ capability, a remaining risk, or an opportunity.
   differential venue fixtures, and crash/replay proofs; no existing enum
   silently approximates those semantics.
 - **High impact risk:** dormant-stop determinism proves only the behavior after
-  a reference command is sequenced. Feed selection, trade correction/bust
-  handling, reference-source authentication, missed-reference recovery, and
-  cross-shard ordering are external. A stale but structurally valid reference
+  a reference command is sequenced. Feed selection, matching response to trade
+  corrections/busts, reference-source authentication, missed-reference
+  recovery, and cross-shard ordering are external. A stale but structurally valid reference
   can deterministically produce a state different from the intended venue
   state without violating the local matching grammar.
 - **Medium impact opportunity:** the explicit reference, trigger-priority, and
@@ -4316,7 +4382,7 @@ capability, a remaining risk, or an opportunity.
 - **High impact:** the numerical profile set is immutable after first command
   sequencing. A revisioned per-instrument admission fence with atomic local
   block-and-cancel and re-enable is implemented. Intraday numerical-limit and
-  position amendments, clearing corrections, account onboarding, controller
+  position amendments, risk-state clearing corrections, account onboarding, controller
   authentication/authorization, and cross-instrument atomic kill coordination
   require additional sequenced, versioned administrative events or protocols;
   they are not represented by registration or the local fence.
@@ -4364,15 +4430,16 @@ capability, a remaining risk, or an opportunity.
   policy.
 - **High impact risk:** call-auction risk profiles are immutable within one
   durable lineage. Profile revision, external position synchronization,
-  clearing transfers, busts/corrections, and administrative controls require a
-  separately sequenced durable event model; mutating those inputs out of band
-  would invalidate deterministic risk replay. The plain durable auction runtime
-  intentionally rejects profile-prefixed risk journals.
+  clearing transfers, and matching/risk application of busts or corrections
+  require a separately sequenced durable event model; A119 changes only ledger
+  state. Mutating risk inputs out of band would invalidate deterministic risk
+  replay. The plain durable auction runtime intentionally rejects profile-
+  prefixed risk journals.
 - **High impact risk:** auction and continuous risk are per-account,
   per-instrument raw-price-times-lots controls. Cross-instrument portfolio
   offsets, collateral, margin, currency conversion, fees, option Greeks,
-  clearing transfers, busts/corrections, and external position synchronization
-  remain unrepresented.
+  clearing transfers, matching/risk bust or correction application, and
+  external position synchronization remain unrepresented.
 - **Medium impact opportunity:** conservative auction reservations and netted
   uncross deltas form deterministic utilization/position time series that can
   be joined to anonymized clearing/depth projections without making public data

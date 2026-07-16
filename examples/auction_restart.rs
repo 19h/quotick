@@ -15,7 +15,9 @@ use quotick::auction_engine::{
 };
 use quotick::durable_auction::DurableCallAuctionEngine;
 use quotick::instrument::InstrumentDefinition;
-use quotick::ledger::{CallAuctionFee, CallAuctionSettlement, Ledger};
+use quotick::ledger::{
+    CallAuctionFee, CallAuctionSettlement, CallAuctionSettlementCorrection, Ledger,
+};
 use quotick::snapshot::{CheckpointSlot, SnapshotOptions};
 use quotick::{
     AccountingDate, AuctionId, CommandId, OrderId, Price, Quantity, Side, TransactionId,
@@ -78,7 +80,7 @@ fn order(
 fn settle_report(
     report: &CallAuctionExecutionReport,
     definition: InstrumentDefinition,
-) -> (usize, usize) {
+) -> (usize, usize, usize) {
     let trade_count = report
         .events
         .iter()
@@ -112,11 +114,30 @@ fn settle_report(
     )
     .unwrap();
     let mut ledger = Ledger::new();
-    let receipt = ledger.settle_call_auction(settlement).unwrap();
+    let receipt = ledger.settle_call_auction(settlement.clone()).unwrap();
     assert_eq!(receipt.transaction_count(), trade_count + 1);
     assert_eq!(ledger.balance(account(90), definition.quote_asset_id()), 3);
+    let correction = CallAuctionSettlementCorrection::bust(
+        vec![
+            TransactionId::new(3).unwrap(),
+            TransactionId::new(4).unwrap(),
+        ],
+        1,
+        AccountingDate::UNIX_EPOCH,
+        timestamp(8),
+        &settlement,
+    )
+    .unwrap();
+    let correction_receipt = ledger.correct_call_auction(correction.clone()).unwrap();
+    assert_eq!(correction_receipt.reversal_transaction_count(), 2);
+    assert!(ledger.correct_call_auction(correction).unwrap().replayed());
+    assert_eq!(ledger.balance(account(90), definition.quote_asset_id()), 0);
     ledger.validate().unwrap();
-    (trade_count, receipt.transaction_count())
+    (
+        trade_count,
+        receipt.transaction_count(),
+        correction_receipt.transaction_count(),
+    )
 }
 
 fn main() {
@@ -182,7 +203,8 @@ fn main() {
         received_at: timestamp(6),
     });
     let report = durable.submit(uncross).unwrap();
-    let (trade_count, settled_transactions) = settle_report(&report, definition);
+    let (trade_count, settled_transactions, corrected_transactions) =
+        settle_report(&report, definition);
     assert_eq!(trade_count, 1);
     durable.close().unwrap();
 
@@ -213,11 +235,12 @@ fn main() {
     recovered.close().unwrap();
 
     println!(
-        "checkpointed_commands={} replayed_suffix={} trades={} settled_transactions={} retained_orders={} retry_wal_growth={}",
+        "checkpointed_commands={} replayed_suffix={} trades={} settled_transactions={} corrected_transactions={} retained_orders={} retry_wal_growth={}",
         recovery.checkpointed_commands,
         recovery.replayed_commands,
         trade_count,
         settled_transactions,
+        corrected_transactions,
         retained_orders,
         bytes_after_retry - bytes_before_retry
     );

@@ -1314,6 +1314,29 @@ periods, batches, and recovery.
     recovery path. Standard entry/batch encoding already represents the fee
     postings, so WAL and snapshot version 19 do not change.
 
+### Call-auction settlement corrections
+
+42. `CallAuctionSettlementCorrection` binds one exact original settlement and
+    accepts one new reversal `TransactionId` for every original DVP and fee
+    entry in canonical settlement order. A bust contains only those inverses;
+    a replacement correction appends every entry from one independently
+    validated complete `CallAuctionSettlement` after all inverses.
+43. Application proves that every original transaction has identical content
+    and was committed as the exact entry or ordered batch represented by the
+    supplied settlement. Missing, colliding, separately committed, differently
+    grouped, or already-reversed original state fails before ledger mutation.
+44. A one-entry bust retains the ordinary entry path. Every larger bust and
+    every replacement correction uses one ordered `LedgerBatch`, so reversal
+    lineage, period and timestamp validation, capacity admission, final
+    balances, exact retry, and recovery expose one all-or-neither event. The
+    correction does not rewind call-auction matching, risk, or market-data
+    state.
+45. `DurableLedger::correct_call_auction` reuses the standard entry or kind-`7`
+    batch append-before-commit path. A correction therefore occupies one WAL
+    frame and one checkpoint record without changing WAL or snapshot version
+    19. Authorization, correction reason, external position synchronization,
+    and clearing evidence remain authoritative external inputs.
+
 Signed balances are intentional accounting state. Credit limits, collateral,
 and margin are not inferred by the ledger. The implemented order risk layer
 consumes seeded positions and matching traces; it does not derive available
@@ -2034,7 +2057,11 @@ exact DVP balances, canonical explicit fee binding and balances, invalid fee
 structure, instrument/version/count/grammar rejection, duplicate fee/DVP
 identity rejection, same-account rejection, arithmetic/capacity atomicity,
 partial-prior-commit detection, single-frame durable recovery, checkpoint
-cutover, and WAL-free exact retry.
+cutover, and WAL-free exact retry. Full-settlement correction tests additionally
+cover fee-enriched busts, reversal-before-replacement order, original-group
+proof, duplicate/colliding identities, timestamp and capacity rejection,
+single-entry retention, one-frame recovery, checkpoint cutover, and exact
+retry without a committed prefix.
 
 Matching checkpoint tests cover capture-time replay audit, displayed-class-
 tail reserve state, resting STP, exact retry, stable kind/codec, semantic
@@ -2252,7 +2279,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | Impact | Capability | Evidence required for completion |
 |---|---|---|
 | High | Durable storage completion | externally coordinated retired-generation archival/handoff; kernel inode locking or qualified alias exclusion; forced-power-loss filesystem/device evidence |
-| High | Ledger lifecycle completion | explicit trade-bound fee transfers over atomic call-auction DVP batches are implemented; remaining work is controller authorization, versioned calendar ingestion, durable external-statement evidence, externally anchored cutoff proofs, allocation adapters, fee calculation, and settlement-date lifecycle adapters |
+| High | Ledger lifecycle completion | explicit trade-bound fee transfers and full-settlement call-auction bust/replacement corrections over atomic DVP batches are implemented; remaining work is controller authorization, versioned calendar ingestion, durable external-statement evidence, externally anchored cutoff proofs, allocation adapters, fee calculation, settlement-date lifecycle adapters, and coordinated external matching/risk state correction |
 | High | Snapshots and compaction | single-file and segmented matching/risk/ledger/call-auction WAL cutover plus off-thread direct and WAL-synchronized plain/coupled continuous-matching and call-auction replay verification are implemented; verified matching/risk/auction handles can retire an older prefix by cursor-streaming only its synchronized suffix. Remaining evidence is bounded checkpoint memory and writer audit-copy/projection/direct-reconstruction pause, bounded suffix-copy pause, semantic generation rollover, and externally retained audit/idempotency proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
@@ -2260,7 +2287,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Instrument lifecycle expansion | authoritative calendar ingestion/distribution/activation, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |
-| High | Clearing lifecycle | explicit positive trade-bound fee transfers are atomic with call-auction DVP; remaining work is novation/allocation, fee calculation and authorization, settlement dates, fails, trade-level corrections/busts, and externally anchored reconciliation |
+| High | Clearing lifecycle | explicit positive trade-bound fee transfers and atomic full-settlement bust/replacement corrections are implemented for call-auction DVP; remaining work is novation/allocation, fee calculation and authorization, settlement dates, fails, partial trade/allocation amendments, coordinated matching/risk/external-position correction, correction-reason evidence, and externally anchored reconciliation |
 | High | Security boundary | authenticated principals, authorization policy, secret management, audit export, and abuse controls |
 | Medium | Gateways and schemas | versioned binary protocol, FIX adapter, backpressure, session recovery, and conformance fixtures |
 | Medium | Market-data distribution | constructor-reserved per-instrument short-gap replay for continuous updates and complete call-auction command batches, with typed gap/collision/eviction/boundary handling and snapshot fallback, is implemented; remaining work is authenticated transport framing, entitlement, fanout, remote retransmission sessions, bandwidth control, and conformance fixtures |

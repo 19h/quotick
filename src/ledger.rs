@@ -61,6 +61,8 @@ pub enum LedgerPreparationResource {
     CallAuctionFeePostings,
     /// DVP entries constructed for one complete call-auction report.
     CallAuctionSettlementEntries,
+    /// Reversal and replacement entries for one call-auction correction.
+    CallAuctionCorrectionEntries,
     /// Identity set used to validate one batch.
     BatchIdentitySet,
     /// Pending transaction lookup for ordered batch semantics.
@@ -124,6 +126,7 @@ impl fmt::Display for LedgerPreparationResource {
             Self::ReversalPostings => "reversal posting preparation",
             Self::CallAuctionFeePostings => "call-auction fee-posting preparation",
             Self::CallAuctionSettlementEntries => "call-auction settlement-entry preparation",
+            Self::CallAuctionCorrectionEntries => "call-auction correction-entry preparation",
             Self::BatchIdentitySet => "batch identity validation",
             Self::PendingTransactions => "batch pending-transaction preparation",
             Self::PendingReversals => "batch pending-reversal preparation",
@@ -545,10 +548,55 @@ pub struct CallAuctionSettlement {
     record: CallAuctionSettlementRecord,
 }
 
+/// One exact full-settlement bust or atomic reversal-plus-replacement event.
+///
+/// Every original DVP and fee transaction is reversed in its canonical
+/// settlement order. A replacement correction appends one independently
+/// validated [`CallAuctionSettlement`] after all reversals. The original
+/// settlement value is retained so application can prove that its transactions
+/// were committed together as that exact ledger event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallAuctionSettlementCorrection {
+    original: CallAuctionSettlement,
+    record: CallAuctionSettlementRecord,
+    reversal_transaction_count: usize,
+    replacement_transaction_count: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CallAuctionSettlementRecord {
     Entry(JournalEntry),
     Batch(LedgerBatch),
+}
+
+impl CallAuctionSettlementRecord {
+    fn from_entries(mut entries: Vec<JournalEntry>) -> Result<Self, LedgerError> {
+        if entries.len() == 1 {
+            let Some(entry) = entries.pop() else {
+                unreachable!("one call-auction entry disappeared")
+            };
+            Ok(Self::Entry(entry))
+        } else if entries.is_empty() {
+            Err(LedgerError::CallAuctionSettlementReportInvalid)
+        } else {
+            LedgerBatch::new(entries).map(Self::Batch)
+        }
+    }
+
+    fn entries(&self) -> &[JournalEntry] {
+        match self {
+            Self::Entry(entry) => std::slice::from_ref(entry),
+            Self::Batch(batch) => batch.entries(),
+        }
+    }
+
+    fn transaction_count(&self) -> usize {
+        self.entries().len()
+    }
+
+    fn primary_transaction_id(&self) -> TransactionId {
+        self.entries()[0].transaction_id
+    }
 }
 
 /// One sequenced ledger event.
@@ -642,6 +690,15 @@ pub enum LedgerError {
     FeeAccountsIdentical(AccountId),
     /// A fee did not bind to the next trade in canonical report order.
     CallAuctionFeeTradeMismatch(TradeId),
+    /// Reversal transaction identifiers did not cover the complete settlement.
+    CallAuctionCorrectionTransactionCountMismatch {
+        /// Supplied reversal transaction identifiers.
+        reversal_transaction_count: usize,
+        /// DVP and fee transactions in the original settlement.
+        settlement_transaction_count: usize,
+    },
+    /// The original single-entry settlement was committed in another grouping.
+    CallAuctionCorrectionOriginalGroupingMismatch(TransactionId),
     /// Ledger state changed after an entry was prepared and before commit.
     StalePreparation,
     /// The transaction targeted by a reversal was not present.
@@ -754,7 +811,9 @@ impl fmt::Display for LedgerError {
             | Self::CallAuctionSettlementTransactionCountMismatch { .. }
             | Self::FeeAmountNotPositive(_)
             | Self::FeeAccountsIdentical(_)
-            | Self::CallAuctionFeeTradeMismatch(_)) => {
+            | Self::CallAuctionFeeTradeMismatch(_)
+            | Self::CallAuctionCorrectionTransactionCountMismatch { .. }
+            | Self::CallAuctionCorrectionOriginalGroupingMismatch(_)) => {
                 format_settlement_error(settlement_error, formatter)
             }
             Self::StalePreparation => formatter.write_str("prepared journal entry is stale"),
@@ -880,6 +939,17 @@ fn format_settlement_error(error: &LedgerError, formatter: &mut fmt::Formatter<'
         LedgerError::CallAuctionFeeTradeMismatch(trade_id) => write!(
             formatter,
             "call-auction fee for trade {trade_id} is absent or outside canonical report order"
+        ),
+        LedgerError::CallAuctionCorrectionTransactionCountMismatch {
+            reversal_transaction_count,
+            settlement_transaction_count,
+        } => write!(
+            formatter,
+            "call-auction correction supplied {reversal_transaction_count} reversal transaction identifiers for {settlement_transaction_count} settlement transactions"
+        ),
+        LedgerError::CallAuctionCorrectionOriginalGroupingMismatch(transaction_id) => write!(
+            formatter,
+            "call-auction settlement transaction {transaction_id} was committed outside its exact original event"
         ),
         _ => unreachable!("settlement formatter received a non-settlement error"),
     }
@@ -1683,28 +1753,168 @@ impl CallAuctionSettlement {
         if let Some(fee) = fees.next() {
             return Err(LedgerError::CallAuctionFeeTradeMismatch(fee.trade_id));
         }
-        let record = if entries.len() == 1 {
-            let Some(entry) = entries.pop() else {
-                return Err(LedgerError::CallAuctionSettlementReportInvalid);
-            };
-            CallAuctionSettlementRecord::Entry(entry)
-        } else {
-            CallAuctionSettlementRecord::Batch(LedgerBatch::new(entries)?)
-        };
+        let record = CallAuctionSettlementRecord::from_entries(entries)?;
         Ok(Self { record })
     }
 
     /// Returns the number of global transactions in the atomic ledger event.
     #[must_use]
     pub fn transaction_count(&self) -> usize {
-        match &self.record {
-            CallAuctionSettlementRecord::Entry(_) => 1,
-            CallAuctionSettlementRecord::Batch(batch) => batch.entries().len(),
-        }
+        self.record.transaction_count()
     }
 
     pub(crate) fn into_record(self) -> CallAuctionSettlementRecord {
         self.record
+    }
+}
+
+impl CallAuctionSettlementCorrection {
+    /// Constructs one exact full-settlement bust.
+    ///
+    /// One new reversal transaction identifier must be supplied for every DVP
+    /// and fee entry in canonical original-settlement order. A one-entry bust
+    /// retains the ordinary entry path; larger busts use one [`LedgerBatch`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] for identifier-count mismatch, an
+    /// unrepresentable inverse, duplicate transaction identity, timestamp
+    /// regression, or preparation allocation failure.
+    pub fn bust(
+        reversal_transaction_ids: Vec<TransactionId>,
+        reversal_reference: u64,
+        reversal_effective_date: AccountingDate,
+        reversal_recorded_at: TimestampNs,
+        original: &CallAuctionSettlement,
+    ) -> Result<Self, LedgerError> {
+        Self::from_parts(
+            reversal_transaction_ids,
+            reversal_reference,
+            reversal_effective_date,
+            reversal_recorded_at,
+            None,
+            original,
+        )
+    }
+
+    /// Constructs one full reversal followed by one replacement settlement.
+    ///
+    /// All original DVP and fee entries are reversed first. Every replacement
+    /// DVP and fee entry follows in its own canonical settlement order. The
+    /// complete correction is one ordered batch and exposes only its aggregate
+    /// final balance image.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] for any bust-construction failure, duplicate
+    /// identity across reversals and replacements, or booking-time regression
+    /// from the reversal group into the replacement.
+    pub fn replace(
+        reversal_transaction_ids: Vec<TransactionId>,
+        reversal_reference: u64,
+        reversal_effective_date: AccountingDate,
+        reversal_recorded_at: TimestampNs,
+        replacement: CallAuctionSettlement,
+        original: &CallAuctionSettlement,
+    ) -> Result<Self, LedgerError> {
+        Self::from_parts(
+            reversal_transaction_ids,
+            reversal_reference,
+            reversal_effective_date,
+            reversal_recorded_at,
+            Some(replacement),
+            original,
+        )
+    }
+
+    fn from_parts(
+        reversal_transaction_ids: Vec<TransactionId>,
+        reversal_reference: u64,
+        reversal_effective_date: AccountingDate,
+        reversal_recorded_at: TimestampNs,
+        replacement: Option<CallAuctionSettlement>,
+        original: &CallAuctionSettlement,
+    ) -> Result<Self, LedgerError> {
+        let reversal_transaction_count = reversal_transaction_ids.len();
+        let settlement_transaction_count = original.transaction_count();
+        if reversal_transaction_count != settlement_transaction_count {
+            return Err(LedgerError::CallAuctionCorrectionTransactionCountMismatch {
+                reversal_transaction_count,
+                settlement_transaction_count,
+            });
+        }
+        let replacement_transaction_count = replacement
+            .as_ref()
+            .map_or(0, CallAuctionSettlement::transaction_count);
+        let transaction_count = reversal_transaction_count
+            .checked_add(replacement_transaction_count)
+            .ok_or(LedgerError::ArithmeticOverflow)?;
+        let mut entries = reserve_ledger_preparation_vec(
+            transaction_count,
+            LedgerPreparationResource::CallAuctionCorrectionEntries,
+        )?;
+        for (transaction_id, original_entry) in reversal_transaction_ids
+            .into_iter()
+            .zip(original.record.entries())
+        {
+            entries.push(JournalEntry::reversal(
+                transaction_id,
+                reversal_reference,
+                reversal_effective_date,
+                reversal_recorded_at,
+                original_entry,
+            )?);
+        }
+        if let Some(replacement) = replacement {
+            entries.extend(replacement.record.entries().iter().cloned());
+        }
+        let record = CallAuctionSettlementRecord::from_entries(entries)?;
+        Ok(Self {
+            original: original.clone(),
+            record,
+            reversal_transaction_count,
+            replacement_transaction_count,
+        })
+    }
+
+    /// Returns the exact original settlement whose event grouping must exist.
+    #[must_use]
+    pub const fn original_settlement(&self) -> &CallAuctionSettlement {
+        &self.original
+    }
+
+    /// Returns the number of exact reversal entries in this correction.
+    #[must_use]
+    pub const fn reversal_transaction_count(&self) -> usize {
+        self.reversal_transaction_count
+    }
+
+    /// Returns the number of replacement DVP and fee entries.
+    #[must_use]
+    pub const fn replacement_transaction_count(&self) -> usize {
+        self.replacement_transaction_count
+    }
+
+    /// Returns the total reversal-plus-replacement transaction count.
+    #[must_use]
+    pub const fn transaction_count(&self) -> usize {
+        self.reversal_transaction_count + self.replacement_transaction_count
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CallAuctionSettlement,
+        CallAuctionSettlementRecord,
+        usize,
+        usize,
+    ) {
+        (
+            self.original,
+            self.record,
+            self.reversal_transaction_count,
+            self.replacement_transaction_count,
+        )
     }
 }
 
@@ -1848,6 +2058,15 @@ pub struct CallAuctionSettlementReceipt {
     transaction_count: usize,
 }
 
+/// Result of committing one full-settlement bust or replacement correction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionSettlementCorrectionReceipt {
+    sequence: u64,
+    replayed: bool,
+    reversal_transaction_count: usize,
+    replacement_transaction_count: usize,
+}
+
 impl CallAuctionSettlementReceipt {
     /// Returns the strictly increasing ledger-event sequence.
     #[must_use]
@@ -1885,6 +2104,55 @@ impl From<BatchReceipt> for CallAuctionSettlementReceipt {
             replayed: receipt.replayed,
             transaction_count: receipt.transaction_count,
         }
+    }
+}
+
+impl CallAuctionSettlementCorrectionReceipt {
+    pub(crate) fn from_settlement_receipt(
+        receipt: CallAuctionSettlementReceipt,
+        reversal_transaction_count: usize,
+        replacement_transaction_count: usize,
+    ) -> Self {
+        debug_assert_eq!(
+            receipt.transaction_count,
+            reversal_transaction_count + replacement_transaction_count
+        );
+        Self {
+            sequence: receipt.sequence,
+            replayed: receipt.replayed,
+            reversal_transaction_count,
+            replacement_transaction_count,
+        }
+    }
+
+    /// Returns the strictly increasing ledger-event sequence.
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    /// Returns whether this exact correction event was already committed.
+    #[must_use]
+    pub const fn replayed(self) -> bool {
+        self.replayed
+    }
+
+    /// Returns the number of exact reversal entries.
+    #[must_use]
+    pub const fn reversal_transaction_count(self) -> usize {
+        self.reversal_transaction_count
+    }
+
+    /// Returns the number of replacement DVP and fee entries.
+    #[must_use]
+    pub const fn replacement_transaction_count(self) -> usize {
+        self.replacement_transaction_count
+    }
+
+    /// Returns the total reversal-plus-replacement transaction count.
+    #[must_use]
+    pub const fn transaction_count(self) -> usize {
+        self.reversal_transaction_count + self.replacement_transaction_count
     }
 }
 
@@ -3089,6 +3357,76 @@ impl Ledger {
         match settlement.record {
             CallAuctionSettlementRecord::Entry(entry) => self.post(entry).map(Into::into),
             CallAuctionSettlementRecord::Batch(batch) => self.post_batch(batch).map(Into::into),
+        }
+    }
+
+    /// Atomically busts or replaces one exact committed call-auction settlement.
+    ///
+    /// The original DVP and fee transactions must still identify the exact
+    /// entry or batch event created by [`Ledger::settle_call_auction`]. Every
+    /// original entry is reversed before any optional replacement entry, while
+    /// balances expose only the complete final image.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] for missing or differently grouped original
+    /// settlement state, reversal lineage, collision, partial prior commitment,
+    /// period, timestamp, capacity, or final-balance failure.
+    pub fn correct_call_auction(
+        &mut self,
+        correction: CallAuctionSettlementCorrection,
+    ) -> Result<CallAuctionSettlementCorrectionReceipt, LedgerError> {
+        let (original, record, reversal_count, replacement_count) = correction.into_parts();
+        self.validate_committed_call_auction_settlement(&original)?;
+        let receipt = match record {
+            CallAuctionSettlementRecord::Entry(entry) => self.post(entry).map(Into::into),
+            CallAuctionSettlementRecord::Batch(batch) => self.post_batch(batch).map(Into::into),
+        }?;
+        Ok(
+            CallAuctionSettlementCorrectionReceipt::from_settlement_receipt(
+                receipt,
+                reversal_count,
+                replacement_count,
+            ),
+        )
+    }
+
+    pub(crate) fn validate_committed_call_auction_settlement(
+        &self,
+        settlement: &CallAuctionSettlement,
+    ) -> Result<(), LedgerError> {
+        match &settlement.record {
+            CallAuctionSettlementRecord::Entry(entry) => {
+                let transaction_id = entry.transaction_id;
+                let posted = self
+                    .entries
+                    .get(&transaction_id)
+                    .ok_or(LedgerError::ReversalTargetMissing(transaction_id))?;
+                if posted.entry != *entry {
+                    return Err(LedgerError::TransactionIdCollision(transaction_id));
+                }
+                let record_index = posted
+                    .sequence
+                    .checked_sub(1)
+                    .and_then(|value| usize::try_from(value).ok());
+                if record_index.and_then(|index| self.journal.get(index))
+                    != Some(&LedgerRecordKey::Entry(transaction_id))
+                {
+                    return Err(LedgerError::CallAuctionCorrectionOriginalGroupingMismatch(
+                        transaction_id,
+                    ));
+                }
+                Ok(())
+            }
+            CallAuctionSettlementRecord::Batch(batch) => {
+                if self.existing_batch_receipt(batch)?.is_some() {
+                    Ok(())
+                } else {
+                    Err(LedgerError::ReversalTargetMissing(
+                        settlement.record.primary_transaction_id(),
+                    ))
+                }
+            }
         }
     }
 

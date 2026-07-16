@@ -11,7 +11,8 @@ use crate::journal::{
     SegmentedJournalError, SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
 };
 use crate::ledger::{
-    BatchPreparation, BatchReceipt, CallAuctionSettlement, CallAuctionSettlementReceipt,
+    BatchPreparation, BatchReceipt, CallAuctionSettlement, CallAuctionSettlementCorrection,
+    CallAuctionSettlementCorrectionReceipt, CallAuctionSettlementReceipt,
     CallAuctionSettlementRecord, CorrectionPreparation, CorrectionReceipt, JournalEntry, Ledger,
     LedgerBatch, LedgerCheckpoint, LedgerCheckpointCaptureError, LedgerCheckpointError,
     LedgerConstructionError, LedgerCorrection, LedgerError, LedgerInvariantViolation,
@@ -669,6 +670,41 @@ impl DurableLedger {
             CallAuctionSettlementRecord::Entry(entry) => self.post(entry).map(Into::into),
             CallAuctionSettlementRecord::Batch(batch) => self.post_batch(batch).map(Into::into),
         }
+    }
+
+    /// Durably busts or replaces one exact committed call-auction settlement.
+    ///
+    /// The original event grouping is proved before WAL append. Every reversal
+    /// and optional replacement entry then shares one batch frame, one ledger
+    /// sequence, and one all-or-neither recovery result. A one-entry bust uses
+    /// one ordinary entry frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableLedgerError`] for original-group, ledger preparation,
+    /// WAL, or commit failure. Ambiguous I/O or post-append failure poisons the
+    /// runtime.
+    pub fn correct_call_auction(
+        &mut self,
+        correction: CallAuctionSettlementCorrection,
+    ) -> Result<CallAuctionSettlementCorrectionReceipt, DurableLedgerError> {
+        if self.poisoned {
+            return Err(DurableLedgerError::Poisoned);
+        }
+        let (original, record, reversal_count, replacement_count) = correction.into_parts();
+        self.ledger
+            .validate_committed_call_auction_settlement(&original)?;
+        let receipt = match record {
+            CallAuctionSettlementRecord::Entry(entry) => self.post(entry).map(Into::into),
+            CallAuctionSettlementRecord::Batch(batch) => self.post_batch(batch).map(Into::into),
+        }?;
+        Ok(
+            CallAuctionSettlementCorrectionReceipt::from_settlement_receipt(
+                receipt,
+                reversal_count,
+                replacement_count,
+            ),
+        )
     }
 
     /// Constructs, durably records, and commits the exact reversal of a prior entry.

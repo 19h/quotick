@@ -17,7 +17,7 @@ services, and print a compact result only after their cross-checks succeed.
 | [`wal_recovery.rs`](wal_recovery.rs) | Durable coupled recovery, asynchronous checkpoint verification, and exact retry |
 | [`segmented_cutover.rs`](segmented_cutover.rs) | Segmented matching WAL rotation, generation cutover, and suffix recovery |
 | [`state_handoff.rs`](state_handoff.rs) | In-memory checkpoint capture, codec round trip, restore, and continuation |
-| [`auction_restart.rs`](auction_restart.rs) | Auction checkpoint recovery through collection, freeze, and uncross |
+| [`auction_restart.rs`](auction_restart.rs) | Auction checkpoint recovery through uncross, DVP-plus-fee settlement, and a full settlement bust |
 
 Run one program from the repository root:
 
