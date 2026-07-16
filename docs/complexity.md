@@ -176,6 +176,17 @@ Full and band iterators each retain two 128-index stacks:
 `2 × 128 × size_of::<usize>() = 2,048 B` on a 64-bit target, plus scalar
 fields. The bound is independent of configured or occupied level count.
 
+`try_depth_range_summary` performs one checked fold over the shared directional
+price-range descent. For `K` occupied execution prices in the selected band,
+including hidden-only prices, it is `O(log(P + 1) + K)` time and `O(1)` fixed
+result/state, and allocates no output. Only visible rows contribute to the
+level, displayed-order, and displayed-quantity totals. The full-side
+`try_depth_summary` uses the same fold over the definition's price domain and
+therefore has `K = P`. Each included row performs constant checked
+`usize`/`u128` additions; overflow or a zero public aggregate/count discards
+the partial local result. Empty and inverted bands retain the same bounded
+setup and zero totals.
+
 `try_best_bid_offer` reads two cached public extrema and performs a constant
 number of aggregate, ordering, provenance, and arithmetic operations. It is
 `O(1)` time and space with one fixed-size result and no successful-path

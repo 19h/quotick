@@ -4527,6 +4527,58 @@ state provenance, hidden-liquidity disclosure, rounded midpoint, overflow,
 panic, mutation, allocation, or consolidated/executable interpretation
 falsifies A128.
 
+## A129 — checked provenance-bound cumulative public depth
+
+**Assumption.** `try_depth_range_summary` observes one immutable continuous
+`OrderBook` state and uses the same stable-slot AVL inclusive range descent and
+market-direction projection as the A123 public-depth iterator. It retains the
+exact caller range start and end. An inverted range is empty.
+`try_depth_summary` composes the same fold with the immutable instrument
+definition's inclusive minimum and maximum prices.
+
+Only displayed aggregate rows enter `DepthSummary`; a fully hidden-only price
+is absent. Bids are inspected from high to low and offers from low to high, so
+the first and last selected visible rows are the exact market-priority best and
+worst prices. Each selected row must have positive aggregate quantity and
+displayed-order count. Level count uses checked `usize`; displayed-order count
+and displayed quantity use checked `u128` addition. Any contradiction or
+overflow returns a typed `InvariantViolation` and discards the local partial
+summary before output ownership changes hands. This aggregate fold does not
+traverse private level membership or replace the complete A45 invariant audit.
+
+The fixed-size result binds side, exact selection endpoints, best/worst prices,
+level count, displayed-order count, and displayed lots to instrument identity,
+immutable instrument-definition version, and last committed book-event
+sequence. It contains no per-level rows, hidden quantity/count, price notional,
+VWAP, currency conversion, fee, queue-priority, or executable-liquidity claim.
+
+The successful path allocates nothing and changes no order, level, cache,
+sequence, history, risk, WAL, snapshot, or market-data state. Human-readable
+failure detail remains an A12 corruption-path allocation boundary. The result
+is a shard-local state observation and supplies no remote pagination,
+conflation, entitlement, clock-alignment, or transport semantics.
+
+**Dependent results.** [A1, A3, A10, A12, A22, A44, A45, A72, A83, A103,
+A123, A129] For `K` occupied execution prices in the selected band among `P`
+occupied prices, setup plus traversal is `O(log(P + 1) + K)` time with `O(1)`
+fixed output/state and no output allocation. Hidden-only in-band prices
+contribute to `K` but not the totals. A full-side summary has `K = P`. Direct
+checkpoint restoration reproduces the same result because semantic price
+levels and public extrema are reconstructed and validated; no wire-version
+change follows.
+
+**Falsification probe.** Exercise both sides; empty, one-sided, hidden-only,
+and mixed visible/hidden books; full-definition and narrow inclusive bands;
+outside, single-price, and inverted ranges; multiple rows and orders; signed
+prices; and direct checkpoint restoration. Compare totals and best/worst
+prices with a literal checked fold over `depth_range_iter`. Require exact
+instrument/version/event-sequence/side/range provenance and unchanged state.
+Corrupt a selected row to zero quantity and zero count, then construct a
+multi-row `u128` quantity overflow; require typed failure without partial
+output. Any hidden disclosure, direction error, endpoint loss, unchecked wrap,
+partial result, mutation, allocation, recovery difference, or implied notional,
+VWAP, consolidated, or executable interpretation falsifies A129.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -4611,6 +4663,18 @@ capability, a remaining risk, or an opportunity.
   consolidated best quote. Cross-venue source identity, clock alignment,
   staleness policy, fees, sizes after queue consumption, entitlements, and
   executable reservation require separately sequenced interfaces.
+
+- **Medium impact:** checked cumulative public-depth summaries now expose
+  provenance-bound level, displayed-order, and displayed-lot totals plus
+  market-priority best/worst prices for full sides and inclusive bands under
+  A129. The fixed-size query allocates no output and fails on zero-valued rows
+  or cumulative overflow; direct checkpoint and hidden-only cases are covered.
+
+- **Medium impact opportunity:** cumulative summaries can drive bounded local
+  liquidity, concentration, imbalance, and surveillance features without
+  materializing depth. Price notional, VWAP, cross-venue consolidation, fees,
+  clock alignment, and executable-liquidity modelling remain separate checked
+  calculations and sequenced inputs.
 
 - **Medium impact risk:** queue position is a state observation, not a fill-
   probability or latency estimate. Subsequent execution, cancellation,

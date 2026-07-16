@@ -3,7 +3,7 @@ use quotick::instrument::{
     QuantityRules, ReserveOrderRules, TradingState,
 };
 use quotick::matching::{
-    BestBidOffer, Command, CommandOutcome, EventKind, ImmediateExecutionRequest,
+    BestBidOffer, Command, CommandOutcome, DepthSummary, EventKind, ImmediateExecutionRequest,
     ImmediateExecutionTermination, MassCancelScope, MatchingHashIndex, NewOrder, OrderBook,
     OrderBookQueryError, OrderBookQueryResource, OrderDisplay, OrderQueueClass, OrderType,
     PriceLevelOrders, RejectReason, SelfTradePrevention, StopActivation, TimeInForce,
@@ -183,6 +183,28 @@ fn execution_totals(report: &quotick::matching::ExecutionReport) -> (u64, u64, u
         }
     }
     (executed, decremented, unfilled, raw_notional)
+}
+
+fn literal_depth_summary(
+    book: &OrderBook,
+    side: Side,
+    range: std::ops::RangeInclusive<Price>,
+) -> (Option<Price>, Option<Price>, usize, u128, u128) {
+    let mut best = None;
+    let mut worst = None;
+    let mut levels = 0_usize;
+    let mut orders = 0_u128;
+    let mut quantity = 0_u128;
+    for level in book.depth_range_iter(side, range) {
+        if best.is_none() {
+            best = Some(level.price);
+        }
+        worst = Some(level.price);
+        levels = levels.checked_add(1).unwrap();
+        orders = orders.checked_add(u128::from(level.order_count)).unwrap();
+        quantity = quantity.checked_add(level.quantity).unwrap();
+    }
+    (best, worst, levels, orders, quantity)
 }
 
 #[test]
@@ -566,6 +588,90 @@ fn best_bid_offer_is_coherent_provenanced_and_exact_at_signed_extremes() {
     assert_eq!(widest.spread_raw(), Some(u64::MAX));
     assert_eq!(widest.midpoint_raw_numerator(), Some(-1));
     extreme.validate().unwrap();
+}
+
+#[test]
+fn depth_summaries_are_provenanced_checked_and_market_ordered() {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<DepthSummary>();
+
+    let book = populated_book();
+    let before_commands = book.retained_command_count();
+    let before_bids = book.depth_iter(Side::Buy).collect::<Vec<_>>();
+    let bids = book.try_depth_summary(Side::Buy).unwrap();
+    assert_eq!(bids.instrument_id(), InstrumentId::new(1).unwrap());
+    assert_eq!(
+        bids.instrument_version(),
+        InstrumentVersion::new(1).unwrap()
+    );
+    assert_eq!(bids.book_event_sequence(), book.last_event_sequence());
+    assert_eq!(bids.side(), Side::Buy);
+    assert_eq!(bids.range_start(), Price::from_raw(-1_000));
+    assert_eq!(bids.range_end(), Price::from_raw(1_000));
+    assert_eq!(bids.best_price(), Some(Price::from_raw(100)));
+    assert_eq!(bids.worst_price(), Some(Price::from_raw(90)));
+    assert_eq!(bids.level_count(), 2);
+    assert_eq!(bids.displayed_order_count(), 2);
+    assert_eq!(bids.displayed_quantity(), 8);
+    assert_eq!(
+        (
+            bids.best_price(),
+            bids.worst_price(),
+            bids.level_count(),
+            bids.displayed_order_count(),
+            bids.displayed_quantity(),
+        ),
+        literal_depth_summary(
+            &book,
+            Side::Buy,
+            Price::from_raw(-1_000)..=Price::from_raw(1_000),
+        )
+    );
+
+    let offers = book.try_depth_summary(Side::Sell).unwrap();
+    assert_eq!(offers.best_price(), Some(Price::from_raw(120)));
+    assert_eq!(offers.worst_price(), Some(Price::from_raw(130)));
+    assert_eq!(offers.level_count(), 2);
+    assert_eq!(offers.displayed_order_count(), 2);
+    assert_eq!(offers.displayed_quantity(), 24);
+
+    let band = book
+        .try_depth_range_summary(Side::Buy, Price::from_raw(95)..=Price::from_raw(110))
+        .unwrap();
+    assert_eq!(band.range_start(), Price::from_raw(95));
+    assert_eq!(band.range_end(), Price::from_raw(110));
+    assert_eq!(band.best_price(), Some(Price::from_raw(100)));
+    assert_eq!(band.worst_price(), Some(Price::from_raw(100)));
+    assert_eq!(band.level_count(), 1);
+    assert_eq!(band.displayed_order_count(), 1);
+    assert_eq!(band.displayed_quantity(), 5);
+    assert_eq!(
+        (
+            band.best_price(),
+            band.worst_price(),
+            band.level_count(),
+            band.displayed_order_count(),
+            band.displayed_quantity(),
+        ),
+        literal_depth_summary(&book, Side::Buy, Price::from_raw(95)..=Price::from_raw(110),)
+    );
+
+    let inverted = book
+        .try_depth_range_summary(Side::Buy, Price::from_raw(110)..=Price::from_raw(95))
+        .unwrap();
+    assert_eq!(inverted.range_start(), Price::from_raw(110));
+    assert_eq!(inverted.range_end(), Price::from_raw(95));
+    assert_eq!(inverted.best_price(), None);
+    assert_eq!(inverted.worst_price(), None);
+    assert_eq!(inverted.level_count(), 0);
+    assert_eq!(inverted.displayed_order_count(), 0);
+    assert_eq!(inverted.displayed_quantity(), 0);
+
+    let restored = OrderBook::from_checkpoint(&book.checkpoint(1, 11).unwrap()).unwrap();
+    assert_eq!(restored.try_depth_summary(Side::Buy).unwrap(), bids);
+    assert_eq!(book.retained_command_count(), before_commands);
+    assert_eq!(book.depth_iter(Side::Buy).collect::<Vec<_>>(), before_bids);
+    book.validate().unwrap();
 }
 
 #[test]
