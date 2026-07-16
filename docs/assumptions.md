@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A137 are stable and are referenced from code comments and other
+identifiers A1-A138 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -5075,6 +5075,57 @@ genesis retention, revision-ahead success, blocked-membership success,
 mutation, successful-path allocation, recovery difference, public account
 disclosure, publisher panic, or wire-byte change falsifies A137.
 
+## A138 — provenance-bound exact active-order observation
+
+**Assumption.** One exact active-order query holds one immutable continuous
+`OrderBook` borrow. The fixed-size `ActiveOrderObservation` binds the queried
+`OrderId` to instrument, immutable definition version, final matching event
+sequence, and an optional `ActiveOrderSnapshot`. The enum distinguishes a
+complete `OrderSnapshot` from a complete `DormantStopSnapshot`; absence is
+bound to the same source state rather than returned as an unversioned `None`.
+
+The query performs one expected bounded-hash identity lookup. A present hash
+key must equal the embedded order identifier. Resting state must have positive
+total and working quantities, working quantity no greater than total leaves,
+and a working/display relationship valid for fully displayed, reserve, or
+fully hidden state. Dormant state must have positive leaves, canonical working
+quantity for its display policy, the activation risk price, no price-level FIFO
+links, non-zero trigger priority, and expiration identical to its retained
+lifetime. `try_order` and `try_dormant_stop` project the observation through
+the same validation; the convenience methods delegate to those typed paths and
+panic on selected-row corruption.
+
+Complete market-data publisher bootstrap/source parity and coupled-risk audit
+consume fallible dormant snapshots, so local dormant corruption becomes typed
+source divergence or `RiskInvariantViolation` rather than a snapshot panic.
+The observation proves only the selected row. It does not prove complete
+price-level FIFO, account membership, GTD-expiry membership, stop-trigger
+membership, or command-history derivation; `try_order_queue_position`,
+`try_price_level_orders`, `OrderBook::validate`, and checkpoint-lineage
+validation retain those stronger scopes. No command, event, checkpoint,
+snapshot, replay, codec, or wire field changes.
+
+**Dependent results.** [A1, A2, A3, A4, A9, A10, A12, A17, A22, A57,
+A72, A103, A125, A138] One observation or typed projection is expected `O(1)`
+time and `O(1)` fixed space; an adversarial complete hash-collision cluster is
+`O(O)` for `O` active identities. Successful paths allocate and mutate nothing.
+Direct checkpoint restoration and full-WAL recovery retain exact provenance
+and absent/resting/dormant state. No wire change follows.
+
+**Falsification probe.** Query absent identities, fully displayed, reserve,
+fully hidden, dormant stop-market, dormant stop-limit, and dormant GTD orders.
+Exercise partial fill, reserve refresh, replacement, cancellation, activation,
+complete fill, business rejection, exact retry, direct checkpoint restoration,
+publisher bootstrap, coupled-risk audit, and full-WAL recovery. Require exact
+identifier/instrument/version/sequence/state, no mutation, and typed-projection
+parity. Inject selected key/identity drift; resting zero leaves, zero working,
+working-above-leaves, and display inconsistency; dormant zero leaves,
+noncanonical working quantity, activation-risk-price drift, price-level links,
+zero priority, and lifetime/expiry drift. Require typed failure before any
+value and typed publisher/risk failure. Any unprovenanced absence, state-class
+ambiguity, local-corruption success, mutation, successful-path allocation,
+recovery difference, publisher/risk panic, or wire-byte change falsifies A138.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -5095,6 +5146,21 @@ capability, a remaining risk, or an opportunity.
   final event sequence, effective admission state, and accepted revision.
   Retained genesis revisions, sequence-ahead revisions, and blocked accounts
   with active membership fail before a value is returned.
+
+- **High impact:** authoritative books now expose one fixed-size exact private
+  order observation bound to queried identity, instrument, immutable definition
+  version, and final event sequence. Resting, dormant-stop, and state-bound
+  absent results share one typed query and fallible projection path.
+
+- **Medium impact risk:** selected-row validation does not prove complete
+  price-level, account, expiry, trigger, or retained-history topology. Queue-
+  position, price-level, structural, and checkpoint-lineage validation remain
+  independent stronger boundaries.
+
+- **Medium impact opportunity:** exact active-order state and state-bound
+  absence can support deterministic OMS/gateway reconciliation, recovery
+  comparison, private lifecycle analytics, and operational visualization
+  without correlating separate order, dormant-stop, and sequence reads.
 
 - **Medium impact risk:** the observation proves one local shard fence and its
   local active-membership consequence. Controller authentication,

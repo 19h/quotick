@@ -3,12 +3,12 @@ use quotick::instrument::{
     QuantityRules, ReserveOrderRules, TradingState,
 };
 use quotick::matching::{
-    BestBidOffer, Command, CommandOutcome, DepthSummary, DisplayedLiquidityRequest,
-    DisplayedLiquidityTermination, EventKind, ImmediateExecutionRequest,
-    ImmediateExecutionTermination, MassCancelScope, MatchingHashIndex, NewOrder, OrderBook,
-    OrderBookQueryError, OrderBookQueryResource, OrderDisplay, OrderQueueClass, OrderType,
-    PriceLevelOrders, PublicDepthImbalance, PublicLevelObservation, RejectReason,
-    SelfTradePrevention, StopActivation, TimeInForce,
+    ActiveOrderObservation, ActiveOrderSnapshot, BestBidOffer, Command, CommandOutcome,
+    DepthSummary, DisplayedLiquidityRequest, DisplayedLiquidityTermination, EventKind,
+    ImmediateExecutionRequest, ImmediateExecutionTermination, MassCancelScope, MatchingHashIndex,
+    NewOrder, OrderBook, OrderBookQueryError, OrderBookQueryResource, OrderDisplay,
+    OrderQueueClass, OrderType, PriceLevelOrders, PublicDepthImbalance, PublicLevelObservation,
+    RejectReason, SelfTradePrevention, StopActivation, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -591,6 +591,60 @@ fn queue_positions_model_current_slices_reserve_refresh_and_hidden_priority() {
     assert_eq!(hidden_after_refresh.order_count_ahead(), 3);
     assert_eq!(hidden_after_refresh.executable_quantity_ahead_lots(), 17);
     book.validate().unwrap();
+}
+
+#[test]
+fn active_order_observations_bind_resting_and_absent_state_to_one_sequence() {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ActiveOrderObservation>();
+    assert_send_sync::<ActiveOrderSnapshot>();
+
+    let mut book = queue_position_book();
+    let order_id = OrderId::new(3).unwrap();
+    let present = book.try_active_order_observation(order_id).unwrap();
+    assert_eq!(present.instrument_id(), InstrumentId::new(1).unwrap());
+    assert_eq!(
+        present.instrument_version(),
+        InstrumentVersion::new(1).unwrap()
+    );
+    assert_eq!(present.book_event_sequence(), book.last_event_sequence());
+    assert_eq!(present.order_id(), order_id);
+    let resting = present.resting_order().unwrap();
+    assert_eq!(resting.order_id, order_id);
+    assert_eq!(present.dormant_stop(), None);
+    let state = present.state().unwrap();
+    assert_eq!(state, ActiveOrderSnapshot::Resting(resting));
+    assert_eq!(state.order_id(), resting.order_id);
+    assert_eq!(state.account_id(), resting.account_id);
+    assert_eq!(state.side(), resting.side);
+    assert_eq!(state.leaves_quantity(), resting.leaves_quantity);
+    assert_eq!(state.expires_at(), resting.expires_at);
+    assert_eq!(state.resting_order(), Some(resting));
+    assert_eq!(state.dormant_stop(), None);
+    assert_eq!(book.try_order(order_id).unwrap(), Some(resting));
+    assert_eq!(book.order(order_id), Some(resting));
+
+    let missing_id = OrderId::new(99).unwrap();
+    let before = book.try_active_order_observation(missing_id).unwrap();
+    assert_eq!(before.order_id(), missing_id);
+    assert_eq!(before.state(), None);
+    assert_eq!(before.resting_order(), None);
+    assert_eq!(before.dormant_stop(), None);
+
+    book.submit(order(
+        6,
+        6,
+        6,
+        Side::Buy,
+        50,
+        1,
+        OrderDisplay::FullyDisplayed,
+    ))
+    .unwrap();
+    let after = book.try_active_order_observation(missing_id).unwrap();
+    assert_eq!(after.state(), None);
+    assert_ne!(after.book_event_sequence(), before.book_event_sequence());
+    assert_eq!(after.book_event_sequence(), book.last_event_sequence());
 }
 
 #[test]

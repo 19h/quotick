@@ -3006,6 +3006,165 @@ pub struct DormantStopSnapshot {
     pub expires_at: Option<TimestampNs>,
 }
 
+/// Private state selected for one accepted active order identifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActiveOrderSnapshot {
+    /// A limit order currently participating in executable price priority.
+    Resting(OrderSnapshot),
+    /// An accepted stop order waiting for its trigger condition.
+    DormantStop(DormantStopSnapshot),
+}
+
+impl ActiveOrderSnapshot {
+    /// Returns the selected order identifier.
+    #[must_use]
+    pub const fn order_id(self) -> OrderId {
+        match self {
+            Self::Resting(order) => order.order_id,
+            Self::DormantStop(order) => order.order_id,
+        }
+    }
+
+    /// Returns the owner account.
+    #[must_use]
+    pub const fn account_id(self) -> AccountId {
+        match self {
+            Self::Resting(order) => order.account_id,
+            Self::DormantStop(order) => order.account_id,
+        }
+    }
+
+    /// Returns the order side.
+    #[must_use]
+    pub const fn side(self) -> Side {
+        match self {
+            Self::Resting(order) => order.side,
+            Self::DormantStop(order) => order.side,
+        }
+    }
+
+    /// Returns the total leaves quantity.
+    #[must_use]
+    pub const fn leaves_quantity(self) -> Quantity {
+        match self {
+            Self::Resting(order) => order.leaves_quantity,
+            Self::DormantStop(order) => order.leaves_quantity,
+        }
+    }
+
+    /// Returns the absolute GTD expiration, if present.
+    #[must_use]
+    pub const fn expires_at(self) -> Option<TimestampNs> {
+        match self {
+            Self::Resting(order) => order.expires_at,
+            Self::DormantStop(order) => order.expires_at,
+        }
+    }
+
+    /// Returns resting-order state, or `None` for a dormant stop.
+    #[must_use]
+    pub const fn resting_order(self) -> Option<OrderSnapshot> {
+        match self {
+            Self::Resting(order) => Some(order),
+            Self::DormantStop(_) => None,
+        }
+    }
+
+    /// Returns dormant-stop state, or `None` for a resting order.
+    #[must_use]
+    pub const fn dormant_stop(self) -> Option<DormantStopSnapshot> {
+        match self {
+            Self::Resting(_) => None,
+            Self::DormantStop(order) => Some(order),
+        }
+    }
+}
+
+/// Provenance-bound private state for one queried order identifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveOrderObservation {
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    book_event_sequence: u64,
+    order_id: OrderId,
+    state: Option<ActiveOrderSnapshot>,
+}
+
+impl ActiveOrderObservation {
+    fn try_new(
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        book_event_sequence: u64,
+        order_id: OrderId,
+        state: Option<ActiveOrderSnapshot>,
+    ) -> Result<Self, InvariantViolation> {
+        if let Some(state) = state
+            && state.order_id() != order_id
+        {
+            return Err(InvariantViolation::new(format!(
+                "order observation key {order_id} resolves to order {}",
+                state.order_id()
+            )));
+        }
+        Ok(Self {
+            instrument_id,
+            instrument_version,
+            book_event_sequence,
+            order_id,
+            state,
+        })
+    }
+
+    /// Returns the observed instrument.
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version used by the query.
+    #[must_use]
+    pub const fn instrument_version(self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the last committed event sequence visible to the query.
+    #[must_use]
+    pub const fn book_event_sequence(self) -> u64 {
+        self.book_event_sequence
+    }
+
+    /// Returns the queried order identifier.
+    #[must_use]
+    pub const fn order_id(self) -> OrderId {
+        self.order_id
+    }
+
+    /// Returns resting or dormant-stop state, or `None` when the identifier is
+    /// not active in the observed book state.
+    #[must_use]
+    pub const fn state(self) -> Option<ActiveOrderSnapshot> {
+        self.state
+    }
+
+    /// Returns resting-order state, or `None` when absent or dormant.
+    #[must_use]
+    pub const fn resting_order(self) -> Option<OrderSnapshot> {
+        match self.state {
+            Some(state) => state.resting_order(),
+            None => None,
+        }
+    }
+
+    /// Returns dormant-stop state, or `None` when absent or resting.
+    #[must_use]
+    pub const fn dormant_stop(self) -> Option<DormantStopSnapshot> {
+        match self.state {
+            Some(state) => state.dormant_stop(),
+            None => None,
+        }
+    }
+}
+
 /// Complete private state of one resting order in a semantic checkpoint.
 ///
 /// Entries are stored in canonical side/price order and FIFO order within a
@@ -5449,14 +5608,53 @@ impl RestingOrder {
         self.stop.is_some()
     }
 
-    fn stop_snapshot(self) -> Option<DormantStopSnapshot> {
-        let stop = self.stop?;
-        Some(DormantStopSnapshot {
+    fn try_stop_snapshot(self) -> Result<Option<DormantStopSnapshot>, InvariantViolation> {
+        let Some(stop) = self.stop else {
+            return Ok(None);
+        };
+        let leaves_quantity = Quantity::new(self.leaves).map_err(|_| {
+            InvariantViolation::new(format!(
+                "dormant stop {} has zero leaves quantity",
+                self.order_id
+            ))
+        })?;
+        let expected_working = self.display.working_lots(self.leaves);
+        if self.displayed != expected_working {
+            return Err(InvariantViolation::new(format!(
+                "dormant stop {} has working quantity inconsistent with its display policy",
+                self.order_id
+            )));
+        }
+        let expected_price = stop.activation.risk_price().unwrap_or(stop.trigger_price);
+        if self.price != expected_price {
+            return Err(InvariantViolation::new(format!(
+                "dormant stop {} has a price inconsistent with its activation risk price",
+                self.order_id
+            )));
+        }
+        if self.previous.is_some() || self.next.is_some() {
+            return Err(InvariantViolation::new(format!(
+                "dormant stop {} retains a price-level FIFO link",
+                self.order_id
+            )));
+        }
+        if stop.priority_sequence == 0 {
+            return Err(InvariantViolation::new(format!(
+                "dormant stop {} has reserved zero trigger priority",
+                self.order_id
+            )));
+        }
+        if stop.time_in_force.expires_at() != self.expires_at {
+            return Err(InvariantViolation::new(format!(
+                "dormant stop {} has expiration inconsistent with its lifetime",
+                self.order_id
+            )));
+        }
+        Ok(Some(DormantStopSnapshot {
             order_id: self.order_id,
             account_id: self.account_id,
             side: self.side,
-            leaves_quantity: Quantity::new(self.leaves)
-                .expect("dormant stop leaves must be non-zero"),
+            leaves_quantity,
             display: self.display,
             trigger_price: stop.trigger_price,
             activation: stop.activation,
@@ -5464,7 +5662,7 @@ impl RestingOrder {
             self_trade_prevention: self.self_trade_prevention,
             priority_sequence: stop.priority_sequence,
             expires_at: self.expires_at,
-        })
+        }))
     }
 }
 
@@ -8511,13 +8709,74 @@ impl OrderBook {
         Ok(PriceLevelOrders::new(self, side, price, level, order_count))
     }
 
-    /// Returns a resting order by identifier.
+    /// Fallibly returns provenance-bound active state for one order identifier.
+    ///
+    /// The fixed-size result distinguishes resting state, dormant-stop state,
+    /// and state-bound absence while carrying the instrument, immutable
+    /// definition version, queried identifier, and final event sequence. The
+    /// successful path performs one expected `O(1)` bounded-hash lookup without
+    /// allocation or mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] if the selected hash key differs from its
+    /// embedded identifier or the selected order's local quantity, display,
+    /// activation-price, FIFO-link, priority, or expiration state is invalid.
+    pub fn try_active_order_observation(
+        &self,
+        order_id: OrderId,
+    ) -> Result<ActiveOrderObservation, InvariantViolation> {
+        let state = match self.orders.get(&order_id).copied() {
+            None => None,
+            Some(order) => {
+                if order.order_id != order_id {
+                    return Err(InvariantViolation::new(format!(
+                        "order observation key {order_id} resolves to order {}",
+                        order.order_id
+                    )));
+                }
+                if order.is_dormant_stop() {
+                    order
+                        .try_stop_snapshot()?
+                        .map(ActiveOrderSnapshot::DormantStop)
+                } else {
+                    order.order_snapshot()?.map(ActiveOrderSnapshot::Resting)
+                }
+            }
+        };
+        ActiveOrderObservation::try_new(
+            self.instrument_id(),
+            self.instrument_version(),
+            self.last_event_sequence(),
+            order_id,
+            state,
+        )
+    }
+
+    /// Fallibly returns a resting order by identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] under the same conditions as
+    /// [`Self::try_active_order_observation`].
+    pub fn try_order(
+        &self,
+        order_id: OrderId,
+    ) -> Result<Option<OrderSnapshot>, InvariantViolation> {
+        Ok(self.try_active_order_observation(order_id)?.resting_order())
+    }
+
+    /// Returns a resting order by identifier using the fallible production
+    /// path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if selected private order state is invalid. Use
+    /// [`Self::try_order`] when failure must remain typed.
     #[must_use]
     pub fn order(&self, order_id: OrderId) -> Option<OrderSnapshot> {
-        self.orders
-            .get(&order_id)
-            .copied()
-            .and_then(|order| order.order_snapshot().ok().flatten())
+        self.try_order(order_id)
+            .expect("order-book resting order is not queryable")
     }
 
     /// Returns exact private execution priority ahead of one resting order.
@@ -8754,9 +9013,15 @@ impl OrderBook {
         &self,
     ) -> impl Iterator<Item = Result<OrderSnapshot, InvariantViolation>> + '_ {
         self.orders
-            .values()
-            .filter(|order| !order.is_dormant_stop())
-            .map(|order| {
+            .iter()
+            .filter(|(_, order)| !order.is_dormant_stop())
+            .map(|(&order_id, order)| {
+                if order.order_id != order_id {
+                    return Err(InvariantViolation::new(format!(
+                        "order index key {order_id} resolves to order {}",
+                        order.order_id
+                    )));
+                }
                 order.order_snapshot()?.ok_or_else(|| {
                     InvariantViolation::new(format!(
                         "dormant stop {} entered resting-order iteration",
@@ -8766,20 +9031,53 @@ impl OrderBook {
             })
     }
 
-    /// Returns one dormant stop by identifier.
-    #[must_use]
-    pub fn dormant_stop(&self, order_id: OrderId) -> Option<DormantStopSnapshot> {
-        self.orders
-            .get(&order_id)
-            .copied()
-            .and_then(RestingOrder::stop_snapshot)
+    /// Fallibly returns one dormant stop by identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] under the same conditions as
+    /// [`Self::try_active_order_observation`].
+    pub fn try_dormant_stop(
+        &self,
+        order_id: OrderId,
+    ) -> Result<Option<DormantStopSnapshot>, InvariantViolation> {
+        Ok(self.try_active_order_observation(order_id)?.dormant_stop())
     }
 
-    /// Iterates dormant stop state in dense process-local order without allocating.
-    pub(crate) fn dormant_stop_states(&self) -> impl Iterator<Item = DormantStopSnapshot> + '_ {
+    /// Returns one dormant stop by identifier using the fallible production
+    /// path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if selected private order state is invalid. Use
+    /// [`Self::try_dormant_stop`] when failure must remain typed.
+    #[must_use]
+    pub fn dormant_stop(&self, order_id: OrderId) -> Option<DormantStopSnapshot> {
+        self.try_dormant_stop(order_id)
+            .expect("order-book dormant stop is not queryable")
+    }
+
+    /// Fallibly iterates dormant stop state in dense process-local order.
+    pub(crate) fn dormant_stop_states(
+        &self,
+    ) -> impl Iterator<Item = Result<DormantStopSnapshot, InvariantViolation>> + '_ {
         self.orders
-            .values()
-            .filter_map(|order| order.stop_snapshot())
+            .iter()
+            .filter(|(_, order)| order.is_dormant_stop())
+            .map(|(&order_id, order)| {
+                if order.order_id != order_id {
+                    return Err(InvariantViolation::new(format!(
+                        "order index key {order_id} resolves to order {}",
+                        order.order_id
+                    )));
+                }
+                order.try_stop_snapshot()?.ok_or_else(|| {
+                    InvariantViolation::new(format!(
+                        "resting order {} entered dormant-stop iteration",
+                        order.order_id
+                    ))
+                })
+            })
     }
 
     /// Returns the number of dormant stops excluded from displayed depth.
@@ -9364,13 +9662,7 @@ impl OrderBook {
         let order = self.orders.get(&order_id).copied().ok_or_else(|| {
             InvariantViolation::new(format!("stop index references missing order {order_id}"))
         })?;
-        if order.side != side
-            || order.stop.is_none()
-            || order.previous.is_some()
-            || order.next.is_some()
-            || order.displayed == 0
-            || order.displayed > order.leaves
-        {
+        if order.side != side || order.try_stop_snapshot()?.is_none() {
             return Err(InvariantViolation::new(format!(
                 "stop index references invalid dormant order {order_id}"
             )));
@@ -11995,15 +12287,16 @@ mod price_level_index_tests {
 
     use super::{
         AccountAdmissionState, AccountControl, AccountControlAction, AccountControlObservation,
-        AccountControlSnapshot, BuyStopKey, Command, CommandOutcome, CommandPreparation,
-        DisplayedLiquidityQuote, DisplayedLiquidityRequest, DisplayedLiquidityTermination,
-        EventTraceBuilder, ImmediateExecutionQuote, ImmediateExecutionRequest,
-        ImmediateExecutionTermination, IncomingPreview, InvariantViolation, LevelSnapshot,
-        MassCancel, MassCancelScope, MatchingCapacity, MatchingError, NewOrder, OrderBook,
-        OrderBookLimits, OrderBookLimitsSpec, OrderBookQueryError, OrderDisplay, OrderQueueClass,
-        OrderSelectionPool, OrderType, PriceLevel, PriceLevels, PublicLevelObservation,
-        RejectReason, ReplaceOrder, RestingOrder, SelfTradePrevention, StopActivation, TimeInForce,
-        TradingStateObservation, try_event_arena,
+        AccountControlSnapshot, ActiveOrderObservation, ActiveOrderSnapshot, BuyStopKey, Command,
+        CommandOutcome, CommandPreparation, DisplayedLiquidityQuote, DisplayedLiquidityRequest,
+        DisplayedLiquidityTermination, DormantStopState, EventTraceBuilder,
+        ImmediateExecutionQuote, ImmediateExecutionRequest, ImmediateExecutionTermination,
+        IncomingPreview, InvariantViolation, LevelSnapshot, MassCancel, MassCancelScope,
+        MatchingCapacity, MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsSpec,
+        OrderBookQueryError, OrderDisplay, OrderQueueClass, OrderSelectionPool, OrderSnapshot,
+        OrderType, PriceLevel, PriceLevels, PublicLevelObservation, RejectReason, ReplaceOrder,
+        RestingOrder, SelfTradePrevention, StopActivation, TimeInForce, TradingStateObservation,
+        try_event_arena,
     };
     use crate::instrument::{
         InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -13671,6 +13964,216 @@ mod price_level_index_tests {
 
         let error = book.try_order_queue_position(target.order_id).unwrap_err();
         assert!(error.detail().contains("broken next FIFO link"));
+    }
+
+    fn active_observation_resting_order() -> RestingOrder {
+        RestingOrder {
+            order_id: OrderId::new(1).unwrap(),
+            account_id: AccountId::new(1).unwrap(),
+            side: Side::Buy,
+            price: Price::from_raw(100),
+            leaves: 1,
+            displayed: 1,
+            display: OrderDisplay::FullyDisplayed,
+            self_trade_prevention: SelfTradePrevention::CancelAggressor,
+            expires_at: None,
+            stop: None,
+            previous: None,
+            next: None,
+            account_previous: None,
+            account_next: None,
+        }
+    }
+
+    fn active_observation_dormant_order() -> RestingOrder {
+        RestingOrder {
+            order_id: OrderId::new(1).unwrap(),
+            account_id: AccountId::new(1).unwrap(),
+            side: Side::Buy,
+            price: Price::from_raw(120),
+            leaves: 5,
+            displayed: 5,
+            display: OrderDisplay::FullyDisplayed,
+            self_trade_prevention: SelfTradePrevention::CancelAggressor,
+            expires_at: Some(TimestampNs::from_unix_nanos(100)),
+            stop: Some(DormantStopState {
+                trigger_price: Price::from_raw(110),
+                activation: StopActivation::Limit(Price::from_raw(120)),
+                time_in_force: TimeInForce::GoodTilTimestamp {
+                    expires_at: TimestampNs::from_unix_nanos(100),
+                },
+                priority_sequence: 1,
+            }),
+            previous: None,
+            next: None,
+            account_previous: None,
+            account_next: None,
+        }
+    }
+
+    fn assert_resting_snapshot_error(order: RestingOrder, expected: &str) {
+        assert!(
+            order
+                .order_snapshot()
+                .unwrap_err()
+                .detail()
+                .contains(expected)
+        );
+    }
+
+    fn assert_dormant_snapshot_error(order: RestingOrder, expected: &str) {
+        assert!(
+            order
+                .try_stop_snapshot()
+                .unwrap_err()
+                .detail()
+                .contains(expected)
+        );
+    }
+
+    #[test]
+    fn active_order_observation_rejects_key_and_resting_quantity_corruption() {
+        let order_id = OrderId::new(1).unwrap();
+        let other_order_id = OrderId::new(2).unwrap();
+        let snapshot = OrderSnapshot {
+            order_id: other_order_id,
+            account_id: AccountId::new(1).unwrap(),
+            side: Side::Buy,
+            price: Price::from_raw(100),
+            leaves_quantity: Quantity::new(1).unwrap(),
+            working_quantity: Quantity::new(1).unwrap(),
+            display: OrderDisplay::FullyDisplayed,
+            expires_at: None,
+        };
+        let error = ActiveOrderObservation::try_new(
+            InstrumentId::new(1).unwrap(),
+            InstrumentVersion::new(1).unwrap(),
+            1,
+            order_id,
+            Some(ActiveOrderSnapshot::Resting(snapshot)),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .detail()
+                .contains("order observation key 1 resolves to order 2")
+        );
+
+        let mut mismatched_key = OrderBook::new(reserve_definition());
+        mismatched_key.append_order(active_observation_resting_order());
+        mismatched_key.orders.get_mut(&order_id).unwrap().order_id = other_order_id;
+        let error = mismatched_key
+            .try_active_order_observation(order_id)
+            .unwrap_err();
+        assert!(
+            error
+                .detail()
+                .contains("order observation key 1 resolves to order 2")
+        );
+        assert!(
+            mismatched_key
+                .active_order_states()
+                .next()
+                .unwrap()
+                .unwrap_err()
+                .detail()
+                .contains("order index key 1 resolves to order 2")
+        );
+
+        let mut book = OrderBook::new(reserve_definition());
+        book.append_order(active_observation_resting_order());
+        book.orders.get_mut(&order_id).unwrap().leaves = 0;
+        let error = book.try_active_order_observation(order_id).unwrap_err();
+        assert!(
+            error
+                .detail()
+                .contains("active order 1 has zero leaves quantity")
+        );
+        assert!(book.try_order(order_id).is_err());
+
+        let mut invalid = active_observation_resting_order();
+        invalid.displayed = 0;
+        assert_resting_snapshot_error(invalid, "zero working quantity");
+
+        let mut invalid = active_observation_resting_order();
+        invalid.displayed = 2;
+        assert_resting_snapshot_error(invalid, "working quantity above total leaves");
+
+        let mut invalid = active_observation_resting_order();
+        invalid.leaves = 2;
+        assert_resting_snapshot_error(invalid, "fully displayed order 1 hides leaves");
+
+        let mut invalid = active_observation_resting_order();
+        invalid.leaves = 2;
+        invalid.displayed = 2;
+        invalid.display = OrderDisplay::Reserve {
+            peak: Quantity::new(1).unwrap(),
+        };
+        assert_resting_snapshot_error(invalid, "reserve order 1 exceeds its display peak");
+
+        let mut invalid = active_observation_resting_order();
+        invalid.leaves = 2;
+        invalid.display = OrderDisplay::Hidden;
+        assert_resting_snapshot_error(invalid, "hidden order 1 has a partial working quantity");
+    }
+
+    #[test]
+    fn active_order_observation_rejects_dormant_local_corruption() {
+        let order_id = OrderId::new(1).unwrap();
+        let other_order_id = OrderId::new(2).unwrap();
+        assert!(
+            active_observation_dormant_order()
+                .try_stop_snapshot()
+                .unwrap()
+                .is_some()
+        );
+
+        let mut mismatched_key = OrderBook::new(reserve_definition());
+        let mut mismatched_order = active_observation_dormant_order();
+        mismatched_order.order_id = other_order_id;
+        mismatched_key.orders.insert(order_id, mismatched_order);
+        assert!(
+            mismatched_key
+                .dormant_stop_states()
+                .next()
+                .unwrap()
+                .unwrap_err()
+                .detail()
+                .contains("order index key 1 resolves to order 2")
+        );
+
+        let mut book = OrderBook::new(reserve_definition());
+        let mut zero_leaves = active_observation_dormant_order();
+        zero_leaves.leaves = 0;
+        zero_leaves.displayed = 0;
+        book.orders.insert(order_id, zero_leaves);
+        let error = book.try_active_order_observation(order_id).unwrap_err();
+        assert!(
+            error
+                .detail()
+                .contains("dormant stop 1 has zero leaves quantity")
+        );
+        assert!(book.try_dormant_stop(order_id).is_err());
+
+        let mut invalid = active_observation_dormant_order();
+        invalid.displayed = 4;
+        assert_dormant_snapshot_error(invalid, "working quantity inconsistent");
+
+        let mut invalid = active_observation_dormant_order();
+        invalid.price = Price::from_raw(119);
+        assert_dormant_snapshot_error(invalid, "activation risk price");
+
+        let mut invalid = active_observation_dormant_order();
+        invalid.previous = Some(other_order_id);
+        assert_dormant_snapshot_error(invalid, "price-level FIFO link");
+
+        let mut invalid = active_observation_dormant_order();
+        invalid.stop.as_mut().unwrap().priority_sequence = 0;
+        assert_dormant_snapshot_error(invalid, "zero trigger priority");
+
+        let mut invalid = active_observation_dormant_order();
+        invalid.expires_at = None;
+        assert_dormant_snapshot_error(invalid, "expiration inconsistent");
     }
 
     #[test]

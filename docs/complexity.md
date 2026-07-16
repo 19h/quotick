@@ -262,6 +262,15 @@ all rows is `O(C)` time. Neither path allocates output, clones a command or
 report, copies an event trace, or mutates the book. An adversarial full hash
 collision cluster can make exact lookup `O(C)` without changing storage.
 
+For one selected `OrderId` among `O` active identities,
+`try_active_order_observation` performs one expected `O(1)` bounded-hash lookup
+and constant local row validation. Present resting, present dormant-stop, and
+absent results have `O(1)` fixed output/state, allocate nothing on success, and
+do not mutate the book. `try_order` and `try_dormant_stop` have the same bound.
+A full adversarial active-order hash collision cluster increases lookup to
+`O(O)` without changing storage. Human-readable invariant detail may allocate
+only after selected-row corruption is detected.
+
 For one resting target with `K` predecessor orders at its price,
 `try_order_queue_position` performs one expected `O(1)` active-order lookup,
 one `O(log(P + 1))` price-level lookup, and `K` expected `O(1)` predecessor

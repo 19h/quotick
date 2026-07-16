@@ -974,6 +974,11 @@ impl MarketDataPublisher {
             );
         }
         for stop in book.dormant_stop_states() {
+            let stop = stop.map_err(|_| {
+                MarketDataConstructionError::Source(MarketDataError::SourceDivergence(
+                    "matching book failed dormant-stop snapshot validation",
+                ))
+            })?;
             let tracked = TrackedStop {
                 account_id: stop.account_id,
                 side: stop.side,
@@ -1312,6 +1317,11 @@ impl MarketDataPublisher {
             }
         }
         for stop in book.dormant_stop_states() {
+            let stop = stop.map_err(|_| {
+                MarketDataError::SourceDivergence(
+                    "matching book failed dormant-stop snapshot validation",
+                )
+            })?;
             let expected = TrackedStop {
                 account_id: stop.account_id,
                 side: stop.side,

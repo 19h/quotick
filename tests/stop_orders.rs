@@ -4,10 +4,10 @@ use quotick::instrument::{
     QuantityRules, ReserveOrderRules, TradingState,
 };
 use quotick::matching::{
-    CancelOrder, CancelReason, Command, CommandOutcome, CommandPreparation, EventKind, ExpirySweep,
-    MatchingCapacity, MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsSpec,
-    OrderDisplay, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention, StopActivation,
-    StopReference, StopReferenceCursor, StopTriggerSweep, TimeInForce,
+    ActiveOrderSnapshot, CancelOrder, CancelReason, Command, CommandOutcome, CommandPreparation,
+    EventKind, ExpirySweep, MatchingCapacity, MatchingError, NewOrder, OrderBook, OrderBookLimits,
+    OrderBookLimitsSpec, OrderDisplay, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention,
+    StopActivation, StopReference, StopReferenceCursor, StopTriggerSweep, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -272,6 +272,28 @@ fn stop_requires_a_reference_and_arms_without_public_depth() {
     let dormant = book.dormant_stop(OrderId::new(10).unwrap()).unwrap();
     assert_eq!(dormant.trigger_price, Price::from_raw(110));
     assert_eq!(dormant.activation, StopActivation::Market);
+    let observation = book
+        .try_active_order_observation(OrderId::new(10).unwrap())
+        .unwrap();
+    assert_eq!(
+        observation.book_event_sequence(),
+        book.last_event_sequence()
+    );
+    assert_eq!(observation.resting_order(), None);
+    assert_eq!(observation.dormant_stop(), Some(dormant));
+    let state = observation.state().unwrap();
+    assert_eq!(state, ActiveOrderSnapshot::DormantStop(dormant));
+    assert_eq!(state.order_id(), dormant.order_id);
+    assert_eq!(state.account_id(), dormant.account_id);
+    assert_eq!(state.side(), dormant.side);
+    assert_eq!(state.leaves_quantity(), dormant.leaves_quantity);
+    assert_eq!(state.expires_at(), dormant.expires_at);
+    assert_eq!(state.resting_order(), None);
+    assert_eq!(state.dormant_stop(), Some(dormant));
+    assert_eq!(
+        book.try_dormant_stop(OrderId::new(10).unwrap()).unwrap(),
+        Some(dormant)
+    );
     book.validate().unwrap();
 }
 
@@ -916,6 +938,12 @@ fn dormant_stop_checkpoint_codec_restores_reference_priority_and_exact_retries()
     for command in [reference, buy, sell] {
         book.submit(command).unwrap();
     }
+    let observed_buy = book
+        .try_active_order_observation(OrderId::new(1).unwrap())
+        .unwrap();
+    let observed_absence = book
+        .try_active_order_observation(OrderId::new(99).unwrap())
+        .unwrap();
     let checkpoint = book.checkpoint(1, 7).unwrap();
     assert_eq!(checkpoint.dormant_stops().len(), 2);
     let encoded = checkpoint.encode().unwrap();
@@ -937,6 +965,18 @@ fn dormant_stop_checkpoint_codec_restores_reference_priority_and_exact_retries()
     assert_eq!(
         restored.dormant_stop(OrderId::new(1).unwrap()),
         book.dormant_stop(OrderId::new(1).unwrap())
+    );
+    assert_eq!(
+        restored
+            .try_active_order_observation(OrderId::new(1).unwrap())
+            .unwrap(),
+        observed_buy
+    );
+    assert_eq!(
+        restored
+            .try_active_order_observation(OrderId::new(99).unwrap())
+            .unwrap(),
+        observed_absence
     );
     assert!(restored.submit(buy).unwrap().replayed);
     let triggered = restored.submit(trigger(4, 2, 110, 2)).unwrap();

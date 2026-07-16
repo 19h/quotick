@@ -357,6 +357,10 @@ fn durable_recovery_restores_dormant_stop_reference_and_activation() {
     let mut durable = DurableOrderBook::open(file.path(), definition(), options()).unwrap();
     durable.submit(reference).unwrap();
     let armed = durable.submit(stop).unwrap();
+    let armed_observation = durable
+        .book()
+        .try_active_order_observation(OrderId::new(1).unwrap())
+        .unwrap();
     durable.sync_all().unwrap();
     drop(durable);
 
@@ -366,6 +370,13 @@ fn durable_recovery_restores_dormant_stop_reference_and_activation() {
         Some(reference_sweep.reference)
     );
     assert_eq!(reopened.book().dormant_stop_count(), 1);
+    assert_eq!(
+        reopened
+            .book()
+            .try_active_order_observation(OrderId::new(1).unwrap())
+            .unwrap(),
+        armed_observation
+    );
     assert!(reopened.submit(stop).unwrap().replayed);
     assert_eq!(reopened.submit(stop).unwrap().events, armed.events);
     let activation = stop_trigger(3, 2, 110);
@@ -387,6 +398,10 @@ fn durable_recovery_restores_dormant_stop_reference_and_activation() {
             .price,
         Price::from_raw(105)
     );
+    let activated_observation = reopened
+        .book()
+        .try_active_order_observation(OrderId::new(1).unwrap())
+        .unwrap();
     reopened.sync_all().unwrap();
     drop(reopened);
 
@@ -396,6 +411,13 @@ fn durable_recovery_restores_dormant_stop_reference_and_activation() {
         Some(activation_sweep.reference)
     );
     assert_eq!(recovered.book().dormant_stop_count(), 0);
+    assert_eq!(
+        recovered
+            .book()
+            .try_active_order_observation(OrderId::new(1).unwrap())
+            .unwrap(),
+        activated_observation
+    );
     assert_eq!(
         recovered
             .book()

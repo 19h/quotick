@@ -2196,6 +2196,7 @@ impl RiskManagedOrderBook {
             }
         }
         for order in self.book.dormant_stop_states() {
+            let order = order.map_err(|error| RiskInvariantViolation::new(error.detail()))?;
             let reservation = self
                 .risk
                 .reservations
