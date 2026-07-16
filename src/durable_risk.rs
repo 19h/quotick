@@ -19,11 +19,12 @@ use crate::journal::{
     SegmentedJournalError, SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
 };
 use crate::matching::{
-    Command, CommandPreparation, ConditionalImmediateExecutionDecision,
-    ConditionalImmediateExecutionPreparation, ExecutionReport, ImmediateExecutionCurve,
-    ImmediateExecutionCurveOutcome, ImmediateExecutionOutcome, ImmediateExecutionQuote,
-    ImmediateExecutionSubmission, MatchingError, OrderBook, OrderBookQueryError, PreparedCommand,
-    evaluate_conditional_immediate_execution,
+    Command, CommandPreparation, ConditionalExecutionDecision, ConditionalExecutionPreflight,
+    ConditionalExecutionPreparation, ConditionalNewOrderOutcome, ExecutionReport,
+    ImmediateExecutionCurve, ImmediateExecutionCurveOutcome, ImmediateExecutionOutcome,
+    ImmediateExecutionQuote, ImmediateExecutionSubmission, MatchingError, NewOrder,
+    NewOrderExecution, OrderBook, OrderBookQueryError, PreparedCommand,
+    evaluate_conditional_execution,
 };
 use crate::risk::{
     AccountRiskDefinition, RiskError, RiskInvariantViolation, RiskManagedCheckpoint,
@@ -879,6 +880,58 @@ impl DurableRiskOrderBook {
         self.commit_prepared(prepared)
     }
 
+    /// Durably risk-gates, observes, and conditionally submits one new order.
+    ///
+    /// Replay plus core or risk rejection bypass `accept`. Otherwise the
+    /// predicate borrows an active private quote or explicit dormant-stop state
+    /// before any WAL append. Decline or unwind changes neither WAL nor coupled
+    /// semantic state. Acceptance persists the command, commits the same
+    /// preparation, and persists its report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableRiskError`] for poison, preparation, journal, or
+    /// coupled commit failure.
+    pub fn submit_new_order_if(
+        &mut self,
+        order: NewOrder,
+        accept: impl FnOnce(&NewOrderExecution<ImmediateExecutionQuote>) -> bool,
+    ) -> Result<ConditionalNewOrderOutcome<ImmediateExecutionQuote>, DurableRiskError> {
+        self.submit_conditional_new_order(order, |_, observation| Ok(observation), accept)
+            .map(Into::into)
+    }
+
+    /// Durably risk-gates, constructs an active private execution curve, and
+    /// conditionally submits one new order.
+    ///
+    /// Replay plus core or risk rejection bypass allocation and `accept`; a
+    /// valid stop exposes explicit dormant state without allocation.
+    /// Allocation failure, decline, or unwind precedes WAL and coupled-state
+    /// mutation. Acceptance persists the command, commits the observation-
+    /// bound preparation, and persists its report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableRiskError`] for poison, preparation, exact curve
+    /// construction, journal, or coupled commit failure.
+    pub fn try_submit_new_order_curve_if(
+        &mut self,
+        order: NewOrder,
+        accept: impl FnOnce(&NewOrderExecution<ImmediateExecutionCurve>) -> bool,
+    ) -> Result<ConditionalNewOrderOutcome<ImmediateExecutionCurve>, DurableRiskError> {
+        self.submit_conditional_new_order(
+            order,
+            |book, observation| match observation {
+                NewOrderExecution::Active(quote) => Ok(NewOrderExecution::Active(
+                    book.try_immediate_execution_curve_for_quote(quote)?,
+                )),
+                NewOrderExecution::DormantStop => Ok(NewOrderExecution::DormantStop),
+            },
+            accept,
+        )
+        .map(Into::into)
+    }
+
     /// Durably risk-gates, quotes, and conditionally submits one canonical IOC order.
     ///
     /// Replay plus core or risk rejection bypass `accept`. Decline occurs
@@ -936,31 +989,56 @@ impl DurableRiskOrderBook {
         submission: ImmediateExecutionSubmission,
         observe: impl FnOnce(&OrderBook, ImmediateExecutionQuote) -> Result<T, DurableRiskError>,
         accept: impl FnOnce(&T) -> bool,
-    ) -> Result<ConditionalImmediateExecutionDecision<T>, DurableRiskError> {
+    ) -> Result<ConditionalExecutionDecision<T>, DurableRiskError> {
         if self.is_poisoned() {
             return Err(DurableRiskError::Poisoned);
         }
         let preflight = self
             .managed
             .prepare_conditional_immediate_execution(submission)?;
-        match evaluate_conditional_immediate_execution(
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_new_order<T>(
+        &mut self,
+        order: NewOrder,
+        observe: impl FnOnce(
+            &OrderBook,
+            NewOrderExecution<ImmediateExecutionQuote>,
+        ) -> Result<T, DurableRiskError>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalExecutionDecision<T>, DurableRiskError> {
+        if self.is_poisoned() {
+            return Err(DurableRiskError::Poisoned);
+        }
+        let preflight = self.managed.prepare_conditional_new_order(order)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_execution<T, U>(
+        &mut self,
+        preflight: ConditionalExecutionPreflight<T>,
+        observe: impl FnOnce(&OrderBook, T) -> Result<U, DurableRiskError>,
+        accept: impl FnOnce(&U) -> bool,
+    ) -> Result<ConditionalExecutionDecision<U>, DurableRiskError> {
+        match evaluate_conditional_execution(
             preflight,
-            |quote| observe(self.managed.book(), quote),
+            |value| observe(self.managed.book(), value),
             accept,
         )? {
-            ConditionalImmediateExecutionPreparation::Complete(decision) => {
+            ConditionalExecutionPreparation::Complete(decision) => {
                 if self.is_poisoned() {
                     return Err(DurableRiskError::Poisoned);
                 }
                 Ok(decision)
             }
-            ConditionalImmediateExecutionPreparation::Commit {
+            ConditionalExecutionPreparation::Commit {
                 prepared,
                 observation,
             } => {
                 let report = self.commit_prepared(prepared)?;
                 let retained_observation = if report.replayed { None } else { observation };
-                Ok(ConditionalImmediateExecutionDecision::Reported {
+                Ok(ConditionalExecutionDecision::Reported {
                     observation: retained_observation,
                     report,
                 })

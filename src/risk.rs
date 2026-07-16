@@ -16,14 +16,14 @@ use crate::bounded_hash::BoundedHashMap;
 use crate::domain::{AccountId, OrderId, Price, Side};
 use crate::instrument::InstrumentDefinition;
 use crate::matching::{
-    Command, CommandOutcome, CommandPreparation, ConditionalImmediateExecutionDecision,
-    ConditionalImmediateExecutionPreparation, EventKind, ExecutionReport, ImmediateExecutionCurve,
-    ImmediateExecutionCurveOutcome, ImmediateExecutionCurveSubmissionError,
-    ImmediateExecutionOutcome, ImmediateExecutionPreflight, ImmediateExecutionQuote,
-    ImmediateExecutionSubmission, MatchingCapacity, MatchingError, NewOrder, OrderBook,
-    OrderBookCheckpoint, OrderBookCheckpointError, OrderBookLimits, OrderBookLimitsSpec, OrderType,
-    PreparedCommand, RejectReason, ReplaceOrder, SelfTradePrevention, Trade,
-    evaluate_conditional_immediate_execution,
+    Command, CommandOutcome, CommandPreparation, ConditionalExecutionDecision,
+    ConditionalExecutionPreflight, ConditionalExecutionPreparation, ConditionalNewOrderOutcome,
+    EventKind, ExecutionReport, ImmediateExecutionCurve, ImmediateExecutionCurveOutcome,
+    ImmediateExecutionCurveSubmissionError, ImmediateExecutionOutcome, ImmediateExecutionQuote,
+    ImmediateExecutionSubmission, MatchingCapacity, MatchingError, NewOrder, NewOrderExecution,
+    OrderBook, OrderBookCheckpoint, OrderBookCheckpointError, OrderBookLimits, OrderBookLimitsSpec,
+    OrderType, PreparedCommand, RejectReason, ReplaceOrder, SelfTradePrevention, Trade,
+    evaluate_conditional_execution,
 };
 
 /// Account-level order-entry state.
@@ -1995,6 +1995,64 @@ impl RiskManagedOrderBook {
         }
     }
 
+    /// Atomically risk-gates, observes, and conditionally submits one new order.
+    ///
+    /// Exact replay plus core or risk rejection bypass `accept`. Otherwise the
+    /// predicate borrows the active private execution quote or explicit
+    /// dormant-stop state under one exclusive coupled-state borrow. Decline or
+    /// unwind mutates neither matching nor risk state; acceptance commits the
+    /// same preparation and applies its trace exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MatchingError`] for collision, configured capacity,
+    /// identifier/sequence exhaustion, or a prepared-commit contradiction.
+    pub fn submit_new_order_if(
+        &mut self,
+        order: NewOrder,
+        accept: impl FnOnce(&NewOrderExecution<ImmediateExecutionQuote>) -> bool,
+    ) -> Result<ConditionalNewOrderOutcome<ImmediateExecutionQuote>, MatchingError> {
+        self.submit_conditional_new_order(order, |_, observation| Ok(observation), accept)
+            .map(Into::into)
+    }
+
+    /// Atomically risk-gates, constructs an active private execution curve,
+    /// and conditionally submits one new order.
+    ///
+    /// Exact replay plus core or risk rejection bypass curve allocation and
+    /// `accept`. A valid stop exposes explicit dormant state without
+    /// allocation. Allocation failure, decline, or unwind leaves matching and
+    /// risk state unchanged; acceptance commits the coupled preparation bound
+    /// to the observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImmediateExecutionCurveSubmissionError::Matching`] for
+    /// matching preparation or coupled commit failure and
+    /// [`ImmediateExecutionCurveSubmissionError::Query`] when an active
+    /// order's exact curve cannot be constructed.
+    pub fn try_submit_new_order_curve_if(
+        &mut self,
+        order: NewOrder,
+        accept: impl FnOnce(&NewOrderExecution<ImmediateExecutionCurve>) -> bool,
+    ) -> Result<
+        ConditionalNewOrderOutcome<ImmediateExecutionCurve>,
+        ImmediateExecutionCurveSubmissionError,
+    > {
+        self.submit_conditional_new_order(
+            order,
+            |book, observation| match observation {
+                NewOrderExecution::Active(quote) => book
+                    .try_immediate_execution_curve_for_quote(quote)
+                    .map(NewOrderExecution::Active)
+                    .map_err(Into::into),
+                NewOrderExecution::DormantStop => Ok(NewOrderExecution::DormantStop),
+            },
+            accept,
+        )
+        .map(Into::into)
+    }
+
     /// Atomically risk-gates, quotes, and conditionally submits one canonical IOC order.
     ///
     /// Core or risk rejection and exact replay bypass `accept`. For a command
@@ -2055,26 +2113,48 @@ impl RiskManagedOrderBook {
         submission: ImmediateExecutionSubmission,
         observe: impl FnOnce(&OrderBook, ImmediateExecutionQuote) -> Result<T, E>,
         accept: impl FnOnce(&T) -> bool,
-    ) -> Result<ConditionalImmediateExecutionDecision<T>, E>
+    ) -> Result<ConditionalExecutionDecision<T>, E>
     where
         E: From<MatchingError>,
     {
         let preflight = self
             .prepare_conditional_immediate_execution(submission)
             .map_err(E::from)?;
-        match evaluate_conditional_immediate_execution(
-            preflight,
-            |quote| observe(&self.book, quote),
-            accept,
-        )? {
-            ConditionalImmediateExecutionPreparation::Complete(decision) => Ok(decision),
-            ConditionalImmediateExecutionPreparation::Commit {
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_new_order<T, E>(
+        &mut self,
+        order: NewOrder,
+        observe: impl FnOnce(&OrderBook, NewOrderExecution<ImmediateExecutionQuote>) -> Result<T, E>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalExecutionDecision<T>, E>
+    where
+        E: From<MatchingError>,
+    {
+        let preflight = self.prepare_conditional_new_order(order).map_err(E::from)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_execution<T, U, E>(
+        &mut self,
+        preflight: ConditionalExecutionPreflight<T>,
+        observe: impl FnOnce(&OrderBook, T) -> Result<U, E>,
+        accept: impl FnOnce(&U) -> bool,
+    ) -> Result<ConditionalExecutionDecision<U>, E>
+    where
+        E: From<MatchingError>,
+    {
+        match evaluate_conditional_execution(preflight, |value| observe(&self.book, value), accept)?
+        {
+            ConditionalExecutionPreparation::Complete(decision) => Ok(decision),
+            ConditionalExecutionPreparation::Commit {
                 prepared,
                 observation,
             } => {
                 let report = self.commit(prepared).map_err(E::from)?;
                 let retained_observation = if report.replayed { None } else { observation };
-                Ok(ConditionalImmediateExecutionDecision::Reported {
+                Ok(ConditionalExecutionDecision::Reported {
                     observation: retained_observation,
                     report,
                 })
@@ -2085,21 +2165,39 @@ impl RiskManagedOrderBook {
     pub(crate) fn prepare_conditional_immediate_execution(
         &self,
         submission: ImmediateExecutionSubmission,
-    ) -> Result<ImmediateExecutionPreflight, MatchingError> {
-        let mut preflight = self
+    ) -> Result<ConditionalExecutionPreflight<ImmediateExecutionQuote>, MatchingError> {
+        let preflight = self
             .book
             .prepare_conditional_immediate_execution(submission)?;
+        Ok(self.apply_conditional_risk_gate(preflight))
+    }
+
+    pub(crate) fn prepare_conditional_new_order(
+        &self,
+        order: NewOrder,
+    ) -> Result<
+        ConditionalExecutionPreflight<NewOrderExecution<ImmediateExecutionQuote>>,
+        MatchingError,
+    > {
+        let preflight = self.book.prepare_conditional_new_order(order)?;
+        Ok(self.apply_conditional_risk_gate(preflight))
+    }
+
+    fn apply_conditional_risk_gate<T>(
+        &self,
+        mut preflight: ConditionalExecutionPreflight<T>,
+    ) -> ConditionalExecutionPreflight<T> {
         if let CommandPreparation::Ready(prepared) = &preflight.preparation {
             debug_assert_eq!(
                 self.risk.reservation_count(),
                 self.book.active_order_count(),
                 "coupled preparation requires matching/risk cardinality parity"
             );
-            if preflight.quote.is_some() && self.risk.authorize(prepared.command()).is_err() {
-                preflight.quote = None;
+            if preflight.observation.is_some() && self.risk.authorize(prepared.command()).is_err() {
+                preflight.observation = None;
             }
         }
-        Ok(preflight)
+        preflight
     }
 
     /// Prepares matching operational/core checks against immutable coupled state.

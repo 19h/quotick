@@ -2533,7 +2533,7 @@ impl From<InvariantViolation> for OrderBookQueryError {
     }
 }
 
-/// Failure while atomically binding a private execution curve to IOC submission.
+/// Failure while atomically binding a private execution curve to submission.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ImmediateExecutionCurveSubmissionError {
     /// Command preparation or prepared commit failed.
@@ -3066,7 +3066,7 @@ pub struct ImmediateExecutionCurve {
     levels: Vec<ImmediateExecutionLevel>,
 }
 
-pub(crate) enum ConditionalImmediateExecutionDecision<T> {
+pub(crate) enum ConditionalExecutionDecision<T> {
     Declined(T),
     Reported {
         observation: Option<T>,
@@ -3111,6 +3111,96 @@ impl ImmediateExecutionCurve {
     #[must_use]
     pub fn into_parts(self) -> (ImmediateExecutionQuote, Vec<ImmediateExecutionLevel>) {
         (self.quote, self.levels)
+    }
+}
+
+/// Current execution state observed for one otherwise admissible new order.
+///
+/// Immediately active market, market-to-limit, and limit orders carry the
+/// exact private-book observation selected by the caller-facing API. A valid
+/// stop order is represented explicitly without forecasting activation-time
+/// liquidity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NewOrderExecution<T> {
+    /// The order is immediately active and carries its current quote or curve.
+    Active(T),
+    /// The order will arm as a dormant stop if the predicate accepts it.
+    DormantStop,
+}
+
+impl<T> NewOrderExecution<T> {
+    /// Returns the active-order observation, or `None` for a dormant stop.
+    #[must_use]
+    pub const fn active(&self) -> Option<&T> {
+        match self {
+            Self::Active(value) => Some(value),
+            Self::DormantStop => None,
+        }
+    }
+
+    /// Returns whether this observation represents a dormant stop.
+    #[must_use]
+    pub const fn is_dormant_stop(&self) -> bool {
+        matches!(self, Self::DormantStop)
+    }
+}
+
+/// Result of atomically observing and conditionally submitting one new order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConditionalNewOrderOutcome<T> {
+    /// The predicate declined the observation before semantic or WAL mutation.
+    Declined(NewOrderExecution<T>),
+    /// Matching produced a report. A current observation is present only for
+    /// a newly accepted command; replay and business/risk rejection bypass it.
+    Reported {
+        /// Exact active quote/curve or explicit dormant-stop state.
+        observation: Option<NewOrderExecution<T>>,
+        /// Complete matching report or exact cached replay.
+        report: ExecutionReport,
+    },
+}
+
+impl<T> ConditionalNewOrderOutcome<T> {
+    /// Returns the observation associated with a decline or new acceptance.
+    #[must_use]
+    pub const fn observation(&self) -> Option<&NewOrderExecution<T>> {
+        match self {
+            Self::Declined(observation) => Some(observation),
+            Self::Reported { observation, .. } => observation.as_ref(),
+        }
+    }
+
+    /// Returns the matching report, or `None` when the predicate declined.
+    #[must_use]
+    pub const fn report(&self) -> Option<&ExecutionReport> {
+        match self {
+            Self::Declined(_) => None,
+            Self::Reported { report, .. } => Some(report),
+        }
+    }
+
+    /// Consumes the outcome and returns its report, if matching ran.
+    #[must_use]
+    pub fn into_report(self) -> Option<ExecutionReport> {
+        match self {
+            Self::Declined(_) => None,
+            Self::Reported { report, .. } => Some(report),
+        }
+    }
+}
+
+impl<T> From<ConditionalExecutionDecision<NewOrderExecution<T>>> for ConditionalNewOrderOutcome<T> {
+    fn from(decision: ConditionalExecutionDecision<NewOrderExecution<T>>) -> Self {
+        match decision {
+            ConditionalExecutionDecision::Declined(observation) => Self::Declined(observation),
+            ConditionalExecutionDecision::Reported {
+                observation,
+                report,
+            } => Self::Reported {
+                observation,
+                report,
+            },
+        }
     }
 }
 
@@ -3167,13 +3257,11 @@ impl ImmediateExecutionOutcome {
     }
 }
 
-impl From<ConditionalImmediateExecutionDecision<ImmediateExecutionQuote>>
-    for ImmediateExecutionOutcome
-{
-    fn from(decision: ConditionalImmediateExecutionDecision<ImmediateExecutionQuote>) -> Self {
+impl From<ConditionalExecutionDecision<ImmediateExecutionQuote>> for ImmediateExecutionOutcome {
+    fn from(decision: ConditionalExecutionDecision<ImmediateExecutionQuote>) -> Self {
         match decision {
-            ConditionalImmediateExecutionDecision::Declined(quote) => Self::Declined(quote),
-            ConditionalImmediateExecutionDecision::Reported {
+            ConditionalExecutionDecision::Declined(quote) => Self::Declined(quote),
+            ConditionalExecutionDecision::Reported {
                 observation,
                 report,
             } => Self::reported(observation, report),
@@ -3233,13 +3321,13 @@ impl ImmediateExecutionCurveOutcome {
     }
 }
 
-impl From<ConditionalImmediateExecutionDecision<ImmediateExecutionCurve>>
+impl From<ConditionalExecutionDecision<ImmediateExecutionCurve>>
     for ImmediateExecutionCurveOutcome
 {
-    fn from(decision: ConditionalImmediateExecutionDecision<ImmediateExecutionCurve>) -> Self {
+    fn from(decision: ConditionalExecutionDecision<ImmediateExecutionCurve>) -> Self {
         match decision {
-            ConditionalImmediateExecutionDecision::Declined(curve) => Self::Declined(curve),
-            ConditionalImmediateExecutionDecision::Reported {
+            ConditionalExecutionDecision::Declined(curve) => Self::Declined(curve),
+            ConditionalExecutionDecision::Reported {
                 observation,
                 report,
             } => Self::reported(observation, report),
@@ -3248,47 +3336,45 @@ impl From<ConditionalImmediateExecutionDecision<ImmediateExecutionCurve>>
 }
 
 #[derive(Debug)]
-pub(crate) struct ImmediateExecutionPreflight {
+pub(crate) struct ConditionalExecutionPreflight<T> {
     pub(crate) preparation: CommandPreparation,
-    pub(crate) quote: Option<ImmediateExecutionQuote>,
+    pub(crate) observation: Option<T>,
 }
 
-pub(crate) enum ConditionalImmediateExecutionPreparation<T> {
-    Complete(ConditionalImmediateExecutionDecision<T>),
+pub(crate) enum ConditionalExecutionPreparation<T> {
+    Complete(ConditionalExecutionDecision<T>),
     Commit {
         prepared: PreparedCommand,
         observation: Option<T>,
     },
 }
 
-pub(crate) fn evaluate_conditional_immediate_execution<T, E>(
-    preflight: ImmediateExecutionPreflight,
-    observe: impl FnOnce(ImmediateExecutionQuote) -> Result<T, E>,
-    accept: impl FnOnce(&T) -> bool,
-) -> Result<ConditionalImmediateExecutionPreparation<T>, E> {
+pub(crate) fn evaluate_conditional_execution<T, U, E>(
+    preflight: ConditionalExecutionPreflight<T>,
+    observe: impl FnOnce(T) -> Result<U, E>,
+    accept: impl FnOnce(&U) -> bool,
+) -> Result<ConditionalExecutionPreparation<U>, E> {
     match preflight.preparation {
-        CommandPreparation::Replay(report) => {
-            Ok(ConditionalImmediateExecutionPreparation::Complete(
-                ConditionalImmediateExecutionDecision::Reported {
-                    observation: None,
-                    report,
-                },
-            ))
-        }
+        CommandPreparation::Replay(report) => Ok(ConditionalExecutionPreparation::Complete(
+            ConditionalExecutionDecision::Reported {
+                observation: None,
+                report,
+            },
+        )),
         CommandPreparation::Ready(prepared) => {
-            let observation = match preflight.quote {
-                Some(quote) => Some(observe(quote)?),
+            let observation = match preflight.observation {
+                Some(value) => Some(observe(value)?),
                 None => None,
             };
             let observation = match observation {
                 Some(value) if !accept(&value) => {
-                    return Ok(ConditionalImmediateExecutionPreparation::Complete(
-                        ConditionalImmediateExecutionDecision::Declined(value),
+                    return Ok(ConditionalExecutionPreparation::Complete(
+                        ConditionalExecutionDecision::Declined(value),
                     ));
                 }
                 value => value,
             };
-            Ok(ConditionalImmediateExecutionPreparation::Commit {
+            Ok(ConditionalExecutionPreparation::Commit {
                 prepared,
                 observation,
             })
@@ -8501,6 +8587,72 @@ impl OrderBook {
         )
     }
 
+    /// Atomically observes and conditionally submits one complete new order.
+    ///
+    /// Exact replay plus core business rejection bypass `accept` and return a
+    /// report without a current observation. Otherwise an immediately active
+    /// order exposes its exact private execution quote, while a valid stop
+    /// order exposes [`NewOrderExecution::DormantStop`]. Returning `false`, or
+    /// unwinding from the predicate, drops the preparation before consuming
+    /// identity, sequence, trade, event, book, or WAL state. Returning `true`
+    /// commits that same preparation under the exclusive book borrow.
+    ///
+    /// Market-to-limit observation and commit use the same current private
+    /// executable best price. The quote describes current private execution
+    /// economics; the submitted time-in-force remains authoritative for FOK,
+    /// minimum-quantity IOC, post-only, and residual handling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MatchingError`] for command collision, configured capacity,
+    /// identifier/sequence exhaustion, or a prepared-commit contradiction.
+    pub fn submit_new_order_if(
+        &mut self,
+        order: NewOrder,
+        accept: impl FnOnce(&NewOrderExecution<ImmediateExecutionQuote>) -> bool,
+    ) -> Result<ConditionalNewOrderOutcome<ImmediateExecutionQuote>, MatchingError> {
+        self.submit_conditional_new_order(order, |_, observation| Ok(observation), accept)
+            .map(Into::into)
+    }
+
+    /// Atomically constructs a private execution curve and conditionally
+    /// submits one complete new order.
+    ///
+    /// Exact replay plus core business rejection bypass curve allocation and
+    /// `accept`. An immediately active order exposes the exact private curve;
+    /// a valid stop exposes [`NewOrderExecution::DormantStop`] without output
+    /// allocation. Allocation failure, decline, or predicate unwind precedes
+    /// all semantic and WAL mutation. Acceptance commits the preparation bound
+    /// to that observation without an intervening book transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImmediateExecutionCurveSubmissionError::Matching`] for
+    /// command preparation or commit failure and
+    /// [`ImmediateExecutionCurveSubmissionError::Query`] when an active
+    /// order's exact curve cannot be constructed.
+    pub fn try_submit_new_order_curve_if(
+        &mut self,
+        order: NewOrder,
+        accept: impl FnOnce(&NewOrderExecution<ImmediateExecutionCurve>) -> bool,
+    ) -> Result<
+        ConditionalNewOrderOutcome<ImmediateExecutionCurve>,
+        ImmediateExecutionCurveSubmissionError,
+    > {
+        self.submit_conditional_new_order(
+            order,
+            |book, observation| match observation {
+                NewOrderExecution::Active(quote) => book
+                    .try_immediate_execution_curve_for_quote(quote)
+                    .map(NewOrderExecution::Active)
+                    .map_err(Into::into),
+                NewOrderExecution::DormantStop => Ok(NewOrderExecution::DormantStop),
+            },
+            accept,
+        )
+        .map(Into::into)
+    }
+
     /// Atomically quotes and conditionally submits one canonical IOC order.
     ///
     /// Core matching rejection and exact replay bypass `accept` and return a
@@ -8570,26 +8722,47 @@ impl OrderBook {
         submission: ImmediateExecutionSubmission,
         observe: impl FnOnce(&Self, ImmediateExecutionQuote) -> Result<T, E>,
         accept: impl FnOnce(&T) -> bool,
-    ) -> Result<ConditionalImmediateExecutionDecision<T>, E>
+    ) -> Result<ConditionalExecutionDecision<T>, E>
     where
         E: From<MatchingError>,
     {
         let preflight = self
             .prepare_conditional_immediate_execution(submission)
             .map_err(E::from)?;
-        match evaluate_conditional_immediate_execution(
-            preflight,
-            |quote| observe(self, quote),
-            accept,
-        )? {
-            ConditionalImmediateExecutionPreparation::Complete(decision) => Ok(decision),
-            ConditionalImmediateExecutionPreparation::Commit {
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_new_order<T, E>(
+        &mut self,
+        order: NewOrder,
+        observe: impl FnOnce(&Self, NewOrderExecution<ImmediateExecutionQuote>) -> Result<T, E>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalExecutionDecision<T>, E>
+    where
+        E: From<MatchingError>,
+    {
+        let preflight = self.prepare_conditional_new_order(order).map_err(E::from)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_execution<T, U, E>(
+        &mut self,
+        preflight: ConditionalExecutionPreflight<T>,
+        observe: impl FnOnce(&Self, T) -> Result<U, E>,
+        accept: impl FnOnce(&U) -> bool,
+    ) -> Result<ConditionalExecutionDecision<U>, E>
+    where
+        E: From<MatchingError>,
+    {
+        match evaluate_conditional_execution(preflight, |value| observe(self, value), accept)? {
+            ConditionalExecutionPreparation::Complete(decision) => Ok(decision),
+            ConditionalExecutionPreparation::Commit {
                 prepared,
                 observation,
             } => {
                 let report = self.commit(prepared).map_err(E::from)?;
                 let retained_observation = if report.replayed { None } else { observation };
-                Ok(ConditionalImmediateExecutionDecision::Reported {
+                Ok(ConditionalExecutionDecision::Reported {
                     observation: retained_observation,
                     report,
                 })
@@ -8597,23 +8770,72 @@ impl OrderBook {
         }
     }
 
+    pub(crate) fn prepare_conditional_new_order(
+        &self,
+        order: NewOrder,
+    ) -> Result<
+        ConditionalExecutionPreflight<NewOrderExecution<ImmediateExecutionQuote>>,
+        MatchingError,
+    > {
+        match self.prepare(Command::New(order))? {
+            preparation @ CommandPreparation::Replay(_) => Ok(ConditionalExecutionPreflight {
+                preparation,
+                observation: None,
+            }),
+            CommandPreparation::Ready(prepared) => {
+                let observation = prepared
+                    .core_rejection()
+                    .is_none()
+                    .then(|| self.new_order_execution_observation(order));
+                Ok(ConditionalExecutionPreflight {
+                    preparation: CommandPreparation::Ready(prepared),
+                    observation,
+                })
+            }
+        }
+    }
+
+    fn new_order_execution_observation(
+        &self,
+        order: NewOrder,
+    ) -> NewOrderExecution<ImmediateExecutionQuote> {
+        let constraint = match order.order_type {
+            OrderType::Market => StopActivation::Market,
+            OrderType::MarketToLimit => StopActivation::Limit(
+                self.best_price(order.side.opposite())
+                    .expect("admissible market-to-limit order must have an opposite price"),
+            ),
+            OrderType::Limit(price) => StopActivation::Limit(price),
+            OrderType::Stop { .. } => return NewOrderExecution::DormantStop,
+        };
+        NewOrderExecution::Active(
+            self.immediate_execution_quote(ImmediateExecutionRequest::new(
+                order.account_id,
+                order.side,
+                order.quantity,
+                constraint,
+                order.self_trade_prevention,
+            )),
+        )
+    }
+
     pub(crate) fn prepare_conditional_immediate_execution(
         &self,
         submission: ImmediateExecutionSubmission,
-    ) -> Result<ImmediateExecutionPreflight, MatchingError> {
+    ) -> Result<ConditionalExecutionPreflight<ImmediateExecutionQuote>, MatchingError> {
         match self.prepare(submission.command())? {
-            preparation @ CommandPreparation::Replay(_) => Ok(ImmediateExecutionPreflight {
+            preparation @ CommandPreparation::Replay(_) => Ok(ConditionalExecutionPreflight {
                 preparation,
-                quote: None,
+                observation: None,
             }),
             CommandPreparation::Ready(prepared) => {
-                let quote = prepared
+                let observation = prepared
                     .core_rejection()
                     .is_none()
                     .then(|| self.immediate_execution_quote(submission.request));
-                Ok(ImmediateExecutionPreflight {
+                Ok(ConditionalExecutionPreflight {
                     preparation: CommandPreparation::Ready(prepared),
-                    quote,
+                    observation,
                 })
             }
         }

@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A142 are stable and are referenced from code comments and other
+identifiers A1-A143 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -5361,6 +5361,85 @@ mutation or WAL growth before acceptance, missing typed query provenance,
 interposed shard mutation, durable protocol drift, recovery divergence, or new
 wire value falsifies A142.
 
+## A143 — atomic conditional new-order execution observation
+
+**Assumption.** One `submit_new_order_if` or
+`try_submit_new_order_curve_if` call on an `OrderBook`,
+`RiskManagedOrderBook`, `DurableOrderBook`, or `DurableRiskOrderBook` holds the
+corresponding exclusive mutable shard borrow across ordinary `NewOrder`
+preparation, coupled-risk authorization precheck when present, observation,
+predicate, and commit of that same preparation. It accepts the complete
+submitted market, market-to-limit, limit, dormant-stop, display, TIF, and STP
+fields; it neither canonicalizes them to A140 IOC nor introduces another
+matching path.
+
+`NewOrderExecution<T>` distinguishes `Active(T)` from `DormantStop`. An active
+order maps account, side, quantity, STP, and its effective market-or-limit
+constraint to the exact A124 quote. Curve submission maps that quote through
+A141 before invoking the predicate. Market-to-limit uses the private opposite
+best that the unchanged commit captures in `MarketToLimitPriced`; a valid
+noncrossing post-only order carries an empty active observation. A valid stop
+instead carries `DormantStop`, allocates no curve, and makes no claim about
+activation-time liquidity. An already-triggered or reference-less stop is a
+core rejection and bypasses the predicate.
+
+The A124/A141 value describes current private execution economics; the
+submitted TIF remains authoritative at commit. A valid FOK reaches the
+predicate only after its complete-fill core preflight. A crossing post-only
+order and an insufficient FOK bypass the predicate as core rejections. A
+minimum-quantity IOC can expose positive external liquidity below its
+threshold, then atomically emit `MinimumQuantityUnavailable` without trading
+if the predicate accepts it. GTC/GTD residuals retain their submitted display
+and effective limit, including the frozen market-to-limit price.
+
+Exact replay plus core or coupled-risk rejection returns a reported outcome
+without observation, curve allocation, or predicate execution. Curve
+reservation failure, predicate decline, or unwind drops the preparation before
+order identity, sequence, event, trade, matching, risk, history, public, or WAL
+mutation. Acceptance commits without an intervening shard transition and
+returns the exact observation with the report. Durable acceptance and business
+rejection retain command-before-state-before-report; allocation failure,
+decline, unwind, and replay append zero frames. The observation and callback
+decision are process-local, unencoded, unauthenticated, and valid only within
+the call. Existing command, report, checkpoint, market-data, and wire values
+are unchanged.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A7, A9, A10, A12, A15, A18,
+A19, A22, A37, A39, A44, A45, A47, A55, A57, A67, A72, A80, A81, A82,
+A83, A85, A103, A105, A115, A124, A139, A140, A141, A142, A143] Let `A`
+be ordinary new-order preparation cost, `Q` the applicable A124 scan cost, `C`
+the contributing-price count, `F` predicate cost, and `M` commit cost. Active
+quote acceptance costs `O(A + Q + F + M)` and decline costs `O(A + Q + F)`.
+Active curve acceptance costs
+`O(A + 2Q + C + F + M) = O(A + Q + F + M)` and decline costs
+`O(A + 2Q + C + F) = O(A + Q + F)`, with `O(C)` caller-owned output and
+`O(1)` scanner state. Dormant-stop acceptance costs `O(A + F + M)`, decline
+costs `O(A + F)`, and uses `O(1)` observation space with no curve allocation.
+Core/risk rejection and replay pay only their existing preparation/gate path
+and skip `Q`, `C`, and `F`. Coupled risk retains its expected `O(1)` precheck
+and commit recheck. Durable acceptance and business rejection append two
+existing frames; allocation failure, decline, unwind, and replay append zero.
+
+**Falsification probe.** Across all four surfaces, exercise market,
+market-to-limit, limit, GTC, GTD, IOC, minimum-quantity IOC, FOK, post-only,
+fully displayed, reserve, fully hidden, and dormant stop-market/stop-limit
+orders on both sides, signed prices, all four STP policies, and every A124
+termination. Run accepting, declining, and unwinding predicates. Require the
+same private best in market-to-limit observation, pricing event, trades, and
+residual; explicit dormant state without a scan; empty valid post-only state;
+and submitted TIF/display behavior after acceptance. Exercise sub-threshold
+minimum IOC, insufficient FOK, crossing post-only, unavailable/already-
+triggered stop, every applicable risk rejection, exact retry, command-ID
+collision, curve reservation failure, and durable write/report failure.
+
+Count predicate and allocation calls; compare identity/sequence availability,
+private/public book, risk positions/reservations/exposures, WAL frames, and
+plain/coupled-risk reopen state. Any observation or predicate on
+rejection/replay, active/dormant misclassification, market-to-limit price
+drift, activation forecast, TIF/display replacement, partial curve, mutation or
+WAL growth before acceptance, interposed shard transition, durable protocol or
+recovery drift, or new wire value falsifies A143.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -5558,6 +5637,24 @@ capability, a remaining risk, or an opportunity.
   curve allocation; allocation failure, decline, and unwind precede all
   matching, risk, identity, sequence, and WAL mutation.
 
+- **High impact:** A143 now applies the same atomic process-local quote/curve
+  decision to every continuous `NewOrder` shape across plain, coupled-risk,
+  durable, and durable-risk books. Active orders preserve their submitted TIF
+  and display semantics; dormant stops are explicit and contain no activation
+  forecast; market-to-limit observation and commit share one frozen private
+  best.
+
+- **Medium impact opportunity:** one predicate can gate immediate slippage,
+  per-price concentration, passive resting admission, reserve/hidden residual
+  policy, minimum-quantity availability, or a market-to-limit captured price
+  without a second book borrow or a duplicated execution implementation.
+
+- **Medium impact boundary:** A124/A141 report current execution economics,
+  while submitted TIF remains authoritative. In particular, accepted sub-
+  threshold minimum-quantity IOC cancels without trading, and dormant-stop
+  observation contains no activation-time curve. Consumers must interpret the
+  observation together with the original `NewOrder`.
+
 - **Medium impact opportunity:** exact per-price predicate input permits local
   deterministic maximum-level, stepwise slippage, and liquidity-concentration
   admission without reconstructing private depth or risking a second-borrow
@@ -5574,11 +5671,11 @@ capability, a remaining risk, or an opportunity.
   query-rate controls remain outside the order-book API.
 
 - **High impact risk:** a standalone A124 quote or A141 curve still neither
-  reserves liquidity nor fences a later borrow. A140 and A142 close only the
-  process-local canonical IOC paths. Remote or asynchronous validity, callback
-  authentication/durability, fees, arbitrary display/lifetime/order types,
-  cross-shard execution, and projected cancel-resting or cancel-both maker
-  effects require separately specified protocols.
+  reserves liquidity nor fences a later borrow. A140/A142 close canonical IOC
+  and A143 closes arbitrary new-order submission only within one synchronous
+  process-local call. Remote or asynchronous validity, callback authentication/
+  durability, fees, cross-shard execution, and projected cancel-resting or
+  cancel-both maker effects require separately specified protocols.
 
 - **Medium impact opportunity:** the exact quantity partition, signed
   notional, worst price, and termination can drive deterministic slippage,

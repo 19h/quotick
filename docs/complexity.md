@@ -573,6 +573,33 @@ frames; allocation failure, decline, unwind, and replay append zero. All
 quantity, count, and signed-notional reconciliation uses exact integer
 arithmetic, so numerical approximation error is zero.
 
+`submit_new_order_if` and `try_submit_new_order_curve_if` compose the same
+conditional evaluator with ordinary `NewOrder` preparation rather than the
+A140 canonical-IOC constructor. Let `A` be ordinary preparation cost, `Q` the
+applicable A124 scan cost, `C` contributing active prices, `F` predicate cost,
+and `M` the submitted order's ordinary commit cost.
+
+- Active quote acceptance is `O(A + Q + F + M)` time; decline is
+  `O(A + Q + F)`. Auxiliary observation state is `O(1)`.
+- Active curve acceptance is
+  `O(A + 2Q + C + F + M) = O(A + Q + F + M)` time; decline is
+  `O(A + 2Q + C + F) = O(A + Q + F)`. The returned/retained curve owns
+  `O(C)` caller output and scanner state remains `O(1)`.
+- Dormant-stop acceptance is `O(A + F + M)` and decline is `O(A + F)`, with
+  one fixed-size enum observation and no quote scan or curve allocation.
+- Core/risk rejection and exact replay retain their existing preparation/gate
+  bound and skip `Q`, `C`, and `F`. Coupled risk adds its expected `O(1)`
+  authorization precheck and unchanged commit recheck.
+
+Market-to-limit observation reads the same cached private best as the unchanged
+commit in `O(1)`. A valid noncrossing post-only order still performs `Q`, but
+its curve has `C = 0`; a crossing post-only order and insufficient FOK are core
+rejections and skip observation. Minimum-quantity IOC observation performs the
+ordinary A124 scan even when its submitted threshold later causes an accepted
+zero-trade cancellation. Durable acceptance and business rejection append two
+existing frames; allocation failure, decline, unwind, and replay append zero.
+No command/report codec, event bound, or fixed authoritative state changes.
+
 ## Default matching limits and memory
 
 This section states the default resource envelopes, the buffer pools, the
