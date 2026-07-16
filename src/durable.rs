@@ -22,11 +22,11 @@ use crate::journal::{
 };
 use crate::matching::{
     Command, CommandPreparation, ConditionalExecutionDecision, ConditionalExecutionPreflight,
-    ConditionalExecutionPreparation, ConditionalNewOrderOutcome, ExecutionReport,
+    ConditionalExecutionPreparation, ConditionalOrderOutcome, ExecutionReport,
     ImmediateExecutionCurve, ImmediateExecutionCurveOutcome, ImmediateExecutionOutcome,
     ImmediateExecutionQuote, ImmediateExecutionSubmission, InvariantViolation, MatchingError,
-    NewOrder, NewOrderExecution, OrderBook, OrderBookCheckpoint, OrderBookCheckpointCapture,
-    OrderBookCheckpointError, OrderBookLimits, OrderBookQueryError, PreparedCommand,
+    NewOrder, OrderBook, OrderBookCheckpoint, OrderBookCheckpointCapture, OrderBookCheckpointError,
+    OrderBookLimits, OrderBookQueryError, OrderExecution, PreparedCommand, ReplaceOrder,
     evaluate_conditional_execution,
 };
 use crate::snapshot::{
@@ -763,8 +763,8 @@ impl DurableOrderBook {
     pub fn submit_new_order_if(
         &mut self,
         order: NewOrder,
-        accept: impl FnOnce(&NewOrderExecution<ImmediateExecutionQuote>) -> bool,
-    ) -> Result<ConditionalNewOrderOutcome<ImmediateExecutionQuote>, DurableError> {
+        accept: impl FnOnce(&OrderExecution<ImmediateExecutionQuote>) -> bool,
+    ) -> Result<ConditionalOrderOutcome<ImmediateExecutionQuote>, DurableError> {
         self.submit_conditional_new_order(order, |_, observation| Ok(observation), accept)
             .map(Into::into)
     }
@@ -785,16 +785,57 @@ impl DurableOrderBook {
     pub fn try_submit_new_order_curve_if(
         &mut self,
         order: NewOrder,
-        accept: impl FnOnce(&NewOrderExecution<ImmediateExecutionCurve>) -> bool,
-    ) -> Result<ConditionalNewOrderOutcome<ImmediateExecutionCurve>, DurableError> {
+        accept: impl FnOnce(&OrderExecution<ImmediateExecutionCurve>) -> bool,
+    ) -> Result<ConditionalOrderOutcome<ImmediateExecutionCurve>, DurableError> {
         self.submit_conditional_new_order(
             order,
-            |book, observation| match observation {
-                NewOrderExecution::Active(quote) => Ok(NewOrderExecution::Active(
-                    book.try_immediate_execution_curve_for_quote(quote)?,
-                )),
-                NewOrderExecution::DormantStop => Ok(NewOrderExecution::DormantStop),
-            },
+            |book, observation| Ok(book.try_order_execution_curve(observation)?),
+            accept,
+        )
+        .map(Into::into)
+    }
+
+    /// Durably observes and conditionally replaces one active order.
+    ///
+    /// Replay and core rejection bypass `accept`. Otherwise the predicate
+    /// borrows an active private quote or explicit dormant-stop state before
+    /// any WAL append. Decline or unwind changes neither WAL nor semantic
+    /// state. Acceptance persists and commits the same preparation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] for poison, matching preparation, journal, or
+    /// commit failure. A failure after command acknowledgement poisons the
+    /// instance for deterministic reopen recovery.
+    pub fn submit_replace_order_if(
+        &mut self,
+        replacement: ReplaceOrder,
+        accept: impl FnOnce(&OrderExecution<ImmediateExecutionQuote>) -> bool,
+    ) -> Result<ConditionalOrderOutcome<ImmediateExecutionQuote>, DurableError> {
+        self.submit_conditional_replace_order(replacement, |_, observation| Ok(observation), accept)
+            .map(Into::into)
+    }
+
+    /// Durably constructs an active private execution curve and conditionally
+    /// replaces one order.
+    ///
+    /// Replay and core rejection bypass allocation and `accept`; a dormant
+    /// stop-limit exposes explicit dormant state without allocation.
+    /// Allocation failure, decline, or unwind precedes WAL and semantic
+    /// mutation. Acceptance persists the observation-bound preparation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] for poison, matching preparation, exact curve
+    /// construction, journal, or commit failure.
+    pub fn try_submit_replace_order_curve_if(
+        &mut self,
+        replacement: ReplaceOrder,
+        accept: impl FnOnce(&OrderExecution<ImmediateExecutionCurve>) -> bool,
+    ) -> Result<ConditionalOrderOutcome<ImmediateExecutionCurve>, DurableError> {
+        self.submit_conditional_replace_order(
+            replacement,
+            |book, observation| Ok(book.try_order_execution_curve(observation)?),
             accept,
         )
         .map(Into::into)
@@ -872,7 +913,7 @@ impl DurableOrderBook {
         order: NewOrder,
         observe: impl FnOnce(
             &OrderBook,
-            NewOrderExecution<ImmediateExecutionQuote>,
+            OrderExecution<ImmediateExecutionQuote>,
         ) -> Result<T, DurableError>,
         accept: impl FnOnce(&T) -> bool,
     ) -> Result<ConditionalExecutionDecision<T>, DurableError> {
@@ -880,6 +921,22 @@ impl DurableOrderBook {
             return Err(DurableError::Poisoned);
         }
         let preflight = self.book.prepare_conditional_new_order(order)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_replace_order<T>(
+        &mut self,
+        replacement: ReplaceOrder,
+        observe: impl FnOnce(
+            &OrderBook,
+            OrderExecution<ImmediateExecutionQuote>,
+        ) -> Result<T, DurableError>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalExecutionDecision<T>, DurableError> {
+        if self.is_poisoned() {
+            return Err(DurableError::Poisoned);
+        }
+        let preflight = self.book.prepare_conditional_replace_order(replacement)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 

@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A143 are stable and are referenced from code comments and other
+identifiers A1-A144 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -5373,7 +5373,7 @@ submitted market, market-to-limit, limit, dormant-stop, display, TIF, and STP
 fields; it neither canonicalizes them to A140 IOC nor introduces another
 matching path.
 
-`NewOrderExecution<T>` distinguishes `Active(T)` from `DormantStop`. An active
+`OrderExecution<T>` distinguishes `Active(T)` from `DormantStop`. An active
 order maps account, side, quantity, STP, and its effective market-or-limit
 constraint to the exact A124 quote. Curve submission maps that quote through
 A141 before invoking the predicate. Market-to-limit uses the private opposite
@@ -5439,6 +5439,88 @@ rejection/replay, active/dormant misclassification, market-to-limit price
 drift, activation forecast, TIF/display replacement, partial curve, mutation or
 WAL growth before acceptance, interposed shard transition, durable protocol or
 recovery drift, or new wire value falsifies A143.
+
+## A144 — atomic conditional replacement execution observation
+
+**Assumption.** One `submit_replace_order_if` or
+`try_submit_replace_order_curve_if` call on an `OrderBook`,
+`RiskManagedOrderBook`, `DurableOrderBook`, or `DurableRiskOrderBook` holds the
+corresponding exclusive mutable shard borrow across ordinary `ReplaceOrder`
+preparation, coupled-risk authorization precheck when present, observation,
+predicate, and commit of that same preparation. It reuses the ordinary
+replacement path and introduces no second ownership, admission, matching,
+risk, report, persistence, or recovery implementation.
+
+Exact replay plus core or coupled-risk rejection returns a reported outcome
+without observation, curve allocation, or predicate execution. Core business
+preflight includes route/version, target existence and ownership, account/
+trading state, quantity/price/display constraints, and the dormant stop-market
+prohibition. Ordinary preparation also fixes capacity and sequence/event
+resources as typed operational errors before observation. Coupled risk applies
+the existing authorization that nets out the target reservation; rejection
+preserves that reservation and clears the observation before the predicate.
+
+For an active target, `OrderExecution<T>::Active` maps its immutable account,
+side, and STP policy plus the replacement quantity and limit price to the exact
+A124 quote or A141 curve. The target is same-side state, so leaving it in place
+during observation cannot alter scanned opposite liquidity. A same-price,
+unchanged-display quantity reduction therefore produces an empty active
+observation and retains priority if accepted. A price or priority-changing
+replacement observes the external executions that its unchanged commit can
+produce. A dormant stop-limit carries `DormantStop`, allocates no curve, and
+makes no claim about activation-time liquidity; dormant stop-market replacement
+remains a core rejection.
+
+Curve reservation failure, predicate decline, or unwind drops the preparation
+before sequence, event, trade, matching, risk, history, public, or WAL mutation
+and leaves the original active order and reservation byte-for-byte unchanged.
+Acceptance commits without an intervening shard transition and returns the
+exact observation with the report. Durable acceptance and business rejection
+retain command-before-state-before-report; allocation failure, decline,
+unwind, and replay append zero frames. The observation and callback decision
+are process-local, unencoded, unauthenticated, and valid only within the call.
+Existing command, report, checkpoint, market-data, and wire values are
+unchanged.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A7, A9, A10, A12, A15, A18,
+A19, A22, A37, A39, A44, A45, A47, A55, A57, A67, A72, A80, A81, A82,
+A83, A85, A103, A124, A139, A141, A142, A143, A144] Let `R` be ordinary
+replacement preparation cost, `Q` the applicable A124 scan cost, `C` the
+contributing-price count, `F` predicate cost, and `M` commit cost. Active quote
+acceptance costs `O(R + Q + F + M)` and decline costs `O(R + Q + F)`. Active
+curve acceptance costs
+`O(R + 2Q + C + F + M) = O(R + Q + F + M)` and decline costs
+`O(R + 2Q + C + F) = O(R + Q + F)`, with `O(C)` caller-owned output and
+`O(1)` scanner state. Dormant-stop acceptance costs `O(R + F + M)`, decline
+costs `O(R + F)`, and uses `O(1)` observation space with no curve allocation.
+Core/risk rejection and replay pay only their existing preparation/gate path
+and skip `Q`, `C`, and `F`. Coupled risk retains its expected `O(1)` net-
+replacement precheck and commit recheck. Durable acceptance and business
+rejection append two existing frames; allocation failure, decline, unwind, and
+replay append zero. All arithmetic is exact integer arithmetic; approximation
+error is zero.
+
+**Falsification probe.** Across all four surfaces, exercise active same-price
+priority-retaining reduction, quantity increase, price changes, signed prices,
+fully displayed/reserve/hidden modes, both sides, every STP policy, partial and
+full execution, every A124 termination, and dormant stop-limit replacement.
+Run accepting, declining, and unwinding predicates. Require exact quote/curve/
+committed-trace parity, unchanged target priority and state after noncommit,
+explicit dormant state without a scan, and ordinary retained/lost-priority
+events after acceptance. Exercise unknown/wrong-owner targets, wrong route or
+version, invalid quantity/price/display, blocked/non-open admission, dormant
+stop-market replacement, every applicable risk rejection, exact retry,
+command-ID collision, curve reservation failure, sequence/event/capacity
+exhaustion, and durable write/report failure.
+
+Count predicate and allocation calls; compare target snapshots and queue
+priority, private/public book, risk positions/reservations/exposures, WAL
+frames, and plain/coupled-risk reopen state. Any observation or predicate on
+rejection/replay, target-dependent opposite-liquidity drift, active/dormant
+misclassification, activation forecast, partial curve, mutation or WAL growth
+before acceptance, reservation loss on risk rejection, interposed shard
+transition, durable protocol or recovery drift, or new wire value falsifies
+A144.
 
 ## Bounded scope expansion
 
@@ -5644,10 +5726,18 @@ capability, a remaining risk, or an opportunity.
   forecast; market-to-limit observation and commit share one frozen private
   best.
 
+- **High impact:** A144 now applies that observation-bound commit to continuous
+  replacement across plain, coupled-risk, durable, and durable-risk books.
+  Active replacement uses the target's account/side/STP with the requested
+  quantity/price; dormant stop-limit replacement remains explicit; decline,
+  unwind, allocation failure, and replay preserve the target and append no WAL
+  frames.
+
 - **Medium impact opportunity:** one predicate can gate immediate slippage,
   per-price concentration, passive resting admission, reserve/hidden residual
-  policy, minimum-quantity availability, or a market-to-limit captured price
-  without a second book borrow or a duplicated execution implementation.
+  policy, minimum-quantity availability, a market-to-limit captured price, or
+  replacement execution without a second book borrow or a duplicated
+  execution implementation.
 
 - **Medium impact boundary:** A124/A141 report current execution economics,
   while submitted TIF remains authoritative. In particular, accepted sub-
@@ -5672,10 +5762,11 @@ capability, a remaining risk, or an opportunity.
 
 - **High impact risk:** a standalone A124 quote or A141 curve still neither
   reserves liquidity nor fences a later borrow. A140/A142 close canonical IOC
-  and A143 closes arbitrary new-order submission only within one synchronous
-  process-local call. Remote or asynchronous validity, callback authentication/
-  durability, fees, cross-shard execution, and projected cancel-resting or
-  cancel-both maker effects require separately specified protocols.
+  A143 closes arbitrary new-order submission, and A144 closes continuous
+  replacement only within one synchronous process-local call. Remote or
+  asynchronous validity, callback authentication/durability, fees, cross-shard
+  execution, and projected cancel-resting or cancel-both maker effects require
+  separately specified protocols.
 
 - **Medium impact opportunity:** the exact quantity partition, signed
   notional, worst price, and termination can drive deterministic slippage,

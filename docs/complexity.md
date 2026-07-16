@@ -600,6 +600,34 @@ zero-trade cancellation. Durable acceptance and business rejection append two
 existing frames; allocation failure, decline, unwind, and replay append zero.
 No command/report codec, event bound, or fixed authoritative state changes.
 
+`submit_replace_order_if` and `try_submit_replace_order_curve_if` reuse the
+same evaluator with ordinary `ReplaceOrder` preparation. Let `R` be ordinary
+replacement preparation cost, `Q` the applicable A124 scan cost, `C` the
+contributing opposite-price count, `F` predicate cost, and `M` replacement
+commit cost.
+
+- Active quote acceptance is `O(R + Q + F + M)` time; decline is
+  `O(R + Q + F)`. Auxiliary observation state is `O(1)`.
+- Active curve acceptance is
+  `O(R + 2Q + C + F + M) = O(R + Q + F + M)` time; decline is
+  `O(R + 2Q + C + F) = O(R + Q + F)`. The returned/retained curve owns
+  `O(C)` caller output and scanner state remains `O(1)`.
+- Dormant stop-limit acceptance is `O(R + F + M)` and decline is
+  `O(R + F)`, with one fixed-size enum observation and no quote scan or curve
+  allocation.
+- Core/risk rejection and exact replay retain their existing preparation/gate
+  bound and skip `Q`, `C`, and `F`. Coupled risk adds its expected `O(1)` net-
+  replacement authorization precheck and unchanged commit recheck.
+
+The old order is same-side state and therefore does not change the opposite-
+side A124 scan. A retained-priority same-price reduction still performs `Q`
+and obtains `C = 0`; its indexed level, account, and order commit retains the
+ordinary replacement bound represented by `M`. Price-changing replacement
+retains its existing matching bound in `M`. Durable acceptance and business
+rejection append two existing frames; allocation failure, decline, unwind, and
+replay append zero. No command/report codec, event bound, or fixed
+authoritative state changes.
+
 ## Default matching limits and memory
 
 This section states the default resource envelopes, the buffer pools, the

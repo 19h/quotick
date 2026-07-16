@@ -12,8 +12,8 @@ use quotick::instrument::{
 };
 use quotick::journal::{Durability, JournalOptions, JournalReader};
 use quotick::matching::{
-    CancelReason, Command, CommandOutcome, ConditionalNewOrderOutcome, EventKind,
-    ImmediateExecutionTermination, NewOrder, NewOrderExecution, OrderBook, OrderDisplay, OrderType,
+    CancelReason, Command, CommandOutcome, ConditionalOrderOutcome, EventKind,
+    ImmediateExecutionTermination, NewOrder, OrderBook, OrderDisplay, OrderExecution, OrderType,
     RejectReason, SelfTradePrevention, StopActivation, StopReference, StopReferenceCursor,
     StopTriggerSweep, TimeInForce,
 };
@@ -191,7 +191,7 @@ fn active_limit_curve_decline_unwind_accept_and_replay_are_atomic() {
 
     let declined = book
         .try_submit_new_order_curve_if(incoming, |observation| {
-            let NewOrderExecution::Active(curve) = observation else {
+            let OrderExecution::Active(curve) = observation else {
                 panic!("an active limit order has an execution curve");
             };
             assert_eq!(curve.quote().book_event_sequence(), sequence_before);
@@ -205,7 +205,7 @@ fn active_limit_curve_decline_unwind_accept_and_replay_are_atomic() {
             false
         })
         .unwrap();
-    let ConditionalNewOrderOutcome::Declined(NewOrderExecution::Active(curve)) = declined else {
+    let ConditionalOrderOutcome::Declined(OrderExecution::Active(curve)) = declined else {
         panic!("the active curve was declined");
     };
     assert_eq!(curve.quote().unfilled_quantity_lots(), 2);
@@ -216,13 +216,13 @@ fn active_limit_curve_decline_unwind_accept_and_replay_are_atomic() {
         .try_submit_new_order_curve_if(incoming, |observation| {
             matches!(
                 observation,
-                NewOrderExecution::Active(curve)
+                OrderExecution::Active(curve)
                     if curve.quote().termination() == ImmediateExecutionTermination::BookExhausted
             )
         })
         .unwrap();
-    let ConditionalNewOrderOutcome::Reported {
-        observation: Some(NewOrderExecution::Active(committed_curve)),
+    let ConditionalOrderOutcome::Reported {
+        observation: Some(OrderExecution::Active(committed_curve)),
         report,
     } = accepted
     else {
@@ -248,7 +248,7 @@ fn active_limit_curve_decline_unwind_accept_and_replay_are_atomic() {
         .unwrap();
     assert!(matches!(
         replay,
-        ConditionalNewOrderOutcome::Reported {
+        ConditionalOrderOutcome::Reported {
             observation: None,
             report
         } if report.replayed
@@ -266,7 +266,7 @@ fn quote_observes_empty_post_only_and_core_rejections_bypass_the_predicate() {
 
     let accepted = book
         .submit_new_order_if(post_only, |observation| {
-            let NewOrderExecution::Active(quote) = observation else {
+            let OrderExecution::Active(quote) = observation else {
                 panic!("a valid post-only order is active");
             };
             assert_eq!(quote.executed_quantity_lots(), 0);
@@ -281,8 +281,8 @@ fn quote_observes_empty_post_only_and_core_rejections_bypass_the_predicate() {
         .unwrap();
     assert!(matches!(
         accepted,
-        ConditionalNewOrderOutcome::Reported {
-            observation: Some(NewOrderExecution::Active(_)),
+        ConditionalOrderOutcome::Reported {
+            observation: Some(OrderExecution::Active(_)),
             report
         } if report.outcome == CommandOutcome::Accepted
     ));
@@ -300,7 +300,7 @@ fn quote_observes_empty_post_only_and_core_rejections_bypass_the_predicate() {
     assert!(!called.get());
     assert!(matches!(
         rejected,
-        ConditionalNewOrderOutcome::Reported {
+        ConditionalOrderOutcome::Reported {
             observation: None,
             report
         } if report.outcome == CommandOutcome::Rejected(RejectReason::WrongInstrument)
@@ -313,7 +313,7 @@ fn quote_observes_empty_post_only_and_core_rejections_bypass_the_predicate() {
         .unwrap();
     assert!(matches!(
         rejected,
-        ConditionalNewOrderOutcome::Reported {
+        ConditionalOrderOutcome::Reported {
             observation: None,
             report
         } if report.outcome == CommandOutcome::Rejected(RejectReason::InsufficientLiquidity)
@@ -328,7 +328,7 @@ fn quote_observes_empty_post_only_and_core_rejections_bypass_the_predicate() {
         .unwrap();
     assert!(matches!(
         rejected,
-        ConditionalNewOrderOutcome::Reported {
+        ConditionalOrderOutcome::Reported {
             observation: None,
             report
         } if report.outcome == CommandOutcome::Rejected(RejectReason::PostOnlyWouldCross)
@@ -346,7 +346,7 @@ fn market_to_limit_curve_uses_the_same_frozen_private_best_as_commit() {
 
     let accepted = book
         .try_submit_new_order_curve_if(incoming, |observation| {
-            let NewOrderExecution::Active(curve) = observation else {
+            let OrderExecution::Active(curve) = observation else {
                 panic!("market-to-limit is immediately active");
             };
             assert_eq!(
@@ -362,8 +362,8 @@ fn market_to_limit_curve_uses_the_same_frozen_private_best_as_commit() {
         .unwrap();
     assert!(matches!(
         accepted,
-        ConditionalNewOrderOutcome::Reported {
-            observation: Some(NewOrderExecution::Active(_)),
+        ConditionalOrderOutcome::Reported {
+            observation: Some(OrderExecution::Active(_)),
             report
         } if report.outcome == CommandOutcome::Accepted
     ));
@@ -459,7 +459,7 @@ fn every_immediately_active_new_order_shape_reaches_one_shared_observation_path(
         let outcome = book
             .submit_new_order_if(incoming, |observation| {
                 predicate_calls.set(predicate_calls.get() + 1);
-                let NewOrderExecution::Active(quote) = observation else {
+                let OrderExecution::Active(quote) = observation else {
                     panic!("every non-stop case is immediately active");
                 };
                 assert_eq!(quote.executed_quantity_lots(), expected_execution_lots);
@@ -469,8 +469,8 @@ fn every_immediately_active_new_order_shape_reaches_one_shared_observation_path(
         assert_eq!(predicate_calls.get(), 1);
         assert!(matches!(
             outcome,
-            ConditionalNewOrderOutcome::Reported {
-                observation: Some(NewOrderExecution::Active(_)),
+            ConditionalOrderOutcome::Reported {
+                observation: Some(OrderExecution::Active(_)),
                 report
             } if report.outcome == CommandOutcome::Accepted
         ));
@@ -489,7 +489,7 @@ fn minimum_quantity_observation_reports_liquidity_while_tif_cancels_subthreshold
 
     let outcome = book
         .submit_new_order_if(incoming, |observation| {
-            let NewOrderExecution::Active(quote) = observation else {
+            let OrderExecution::Active(quote) = observation else {
                 panic!("minimum-quantity IOC is immediately active");
             };
             assert_eq!(quote.executed_quantity_lots(), 1);
@@ -497,8 +497,8 @@ fn minimum_quantity_observation_reports_liquidity_while_tif_cancels_subthreshold
             true
         })
         .unwrap();
-    let ConditionalNewOrderOutcome::Reported {
-        observation: Some(NewOrderExecution::Active(_)),
+    let ConditionalOrderOutcome::Reported {
+        observation: Some(OrderExecution::Active(_)),
         report,
     } = outcome
     else {
@@ -538,7 +538,7 @@ fn dormant_stop_predicate_receives_explicit_non_execution_state() {
         .unwrap();
     assert!(matches!(
         rejected,
-        ConditionalNewOrderOutcome::Reported {
+        ConditionalOrderOutcome::Reported {
             observation: None,
             report
         } if report.outcome == CommandOutcome::Rejected(RejectReason::StopReferenceUnavailable)
@@ -554,26 +554,26 @@ fn dormant_stop_predicate_receives_explicit_non_execution_state() {
 
     let declined = book
         .submit_new_order_if(stop, |observation| {
-            assert_eq!(observation, &NewOrderExecution::DormantStop);
+            assert_eq!(observation, &OrderExecution::DormantStop);
             false
         })
         .unwrap();
     assert_eq!(
         declined,
-        ConditionalNewOrderOutcome::Declined(NewOrderExecution::DormantStop)
+        ConditionalOrderOutcome::Declined(OrderExecution::DormantStop)
     );
     assert!(book.dormant_stop(OrderId::new(2).unwrap()).is_none());
 
     let accepted = book
         .try_submit_new_order_curve_if(stop, |observation| {
-            assert_eq!(observation, &NewOrderExecution::DormantStop);
+            assert_eq!(observation, &OrderExecution::DormantStop);
             true
         })
         .unwrap();
     assert!(matches!(
         accepted,
-        ConditionalNewOrderOutcome::Reported {
-            observation: Some(NewOrderExecution::DormantStop),
+        ConditionalOrderOutcome::Reported {
+            observation: Some(OrderExecution::DormantStop),
             report
         } if report.outcome == CommandOutcome::Accepted
     ));
@@ -591,7 +591,7 @@ fn dormant_stop_predicate_receives_explicit_non_execution_state() {
         .unwrap();
     assert!(matches!(
         rejected,
-        ConditionalNewOrderOutcome::Reported {
+        ConditionalOrderOutcome::Reported {
             observation: None,
             report
         } if report.outcome == CommandOutcome::Rejected(RejectReason::StopAlreadyTriggered)
@@ -604,14 +604,14 @@ fn dormant_stop_predicate_receives_explicit_non_execution_state() {
     };
     let accepted = book
         .try_submit_new_order_curve_if(stop_limit, |observation| {
-            assert_eq!(observation, &NewOrderExecution::DormantStop);
+            assert_eq!(observation, &OrderExecution::DormantStop);
             true
         })
         .unwrap();
     assert!(matches!(
         accepted,
-        ConditionalNewOrderOutcome::Reported {
-            observation: Some(NewOrderExecution::DormantStop),
+        ConditionalOrderOutcome::Reported {
+            observation: Some(OrderExecution::DormantStop),
             report
         } if report.outcome == CommandOutcome::Accepted
     ));
@@ -635,7 +635,7 @@ fn coupled_risk_rejection_bypasses_observation_and_acceptance_tracks_residual() 
         .unwrap();
     assert!(matches!(
         rejected,
-        ConditionalNewOrderOutcome::Reported {
+        ConditionalOrderOutcome::Reported {
             observation: None,
             report
         } if report.outcome == CommandOutcome::Rejected(RejectReason::RiskOrderQuantityLimit)
@@ -646,7 +646,7 @@ fn coupled_risk_rejection_bypasses_observation_and_acceptance_tracks_residual() 
         .try_submit_new_order_curve_if(accepted_order, |observation| {
             matches!(
                 observation,
-                NewOrderExecution::Active(curve)
+                OrderExecution::Active(curve)
                     if curve.quote().executed_quantity_lots() == 5
                         && curve.quote().unfilled_quantity_lots() == 2
             )
@@ -654,8 +654,8 @@ fn coupled_risk_rejection_bypasses_observation_and_acceptance_tracks_residual() 
         .unwrap();
     assert!(matches!(
         accepted,
-        ConditionalNewOrderOutcome::Reported {
-            observation: Some(NewOrderExecution::Active(_)),
+        ConditionalOrderOutcome::Reported {
+            observation: Some(OrderExecution::Active(_)),
             report
         } if report.outcome == CommandOutcome::Accepted
     ));
@@ -687,19 +687,19 @@ fn durable_plain_decline_unwind_accept_replay_and_reopen_preserve_frame_contract
 
     assert!(matches!(
         durable.submit_new_order_if(incoming, |_| false).unwrap(),
-        ConditionalNewOrderOutcome::Declined(NewOrderExecution::Active(_))
+        ConditionalOrderOutcome::Declined(OrderExecution::Active(_))
     ));
     assert_eq!(frame_count(file.path()), frames_before);
 
     let accepted = durable
         .try_submit_new_order_curve_if(incoming, |observation| {
-            matches!(observation, NewOrderExecution::Active(_))
+            matches!(observation, OrderExecution::Active(_))
         })
         .unwrap();
     assert!(matches!(
         accepted,
-        ConditionalNewOrderOutcome::Reported {
-            observation: Some(NewOrderExecution::Active(_)),
+        ConditionalOrderOutcome::Reported {
+            observation: Some(OrderExecution::Active(_)),
             report
         } if report.outcome == CommandOutcome::Accepted
     ));
@@ -709,7 +709,7 @@ fn durable_plain_decline_unwind_accept_replay_and_reopen_preserve_frame_contract
         durable
             .try_submit_new_order_curve_if(incoming, |_| panic!("replay bypasses observation"))
             .unwrap(),
-        ConditionalNewOrderOutcome::Reported {
+        ConditionalOrderOutcome::Reported {
             observation: None,
             report
         } if report.replayed
@@ -744,7 +744,7 @@ fn durable_risk_decline_accept_replay_and_reopen_preserve_coupled_state() {
         durable
             .try_submit_new_order_curve_if(incoming, |_| false)
             .unwrap(),
-        ConditionalNewOrderOutcome::Declined(NewOrderExecution::Active(_))
+        ConditionalOrderOutcome::Declined(OrderExecution::Active(_))
     ));
     assert_eq!(frame_count(file.path()), frames_before);
     assert_eq!(
@@ -759,13 +759,13 @@ fn durable_risk_decline_accept_replay_and_reopen_preserve_coupled_state() {
 
     let accepted = durable
         .try_submit_new_order_curve_if(incoming, |observation| {
-            matches!(observation, NewOrderExecution::Active(_))
+            matches!(observation, OrderExecution::Active(_))
         })
         .unwrap();
     assert!(matches!(
         accepted,
-        ConditionalNewOrderOutcome::Reported {
-            observation: Some(NewOrderExecution::Active(_)),
+        ConditionalOrderOutcome::Reported {
+            observation: Some(OrderExecution::Active(_)),
             report
         } if report.outcome == CommandOutcome::Accepted
     ));
@@ -793,7 +793,7 @@ fn durable_risk_decline_accept_replay_and_reopen_preserve_coupled_state() {
         durable
             .submit_new_order_if(incoming, |_| panic!("replay bypasses observation"))
             .unwrap(),
-        ConditionalNewOrderOutcome::Reported {
+        ConditionalOrderOutcome::Reported {
             observation: None,
             report
         } if report.replayed

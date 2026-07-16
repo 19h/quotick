@@ -3114,21 +3114,21 @@ impl ImmediateExecutionCurve {
     }
 }
 
-/// Current execution state observed for one otherwise admissible new order.
+/// Current execution state observed for one otherwise admissible order action.
 ///
 /// Immediately active market, market-to-limit, and limit orders carry the
 /// exact private-book observation selected by the caller-facing API. A valid
 /// stop order is represented explicitly without forecasting activation-time
 /// liquidity.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum NewOrderExecution<T> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderExecution<T> {
     /// The order is immediately active and carries its current quote or curve.
     Active(T),
-    /// The order will arm as a dormant stop if the predicate accepts it.
+    /// The action concerns a dormant stop and has no current execution path.
     DormantStop,
 }
 
-impl<T> NewOrderExecution<T> {
+impl<T> OrderExecution<T> {
     /// Returns the active-order observation, or `None` for a dormant stop.
     #[must_use]
     pub const fn active(&self) -> Option<&T> {
@@ -3145,25 +3145,25 @@ impl<T> NewOrderExecution<T> {
     }
 }
 
-/// Result of atomically observing and conditionally submitting one new order.
+/// Result of atomically observing and conditionally submitting one order action.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ConditionalNewOrderOutcome<T> {
+pub enum ConditionalOrderOutcome<T> {
     /// The predicate declined the observation before semantic or WAL mutation.
-    Declined(NewOrderExecution<T>),
+    Declined(OrderExecution<T>),
     /// Matching produced a report. A current observation is present only for
     /// a newly accepted command; replay and business/risk rejection bypass it.
     Reported {
         /// Exact active quote/curve or explicit dormant-stop state.
-        observation: Option<NewOrderExecution<T>>,
+        observation: Option<OrderExecution<T>>,
         /// Complete matching report or exact cached replay.
         report: ExecutionReport,
     },
 }
 
-impl<T> ConditionalNewOrderOutcome<T> {
+impl<T> ConditionalOrderOutcome<T> {
     /// Returns the observation associated with a decline or new acceptance.
     #[must_use]
-    pub const fn observation(&self) -> Option<&NewOrderExecution<T>> {
+    pub const fn observation(&self) -> Option<&OrderExecution<T>> {
         match self {
             Self::Declined(observation) => Some(observation),
             Self::Reported { observation, .. } => observation.as_ref(),
@@ -3189,8 +3189,8 @@ impl<T> ConditionalNewOrderOutcome<T> {
     }
 }
 
-impl<T> From<ConditionalExecutionDecision<NewOrderExecution<T>>> for ConditionalNewOrderOutcome<T> {
-    fn from(decision: ConditionalExecutionDecision<NewOrderExecution<T>>) -> Self {
+impl<T> From<ConditionalExecutionDecision<OrderExecution<T>>> for ConditionalOrderOutcome<T> {
+    fn from(decision: ConditionalExecutionDecision<OrderExecution<T>>) -> Self {
         match decision {
             ConditionalExecutionDecision::Declined(observation) => Self::Declined(observation),
             ConditionalExecutionDecision::Reported {
@@ -8592,7 +8592,7 @@ impl OrderBook {
     /// Exact replay plus core business rejection bypass `accept` and return a
     /// report without a current observation. Otherwise an immediately active
     /// order exposes its exact private execution quote, while a valid stop
-    /// order exposes [`NewOrderExecution::DormantStop`]. Returning `false`, or
+    /// order exposes [`OrderExecution::DormantStop`]. Returning `false`, or
     /// unwinding from the predicate, drops the preparation before consuming
     /// identity, sequence, trade, event, book, or WAL state. Returning `true`
     /// commits that same preparation under the exclusive book borrow.
@@ -8609,8 +8609,8 @@ impl OrderBook {
     pub fn submit_new_order_if(
         &mut self,
         order: NewOrder,
-        accept: impl FnOnce(&NewOrderExecution<ImmediateExecutionQuote>) -> bool,
-    ) -> Result<ConditionalNewOrderOutcome<ImmediateExecutionQuote>, MatchingError> {
+        accept: impl FnOnce(&OrderExecution<ImmediateExecutionQuote>) -> bool,
+    ) -> Result<ConditionalOrderOutcome<ImmediateExecutionQuote>, MatchingError> {
         self.submit_conditional_new_order(order, |_, observation| Ok(observation), accept)
             .map(Into::into)
     }
@@ -8620,7 +8620,7 @@ impl OrderBook {
     ///
     /// Exact replay plus core business rejection bypass curve allocation and
     /// `accept`. An immediately active order exposes the exact private curve;
-    /// a valid stop exposes [`NewOrderExecution::DormantStop`] without output
+    /// a valid stop exposes [`OrderExecution::DormantStop`] without output
     /// allocation. Allocation failure, decline, or predicate unwind precedes
     /// all semantic and WAL mutation. Acceptance commits the preparation bound
     /// to that observation without an intervening book transition.
@@ -8634,19 +8634,72 @@ impl OrderBook {
     pub fn try_submit_new_order_curve_if(
         &mut self,
         order: NewOrder,
-        accept: impl FnOnce(&NewOrderExecution<ImmediateExecutionCurve>) -> bool,
+        accept: impl FnOnce(&OrderExecution<ImmediateExecutionCurve>) -> bool,
     ) -> Result<
-        ConditionalNewOrderOutcome<ImmediateExecutionCurve>,
+        ConditionalOrderOutcome<ImmediateExecutionCurve>,
         ImmediateExecutionCurveSubmissionError,
     > {
         self.submit_conditional_new_order(
             order,
-            |book, observation| match observation {
-                NewOrderExecution::Active(quote) => book
-                    .try_immediate_execution_curve_for_quote(quote)
-                    .map(NewOrderExecution::Active)
-                    .map_err(Into::into),
-                NewOrderExecution::DormantStop => Ok(NewOrderExecution::DormantStop),
+            |book, observation| {
+                book.try_order_execution_curve(observation)
+                    .map_err(Into::into)
+            },
+            accept,
+        )
+        .map(Into::into)
+    }
+
+    /// Atomically observes and conditionally replaces one active order.
+    ///
+    /// Exact replay plus core business rejection bypass `accept`. Otherwise an
+    /// active replacement exposes its exact private execution quote, while a
+    /// dormant stop-limit exposes [`OrderExecution::DormantStop`]. Decline or
+    /// predicate unwind drops the preparation before consuming sequence,
+    /// trade, event, book, or WAL state. Acceptance commits that same
+    /// preparation without an intervening book transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MatchingError`] for command collision, configured capacity,
+    /// identifier/sequence exhaustion, or a prepared-commit contradiction.
+    pub fn submit_replace_order_if(
+        &mut self,
+        replacement: ReplaceOrder,
+        accept: impl FnOnce(&OrderExecution<ImmediateExecutionQuote>) -> bool,
+    ) -> Result<ConditionalOrderOutcome<ImmediateExecutionQuote>, MatchingError> {
+        self.submit_conditional_replace_order(replacement, |_, observation| Ok(observation), accept)
+            .map(Into::into)
+    }
+
+    /// Atomically constructs a private execution curve and conditionally
+    /// replaces one active order.
+    ///
+    /// Exact replay plus core business rejection bypass curve allocation and
+    /// `accept`. A dormant stop-limit exposes explicit dormant state without
+    /// allocation. Allocation failure, decline, or predicate unwind precedes
+    /// all semantic and WAL mutation. Acceptance commits the preparation bound
+    /// to the observed curve.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImmediateExecutionCurveSubmissionError::Matching`] for
+    /// command preparation or commit failure and
+    /// [`ImmediateExecutionCurveSubmissionError::Query`] when an active
+    /// replacement's exact curve cannot be constructed.
+    pub fn try_submit_replace_order_curve_if(
+        &mut self,
+        replacement: ReplaceOrder,
+        accept: impl FnOnce(&OrderExecution<ImmediateExecutionCurve>) -> bool,
+    ) -> Result<
+        ConditionalOrderOutcome<ImmediateExecutionCurve>,
+        ImmediateExecutionCurveSubmissionError,
+    > {
+        self.submit_conditional_replace_order(
+            replacement,
+            |book, observation| {
+                book.try_order_execution_curve(observation)
+                    .map_err(Into::into)
             },
             accept,
         )
@@ -8735,13 +8788,28 @@ impl OrderBook {
     fn submit_conditional_new_order<T, E>(
         &mut self,
         order: NewOrder,
-        observe: impl FnOnce(&Self, NewOrderExecution<ImmediateExecutionQuote>) -> Result<T, E>,
+        observe: impl FnOnce(&Self, OrderExecution<ImmediateExecutionQuote>) -> Result<T, E>,
         accept: impl FnOnce(&T) -> bool,
     ) -> Result<ConditionalExecutionDecision<T>, E>
     where
         E: From<MatchingError>,
     {
         let preflight = self.prepare_conditional_new_order(order).map_err(E::from)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_replace_order<T, E>(
+        &mut self,
+        replacement: ReplaceOrder,
+        observe: impl FnOnce(&Self, OrderExecution<ImmediateExecutionQuote>) -> Result<T, E>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalExecutionDecision<T>, E>
+    where
+        E: From<MatchingError>,
+    {
+        let preflight = self
+            .prepare_conditional_replace_order(replacement)
+            .map_err(E::from)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 
@@ -8773,10 +8841,8 @@ impl OrderBook {
     pub(crate) fn prepare_conditional_new_order(
         &self,
         order: NewOrder,
-    ) -> Result<
-        ConditionalExecutionPreflight<NewOrderExecution<ImmediateExecutionQuote>>,
-        MatchingError,
-    > {
+    ) -> Result<ConditionalExecutionPreflight<OrderExecution<ImmediateExecutionQuote>>, MatchingError>
+    {
         match self.prepare(Command::New(order))? {
             preparation @ CommandPreparation::Replay(_) => Ok(ConditionalExecutionPreflight {
                 preparation,
@@ -8795,10 +8861,33 @@ impl OrderBook {
         }
     }
 
+    pub(crate) fn prepare_conditional_replace_order(
+        &self,
+        replacement: ReplaceOrder,
+    ) -> Result<ConditionalExecutionPreflight<OrderExecution<ImmediateExecutionQuote>>, MatchingError>
+    {
+        match self.prepare(Command::Replace(replacement))? {
+            preparation @ CommandPreparation::Replay(_) => Ok(ConditionalExecutionPreflight {
+                preparation,
+                observation: None,
+            }),
+            CommandPreparation::Ready(prepared) => {
+                let observation = prepared
+                    .core_rejection()
+                    .is_none()
+                    .then(|| self.replace_order_execution_observation(replacement));
+                Ok(ConditionalExecutionPreflight {
+                    preparation: CommandPreparation::Ready(prepared),
+                    observation,
+                })
+            }
+        }
+    }
+
     fn new_order_execution_observation(
         &self,
         order: NewOrder,
-    ) -> NewOrderExecution<ImmediateExecutionQuote> {
+    ) -> OrderExecution<ImmediateExecutionQuote> {
         let constraint = match order.order_type {
             OrderType::Market => StopActivation::Market,
             OrderType::MarketToLimit => StopActivation::Limit(
@@ -8806,9 +8895,9 @@ impl OrderBook {
                     .expect("admissible market-to-limit order must have an opposite price"),
             ),
             OrderType::Limit(price) => StopActivation::Limit(price),
-            OrderType::Stop { .. } => return NewOrderExecution::DormantStop,
+            OrderType::Stop { .. } => return OrderExecution::DormantStop,
         };
-        NewOrderExecution::Active(
+        OrderExecution::Active(
             self.immediate_execution_quote(ImmediateExecutionRequest::new(
                 order.account_id,
                 order.side,
@@ -8817,6 +8906,40 @@ impl OrderBook {
                 order.self_trade_prevention,
             )),
         )
+    }
+
+    fn replace_order_execution_observation(
+        &self,
+        replacement: ReplaceOrder,
+    ) -> OrderExecution<ImmediateExecutionQuote> {
+        let order = self
+            .orders
+            .get(&replacement.order_id)
+            .expect("admissible replacement must select an active order");
+        if order.is_dormant_stop() {
+            return OrderExecution::DormantStop;
+        }
+        OrderExecution::Active(
+            self.immediate_execution_quote(ImmediateExecutionRequest::new(
+                order.account_id,
+                order.side,
+                replacement.new_quantity,
+                StopActivation::Limit(replacement.new_price),
+                order.self_trade_prevention,
+            )),
+        )
+    }
+
+    pub(crate) fn try_order_execution_curve(
+        &self,
+        observation: OrderExecution<ImmediateExecutionQuote>,
+    ) -> Result<OrderExecution<ImmediateExecutionCurve>, OrderBookQueryError> {
+        match observation {
+            OrderExecution::Active(quote) => self
+                .try_immediate_execution_curve_for_quote(quote)
+                .map(OrderExecution::Active),
+            OrderExecution::DormantStop => Ok(OrderExecution::DormantStop),
+        }
     }
 
     pub(crate) fn prepare_conditional_immediate_execution(

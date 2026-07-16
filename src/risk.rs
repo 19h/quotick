@@ -17,13 +17,13 @@ use crate::domain::{AccountId, OrderId, Price, Side};
 use crate::instrument::InstrumentDefinition;
 use crate::matching::{
     Command, CommandOutcome, CommandPreparation, ConditionalExecutionDecision,
-    ConditionalExecutionPreflight, ConditionalExecutionPreparation, ConditionalNewOrderOutcome,
+    ConditionalExecutionPreflight, ConditionalExecutionPreparation, ConditionalOrderOutcome,
     EventKind, ExecutionReport, ImmediateExecutionCurve, ImmediateExecutionCurveOutcome,
     ImmediateExecutionCurveSubmissionError, ImmediateExecutionOutcome, ImmediateExecutionQuote,
-    ImmediateExecutionSubmission, MatchingCapacity, MatchingError, NewOrder, NewOrderExecution,
-    OrderBook, OrderBookCheckpoint, OrderBookCheckpointError, OrderBookLimits, OrderBookLimitsSpec,
-    OrderType, PreparedCommand, RejectReason, ReplaceOrder, SelfTradePrevention, Trade,
-    evaluate_conditional_execution,
+    ImmediateExecutionSubmission, MatchingCapacity, MatchingError, NewOrder, OrderBook,
+    OrderBookCheckpoint, OrderBookCheckpointError, OrderBookLimits, OrderBookLimitsSpec,
+    OrderExecution, OrderType, PreparedCommand, RejectReason, ReplaceOrder, SelfTradePrevention,
+    Trade, evaluate_conditional_execution,
 };
 
 /// Account-level order-entry state.
@@ -2010,8 +2010,8 @@ impl RiskManagedOrderBook {
     pub fn submit_new_order_if(
         &mut self,
         order: NewOrder,
-        accept: impl FnOnce(&NewOrderExecution<ImmediateExecutionQuote>) -> bool,
-    ) -> Result<ConditionalNewOrderOutcome<ImmediateExecutionQuote>, MatchingError> {
+        accept: impl FnOnce(&OrderExecution<ImmediateExecutionQuote>) -> bool,
+    ) -> Result<ConditionalOrderOutcome<ImmediateExecutionQuote>, MatchingError> {
         self.submit_conditional_new_order(order, |_, observation| Ok(observation), accept)
             .map(Into::into)
     }
@@ -2034,19 +2034,70 @@ impl RiskManagedOrderBook {
     pub fn try_submit_new_order_curve_if(
         &mut self,
         order: NewOrder,
-        accept: impl FnOnce(&NewOrderExecution<ImmediateExecutionCurve>) -> bool,
+        accept: impl FnOnce(&OrderExecution<ImmediateExecutionCurve>) -> bool,
     ) -> Result<
-        ConditionalNewOrderOutcome<ImmediateExecutionCurve>,
+        ConditionalOrderOutcome<ImmediateExecutionCurve>,
         ImmediateExecutionCurveSubmissionError,
     > {
         self.submit_conditional_new_order(
             order,
-            |book, observation| match observation {
-                NewOrderExecution::Active(quote) => book
-                    .try_immediate_execution_curve_for_quote(quote)
-                    .map(NewOrderExecution::Active)
-                    .map_err(Into::into),
-                NewOrderExecution::DormantStop => Ok(NewOrderExecution::DormantStop),
+            |book, observation| {
+                book.try_order_execution_curve(observation)
+                    .map_err(Into::into)
+            },
+            accept,
+        )
+        .map(Into::into)
+    }
+
+    /// Atomically risk-gates, observes, and conditionally replaces one order.
+    ///
+    /// Exact replay plus core or risk rejection bypass `accept`. Otherwise the
+    /// predicate borrows an active private quote or explicit dormant-stop state
+    /// under one exclusive coupled-state borrow. Decline or unwind mutates
+    /// neither matching nor risk state; acceptance commits the same coupled
+    /// preparation exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MatchingError`] for collision, configured capacity,
+    /// identifier/sequence exhaustion, or a prepared-commit contradiction.
+    pub fn submit_replace_order_if(
+        &mut self,
+        replacement: ReplaceOrder,
+        accept: impl FnOnce(&OrderExecution<ImmediateExecutionQuote>) -> bool,
+    ) -> Result<ConditionalOrderOutcome<ImmediateExecutionQuote>, MatchingError> {
+        self.submit_conditional_replace_order(replacement, |_, observation| Ok(observation), accept)
+            .map(Into::into)
+    }
+
+    /// Atomically risk-gates, constructs an active private execution curve,
+    /// and conditionally replaces one order.
+    ///
+    /// Exact replay plus core or risk rejection bypass allocation and
+    /// `accept`; a dormant stop-limit exposes explicit dormant state. An
+    /// allocation failure, decline, or unwind leaves matching and risk state
+    /// unchanged. Acceptance commits the observation-bound preparation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ImmediateExecutionCurveSubmissionError::Matching`] for
+    /// matching preparation or coupled commit failure and
+    /// [`ImmediateExecutionCurveSubmissionError::Query`] when an active
+    /// replacement's exact curve cannot be constructed.
+    pub fn try_submit_replace_order_curve_if(
+        &mut self,
+        replacement: ReplaceOrder,
+        accept: impl FnOnce(&OrderExecution<ImmediateExecutionCurve>) -> bool,
+    ) -> Result<
+        ConditionalOrderOutcome<ImmediateExecutionCurve>,
+        ImmediateExecutionCurveSubmissionError,
+    > {
+        self.submit_conditional_replace_order(
+            replacement,
+            |book, observation| {
+                book.try_order_execution_curve(observation)
+                    .map_err(Into::into)
             },
             accept,
         )
@@ -2126,13 +2177,28 @@ impl RiskManagedOrderBook {
     fn submit_conditional_new_order<T, E>(
         &mut self,
         order: NewOrder,
-        observe: impl FnOnce(&OrderBook, NewOrderExecution<ImmediateExecutionQuote>) -> Result<T, E>,
+        observe: impl FnOnce(&OrderBook, OrderExecution<ImmediateExecutionQuote>) -> Result<T, E>,
         accept: impl FnOnce(&T) -> bool,
     ) -> Result<ConditionalExecutionDecision<T>, E>
     where
         E: From<MatchingError>,
     {
         let preflight = self.prepare_conditional_new_order(order).map_err(E::from)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_replace_order<T, E>(
+        &mut self,
+        replacement: ReplaceOrder,
+        observe: impl FnOnce(&OrderBook, OrderExecution<ImmediateExecutionQuote>) -> Result<T, E>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalExecutionDecision<T>, E>
+    where
+        E: From<MatchingError>,
+    {
+        let preflight = self
+            .prepare_conditional_replace_order(replacement)
+            .map_err(E::from)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 
@@ -2175,11 +2241,18 @@ impl RiskManagedOrderBook {
     pub(crate) fn prepare_conditional_new_order(
         &self,
         order: NewOrder,
-    ) -> Result<
-        ConditionalExecutionPreflight<NewOrderExecution<ImmediateExecutionQuote>>,
-        MatchingError,
-    > {
+    ) -> Result<ConditionalExecutionPreflight<OrderExecution<ImmediateExecutionQuote>>, MatchingError>
+    {
         let preflight = self.book.prepare_conditional_new_order(order)?;
+        Ok(self.apply_conditional_risk_gate(preflight))
+    }
+
+    pub(crate) fn prepare_conditional_replace_order(
+        &self,
+        replacement: ReplaceOrder,
+    ) -> Result<ConditionalExecutionPreflight<OrderExecution<ImmediateExecutionQuote>>, MatchingError>
+    {
+        let preflight = self.book.prepare_conditional_replace_order(replacement)?;
         Ok(self.apply_conditional_risk_gate(preflight))
     }
 
