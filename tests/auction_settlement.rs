@@ -690,6 +690,7 @@ fn replacement_correction_reverses_the_original_before_new_settlement() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn settlement_correction_rejects_count_identity_grouping_and_capacity_failures() {
     let original = fee_settlement(&multi_trade_report());
     assert_eq!(
