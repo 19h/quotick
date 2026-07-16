@@ -29,7 +29,7 @@ use crate::matching::{
     DisplayedLiquidityRequest, Event, EventKind, ExecutionReport, LevelSnapshot, MassCancelScope,
     OrderBook, OrderBookLimits, OrderDisplay, OrderType, PublicDepthImbalance,
     PublicLevelObservation, SelfTradePrevention, StopActivation, StopReference, TimeInForce, Trade,
-    TradingStateControlAction, TradingStateSnapshot,
+    TradingStateControlAction, TradingStateObservation, TradingStateSnapshot,
 };
 
 mod replay;
@@ -895,6 +895,8 @@ impl MarketDataPublisher {
     ) -> Result<Self, MarketDataConstructionError> {
         ensure_source_limits(limits, book.limits())?;
         let maximum_levels = limits.max_price_levels_per_side();
+        let trading_state =
+            source_trading_state(book).map_err(MarketDataConstructionError::Source)?;
         let mut publisher = Self {
             limits,
             instrument_id: book.instrument_id(),
@@ -926,7 +928,7 @@ impl MarketDataPublisher {
                 limits.max_batch_updates(),
                 MarketDataResource::BatchLevelIdentities,
             )?,
-            trading_state: book.trading_state(),
+            trading_state,
             expiry_watermark: book.expiry_watermark(),
             stop_reference: book.stop_reference(),
             last_sequence: book.last_event_sequence(),
@@ -1257,9 +1259,10 @@ impl MarketDataPublisher {
         if self.instrument_version != book.instrument_version() {
             return Err(MarketDataError::WrongInstrumentVersion);
         }
+        let source_trading_state = source_trading_state(book)?;
         if self.last_sequence != book.last_event_sequence()
             || self.last_trade_id != book.last_trade_id()
-            || self.trading_state != book.trading_state()
+            || self.trading_state != source_trading_state
             || self.expiry_watermark != book.expiry_watermark()
             || self.stop_reference != book.stop_reference()
         {
@@ -3010,11 +3013,12 @@ impl MarketDataPublisher {
         if book.instrument_version() != self.instrument_version {
             return Err(MarketDataError::WrongInstrumentVersion);
         }
+        let source_trading_state = source_trading_state(book)?;
         if book.last_event_sequence() != self.last_sequence
             || book.last_trade_id() != self.last_trade_id
             || book.resting_order_count() != self.orders.len()
             || book.dormant_stop_count() != self.stops.len()
-            || book.trading_state() != self.trading_state
+            || source_trading_state != self.trading_state
             || book.stop_reference() != self.stop_reference
         {
             return Err(MarketDataError::SourceDivergence(
@@ -3837,26 +3841,54 @@ impl MarketDataReplica {
         self.last_sequence
     }
 
+    /// Fallibly returns one provenance-bound trading-state observation.
+    ///
+    /// The fixed-size result carries the replica instrument, immutable
+    /// definition version, final applied source sequence, effective state, and
+    /// accepted control revision. The successful path costs `O(log(P + 1))`
+    /// time and `O(1)` space without allocation or mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketDataError::Poisoned`] while snapshot repair is required,
+    /// or [`MarketDataError::SourceDivergence`] if public extrema are invalid
+    /// or locked/crossed, or the state revision is ahead of the source
+    /// sequence.
+    pub fn try_trading_state_observation(
+        &self,
+    ) -> Result<TradingStateObservation, MarketDataError> {
+        self.try_observation_state()?;
+        TradingStateObservation::try_new(
+            self.instrument_id,
+            self.instrument_version,
+            self.last_sequence,
+            self.trading_state,
+        )
+        .map_err(|_| {
+            MarketDataError::SourceDivergence(
+                "replica trading-state revision exceeds source sequence",
+            )
+        })
+    }
+
     /// Fallibly returns the current effective trading state and revision.
     ///
     /// # Errors
     ///
     /// Returns [`MarketDataError::Poisoned`] while snapshot repair is required,
-    /// or [`MarketDataError::SourceDivergence`] if the public observation state
-    /// is internally incoherent. The coherent observation gate costs
-    /// `O(log(P + 1))` time and `O(1)` space.
+    /// or [`MarketDataError::SourceDivergence`] under the same conditions as
+    /// [`Self::try_trading_state_observation`].
     pub fn try_trading_state(&self) -> Result<TradingStateSnapshot, MarketDataError> {
-        self.try_observation_state()?;
-        Ok(self.trading_state)
+        Ok(self.try_trading_state_observation()?.snapshot())
     }
 
     /// Returns effective trading state using the fallible production path.
     ///
     /// # Panics
     ///
-    /// Panics if the replica requires snapshot repair or public observation
-    /// state is internally incoherent. Use [`Self::try_trading_state`] when
-    /// failure must remain typed.
+    /// Panics if the replica requires snapshot repair, public extrema are
+    /// invalid, or the state revision is ahead of the source sequence. Use
+    /// [`Self::try_trading_state`] when failure must remain typed.
     #[must_use]
     pub fn trading_state(&self) -> TradingStateSnapshot {
         self.try_trading_state()
@@ -4180,6 +4212,11 @@ fn ensure_source_limits(
         }
     }
     Ok(())
+}
+
+fn source_trading_state(book: &OrderBook) -> Result<TradingStateSnapshot, MarketDataError> {
+    book.try_trading_state()
+        .map_err(|_| MarketDataError::SourceDivergence("matching book trading state is invalid"))
 }
 
 const fn side_resource(side: Side) -> MarketDataResource {
@@ -4532,6 +4569,10 @@ mod resource_limit_tests {
         assert_eq!(poisoned.try_best_ask(), Err(MarketDataError::Poisoned));
         assert_eq!(poisoned.try_trading_state(), Err(MarketDataError::Poisoned));
         assert_eq!(
+            poisoned.try_trading_state_observation(),
+            Err(MarketDataError::Poisoned)
+        );
+        assert_eq!(
             poisoned.try_public_level(Side::Buy, Price::from_raw(100)),
             Err(MarketDataError::Poisoned)
         );
@@ -4630,9 +4671,33 @@ mod resource_limit_tests {
             ))
         );
         assert_eq!(
+            crossed.try_trading_state_observation(),
+            Err(MarketDataError::SourceDivergence(
+                "replica best bid and offer are invalid"
+            ))
+        );
+        assert_eq!(
             crossed.try_public_level(Side::Buy, Price::from_raw(80)),
             Err(MarketDataError::SourceDivergence(
                 "replica best bid and offer are invalid"
+            ))
+        );
+    }
+
+    #[test]
+    fn replica_trading_state_observation_rejects_revision_ahead_of_sequence() {
+        let mut invalid = replica();
+        invalid.trading_state = TradingStateSnapshot::from_parts(TradingState::Halted, 1);
+        assert_eq!(
+            invalid.try_trading_state_observation(),
+            Err(MarketDataError::SourceDivergence(
+                "replica trading-state revision exceeds source sequence"
+            ))
+        );
+        assert_eq!(
+            invalid.try_trading_state(),
+            Err(MarketDataError::SourceDivergence(
+                "replica trading-state revision exceeds source sequence"
             ))
         );
     }

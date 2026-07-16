@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A135 are stable and are referenced from code comments and other
+identifiers A1-A136 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -4976,6 +4976,55 @@ disclosure, partial ownership, successful-path streaming allocation, mutation,
 recovery/parity difference, panic in a typed path, or wire-byte change
 falsifies A135.
 
+## A136 — provenance-bound revisioned trading-state observation
+
+**Assumption.** One trading-state query holds one immutable continuous
+`OrderBook` or healthy `MarketDataReplica` borrow. The fixed-size
+`TradingStateObservation` binds `TradingStateSnapshot` to instrument,
+immutable definition version, and the final matching/source event sequence.
+Revision zero is valid genesis state; every other accepted revision must be
+less than or equal to that sequence. One shared constructor enforces this
+bound before a value is exposed.
+
+The authoritative query first applies the A135 coherent-extrema gate in
+`O(1)` time. The replica query first applies the A132 poison/coherent-extrema
+gate in `O(log(P + 1))` time for `P` occupied public prices. Revision-ahead
+corruption returns typed `InvariantViolation` at the source and static
+`MarketDataError::SourceDivergence` at the replica. Existing snapshot-returning
+fallible methods compose the observation path, and convenience methods panic
+on typed corruption. Publisher bootstrap and source parity checks reuse one
+fallible adapter, mapping source corruption to typed source divergence rather
+than entering a convenience panic boundary.
+
+Successful queries allocate and mutate nothing and add no command, event,
+risk, WAL, checkpoint, snapshot, replay, market-data payload, or wire-version
+field. The local revision bound and coherent public extrema do not prove that
+the state/revision pair is derivable from complete retained command history;
+checkpoint capture's live-lineage comparison and checkpoint reconstruction
+remain the complete local history-definition checks. `OrderBook::validate`
+remains the complete live structural-index audit.
+
+**Dependent results.** [A1, A3, A10, A12, A23, A44, A55, A59, A70, A72, A83,
+A103, A128, A130, A132, A135, A136] Source observation is `O(1)` time and
+`O(1)` fixed space. Replica observation is `O(log(P + 1))` time and `O(1)`
+fixed space. Genesis, direct checkpoint restoration, WAL recovery, publisher
+bootstrap, caught-up incremental application, exact retry, and repaired-
+snapshot replicas reproduce the same provenance and revision. No wire change
+follows.
+
+**Falsification probe.** Observe genesis and every accepted state transition;
+exercise transition-only and transition-and-cancel, rejection, exact retry,
+checkpoint restoration, WAL recovery, durable publisher bootstrap, incremental
+replication, and snapshot repair. Require exact instrument/version/sequence,
+state/revision, source/replica equality, no revision advance on rejection or
+retry, and unchanged state after every query. Inject a revision greater than
+the event/source sequence; corrupt, lock, and cross public extrema; poison and
+repair a replica. Require typed failure before any value for revision,
+extrema, or poison corruption and exact parity after repair. Any unprovenanced
+state, revision-ahead success, stale poisoned value, mutation, successful-path
+allocation, publisher panic, recovery/parity difference, or wire-byte change
+falsifies A136.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -4985,6 +5034,22 @@ capability, a remaining risk, or an opportunity.
   share the same coherent-extrema and selected-row validation semantics as
   healthy replicas. Full/range streaming remains allocation-free and double-
   ended; materializers reserve exact output and return no partial vector.
+
+- **Medium impact:** authoritative books and healthy replicas now expose one
+  fixed-size trading-state observation bound to instrument, immutable
+  definition version, final source sequence, and accepted control revision.
+  The shared constructor rejects a revision ahead of that sequence.
+
+- **Medium impact risk:** provenance and the local revision bound do not prove
+  controller/session authorization, remote freshness, venue-specific state-
+  transition legality, or complete history derivation. The authoritative
+  structural audit, checkpoint-lineage audit, and external control-plane
+  evidence remain separate boundaries.
+
+- **Medium impact opportunity:** exact state/revision/source-sequence fences
+  can drive deterministic gateway admission, state-duration series, recovery
+  comparison, and visualization without correlating an unversioned state read
+  to a separate sequence read.
 
 - **Medium impact risk:** a fallible stream may yield a valid prefix before a
   later non-extremum contradiction is reached. Consumers requiring all-or-

@@ -216,6 +216,13 @@ only after a zero aggregate/count or locked/crossed pair is detected.
 `try_best_bid` and `try_best_ask` select one optional side from this same value
 without another traversal, retaining `O(1)` time and space.
 
+`try_trading_state_observation` applies that same `O(1)` coherent-extrema
+check, validates `revision <= book_event_sequence`, and returns one fixed-size
+instrument/version/sequence/state/revision value. `try_trading_state` selects
+its snapshot without another traversal. Successful source queries allocate no
+output, use `O(1)` space, and perform no mutation; failure-detail formatting
+may allocate only after corruption is detected.
+
 `try_public_level` performs the authoritative `O(1)` coherent-extrema check,
 one `O(log(P + 1))` execution-level lookup, and one
 `O(log(P + 1))` redundant public-membership lookup at the exact key. Constant
@@ -765,8 +772,11 @@ size. The infallible compatibility iterators compose these paths and panic on
 typed failure rather than return poisoned or invalid state.
 
 On a healthy continuous replica, `try_best_bid_offer`, `try_best_bid`,
-`try_best_ask`, and `try_trading_state` compose the shared coherent-state gate
-in `O(log(P + 1))` time and `O(1)` space.
+`try_best_ask`, `try_trading_state_observation`, and `try_trading_state`
+compose the shared coherent-state gate in `O(log(P + 1))` time and `O(1)`
+space. Trading-state observation adds one constant revision/source-sequence
+comparison and returns fixed-size instrument/version/sequence/state/revision
+provenance.
 `try_depth_range_summary` performs one checked fold over the existing band
 iterator in `O(log(P + 1) + K)` time and `O(1)` fixed result/state for `K`
 selected public levels. Neither query allocates output. Poison rejection is

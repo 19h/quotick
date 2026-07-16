@@ -14,6 +14,7 @@ use quotick::matching::{
     CancelReason, Command, CommandOutcome, EventKind, MatchingCapacity, MatchingError, NewOrder,
     OrderBook, OrderBookCheckpoint, OrderBookLimits, OrderBookLimitsSpec, OrderDisplay, OrderType,
     RejectReason, SelfTradePrevention, TimeInForce, TradingStateControl, TradingStateControlAction,
+    TradingStateObservation,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -115,9 +116,20 @@ fn control(
     })
 }
 
+const fn assert_send_sync<T: Send + Sync>() {}
+
 #[test]
 fn transition_and_cancel_is_revisioned_canonical_atomic_and_public() {
     let mut book = OrderBook::new(definition());
+    assert_send_sync::<TradingStateObservation>();
+    let genesis = book.try_trading_state_observation().unwrap();
+    assert_eq!(genesis.instrument_id(), instrument_id());
+    assert_eq!(genesis.instrument_version(), version());
+    assert_eq!(genesis.book_event_sequence(), 0);
+    assert_eq!(genesis.state(), TradingState::Open);
+    assert_eq!(genesis.revision(), 0);
+    assert_eq!(genesis.snapshot(), book.try_trading_state().unwrap());
+
     book.submit(order(1, 30, 11, Side::Buy, 5, 90)).unwrap();
     book.submit(order(2, 10, 12, Side::Sell, 7, 110)).unwrap();
     book.submit(order(3, 20, 13, Side::Buy, 3, 80)).unwrap();
@@ -177,6 +189,10 @@ fn transition_and_cancel_is_revisioned_canonical_atomic_and_public() {
         }
     ));
     replica.apply_batch(&batch).unwrap();
+    assert_eq!(
+        replica.try_trading_state_observation().unwrap(),
+        book.try_trading_state_observation().unwrap()
+    );
     assert_eq!(replica.trading_state().state(), TradingState::Halted);
     assert_eq!(replica.trading_state().revision(), 1);
     assert!(replica.depth(Side::Buy, usize::MAX).is_empty());
@@ -282,6 +298,10 @@ fn checkpoint_codec_and_restore_derive_effective_state_from_control_history() {
     let decoded = OrderBookCheckpoint::decode(&encoded).unwrap();
     let mut restored = OrderBook::from_checkpoint(&decoded).unwrap();
 
+    assert_eq!(
+        restored.try_trading_state_observation().unwrap(),
+        book.try_trading_state_observation().unwrap()
+    );
     assert_eq!(restored.trading_state().state(), TradingState::Halted);
     assert_eq!(restored.trading_state().revision(), 1);
     assert_eq!(restored.active_order_count(), 0);
@@ -312,11 +332,15 @@ fn wal_recovery_reconstructs_state_revision_and_exact_retry() {
     };
 
     let mut recovered = DurableOrderBook::open(wal.path(), definition(), options).unwrap();
+    let recovered_state = recovered.book().try_trading_state_observation().unwrap();
+    assert_eq!(recovered_state.instrument_id(), instrument_id());
+    assert_eq!(recovered_state.instrument_version(), version());
     assert_eq!(
-        recovered.book().trading_state().state(),
-        TradingState::Closed
+        recovered_state.book_event_sequence(),
+        recovered.book().last_event_sequence()
     );
-    assert_eq!(recovered.book().trading_state().revision(), 1);
+    assert_eq!(recovered_state.state(), TradingState::Closed);
+    assert_eq!(recovered_state.revision(), 1);
     assert_eq!(recovered.book().active_order_count(), 0);
     let replay = recovered.submit(halt).unwrap();
     assert!(replay.replayed);

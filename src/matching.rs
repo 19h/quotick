@@ -573,6 +573,74 @@ impl TradingStateSnapshot {
     }
 }
 
+/// One revisioned trading-state observation bound to matching-book provenance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TradingStateObservation {
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    book_event_sequence: u64,
+    snapshot: TradingStateSnapshot,
+}
+
+impl TradingStateObservation {
+    pub(crate) fn try_new(
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        book_event_sequence: u64,
+        snapshot: TradingStateSnapshot,
+    ) -> Result<Self, InvariantViolation> {
+        if snapshot.revision() > book_event_sequence {
+            return Err(InvariantViolation::new(format!(
+                "trading-state revision {} exceeds event sequence {}",
+                snapshot.revision(),
+                book_event_sequence
+            )));
+        }
+        Ok(Self {
+            instrument_id,
+            instrument_version,
+            book_event_sequence,
+            snapshot,
+        })
+    }
+
+    /// Returns the instrument whose trading state was observed.
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version.
+    #[must_use]
+    pub const fn instrument_version(self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the final matching event sequence included in the observation.
+    #[must_use]
+    pub const fn book_event_sequence(self) -> u64 {
+        self.book_event_sequence
+    }
+
+    /// Returns the revisioned effective trading-state snapshot.
+    #[must_use]
+    pub const fn snapshot(self) -> TradingStateSnapshot {
+        self.snapshot
+    }
+
+    /// Returns the effective trading state.
+    #[must_use]
+    pub const fn state(self) -> TradingState {
+        self.snapshot.state()
+    }
+
+    /// Returns the last accepted state-control revision.
+    #[must_use]
+    pub const fn revision(self) -> u64 {
+        self.snapshot.revision()
+    }
+}
+
 /// Read-only effective account-fence state.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AccountControlSnapshot {
@@ -6607,10 +6675,55 @@ impl OrderBook {
         self.definition.version()
     }
 
-    /// Returns the effective instrument trading state and accepted revision.
-    #[must_use]
-    pub const fn trading_state(&self) -> TradingStateSnapshot {
+    const fn raw_trading_state(&self) -> TradingStateSnapshot {
         self.trading_state
+    }
+
+    /// Fallibly returns one provenance-bound trading-state observation.
+    ///
+    /// The fixed-size result carries this book's instrument, immutable
+    /// definition version, final event sequence, effective state, and accepted
+    /// control revision. It validates coherent public extrema and the bound
+    /// `revision <= book_event_sequence` in `O(1)` time without allocation or
+    /// mutation on the successful path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] if public extrema are invalid, locked, or
+    /// crossed, or the state revision is ahead of the book event sequence.
+    pub fn try_trading_state_observation(
+        &self,
+    ) -> Result<TradingStateObservation, InvariantViolation> {
+        self.try_best_bid_offer()?;
+        TradingStateObservation::try_new(
+            self.instrument_id(),
+            self.instrument_version(),
+            self.last_event_sequence(),
+            self.raw_trading_state(),
+        )
+    }
+
+    /// Fallibly returns the effective instrument trading state and revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] under the same conditions as
+    /// [`Self::try_trading_state_observation`].
+    pub fn try_trading_state(&self) -> Result<TradingStateSnapshot, InvariantViolation> {
+        Ok(self.try_trading_state_observation()?.snapshot())
+    }
+
+    /// Returns effective trading state using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if public extrema are invalid or the trading-state revision is
+    /// ahead of the event sequence. Use [`Self::try_trading_state`] when
+    /// failure must remain typed.
+    #[must_use]
+    pub fn trading_state(&self) -> TradingStateSnapshot {
+        self.try_trading_state()
+            .expect("order-book trading state is not queryable")
     }
 
     /// Returns the committed inclusive GTD-expiry watermark, if any.
@@ -11719,7 +11832,7 @@ mod price_level_index_tests {
         MatchingCapacity, MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsSpec,
         OrderBookQueryError, OrderDisplay, OrderQueueClass, OrderSelectionPool, OrderType,
         PriceLevel, PriceLevels, PublicLevelObservation, RejectReason, ReplaceOrder, RestingOrder,
-        SelfTradePrevention, StopActivation, TimeInForce, try_event_arena,
+        SelfTradePrevention, StopActivation, TimeInForce, TradingStateObservation, try_event_arena,
     };
     use crate::instrument::{
         InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -12623,6 +12736,48 @@ mod price_level_index_tests {
         );
         assert!(book.try_displayed_liquidity_quote(request).is_err());
         assert!(book.try_public_depth_imbalance(0).is_err());
+    }
+
+    #[test]
+    fn trading_state_observation_rejects_revision_and_extrema_corruption() {
+        let instrument_id = InstrumentId::new(1).unwrap();
+        let instrument_version = InstrumentVersion::new(1).unwrap();
+        let invalid = TradingStateObservation::try_new(
+            instrument_id,
+            instrument_version,
+            0,
+            super::TradingStateSnapshot::from_parts(TradingState::Halted, 1),
+        )
+        .unwrap_err();
+        assert!(
+            invalid
+                .detail()
+                .contains("revision 1 exceeds event sequence 0")
+        );
+
+        let mut book = OrderBook::new(reserve_definition());
+        let genesis = book.try_trading_state_observation().unwrap();
+        assert_eq!(genesis.revision(), 0);
+        assert_eq!(genesis.book_event_sequence(), 0);
+
+        book.trading_state = super::TradingStateSnapshot::from_parts(TradingState::Halted, 1);
+        let error = book.try_trading_state_observation().unwrap_err();
+        assert!(
+            error
+                .detail()
+                .contains("revision 1 exceeds event sequence 0")
+        );
+        assert!(book.try_trading_state().is_err());
+
+        book.trading_state = super::TradingStateSnapshot::from_parts(TradingState::Open, 0);
+        book.bids.insert(Price::from_raw(100), level(1));
+        book.bids
+            .best_visible
+            .as_mut()
+            .unwrap()
+            .1
+            .visible_order_count = 0;
+        assert!(book.try_trading_state_observation().is_err());
     }
 
     #[test]

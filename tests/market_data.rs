@@ -214,7 +214,14 @@ fn assert_mirrors(book: &OrderBook, replica: &MarketDataReplica) {
         book.depth(Side::Sell, usize::MAX)
     );
     assert_eq!(replica.last_sequence(), book.last_event_sequence());
-    assert_eq!(replica.try_trading_state().unwrap(), book.trading_state());
+    assert_eq!(
+        replica.try_trading_state_observation().unwrap(),
+        book.try_trading_state_observation().unwrap()
+    );
+    assert_eq!(
+        replica.try_trading_state().unwrap(),
+        book.try_trading_state().unwrap()
+    );
     assert_eq!(
         replica.try_best_bid_offer().unwrap(),
         book.try_best_bid_offer().unwrap()

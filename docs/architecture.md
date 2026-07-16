@@ -561,6 +561,20 @@ so an invalid opposite extremum or locked/crossed pair still rejects the
 observation. Their convenience methods delegate to the typed path and panic on
 corruption rather than return a partially validated side.
 
+`try_trading_state_observation` returns one fixed-size
+`TradingStateObservation` containing instrument, immutable definition version,
+final matching event sequence, effective `TradingState`, and accepted control
+revision. It composes the same coherent-extrema boundary and rejects a revision
+greater than the event sequence. `try_trading_state` selects the embedded
+snapshot; the convenience `trading_state` method delegates to that typed path.
+The replica constructs the identical value after its poison/coherent-extrema
+gate using the final applied source sequence. Publisher bootstrap and parity
+checks use the fallible authoritative read and convert corruption to typed
+source divergence. These reads add no market-data field or wire-version change;
+complete authoritative history derivation remains a checkpoint-lineage
+capture/semantic-validation responsibility, separate from the live structural
+audit.
+
 `try_public_level` performs one exact `(Side, Price)` public observation after
 the same coherent-extrema check. `PublicLevelObservation` retains the queried
 key, optional `LevelSnapshot`, and exact instrument/version/event-sequence
