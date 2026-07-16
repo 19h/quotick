@@ -187,6 +187,18 @@ therefore has `K = P`. Each included row performs constant checked
 the partial local result. Empty and inverted bands retain the same bounded
 setup and zero totals.
 
+`try_public_depth_imbalance` first performs the authoritative `O(1)` coherent-
+extrema check, then initializes both directional depth traversals. Let `K_b`
+and `K_a` be the occupied execution prices traversed to select at most `N`
+visible bid and ask levels independently. The query costs
+`O(log(P + 1) + K_b + K_a)` time and `O(1)` fixed output/state. Hidden-only
+prices can contribute to `K_b` or `K_a` but not to the output. Both sides reuse
+the `DepthSummary` checked `usize`/`u128` accumulator; one additional checked
+`u128` addition forms combined displayed quantity, and one comparison plus one
+subtraction forms the exact signed-magnitude imbalance numerator. Per-side or
+combined overflow, or an invalid selected candidate, discards the complete
+local result. The successful path allocates no output and performs no mutation.
+
 `try_best_bid_offer` reads two cached public extrema and performs a constant
 number of aggregate, ordering, provenance, and arithmetic operations. It is
 `O(1)` time and space with one fixed-size result and no successful-path
@@ -745,6 +757,16 @@ selected public levels. Neither query allocates output. Poison rejection is
 detail may allocate only after corruption and is then discarded. No error path
 returns a partial summary. The replica exposes no definition-wide summary
 because it retains no price-rule endpoints.
+
+For `B` public bid levels, `A` public ask levels, and one independently applied
+limit `N`, replica `try_public_depth_imbalance` costs
+`O(log(P + 1) + min(B, N) + min(A, N))` time and `O(1)` fixed output/state.
+The first term is the shared poison/coherent-extrema gate. Every replica level
+is public, so the two folds have no hidden-price traversal term. The query
+reuses the authoritative checked per-side accumulator and combined-quantity
+calculation. Invalid selected rows and arithmetic overflow return one static
+source-divergence category without partial output; poison returns before tree
+access. No successful path allocates or mutates replica state.
 
 `try_displayed_liquidity_quote` performs one market-priority fold over the
 opposite replica side. For `K` public prices inspected through termination

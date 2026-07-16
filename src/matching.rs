@@ -1633,6 +1633,57 @@ impl BestBidOffer {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DepthAggregateTotals {
+    best_price: Option<Price>,
+    worst_price: Option<Price>,
+    level_count: usize,
+    displayed_order_count: u128,
+    displayed_quantity: u128,
+}
+
+impl DepthAggregateTotals {
+    fn try_from_depth<I>(depth: I, level_limit: usize) -> Result<Self, InvariantViolation>
+    where
+        I: IntoIterator<Item = LevelSnapshot>,
+    {
+        let mut totals = Self::default();
+        for level in depth.into_iter().take(level_limit) {
+            totals.try_include(level)?;
+        }
+        Ok(totals)
+    }
+
+    fn try_include(&mut self, level: LevelSnapshot) -> Result<(), InvariantViolation> {
+        if level.quantity == 0 || level.order_count == 0 {
+            return Err(InvariantViolation::new(format!(
+                "public depth level at {} has a zero aggregate or order count",
+                level.price.raw()
+            )));
+        }
+        let level_count = self
+            .level_count
+            .checked_add(1)
+            .ok_or_else(|| InvariantViolation::new("public depth level count is exhausted"))?;
+        let displayed_order_count = self
+            .displayed_order_count
+            .checked_add(u128::from(level.order_count))
+            .ok_or_else(|| InvariantViolation::new("public depth order count exceeds u128"))?;
+        let displayed_quantity = self
+            .displayed_quantity
+            .checked_add(level.quantity)
+            .ok_or_else(|| InvariantViolation::new("public depth quantity exceeds u128"))?;
+        if self.best_price.is_none() {
+            self.best_price = Some(level.price);
+        }
+        self.worst_price = Some(level.price);
+        self.level_count = level_count;
+        self.displayed_order_count = displayed_order_count;
+        self.displayed_quantity = displayed_quantity;
+        Ok(())
+    }
+}
+
 /// Checked cumulative public depth over one side and price selection.
 ///
 /// The summary contains displayed liquidity only and binds its exact selection
@@ -1645,11 +1696,7 @@ pub struct DepthSummary {
     side: Side,
     range_start: Price,
     range_end: Price,
-    best_price: Option<Price>,
-    worst_price: Option<Price>,
-    level_count: usize,
-    displayed_order_count: u128,
-    displayed_quantity: u128,
+    totals: DepthAggregateTotals,
 }
 
 impl DepthSummary {
@@ -1668,11 +1715,13 @@ impl DepthSummary {
             side,
             range_start,
             range_end,
-            best_price: None,
-            worst_price: None,
-            level_count: 0,
-            displayed_order_count: 0,
-            displayed_quantity: 0,
+            totals: DepthAggregateTotals {
+                best_price: None,
+                worst_price: None,
+                level_count: 0,
+                displayed_order_count: 0,
+                displayed_quantity: 0,
+            },
         }
     }
 
@@ -1715,60 +1764,214 @@ impl DepthSummary {
     /// Returns the best selected visible price in market priority.
     #[must_use]
     pub const fn best_price(self) -> Option<Price> {
-        self.best_price
+        self.totals.best_price
     }
 
     /// Returns the worst selected visible price in market priority.
     #[must_use]
     pub const fn worst_price(self) -> Option<Price> {
-        self.worst_price
+        self.totals.worst_price
     }
 
     /// Returns the number of selected visible price levels.
     #[must_use]
     pub const fn level_count(self) -> usize {
-        self.level_count
+        self.totals.level_count
     }
 
     /// Returns the exact number of displayed orders across selected levels.
     #[must_use]
     pub const fn displayed_order_count(self) -> u128 {
-        self.displayed_order_count
+        self.totals.displayed_order_count
     }
 
     /// Returns exact displayed lots across selected levels.
     #[must_use]
     pub const fn displayed_quantity(self) -> u128 {
-        self.displayed_quantity
+        self.totals.displayed_quantity
     }
 
     pub(crate) fn try_include(&mut self, level: LevelSnapshot) -> Result<(), InvariantViolation> {
-        if level.quantity == 0 || level.order_count == 0 {
-            return Err(InvariantViolation::new(format!(
-                "public depth level at {} has a zero aggregate or order count",
-                level.price.raw()
-            )));
-        }
-        let level_count = self
-            .level_count
-            .checked_add(1)
-            .ok_or_else(|| InvariantViolation::new("public depth level count is exhausted"))?;
-        let displayed_order_count = self
-            .displayed_order_count
-            .checked_add(u128::from(level.order_count))
-            .ok_or_else(|| InvariantViolation::new("public depth order count exceeds u128"))?;
-        let displayed_quantity = self
+        self.totals.try_include(level)
+    }
+}
+
+/// Exact top-N displayed public-depth imbalance from one immutable state.
+///
+/// The same visible-level limit is applied independently to bids and asks in
+/// market priority. For non-empty depth, the normalized imbalance fraction is
+/// represented without rounding by [`Self::imbalance_side`],
+/// [`Self::absolute_displayed_quantity_imbalance`], and
+/// [`Self::total_displayed_quantity`]. A buy-side imbalance is positive, a
+/// sell-side imbalance is negative, and `None` denotes equality. Empty depth
+/// has numerator and denominator zero and therefore defines no normalized
+/// ratio.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublicDepthImbalance {
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    book_event_sequence: u64,
+    level_limit: usize,
+    bids: DepthAggregateTotals,
+    asks: DepthAggregateTotals,
+    total_displayed_quantity: u128,
+    imbalance_side: Option<Side>,
+    absolute_displayed_quantity_imbalance: u128,
+}
+
+impl PublicDepthImbalance {
+    pub(crate) fn try_from_depth<I, J>(
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        book_event_sequence: u64,
+        level_limit: usize,
+        bids: I,
+        asks: J,
+    ) -> Result<Self, InvariantViolation>
+    where
+        I: IntoIterator<Item = LevelSnapshot>,
+        J: IntoIterator<Item = LevelSnapshot>,
+    {
+        let bids = DepthAggregateTotals::try_from_depth(bids, level_limit)?;
+        let asks = DepthAggregateTotals::try_from_depth(asks, level_limit)?;
+        let total_displayed_quantity = bids
             .displayed_quantity
-            .checked_add(level.quantity)
-            .ok_or_else(|| InvariantViolation::new("public depth quantity exceeds u128"))?;
-        if self.best_price.is_none() {
-            self.best_price = Some(level.price);
-        }
-        self.worst_price = Some(level.price);
-        self.level_count = level_count;
-        self.displayed_order_count = displayed_order_count;
-        self.displayed_quantity = displayed_quantity;
-        Ok(())
+            .checked_add(asks.displayed_quantity)
+            .ok_or_else(|| {
+                InvariantViolation::new("combined public depth quantity exceeds u128")
+            })?;
+        let (imbalance_side, absolute_displayed_quantity_imbalance) =
+            match bids.displayed_quantity.cmp(&asks.displayed_quantity) {
+                std::cmp::Ordering::Greater => (
+                    Some(Side::Buy),
+                    bids.displayed_quantity - asks.displayed_quantity,
+                ),
+                std::cmp::Ordering::Less => (
+                    Some(Side::Sell),
+                    asks.displayed_quantity - bids.displayed_quantity,
+                ),
+                std::cmp::Ordering::Equal => (None, 0),
+            };
+        Ok(Self {
+            instrument_id,
+            instrument_version,
+            book_event_sequence,
+            level_limit,
+            bids,
+            asks,
+            total_displayed_quantity,
+            imbalance_side,
+            absolute_displayed_quantity_imbalance,
+        })
+    }
+
+    /// Returns the observed instrument.
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version observed.
+    #[must_use]
+    pub const fn instrument_version(self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the final source event sequence observed.
+    #[must_use]
+    pub const fn book_event_sequence(self) -> u64 {
+        self.book_event_sequence
+    }
+
+    /// Returns the maximum visible levels selected independently per side.
+    #[must_use]
+    pub const fn level_limit(self) -> usize {
+        self.level_limit
+    }
+
+    /// Returns the selected bid-level count.
+    #[must_use]
+    pub const fn bid_level_count(self) -> usize {
+        self.bids.level_count
+    }
+
+    /// Returns the selected ask-level count.
+    #[must_use]
+    pub const fn ask_level_count(self) -> usize {
+        self.asks.level_count
+    }
+
+    /// Returns the selected displayed bid-order count.
+    #[must_use]
+    pub const fn bid_displayed_order_count(self) -> u128 {
+        self.bids.displayed_order_count
+    }
+
+    /// Returns the selected displayed ask-order count.
+    #[must_use]
+    pub const fn ask_displayed_order_count(self) -> u128 {
+        self.asks.displayed_order_count
+    }
+
+    /// Returns the selected displayed bid quantity in lots.
+    #[must_use]
+    pub const fn bid_displayed_quantity(self) -> u128 {
+        self.bids.displayed_quantity
+    }
+
+    /// Returns the selected displayed ask quantity in lots.
+    #[must_use]
+    pub const fn ask_displayed_quantity(self) -> u128 {
+        self.asks.displayed_quantity
+    }
+
+    /// Returns the best selected displayed bid price.
+    #[must_use]
+    pub const fn bid_best_price(self) -> Option<Price> {
+        self.bids.best_price
+    }
+
+    /// Returns the worst selected displayed bid price.
+    #[must_use]
+    pub const fn bid_worst_price(self) -> Option<Price> {
+        self.bids.worst_price
+    }
+
+    /// Returns the best selected displayed ask price.
+    #[must_use]
+    pub const fn ask_best_price(self) -> Option<Price> {
+        self.asks.best_price
+    }
+
+    /// Returns the worst selected displayed ask price.
+    #[must_use]
+    pub const fn ask_worst_price(self) -> Option<Price> {
+        self.asks.worst_price
+    }
+
+    /// Returns selected displayed quantity across both sides in lots.
+    #[must_use]
+    pub const fn total_displayed_quantity(self) -> u128 {
+        self.total_displayed_quantity
+    }
+
+    /// Returns the side with greater selected displayed quantity.
+    ///
+    /// `None` denotes equal quantities, including an empty selection. This is
+    /// an exact state comparison, not a price-direction forecast.
+    #[must_use]
+    pub const fn imbalance_side(self) -> Option<Side> {
+        self.imbalance_side
+    }
+
+    /// Returns the absolute displayed-quantity difference in lots.
+    ///
+    /// When [`Self::total_displayed_quantity`] is non-zero, that denominator,
+    /// this numerator, and [`Self::imbalance_side`] represent exact normalized
+    /// imbalance without a rounding policy.
+    #[must_use]
+    pub const fn absolute_displayed_quantity_imbalance(self) -> u128 {
+        self.absolute_displayed_quantity_imbalance
     }
 }
 
@@ -7490,6 +7693,38 @@ impl OrderBook {
         )
     }
 
+    /// Returns exact top-N displayed public-depth imbalance.
+    ///
+    /// The same visible-level limit is applied independently to bids and asks
+    /// in market priority. Hidden-only prices are absent, and reserve-hidden
+    /// quantity is excluded from partially displayed orders. The fixed-size
+    /// result binds both sides to instrument/version/event-sequence
+    /// provenance. For `K_b` and `K_a` occupied execution prices traversed to
+    /// select at most `N` visible levels per side, work is
+    /// `O(log(P + 1) + K_b + K_a)`; hidden-only prices can contribute to `K_b`
+    /// or `K_a` but never to the result. The successful path uses `O(1)`
+    /// auxiliary space without allocation or mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] if public extrema are invalid or locked/
+    /// crossed, a selected level has a zero aggregate/count, or cumulative
+    /// arithmetic cannot fit the fixed-size output.
+    pub fn try_public_depth_imbalance(
+        &self,
+        level_limit: usize,
+    ) -> Result<PublicDepthImbalance, InvariantViolation> {
+        self.try_best_bid_offer()?;
+        PublicDepthImbalance::try_from_depth(
+            self.definition.instrument_id(),
+            self.definition.version(),
+            self.last_event_sequence(),
+            level_limit,
+            self.public_depth_candidates(Side::Buy),
+            self.public_depth_candidates(Side::Sell),
+        )
+    }
+
     /// Returns process-local allocation telemetry for one execution-price
     /// arena.
     ///
@@ -11889,6 +12124,45 @@ mod price_level_index_tests {
             error
                 .detail()
                 .contains("public depth quantity exceeds u128")
+        );
+    }
+
+    #[test]
+    fn depth_imbalance_rejects_invalid_rows_and_combined_quantity_overflow() {
+        let mut book = OrderBook::new(reserve_definition());
+        book.bids.insert(Price::from_raw(100), level(1));
+        book.bids.insert(Price::from_raw(90), level(1));
+        book.asks.insert(Price::from_raw(120), level(2));
+
+        book.bids
+            .update(Price::from_raw(90), |level| {
+                level.visible_order_count = 0;
+            })
+            .unwrap();
+        assert!(book.try_public_depth_imbalance(1).is_ok());
+        let error = book.try_public_depth_imbalance(2).unwrap_err();
+        assert!(error.detail().contains("zero aggregate or order count"));
+
+        book.bids
+            .update(Price::from_raw(100), |level| {
+                level.total_quantity = u128::MAX;
+            })
+            .unwrap();
+        book.bids
+            .update(Price::from_raw(90), |level| {
+                level.visible_order_count = 1;
+            })
+            .unwrap();
+        book.asks
+            .update(Price::from_raw(120), |level| {
+                level.total_quantity = 1;
+            })
+            .unwrap();
+        let error = book.try_public_depth_imbalance(1).unwrap_err();
+        assert!(
+            error
+                .detail()
+                .contains("combined public depth quantity exceeds u128")
         );
     }
 

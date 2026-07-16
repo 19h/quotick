@@ -221,6 +221,12 @@ fn assert_mirrors(book: &OrderBook, replica: &MarketDataReplica) {
     );
     assert_eq!(replica.try_best_bid().unwrap(), book.best_bid());
     assert_eq!(replica.try_best_ask().unwrap(), book.best_ask());
+    for level_limit in [0, 1, usize::MAX] {
+        assert_eq!(
+            replica.try_public_depth_imbalance(level_limit).unwrap(),
+            book.try_public_depth_imbalance(level_limit).unwrap()
+        );
+    }
     for side in [Side::Buy, Side::Sell] {
         let range = Price::from_raw(-1_000)..=Price::from_raw(1_000);
         assert_eq!(
@@ -1206,6 +1212,10 @@ fn replica_rejects_a_trade_that_does_not_reconcile_to_the_maker_level() {
     ));
     assert_eq!(replica.try_best_ask(), Err(MarketDataError::Poisoned));
     assert_eq!(replica.try_trading_state(), Err(MarketDataError::Poisoned));
+    assert_eq!(
+        replica.try_public_depth_imbalance(usize::MAX),
+        Err(MarketDataError::Poisoned)
+    );
 
     replica
         .apply_snapshot(&publisher.snapshot())

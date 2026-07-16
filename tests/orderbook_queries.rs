@@ -7,7 +7,8 @@ use quotick::matching::{
     DisplayedLiquidityTermination, EventKind, ImmediateExecutionRequest,
     ImmediateExecutionTermination, MassCancelScope, MatchingHashIndex, NewOrder, OrderBook,
     OrderBookQueryError, OrderBookQueryResource, OrderDisplay, OrderQueueClass, OrderType,
-    PriceLevelOrders, RejectReason, SelfTradePrevention, StopActivation, TimeInForce,
+    PriceLevelOrders, PublicDepthImbalance, RejectReason, SelfTradePrevention, StopActivation,
+    TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -835,6 +836,103 @@ fn depth_summaries_are_provenanced_checked_and_market_ordered() {
     assert_eq!(restored.try_depth_summary(Side::Buy).unwrap(), bids);
     assert_eq!(book.retained_command_count(), before_commands);
     assert_eq!(book.depth_iter(Side::Buy).collect::<Vec<_>>(), before_bids);
+    book.validate().unwrap();
+}
+
+#[test]
+fn public_depth_imbalance_is_exact_bounded_provenanced_and_displayed_only() {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<PublicDepthImbalance>();
+
+    let book = populated_book();
+    let before_commands = book.retained_command_count();
+    let empty = book.try_public_depth_imbalance(0).unwrap();
+    assert_eq!(empty.instrument_id(), InstrumentId::new(1).unwrap());
+    assert_eq!(
+        empty.instrument_version(),
+        InstrumentVersion::new(1).unwrap()
+    );
+    assert_eq!(empty.book_event_sequence(), book.last_event_sequence());
+    assert_eq!(empty.level_limit(), 0);
+    assert_eq!(empty.bid_level_count(), 0);
+    assert_eq!(empty.ask_level_count(), 0);
+    assert_eq!(empty.total_displayed_quantity(), 0);
+    assert_eq!(empty.imbalance_side(), None);
+    assert_eq!(empty.absolute_displayed_quantity_imbalance(), 0);
+
+    let top = book.try_public_depth_imbalance(1).unwrap();
+    assert_eq!(top.bid_best_price(), Some(Price::from_raw(100)));
+    assert_eq!(top.bid_worst_price(), Some(Price::from_raw(100)));
+    assert_eq!(top.ask_best_price(), Some(Price::from_raw(120)));
+    assert_eq!(top.ask_worst_price(), Some(Price::from_raw(120)));
+    assert_eq!(top.bid_level_count(), 1);
+    assert_eq!(top.ask_level_count(), 1);
+    assert_eq!(top.bid_displayed_order_count(), 1);
+    assert_eq!(top.ask_displayed_order_count(), 1);
+    assert_eq!(top.bid_displayed_quantity(), 5);
+    assert_eq!(top.ask_displayed_quantity(), 11);
+    assert_eq!(top.total_displayed_quantity(), 16);
+    assert_eq!(top.imbalance_side(), Some(Side::Sell));
+    assert_eq!(top.absolute_displayed_quantity_imbalance(), 6);
+
+    let complete = book.try_public_depth_imbalance(usize::MAX).unwrap();
+    assert_eq!(complete.level_limit(), usize::MAX);
+    assert_eq!(complete.bid_best_price(), Some(Price::from_raw(100)));
+    assert_eq!(complete.bid_worst_price(), Some(Price::from_raw(90)));
+    assert_eq!(complete.ask_best_price(), Some(Price::from_raw(120)));
+    assert_eq!(complete.ask_worst_price(), Some(Price::from_raw(130)));
+    assert_eq!(complete.bid_level_count(), 2);
+    assert_eq!(complete.ask_level_count(), 2);
+    assert_eq!(complete.bid_displayed_order_count(), 2);
+    assert_eq!(complete.ask_displayed_order_count(), 2);
+    assert_eq!(complete.bid_displayed_quantity(), 8);
+    assert_eq!(complete.ask_displayed_quantity(), 24);
+    assert_eq!(complete.total_displayed_quantity(), 32);
+    assert_eq!(complete.imbalance_side(), Some(Side::Sell));
+    assert_eq!(complete.absolute_displayed_quantity_imbalance(), 16);
+    assert_eq!(book.retained_command_count(), before_commands);
+
+    let mut reserve_book = OrderBook::new(definition());
+    reserve_book
+        .submit(order(
+            1,
+            1,
+            1,
+            Side::Buy,
+            100,
+            10,
+            OrderDisplay::Reserve {
+                peak: Quantity::new(3).unwrap(),
+            },
+        ))
+        .unwrap();
+    let one_sided = reserve_book.try_public_depth_imbalance(1).unwrap();
+    assert_eq!(one_sided.bid_displayed_quantity(), 3);
+    assert_eq!(one_sided.ask_displayed_quantity(), 0);
+    assert_eq!(one_sided.total_displayed_quantity(), 3);
+    assert_eq!(one_sided.imbalance_side(), Some(Side::Buy));
+    assert_eq!(one_sided.absolute_displayed_quantity_imbalance(), 3);
+    reserve_book
+        .submit(order(
+            2,
+            2,
+            2,
+            Side::Sell,
+            120,
+            3,
+            OrderDisplay::FullyDisplayed,
+        ))
+        .unwrap();
+    let balanced = reserve_book.try_public_depth_imbalance(1).unwrap();
+    assert_eq!(balanced.total_displayed_quantity(), 6);
+    assert_eq!(balanced.imbalance_side(), None);
+    assert_eq!(balanced.absolute_displayed_quantity_imbalance(), 0);
+
+    let restored = OrderBook::from_checkpoint(&book.checkpoint(1, 11).unwrap()).unwrap();
+    assert_eq!(
+        restored.try_public_depth_imbalance(usize::MAX).unwrap(),
+        complete
+    );
     book.validate().unwrap();
 }
 

@@ -27,8 +27,9 @@ use crate::matching::{
     AccountAdmissionState, AccountControlAction, AccountControlSnapshot, BestBidOffer,
     CancelReason, Command, CommandOutcome, DepthSummary, DisplayedLiquidityQuote,
     DisplayedLiquidityRequest, Event, EventKind, ExecutionReport, LevelSnapshot, MassCancelScope,
-    OrderBook, OrderBookLimits, OrderDisplay, OrderType, SelfTradePrevention, StopActivation,
-    StopReference, TimeInForce, Trade, TradingStateControlAction, TradingStateSnapshot,
+    OrderBook, OrderBookLimits, OrderDisplay, OrderType, PublicDepthImbalance, SelfTradePrevention,
+    StopActivation, StopReference, TimeInForce, Trade, TradingStateControlAction,
+    TradingStateSnapshot,
 };
 
 mod replay;
@@ -3348,6 +3349,42 @@ impl MarketDataReplica {
         .map_err(|_| MarketDataError::SourceDivergence("replica best bid and offer are invalid"))
     }
 
+    /// Returns exact top-N displayed public-depth imbalance.
+    ///
+    /// The same visible-level limit is applied independently to bids and asks
+    /// in market priority. The fixed-size result carries replica instrument,
+    /// immutable-definition-version, and final-source-sequence provenance.
+    /// At most `min(B, N) + min(A, N)` visible levels are inspected for `B`
+    /// bid levels, `A` ask levels, and limit `N`, after the
+    /// `O(log(P + 1))` coherent-extrema gate. The successful path uses `O(1)`
+    /// auxiliary space without allocation or mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketDataError::Poisoned`] while snapshot repair is required,
+    /// or [`MarketDataError::SourceDivergence`] if public extrema are invalid
+    /// or locked/crossed, a selected level has a zero aggregate/count, or
+    /// cumulative arithmetic is not representable.
+    pub fn try_public_depth_imbalance(
+        &self,
+        level_limit: usize,
+    ) -> Result<PublicDepthImbalance, MarketDataError> {
+        self.try_observation_state()?;
+        PublicDepthImbalance::try_from_depth(
+            self.instrument_id,
+            self.instrument_version,
+            self.last_sequence,
+            level_limit,
+            self.raw_depth_iter(Side::Buy),
+            self.raw_depth_iter(Side::Sell),
+        )
+        .map_err(|_| {
+            MarketDataError::SourceDivergence(
+                "replica depth imbalance encountered invalid aggregates",
+            )
+        })
+    }
+
     /// Quotes current displayed public liquidity without successful-path
     /// allocation or mutation.
     ///
@@ -4629,6 +4666,56 @@ mod resource_limit_tests {
             overflowing.try_depth_range_summary(Side::Buy, full_range),
             Err(MarketDataError::SourceDivergence(
                 "replica depth summary encountered invalid aggregates"
+            ))
+        );
+    }
+
+    #[test]
+    fn replica_depth_imbalance_rejects_poison_corruption_and_overflow() {
+        let mut poisoned = replica();
+        poisoned.poisoned = true;
+        assert_eq!(
+            poisoned.try_public_depth_imbalance(usize::MAX),
+            Err(MarketDataError::Poisoned)
+        );
+
+        let mut invalid_non_best = replica();
+        for (price, quantity) in [(100, 1), (90, 0)] {
+            invalid_non_best.bids.insert(
+                Price::from_raw(price),
+                Aggregate {
+                    quantity,
+                    order_count: 1,
+                },
+            );
+        }
+        assert!(invalid_non_best.try_public_depth_imbalance(1).is_ok());
+        assert_eq!(
+            invalid_non_best.try_public_depth_imbalance(2),
+            Err(MarketDataError::SourceDivergence(
+                "replica depth imbalance encountered invalid aggregates"
+            ))
+        );
+
+        let mut overflowing = replica();
+        overflowing.bids.insert(
+            Price::from_raw(100),
+            Aggregate {
+                quantity: u128::MAX,
+                order_count: 1,
+            },
+        );
+        overflowing.asks.insert(
+            Price::from_raw(120),
+            Aggregate {
+                quantity: 1,
+                order_count: 1,
+            },
+        );
+        assert_eq!(
+            overflowing.try_public_depth_imbalance(1),
+            Err(MarketDataError::SourceDivergence(
+                "replica depth imbalance encountered invalid aggregates"
             ))
         );
     }

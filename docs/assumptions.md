@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A132 are stable and are referenced from code comments and other
+identifiers A1-A133 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -4712,15 +4712,16 @@ static `MarketDataError::SourceDivergence` category before an output or
 iterator is exposed.
 
 The boundary includes BBO, separate best bid/ask, trading state, explicit-band
-summary, displayed-liquidity quote, full/range depth materialization, and
-fallible full/range depth iterators. Each iterator item independently requires
-positive quantity and order count at the exact row encountered. A stream may
-therefore yield a valid selected row before a later corrupt non-extremum row
-returns `SourceDivergence`; it never skips that row. `try_depth` validates only
-the requested market-priority prefix. `try_depth_range` first validates and
-counts the exact selected range/limit, reserves that complete cardinality, and
-copies through a second identical pass while the same immutable borrow prevents
-drift. Neither materializer returns a partial owned vector.
+summary, top-N public-depth imbalance, displayed-liquidity quote, full/range
+depth materialization, and fallible full/range depth iterators. Each iterator
+item independently requires positive quantity and order count at the exact row
+encountered. A stream may therefore yield a valid selected row before a later
+corrupt non-extremum row returns `SourceDivergence`; it never skips that row.
+`try_depth` validates only the requested market-priority prefix.
+`try_depth_range` first validates and counts the exact selected range/limit,
+reserves that complete cardinality, and copies through a second identical pass
+while the same immutable borrow prevents drift. Neither materializer returns a
+partial owned vector.
 
 The convenience depth, range, iterator, best-side, and trading-state methods
 delegate to the fallible boundary and panic on typed failure rather than return
@@ -4748,24 +4749,113 @@ retain exact authoritative parity.
 **Falsification probe.** Cause an actual incremental trade-reconciliation
 failure after at least one replica mutation and require poison from every
 fallible economic observation. Apply the current valid publisher snapshot and
-require exact depth, iterator, best-side, BBO, trading-state, summary, and quote
-parity. In white-box state, inject zero quantity/count at an extremum and at a
-deeper row, locked/crossed extrema, and invalid rows reached first from either
-iterator end and inside an inclusive range. Require outer-gate failure for
-poison/extremum corruption, exact per-item failure for deeper corruption,
-success when the invalid deeper row is outside the selected limit/range, and a
-typed bulk failure without partial ownership when it is selected. Exercise
-empty, one-sided, both-sided, inverted-range, incremental, exact-retry,
-snapshot-repair, and durable-bootstrap states. Any economic output while
+require exact depth, iterator, best-side, BBO, trading-state, summary, quote,
+and imbalance parity. In white-box state, inject zero quantity/count at an
+extremum and at a deeper row, locked/crossed extrema, and invalid rows reached
+first from either iterator end and inside an inclusive range. Require outer-
+gate failure for poison/extremum corruption, exact per-item failure for deeper
+corruption, success when the invalid deeper row is outside the selected limit/
+range, and a typed bulk failure without partial ownership when it is selected.
+Exercise empty, one-sided, both-sided, inverted-range, incremental, exact-
+retry, snapshot-repair, and durable-bootstrap states. Any economic output while
 poisoned, iterator exposed through incoherent extrema, invalid selected row
 omitted, partial bulk result, diagnostic read treated as economic state,
 mutation, allocation on successful streaming, recovery/parity difference, or
 wire-byte change falsifies A132.
 
+## A133 — exact provenance-bound top-N public-depth imbalance
+
+**Assumption.** One `try_public_depth_imbalance(N)` call observes one immutable
+continuous `OrderBook` or healthy `MarketDataReplica` borrow. The same
+caller-supplied `usize` visible-level limit `N` is applied independently in
+market priority to bids and asks. `N = 0` selects neither side. A limit larger
+than current public depth selects every visible level without changing the
+reported limit.
+
+Only displayed aggregate rows enter the result. A fully hidden-only price is
+absent, and a reserve order contributes only its current displayed slice, not
+reserve-hidden leaves. Per side, the result retains exact selected level count,
+displayed-order count, displayed quantity in lots, and market-priority best and
+worst selected prices. Both selections bind to one instrument identifier,
+immutable definition version, and final observed book-event/source sequence.
+The output contains no per-order identity, private quantity, executable-
+liquidity reservation, notional, price-distance weighting, consolidation, or
+clock-freshness claim.
+
+Both side folds use the exact private `DepthAggregateTotals` accumulator shared
+with A129 `DepthSummary`. Every selected candidate has positive displayed
+quantity and order count; level count uses checked `usize`, while displayed-
+order and displayed-quantity totals use checked `u128`. Combined displayed
+quantity is the checked sum of both per-side quantities. The normalized
+imbalance is represented without rounding as an optional greater-quantity
+`Side`, the absolute displayed-quantity difference numerator, and combined
+displayed-quantity denominator. Equal positive sides and empty depth both have
+no imbalance side and numerator zero; only empty depth has denominator zero.
+No normalized ratio is defined for that empty state. The value is an exact
+state statistic, not a price-direction forecast.
+
+The authoritative query first applies A128 coherent-extrema validation and
+then folds public-depth candidates, including contradictory quantity/count rows
+that a convenience public iterator could otherwise omit. Fully hidden rows
+remain absent. The replica query first applies the A132 poison/coherent-extrema
+gate, folds its public-only AVL state, and maps any accumulator or combined-
+quantity failure to static `MarketDataError::SourceDivergence`. Any error
+discards both local side totals and exposes no partial value. A healthy caught-
+up replica equals its authoritative source exactly. Neither successful path
+allocates or mutates state, and the fixed-size process-local query adds no WAL,
+checkpoint, snapshot, or market-data payload field.
+
+**Dependent results.** [A1, A2, A3, A10, A12, A22, A44, A45, A55, A70, A72,
+A83, A103, A123, A128, A129, A130, A132, A133] For `K_b` and `K_a` occupied
+authoritative execution prices traversed to select at most `N` visible levels
+per side, work is `O(log(P + 1) + K_b + K_a)` time with `O(1)` fixed
+output/state; hidden-only prices can contribute to traversal but not output.
+For `B` public replica bids and `A` public replica asks, work is
+`O(log(P + 1) + min(B, N) + min(A, N))` time and `O(1)` space, including the
+shared coherent-state gate. Direct checkpoint restoration and caught-up
+incremental, retry, repaired-snapshot, and durable-bootstrap replicas reproduce
+the exact value. No wire-version change follows.
+
+**Falsification probe.** Exercise `N` equal to `0`, `1`, exact side depth, and
+`usize::MAX`; empty, bid-only, ask-only, equal-positive, buy-dominant, and sell-
+dominant states; multiple levels/orders; signed prices; fully hidden-only
+prices; current reserve slices with reserve-hidden leaves; and unequal side
+cardinalities. Require exact provenance, market-priority endpoints, side
+counts/totals, checked combined denominator, side plus absolute numerator,
+unchanged state, and source/replica/checkpoint equality. Corrupt the best and a
+selected non-best row to zero quantity or count; place the deeper corrupt row
+just inside and outside `N`; construct per-side and bid-plus-ask `u128`
+overflow; poison a replica and then repair it by valid snapshot. Require gate
+failure for corrupt extrema irrespective of `N`; require typed failure without
+partial output when deeper corruption or overflow is selected, and success
+when it lies outside the selected prefix. Any hidden or reserve-hidden
+disclosure, asymmetric limit interpretation, rounded or empty-state ratio,
+unchecked wrap, stale poisoned output, provenance/parity/recovery divergence,
+mutation, successful-path allocation, predictive interpretation, or wire-byte
+change falsifies A133.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **Medium impact:** authoritative continuous books and healthy public replicas
+  now expose one exact fixed-size top-N displayed-depth imbalance with common
+  provenance, independently bounded bid/ask market-priority prefixes, shared
+  checked per-side accumulation, checked combined quantity, and source/replica/
+  checkpoint parity. Hidden-only and reserve-hidden liquidity remain excluded.
+
+- **Medium impact risk:** the statistic is level-count bounded and quantity-
+  weighted. It does not normalize by price distance, elapsed time, order age,
+  venue, or executable hidden liquidity, and it makes no price-direction or
+  subsequent-fill claim. A consumer requiring any such semantics needs a
+  separately specified feature and data provenance.
+
+- **Medium impact opportunity:** the exact side, numerator, denominator, level
+  endpoints, and source sequence can form deterministic replayable imbalance
+  series without floating-point rounding. Cross-venue aggregation or event-time
+  alignment requires authenticated source identity, transport, and clock
+  contracts outside this query.
 
 - **High impact:** every continuous public-replica economic observation now
   shares the A132 poison/coherent-extrema gate. Typed full/range iterators add
