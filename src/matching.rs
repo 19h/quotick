@@ -1529,6 +1529,78 @@ pub struct LevelSnapshot {
     pub order_count: u64,
 }
 
+/// Coherent public best bid and offer from one immutable book state.
+///
+/// Both sides carry only displayed aggregate liquidity. Instrument identity,
+/// definition version, and the last committed event sequence bind the value to
+/// the exact local state observed by the query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BestBidOffer {
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    book_event_sequence: u64,
+    bid: Option<LevelSnapshot>,
+    offer: Option<LevelSnapshot>,
+}
+
+impl BestBidOffer {
+    /// Returns the quoted instrument.
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version used by the query.
+    #[must_use]
+    pub const fn instrument_version(self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the last committed event sequence visible to the query.
+    #[must_use]
+    pub const fn book_event_sequence(self) -> u64 {
+        self.book_event_sequence
+    }
+
+    /// Returns the best displayed bid, excluding hidden-only prices.
+    #[must_use]
+    pub const fn bid(self) -> Option<LevelSnapshot> {
+        self.bid
+    }
+
+    /// Returns the best displayed offer, excluding hidden-only prices.
+    #[must_use]
+    pub const fn offer(self) -> Option<LevelSnapshot> {
+        self.offer
+    }
+
+    /// Returns the exact offer-minus-bid distance in raw price units.
+    ///
+    /// A one-sided or empty book returns `None`. The complete signed `i64`
+    /// price domain fits because the positive distance is represented by
+    /// `u64`.
+    #[must_use]
+    pub fn spread_raw(self) -> Option<u64> {
+        let (Some(bid), Some(offer)) = (self.bid, self.offer) else {
+            return None;
+        };
+        let spread = i128::from(offer.price.raw()) - i128::from(bid.price.raw());
+        u64::try_from(spread).ok()
+    }
+
+    /// Returns the exact raw-price midpoint numerator with denominator two.
+    ///
+    /// This preserves half-unit midpoints without selecting a rounding policy.
+    /// A one-sided or empty book returns `None`.
+    #[must_use]
+    pub fn midpoint_raw_numerator(self) -> Option<i128> {
+        let (Some(bid), Some(offer)) = (self.bid, self.offer) else {
+            return None;
+        };
+        Some(i128::from(bid.price.raw()) + i128::from(offer.price.raw()))
+    }
+}
+
 /// Caller-owned output allocated by a read-only order-book query.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OrderBookQueryResource {
@@ -6937,6 +7009,45 @@ impl OrderBook {
             .map(|(price, level)| Self::level_snapshot(price, &level))
     }
 
+    /// Fallibly returns one coherent public best-bid-and-offer observation.
+    ///
+    /// The value composes the existing displayed best-level caches, excludes
+    /// hidden-only prices, and binds both sides to instrument/version/event-
+    /// sequence provenance. The successful path executes in `O(1)` time
+    /// without allocation or mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] if a cached visible level has a zero
+    /// aggregate/count or the two cached sides are locked or crossed.
+    pub fn try_best_bid_offer(&self) -> Result<BestBidOffer, InvariantViolation> {
+        let bid = self.best_bid();
+        let offer = self.best_ask();
+        for (side, level) in [(Side::Buy, bid), (Side::Sell, offer)] {
+            if level.is_some_and(|level| level.quantity == 0 || level.order_count == 0) {
+                return Err(InvariantViolation::new(format!(
+                    "cached public {side:?} best has a zero aggregate or order count"
+                )));
+            }
+        }
+        if let (Some(bid), Some(offer)) = (bid, offer) {
+            if bid.price >= offer.price {
+                return Err(InvariantViolation::new(format!(
+                    "locked or crossed public best: bid {} >= offer {}",
+                    bid.price.raw(),
+                    offer.price.raw()
+                )));
+            }
+        }
+        Ok(BestBidOffer {
+            instrument_id: self.definition.instrument_id(),
+            instrument_version: self.definition.version(),
+            book_event_sequence: self.last_event_sequence(),
+            bid,
+            offer,
+        })
+    }
+
     /// Returns process-local allocation telemetry for one execution-price
     /// arena.
     ///
@@ -11169,6 +11280,33 @@ mod price_level_index_tests {
             assert_eq!(levels.best_price(), Some(Price::from_raw(expected)));
             levels.validate_extremum().unwrap();
         }
+    }
+
+    #[test]
+    fn best_bid_offer_rejects_invalid_cached_public_state() {
+        let mut book = OrderBook::new(reserve_definition());
+        book.bids.insert(Price::from_raw(100), level(1));
+        book.asks.insert(Price::from_raw(120), level(2));
+        assert!(book.try_best_bid_offer().is_ok());
+
+        let valid_bid = book.bids.best_visible.unwrap();
+        let valid_offer = book.asks.best_visible.unwrap();
+        let mut zero_bid = valid_bid.1;
+        zero_bid.total_quantity = 0;
+        book.bids.best_visible = Some((valid_bid.0, zero_bid));
+        let error = book.try_best_bid_offer().unwrap_err();
+        assert!(error.detail().contains("zero aggregate or order count"));
+
+        let mut zero_count_bid = valid_bid.1;
+        zero_count_bid.visible_order_count = 0;
+        book.bids.best_visible = Some((valid_bid.0, zero_count_bid));
+        let error = book.try_best_bid_offer().unwrap_err();
+        assert!(error.detail().contains("zero aggregate or order count"));
+
+        book.bids.best_visible = Some(valid_bid);
+        book.asks.best_visible = Some((valid_bid.0, valid_offer.1));
+        let error = book.try_best_bid_offer().unwrap_err();
+        assert!(error.detail().contains("locked or crossed public best"));
     }
 
     #[test]

@@ -3,17 +3,17 @@ use quotick::instrument::{
     QuantityRules, ReserveOrderRules, TradingState,
 };
 use quotick::matching::{
-    Command, CommandOutcome, EventKind, ImmediateExecutionRequest, ImmediateExecutionTermination,
-    MassCancelScope, MatchingHashIndex, NewOrder, OrderBook, OrderBookQueryError,
-    OrderBookQueryResource, OrderDisplay, OrderQueueClass, OrderType, PriceLevelOrders,
-    RejectReason, SelfTradePrevention, StopActivation, TimeInForce,
+    BestBidOffer, Command, CommandOutcome, EventKind, ImmediateExecutionRequest,
+    ImmediateExecutionTermination, MassCancelScope, MatchingHashIndex, NewOrder, OrderBook,
+    OrderBookQueryError, OrderBookQueryResource, OrderDisplay, OrderQueueClass, OrderType,
+    PriceLevelOrders, RejectReason, SelfTradePrevention, StopActivation, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
     TimestampNs,
 };
 
-fn definition() -> InstrumentDefinition {
+fn definition_with_price_bounds(minimum: Price, maximum: Price) -> InstrumentDefinition {
     InstrumentDefinition::new(InstrumentSpec {
         instrument_id: InstrumentId::new(1).unwrap(),
         version: InstrumentVersion::new(1).unwrap(),
@@ -22,7 +22,7 @@ fn definition() -> InstrumentDefinition {
         kind: InstrumentKind::Equity,
         base_asset_id: AssetId::new(1).unwrap(),
         quote_asset_id: AssetId::new(2).unwrap(),
-        price: PriceRules::new(0, 1, Price::from_raw(-1_000), Price::from_raw(1_000)).unwrap(),
+        price: PriceRules::new(0, 1, minimum, maximum).unwrap(),
         quantity: QuantityRules::new(1, 1, 1_000).unwrap(),
         reserve: ReserveOrderRules::new(32).unwrap(),
         hidden_orders_supported: true,
@@ -31,6 +31,10 @@ fn definition() -> InstrumentDefinition {
         trading_state: TradingState::Open,
     })
     .unwrap()
+}
+
+fn definition() -> InstrumentDefinition {
+    definition_with_price_bounds(Price::from_raw(-1_000), Price::from_raw(1_000))
 }
 
 #[allow(
@@ -462,6 +466,106 @@ fn private_price_level_orders_are_prevalidated_exact_and_double_ended() {
         before_depth
     );
     book.validate().unwrap();
+}
+
+#[test]
+fn best_bid_offer_distinguishes_empty_one_sided_and_hidden_liquidity() {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<BestBidOffer>();
+
+    let empty_book = OrderBook::new(definition());
+    let empty = empty_book.try_best_bid_offer().unwrap();
+    assert_eq!(empty.instrument_id(), InstrumentId::new(1).unwrap());
+    assert_eq!(
+        empty.instrument_version(),
+        InstrumentVersion::new(1).unwrap()
+    );
+    assert_eq!(empty.book_event_sequence(), 0);
+    assert_eq!(empty.bid(), None);
+    assert_eq!(empty.offer(), None);
+    assert_eq!(empty.spread_raw(), None);
+    assert_eq!(empty.midpoint_raw_numerator(), None);
+
+    for (side, expected_bid, expected_offer) in
+        [(Side::Buy, true, false), (Side::Sell, false, true)]
+    {
+        let mut one_sided_book = OrderBook::new(definition());
+        one_sided_book
+            .submit(order(1, 1, 1, side, 100, 2, OrderDisplay::FullyDisplayed))
+            .unwrap();
+        let one_sided = one_sided_book.try_best_bid_offer().unwrap();
+        assert_eq!(one_sided.bid().is_some(), expected_bid);
+        assert_eq!(one_sided.offer().is_some(), expected_offer);
+        assert_eq!(one_sided.spread_raw(), None);
+        assert_eq!(one_sided.midpoint_raw_numerator(), None);
+    }
+
+    let mut hidden_only_book = OrderBook::new(definition());
+    hidden_only_book
+        .submit(order(1, 1, 1, Side::Buy, 100, 2, OrderDisplay::Hidden))
+        .unwrap();
+    let hidden_only = hidden_only_book.try_best_bid_offer().unwrap();
+    assert_eq!(hidden_only.bid(), None);
+    assert_eq!(hidden_only.offer(), None);
+}
+
+#[test]
+fn best_bid_offer_is_coherent_provenanced_and_exact_at_signed_extremes() {
+    let multi_order_level = queue_position_book()
+        .try_best_bid_offer()
+        .unwrap()
+        .offer()
+        .unwrap();
+    assert_eq!(multi_order_level.quantity, 7);
+    assert_eq!(multi_order_level.order_count, 3);
+
+    let book = populated_book();
+    let before_commands = book.retained_command_count();
+    let quote = book.try_best_bid_offer().unwrap();
+    assert_eq!(quote.bid(), book.best_bid());
+    assert_eq!(quote.bid().unwrap().price, Price::from_raw(100));
+    assert_eq!(quote.offer(), book.best_ask());
+    assert_eq!(quote.offer().unwrap().price, Price::from_raw(120));
+    assert_eq!(quote.book_event_sequence(), book.last_event_sequence());
+    assert_eq!(quote.spread_raw(), Some(20));
+    assert_eq!(quote.midpoint_raw_numerator(), Some(220));
+    assert_eq!(book.retained_command_count(), before_commands);
+    let restored = OrderBook::from_checkpoint(&book.checkpoint(1, 11).unwrap()).unwrap();
+    assert_eq!(restored.try_best_bid_offer().unwrap(), quote);
+
+    let mut extreme = OrderBook::new(definition_with_price_bounds(
+        Price::from_raw(i64::MIN),
+        Price::from_raw(i64::MAX),
+    ));
+    for command in [
+        order(
+            1,
+            1,
+            1,
+            Side::Buy,
+            i64::MIN,
+            1,
+            OrderDisplay::FullyDisplayed,
+        ),
+        order(
+            2,
+            2,
+            2,
+            Side::Sell,
+            i64::MAX,
+            1,
+            OrderDisplay::FullyDisplayed,
+        ),
+    ] {
+        assert_eq!(
+            extreme.submit(command).unwrap().outcome,
+            CommandOutcome::Accepted
+        );
+    }
+    let widest = extreme.try_best_bid_offer().unwrap();
+    assert_eq!(widest.spread_raw(), Some(u64::MAX));
+    assert_eq!(widest.midpoint_raw_numerator(), Some(-1));
+    extreme.validate().unwrap();
 }
 
 #[test]

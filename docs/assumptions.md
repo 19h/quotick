@@ -4479,6 +4479,54 @@ before and after the query. Any partial output before validation, duplicate,
 omission, order/class divergence, leaked raw link, mutation, allocation,
 recovery difference, or implied authorization falsifies A127.
 
+## A128 — coherent provenance-bound best bid and offer
+
+**Assumption.** `try_best_bid_offer` observes one immutable continuous
+`OrderBook` state and composes its existing cached public best bid and offer.
+Each present side is a `LevelSnapshot` containing only positive displayed
+aggregate quantity and displayed-order count; a fully hidden-only price is not
+a quote. Empty, bid-only, offer-only, and two-sided states remain distinct
+through the two optional sides.
+
+The fixed-size `BestBidOffer` binds both sides to the instrument identifier,
+immutable instrument-definition version, and last committed book-event
+sequence observed by the query. A present two-sided quote must be strictly
+uncrossed. A zero cached aggregate or order count, or a locked/crossed pair,
+returns a typed `InvariantViolation` before a value exists. This local check
+does not replace the complete A45 price-index/extremum audit.
+
+For a two-sided quote, `spread_raw` is exact offer raw price minus bid raw
+price in raw-price units. The widest valid signed-domain spread is
+`i64::MAX - i64::MIN = 18,446,744,073,709,551,615 = u64::MAX` raw-price units.
+`midpoint_raw_numerator` is the exact bid-plus-offer raw-price sum in `i128`
+with denominator two, so a half-unit midpoint is retained without a rounding
+rule. Either arithmetic accessor returns absence unless both sides exist.
+
+The successful path allocates nothing and changes no order, level, cache,
+sequence, history, risk, WAL, snapshot, or market-data state. Human-readable
+failure detail remains an A12 corruption-path allocation boundary. The value
+is one shard-local source observation; it is not a consolidated cross-venue
+quote, clock-synchronization proof, executable-liquidity reservation, or
+remote transport message.
+
+**Dependent results.** [A1, A3, A10, A12, A22, A44, A45, A72, A83, A103,
+A128] Both cached-side reads, provenance capture, selected-aggregate checks,
+cross check, and exact `i128` arithmetic are `O(1)` time and space with zero
+output allocation. Direct checkpoint restoration reproduces the value because
+the visible extrema are reconstructed and validated from semantic price-level
+state; no wire-version change follows.
+
+**Falsification probe.** Exercise empty, bid-only, offer-only, hidden-only,
+and two-sided books; positive, negative, zero-adjacent, and signed-extreme
+prices; multiple visible orders per level; and a better hidden-only price.
+Require exact instrument/version/event-sequence provenance, unchanged state,
+the full-domain `u64::MAX` spread, an exact `-1/2` raw midpoint at the signed
+extremes, and direct-checkpoint equivalence. Corrupt each cached side to a zero
+quantity/count and to a locked/crossed pair; require typed failure. Any mixed-
+state provenance, hidden-liquidity disclosure, rounded midpoint, overflow,
+panic, mutation, allocation, or consolidated/executable interpretation
+falsifies A128.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -4552,6 +4600,17 @@ capability, a remaining risk, or an opportunity.
   order, total-leaves, working-slice, display, and expiry state to its local
   in-process caller. Authentication, entitlement, venue disclosure policy,
   conflation, remote pagination, and transport remain separate interfaces.
+
+- **Medium impact:** one fixed-size continuous-book BBO now binds both public
+  visible extrema to instrument/version/event-sequence provenance under A128.
+  Exact raw spread covers the complete signed-price domain; the midpoint keeps
+  denominator two without rounding. Empty, one-sided, hidden-only, corrupted,
+  direct-checkpoint, and signed-extreme cases are covered.
+
+- **Medium impact risk:** the BBO is one shard-local source observation, not a
+  consolidated best quote. Cross-venue source identity, clock alignment,
+  staleness policy, fees, sizes after queue consumption, entitlements, and
+  executable reservation require separately sequenced interfaces.
 
 - **Medium impact risk:** queue position is a state observation, not a fill-
   probability or latency estimate. Subsequent execution, cancellation,

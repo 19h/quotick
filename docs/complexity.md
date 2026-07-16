@@ -176,6 +176,15 @@ Full and band iterators each retain two 128-index stacks:
 `2 × 128 × size_of::<usize>() = 2,048 B` on a 64-bit target, plus scalar
 fields. The bound is independent of configured or occupied level count.
 
+`try_best_bid_offer` reads two cached public extrema and performs a constant
+number of aggregate, ordering, provenance, and arithmetic operations. It is
+`O(1)` time and space with one fixed-size result and no successful-path
+allocation. For raw bid `b` and offer `a`, exact spread `a - b` fits `u64`
+across the complete signed `i64` price domain; exact midpoint numerator
+`a + b` fits `i128` and retains denominator two. Empty and one-sided books
+perform the same bounded work. Human-readable invariant detail may allocate
+only after a zero aggregate/count or locked/crossed pair is detected.
+
 For `C` retained commands, `retained_command_report` performs one expected
 `O(1)` bounded-hash lookup and returns one borrowed command/report view.
 `retained_history` has `O(1)` setup and exact-size iterator state; consuming
