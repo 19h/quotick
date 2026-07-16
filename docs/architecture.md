@@ -218,6 +218,13 @@ shard, from command admission through checkpoint capture.
       IDs without another account-list traversal or sort. Predicate decline or
       unwind drops the preparation and returns its cleared lease without
       changing matching, risk, history, or WAL state.
+    - Conditional block-and-cancel preparation reuses the same selection and
+      selected-state path, but binds it to the current revisioned account fence,
+      requested action, and resulting blocked state in one
+      `AccountControlSubmissionObservation`. Conditional enable observes the
+      current fence and resulting enabled state without acquiring a selection
+      lease or allocating selected-order output. Replay, core rejection, and
+      coupled-risk rejection bypass observation and predicate execution.
     - Neither vector grows during cancellation; execution removes only
       selected order IDs in ascending order and never scans unrelated active
       orders.
@@ -387,6 +394,18 @@ shard, from command admission through checkpoint capture.
     Durable acceptance and business rejection retain the existing two frames,
     while output failure, decline, unwind, and replay append zero. The API adds
     no command, report, snapshot, market-data, or wire value.
+    `try_submit_account_control_if` composes ordinary `AccountControl`
+    preparation with one `AccountControlSubmissionObservation`, a borrowed
+    local predicate, and commit of that same preparation. The observation binds
+    the current `AccountControlObservation`, requested action, resulting fence,
+    and, for block-and-cancel, the exact ascending selected states, count, and
+    checked `u128` total leaves. Acceptance consumes the same prepared IDs;
+    query failure, predicate decline, or unwind returns the selection lease and
+    changes no matching, risk, history, or WAL state. Enable has empty selected
+    state and consumes no lease. Coupled risk rejects an unprofiled account
+    before selected-state construction or predicate execution. Durable
+    acceptance and business rejection use the existing two frames; query
+    failure, decline, unwind, and replay append zero. No wire value changes.
     A separate displayed-liquidity quote folds the current public aggregate
     projection under the same market-or-limit crossing rule. It excludes fully
     hidden leaves and undisplayed reserve leaves, reports exact quoted and
@@ -500,6 +519,12 @@ shard, from command admission through checkpoint capture.
     and exact retries cannot advance revision twice. The never-evicted control
     hash is constructor-reserved, finite, checkpoint-derived from history, and
     included in structural and market-data publisher cross-audits.
+    - Conditional account control observes the exact current fence, action,
+      resulting state, and block-and-cancel order set inside the same exclusive
+      borrow that commits the prepared command. It therefore closes the local
+      query-to-control race without creating a remotely valid fence token.
+      Enable has no selected-order storage; block-and-cancel reuses the ordinary
+      constructor-owned selection lease and cancellation trace.
 32. Effective instrument trading state starts from the immutable definition at
     revision zero. Each accepted state control compares the exact revision,
     increments it once without wrap, and changes to a different open,
@@ -845,8 +870,10 @@ selection additionally acquires one constructor-owned lease in expected `O(1)`;
 exhaustion precedes sequencing, event initialization, WAL append, and state
 mutation. Ordinary commit fills, sorts, and drains that fixed-capacity buffer;
 conditional mass-cancel preparation fills and sorts it before its caller-owned
-observation is constructed, and accepted commit drains the same IDs. RAII
-returns the buffer on every completion or rejection path. Commit adds
+observation is constructed. Conditional block-and-cancel uses the same path,
+while conditional enable acquires no lease and constructs no selected-order
+output. Accepted commit drains the same prepared IDs. RAII returns the buffer
+on every completion or rejection path. Commit adds
 expected `O(1)` identity, idempotency, and generation validation before the
 already-prepared transition.
 
@@ -1876,6 +1903,8 @@ accounting for the continuous-matching risk layer.
     unprofiled account before matching mutation. An accepted control releases
     reservations from its ordinary cancellation trace; the final control event
     has no second exposure effect.
+    Conditional account-control preparation performs that profile authorization
+    before constructing selected-order output or invoking its predicate.
 
 ## Market-data publication invariants
 
@@ -2551,6 +2580,15 @@ durable noncommit and replay; two-frame acceptance and business rejection; and
 plain/coupled-risk reopen parity. An internal account-list corruption test
 requires a typed query failure before predicate execution or semantic mutation
 and proves the selection lease is returned.
+Conditional account-control tests cover current fence/action/resulting-state
+provenance; mixed fully displayed, reserve, fully hidden, and dormant-stop
+block-and-cancel selections; enable without selected output or a lease;
+predicate acceptance, decline, and unwind; wrong-version, stale-revision,
+unprofiled-risk, and exact-replay predicate bypass; coupled reservation release;
+zero-frame durable noncommit and replay; two-frame business rejection and
+acceptance; and plain/coupled-risk reopen parity. An internal account-list
+corruption test requires a typed query failure before predicate execution or
+semantic mutation and proves the selection lease is returned.
 Displayed-liquidity quote tests cover both aggressor directions, empty and
 one-/multi-level books, market and limit constraints, filled, price-limit, and
 public-book-exhaustion outcomes, current reserve slices, fully hidden
@@ -2918,7 +2956,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Snapshots and compaction | single-file and segmented matching/risk/ledger/call-auction WAL cutover plus off-thread direct and WAL-synchronized plain/coupled continuous-matching and call-auction replay verification are implemented; verified matching/risk/auction handles can retire an older prefix by cursor-streaming only its synchronized suffix. Remaining evidence is bounded checkpoint memory and writer audit-copy/projection/direct-reconstruction pause, bounded suffix-copy pause, semantic generation rollover, and externally retained audit/idempotency proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
-| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, frozen-best continuous market-to-limit with GTC/GTD residuals, sourced explicit-reference stop-market/stop-limit activation with durable source identity/version/sequence and gap/reset validation, native reserve and fully hidden continuous queue classes, atomic minimum-quantity IOC, atomic FOK under all four continuous self-trade policies, coherent provenance-bound BBO, exact-price provenance-bound public levels, checked cumulative public-depth summaries, exact top-N displayed public-depth imbalance, and exact displayed-liquidity sweep quotes on authoritative books and continuous public replicas, exact state-bound private immediate-execution economics and per-price curves, atomic local conditional quote/curve binding for canonical IOC, every new-order shape, continuous replacement, continuous cancellation, and continuous mass cancellation, active-order identity observations, resting-order queue position, and prevalidated price-level order traversal, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, authoritative typed priority classes, account/side mass cancellation, atomic new-identity replacement with full priority loss, fail-closed full and inclusive price-band aggregate depth queries on authoritative books and public replicas, banded discovery, sequenced nullable indicative publication, explicit price-time and price/class-tier pro-rata-time allocation, deterministic pairing/atomic uncross with fail-closed self-trade abort, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, plain/coupled-risk full-WAL plus cutover recovery, instrument-bound atomic DVP settlement of complete accepted uncross reports, and explicit trade-bound fee transfers in the same atomic ledger event are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authenticated external stop-reference acquisition/normalization and missed-reference recovery, auction reference and dynamic-band derivation, authenticated venue-category-to-class and beneficial-owner mapping, venue-specific display/allocation policies, venue-specific call-auction self-trade cancellation/decrement and alternative-pairing policies, clearing lifecycle authorization, fee calculation/authorization, settlement-date derivation, volatility/interruption auctions, pegged, discretionary, venue-specific in-place amendment/uncross/publication cadence/filtering semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
+| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, frozen-best continuous market-to-limit with GTC/GTD residuals, sourced explicit-reference stop-market/stop-limit activation with durable source identity/version/sequence and gap/reset validation, native reserve and fully hidden continuous queue classes, atomic minimum-quantity IOC, atomic FOK under all four continuous self-trade policies, coherent provenance-bound BBO, exact-price provenance-bound public levels, checked cumulative public-depth summaries, exact top-N displayed public-depth imbalance, and exact displayed-liquidity sweep quotes on authoritative books and continuous public replicas, exact state-bound private immediate-execution economics and per-price curves, atomic local conditional quote/curve binding for canonical IOC, every new-order shape, continuous replacement, continuous cancellation, continuous mass cancellation, and revisioned account control, active-order identity observations, resting-order queue position, and prevalidated price-level order traversal, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, authoritative typed priority classes, account/side mass cancellation, atomic new-identity replacement with full priority loss, fail-closed full and inclusive price-band aggregate depth queries on authoritative books and public replicas, banded discovery, sequenced nullable indicative publication, explicit price-time and price/class-tier pro-rata-time allocation, deterministic pairing/atomic uncross with fail-closed self-trade abort, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, plain/coupled-risk full-WAL plus cutover recovery, instrument-bound atomic DVP settlement of complete accepted uncross reports, and explicit trade-bound fee transfers in the same atomic ledger event are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authenticated external stop-reference acquisition/normalization and missed-reference recovery, auction reference and dynamic-band derivation, authenticated venue-category-to-class and beneficial-owner mapping, venue-specific display/allocation policies, venue-specific call-auction self-trade cancellation/decrement and alternative-pairing policies, clearing lifecycle authorization, fee calculation/authorization, settlement-date derivation, volatility/interruption auctions, pegged, discretionary, venue-specific in-place amendment/uncross/publication cadence/filtering semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
 | High | Instrument lifecycle expansion | authoritative calendar ingestion/distribution/activation, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |

@@ -19,12 +19,13 @@ use crate::journal::{
     SegmentedJournalError, SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
 };
 use crate::matching::{
-    ActiveOrderObservation, CancelOrder, Command, CommandPreparation, ConditionalCommandOutcome,
-    ConditionalExecutionPreflight, ConditionalExecutionPreparation, ConditionalOrderOutcome,
-    ExecutionReport, ImmediateExecutionCurve, ImmediateExecutionCurveOutcome,
-    ImmediateExecutionOutcome, ImmediateExecutionQuote, ImmediateExecutionSubmission, MassCancel,
-    MassCancelObservation, MatchingError, NewOrder, OrderBook, OrderBookQueryError, OrderExecution,
-    PreparedCommand, ReplaceOrder, evaluate_conditional_execution,
+    AccountControl, AccountControlSubmissionObservation, ActiveOrderObservation, CancelOrder,
+    Command, CommandPreparation, ConditionalCommandOutcome, ConditionalExecutionPreflight,
+    ConditionalExecutionPreparation, ConditionalOrderOutcome, ExecutionReport,
+    ImmediateExecutionCurve, ImmediateExecutionCurveOutcome, ImmediateExecutionOutcome,
+    ImmediateExecutionQuote, ImmediateExecutionSubmission, MassCancel, MassCancelObservation,
+    MatchingError, NewOrder, OrderBook, OrderBookQueryError, OrderExecution, PreparedCommand,
+    ReplaceOrder, evaluate_conditional_execution,
 };
 use crate::risk::{
     AccountRiskDefinition, RiskError, RiskInvariantViolation, RiskManagedCheckpoint,
@@ -1008,6 +1009,27 @@ impl DurableRiskOrderBook {
         self.submit_conditional_mass_cancel(command, |_, observation| Ok(observation), accept)
     }
 
+    /// Durably risk-gates, observes, and conditionally applies one account control.
+    ///
+    /// Replay plus core or risk rejection bypass observation and `accept`.
+    /// Otherwise the predicate borrows the frozen current fence and complete
+    /// canonical block-and-cancel selection before WAL mutation. Observation
+    /// failure, decline, or unwind changes neither WAL nor coupled state.
+    /// Acceptance releases every selected reservation exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableRiskError`] for poison, preparation, observation,
+    /// journal, or coupled commit failure.
+    pub fn try_submit_account_control_if(
+        &mut self,
+        command: AccountControl,
+        accept: impl FnOnce(&AccountControlSubmissionObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<AccountControlSubmissionObservation>, DurableRiskError>
+    {
+        self.submit_conditional_account_control(command, |_, observation| Ok(observation), accept)
+    }
+
     /// Durably risk-gates, quotes, and conditionally submits one canonical IOC order.
     ///
     /// Replay plus core or risk rejection bypass `accept`. Decline occurs
@@ -1136,6 +1158,24 @@ impl DurableRiskOrderBook {
         let preflight = self
             .managed
             .prepare_conditional_mass_cancel::<DurableRiskError>(command)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_account_control<T>(
+        &mut self,
+        command: AccountControl,
+        observe: impl FnOnce(
+            &OrderBook,
+            AccountControlSubmissionObservation,
+        ) -> Result<T, DurableRiskError>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, DurableRiskError> {
+        if self.is_poisoned() {
+            return Err(DurableRiskError::Poisoned);
+        }
+        let preflight = self
+            .managed
+            .prepare_conditional_account_control::<DurableRiskError>(command)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 

@@ -16,15 +16,16 @@ use crate::bounded_hash::BoundedHashMap;
 use crate::domain::{AccountId, OrderId, Price, Side};
 use crate::instrument::InstrumentDefinition;
 use crate::matching::{
-    ActiveOrderObservation, CancelOrder, Command, CommandOutcome, CommandPreparation,
-    ConditionalCommandOutcome, ConditionalExecutionPreflight, ConditionalExecutionPreparation,
-    ConditionalOrderError, ConditionalOrderOutcome, EventKind, ExecutionReport,
-    ImmediateExecutionCurve, ImmediateExecutionCurveOutcome, ImmediateExecutionOutcome,
-    ImmediateExecutionQuote, ImmediateExecutionSubmission, MassCancel, MassCancelObservation,
-    MatchingCapacity, MatchingError, NewOrder, OrderBook, OrderBookCheckpoint,
-    OrderBookCheckpointError, OrderBookLimits, OrderBookLimitsSpec, OrderBookQueryError,
-    OrderExecution, OrderType, PreparedCommand, RejectReason, ReplaceOrder, SelfTradePrevention,
-    Trade, evaluate_conditional_execution,
+    AccountControl, AccountControlSubmissionObservation, ActiveOrderObservation, CancelOrder,
+    Command, CommandOutcome, CommandPreparation, ConditionalCommandOutcome,
+    ConditionalExecutionPreflight, ConditionalExecutionPreparation, ConditionalOrderError,
+    ConditionalOrderOutcome, EventKind, ExecutionReport, ImmediateExecutionCurve,
+    ImmediateExecutionCurveOutcome, ImmediateExecutionOutcome, ImmediateExecutionQuote,
+    ImmediateExecutionSubmission, MassCancel, MassCancelObservation, MatchingCapacity,
+    MatchingError, NewOrder, OrderBook, OrderBookCheckpoint, OrderBookCheckpointError,
+    OrderBookLimits, OrderBookLimitsSpec, OrderBookQueryError, OrderExecution, OrderType,
+    PreparedCommand, RejectReason, ReplaceOrder, SelfTradePrevention, Trade,
+    evaluate_conditional_execution,
 };
 
 /// Account-level order-entry state.
@@ -2137,6 +2138,29 @@ impl RiskManagedOrderBook {
         self.submit_conditional_mass_cancel(command, |_, observation| Ok(observation), accept)
     }
 
+    /// Atomically risk-gates, observes, and conditionally applies one account control.
+    ///
+    /// Core or risk rejection and replay bypass `accept`. Otherwise the
+    /// predicate borrows the frozen current account fence and, for
+    /// block-and-cancel, every canonical selected active state. Decline,
+    /// observation failure, or unwind changes neither matching nor risk state.
+    /// Acceptance applies the same preparation and releases selected
+    /// reservations exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConditionalOrderError::Matching`] for preparation or coupled
+    /// commit failure and [`ConditionalOrderError::Query`] when the complete
+    /// observation cannot be validated or reserved.
+    pub fn try_submit_account_control_if(
+        &mut self,
+        command: AccountControl,
+        accept: impl FnOnce(&AccountControlSubmissionObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<AccountControlSubmissionObservation>, ConditionalOrderError>
+    {
+        self.submit_conditional_account_control(command, |_, observation| Ok(observation), accept)
+    }
+
     /// Atomically risk-gates, quotes, and conditionally submits one canonical IOC order.
     ///
     /// Core or risk rejection and exact replay bypass `accept`. For a command
@@ -2261,6 +2285,19 @@ impl RiskManagedOrderBook {
         self.submit_conditional_execution(preflight, observe, accept)
     }
 
+    fn submit_conditional_account_control<T, E>(
+        &mut self,
+        command: AccountControl,
+        observe: impl FnOnce(&OrderBook, AccountControlSubmissionObservation) -> Result<T, E>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, E>
+    where
+        E: From<MatchingError> + From<OrderBookQueryError>,
+    {
+        let preflight = self.prepare_conditional_account_control::<E>(command)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
     fn submit_conditional_execution<T, U, E>(
         &mut self,
         preflight: ConditionalExecutionPreflight<T>,
@@ -2336,6 +2373,46 @@ impl RiskManagedOrderBook {
         E: From<MatchingError> + From<OrderBookQueryError>,
     {
         let preflight = self.book.prepare_conditional_mass_cancel::<E>(command)?;
+        Ok(self.apply_conditional_risk_gate(preflight))
+    }
+
+    pub(crate) fn prepare_conditional_account_control<E>(
+        &self,
+        command: AccountControl,
+    ) -> Result<ConditionalExecutionPreflight<AccountControlSubmissionObservation>, E>
+    where
+        E: From<MatchingError> + From<OrderBookQueryError>,
+    {
+        let preparation = self
+            .book
+            .prepare(Command::AccountControl(command))
+            .map_err(E::from)?;
+        let preflight = match preparation {
+            preparation @ CommandPreparation::Replay(_) => ConditionalExecutionPreflight {
+                preparation,
+                observation: None,
+            },
+            CommandPreparation::Ready(mut prepared) => {
+                let observation = if prepared.core_rejection().is_none()
+                    && self
+                        .risk
+                        .authorize(Command::AccountControl(command))
+                        .is_ok()
+                {
+                    Some(
+                        self.book
+                            .try_account_control_submission_observation(command, &mut prepared)
+                            .map_err(E::from)?,
+                    )
+                } else {
+                    None
+                };
+                ConditionalExecutionPreflight {
+                    preparation: CommandPreparation::Ready(prepared),
+                    observation,
+                }
+            }
+        };
         Ok(self.apply_conditional_risk_gate(preflight))
     }
 

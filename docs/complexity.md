@@ -118,6 +118,14 @@ remains `O(K(log K + log P))`; the constructor-owned lease retains `O(K)` ID
 scratch and the caller-owned observation adds `O(K)` rows. Decline and unwind
 omit all price-level removals.
 
+Conditional block-and-cancel reuses that same prepared selection and caller
+output, while additionally binding the current revisioned account fence,
+requested action, and resulting blocked state. Accepted commit drains the same
+IDs without another account-list traversal or sort. Conditional enable performs
+no account-list traversal, acquires no selection lease, and allocates no
+selected-order output; its preparation and commit retain the ordinary expected
+`O(1)` fence work.
+
 For `K` GTD orders at or before one inclusive expiry watermark, preparation
 counts the ordered expiry prefix in `O(K + 1)` time and leases `O(K)` existing
 selection scratch. Commit traverses that prefix again in canonical
@@ -671,6 +679,26 @@ frames; output failure, decline, unwind, and replay append zero. Count and
 quantity calculations use exact integer arithmetic with zero approximation
 error. No command/report codec, event bound, or fixed authoritative state
 changes.
+
+`try_submit_account_control_if` composes ordinary `AccountControl` preparation
+with the current fence/action/resulting-state observation and, for
+block-and-cancel, the same canonical prepared selection and selected-state
+output as conditional mass cancellation. Let `A` be ordinary account-control
+preparation cost, `K` selected orders, `F` predicate cost, and `M` ordinary
+account-control commit cost. Block-and-cancel acceptance is
+`O(A + K log K + F + M)` time; decline is `O(A + K log K + F)`. The
+constructor-owned lease contains `O(K)` ID scratch, caller output owns `O(K)`
+`ActiveOrderSnapshot` rows, and evaluator auxiliary state is `O(1)`. Accepted
+commit reuses the prepared IDs without another account-list selection or sort.
+
+Enable acceptance is `O(A + F + M)` and decline is `O(A + F)`, with one
+`O(1)` observation and no selected output or lease. Core rejection and exact
+replay skip observation/output and `F`; coupled-risk rejection occurs before
+selected-state construction and also skips `F`. Coupled acceptance releases
+`K` reservations in expected `O(K)` time. Durable acceptance and business
+rejection append the existing two frames; query failure, decline, unwind, and
+replay append zero. Count, revision, and quantity arithmetic has zero
+approximation error, and no wire value or fixed authoritative state changes.
 
 ## Default matching limits and memory
 

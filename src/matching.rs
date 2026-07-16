@@ -2481,6 +2481,8 @@ pub enum OrderBookQueryResource {
     AccountOrderIds,
     /// Complete active-order states selected by one conditional mass cancel.
     MassCancelOrders,
+    /// Complete active-order states selected by one conditional account control.
+    AccountControlOrders,
 }
 
 impl fmt::Display for OrderBookQueryResource {
@@ -2491,6 +2493,7 @@ impl fmt::Display for OrderBookQueryResource {
             Self::ActiveOrders => "active-order output",
             Self::AccountOrderIds => "account-order-identifier output",
             Self::MassCancelOrders => "mass-cancel-order output",
+            Self::AccountControlOrders => "account-control-order output",
         })
     }
 }
@@ -3681,6 +3684,44 @@ pub struct MassCancelObservation {
     selected_quantity_lots: u128,
 }
 
+fn try_account_order_selection_quantity(
+    account_id: AccountId,
+    scope: MassCancelScope,
+    orders: &[ActiveOrderSnapshot],
+) -> Result<u128, InvariantViolation> {
+    let mut previous_order_id = None;
+    let mut selected_quantity_lots = 0_u128;
+    for order in orders {
+        if order.account_id() != account_id {
+            return Err(InvariantViolation::new(format!(
+                "account {account_id} selection contains order {} owned by {}",
+                order.order_id(),
+                order.account_id()
+            )));
+        }
+        if let MassCancelScope::Side(side) = scope
+            && order.side() != side
+        {
+            return Err(InvariantViolation::new(format!(
+                "account {account_id} {side:?} selection contains {:?} order {}",
+                order.side(),
+                order.order_id()
+            )));
+        }
+        if previous_order_id.is_some_and(|previous| previous >= order.order_id()) {
+            return Err(InvariantViolation::new(format!(
+                "account {account_id} selection is not strictly ordered at order {}",
+                order.order_id()
+            )));
+        }
+        previous_order_id = Some(order.order_id());
+        selected_quantity_lots = selected_quantity_lots
+            .checked_add(u128::from(order.leaves_quantity().lots()))
+            .ok_or_else(|| InvariantViolation::new("selected account quantity is exhausted"))?;
+    }
+    Ok(selected_quantity_lots)
+}
+
 impl MassCancelObservation {
     fn try_new(
         instrument_id: InstrumentId,
@@ -3690,38 +3731,8 @@ impl MassCancelObservation {
         scope: MassCancelScope,
         orders: Vec<ActiveOrderSnapshot>,
     ) -> Result<Self, InvariantViolation> {
-        let mut previous_order_id = None;
-        let mut selected_quantity_lots = 0_u128;
-        for order in &orders {
-            if order.account_id() != account_id {
-                return Err(InvariantViolation::new(format!(
-                    "mass-cancel account {account_id} selected order {} owned by {}",
-                    order.order_id(),
-                    order.account_id()
-                )));
-            }
-            if let MassCancelScope::Side(side) = scope
-                && order.side() != side
-            {
-                return Err(InvariantViolation::new(format!(
-                    "mass-cancel account {account_id} {side:?} scope selected {:?} order {}",
-                    order.side(),
-                    order.order_id()
-                )));
-            }
-            if previous_order_id.is_some_and(|previous| previous >= order.order_id()) {
-                return Err(InvariantViolation::new(format!(
-                    "mass-cancel selection is not strictly ordered at order {}",
-                    order.order_id()
-                )));
-            }
-            previous_order_id = Some(order.order_id());
-            selected_quantity_lots = selected_quantity_lots
-                .checked_add(u128::from(order.leaves_quantity().lots()))
-                .ok_or_else(|| {
-                    InvariantViolation::new("mass-cancel selected quantity is exhausted")
-                })?;
-        }
+        let selected_quantity_lots =
+            try_account_order_selection_quantity(account_id, scope, &orders)?;
         Ok(Self {
             instrument_id,
             instrument_version,
@@ -3776,6 +3787,108 @@ impl MassCancelObservation {
     }
 
     /// Returns the exact total selected leaves in lots.
+    #[must_use]
+    pub const fn selected_quantity_lots(&self) -> u128 {
+        self.selected_quantity_lots
+    }
+}
+
+/// Frozen current fence and private state selected by one account control.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountControlSubmissionObservation {
+    control: AccountControlObservation,
+    action: AccountControlAction,
+    orders: Vec<ActiveOrderSnapshot>,
+    selected_quantity_lots: u128,
+}
+
+impl AccountControlSubmissionObservation {
+    fn try_new(
+        control: AccountControlObservation,
+        action: AccountControlAction,
+        orders: Vec<ActiveOrderSnapshot>,
+    ) -> Result<Self, InvariantViolation> {
+        if action == AccountControlAction::Enable && !orders.is_empty() {
+            return Err(InvariantViolation::new(
+                "account enable observation contains selected orders",
+            ));
+        }
+        if control.state() == AccountAdmissionState::Blocked && !orders.is_empty() {
+            return Err(InvariantViolation::new(
+                "blocked account-control observation contains active orders",
+            ));
+        }
+        let selected_quantity_lots = try_account_order_selection_quantity(
+            control.account_id(),
+            MassCancelScope::All,
+            &orders,
+        )?;
+        Ok(Self {
+            control,
+            action,
+            orders,
+            selected_quantity_lots,
+        })
+    }
+
+    /// Returns the selected instrument.
+    #[must_use]
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.control.instrument_id()
+    }
+
+    /// Returns the immutable instrument-definition version used by preparation.
+    #[must_use]
+    pub const fn instrument_version(&self) -> InstrumentVersion {
+        self.control.instrument_version()
+    }
+
+    /// Returns the last committed event sequence visible to preparation.
+    #[must_use]
+    pub const fn book_event_sequence(&self) -> u64 {
+        self.control.book_event_sequence()
+    }
+
+    /// Returns the account selected by the control.
+    #[must_use]
+    pub const fn account_id(&self) -> AccountId {
+        self.control.account_id()
+    }
+
+    /// Returns the frozen current account-fence observation.
+    #[must_use]
+    pub const fn control(&self) -> AccountControlObservation {
+        self.control
+    }
+
+    /// Returns the requested account-control action.
+    #[must_use]
+    pub const fn action(&self) -> AccountControlAction {
+        self.action
+    }
+
+    /// Returns the admission state produced by the requested action.
+    #[must_use]
+    pub const fn resulting_state(&self) -> AccountAdmissionState {
+        self.action.resulting_state()
+    }
+
+    /// Returns complete selected states in ascending order-identifier order.
+    ///
+    /// Enable observations are empty. Block-and-cancel observations contain
+    /// every active resting or dormant-stop order for the controlled account.
+    #[must_use]
+    pub fn orders(&self) -> &[ActiveOrderSnapshot] {
+        &self.orders
+    }
+
+    /// Returns the number of active orders selected for cancellation.
+    #[must_use]
+    pub fn selected_order_count(&self) -> usize {
+        self.orders.len()
+    }
+
+    /// Returns exact selected total leaves in lots.
     #[must_use]
     pub const fn selected_quantity_lots(&self) -> u128 {
         self.selected_quantity_lots
@@ -8838,6 +8951,30 @@ impl OrderBook {
         self.submit_conditional_mass_cancel(command, |_, observation| Ok(observation), accept)
     }
 
+    /// Atomically observes and conditionally applies one account control.
+    ///
+    /// The predicate borrows the frozen current account fence and requested
+    /// action. A block-and-cancel observation additionally contains every
+    /// selected resting and dormant-stop state in canonical order under the
+    /// same exclusive book borrow as commit; enable contains no selected
+    /// orders and acquires no selection lease. Replay and core rejection bypass
+    /// observation and predicate execution. Query failure, decline, or unwind
+    /// precedes semantic mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConditionalOrderError::Matching`] for preparation or commit
+    /// failure and [`ConditionalOrderError::Query`] when the current fence or
+    /// complete caller-owned selected state cannot be validated or reserved.
+    pub fn try_submit_account_control_if(
+        &mut self,
+        command: AccountControl,
+        accept: impl FnOnce(&AccountControlSubmissionObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<AccountControlSubmissionObservation>, ConditionalOrderError>
+    {
+        self.submit_conditional_account_control(command, |_, observation| Ok(observation), accept)
+    }
+
     /// Atomically quotes and conditionally submits one canonical IOC order.
     ///
     /// Core matching rejection and exact replay bypass `accept` and return a
@@ -8968,6 +9105,19 @@ impl OrderBook {
         E: From<MatchingError> + From<OrderBookQueryError>,
     {
         let preflight = self.prepare_conditional_mass_cancel::<E>(command)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_account_control<T, E>(
+        &mut self,
+        command: AccountControl,
+        observe: impl FnOnce(&Self, AccountControlSubmissionObservation) -> Result<T, E>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, E>
+    where
+        E: From<MatchingError> + From<OrderBookQueryError>,
+    {
+        let preflight = self.prepare_conditional_account_control::<E>(command)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 
@@ -9108,41 +9258,49 @@ impl OrderBook {
         }
     }
 
+    pub(crate) fn prepare_conditional_account_control<E>(
+        &self,
+        command: AccountControl,
+    ) -> Result<ConditionalExecutionPreflight<AccountControlSubmissionObservation>, E>
+    where
+        E: From<MatchingError> + From<OrderBookQueryError>,
+    {
+        match self
+            .prepare(Command::AccountControl(command))
+            .map_err(E::from)?
+        {
+            preparation @ CommandPreparation::Replay(_) => Ok(ConditionalExecutionPreflight {
+                preparation,
+                observation: None,
+            }),
+            CommandPreparation::Ready(mut prepared) => {
+                let observation = if prepared.core_rejection().is_none() {
+                    Some(
+                        self.try_account_control_submission_observation(command, &mut prepared)
+                            .map_err(E::from)?,
+                    )
+                } else {
+                    None
+                };
+                Ok(ConditionalExecutionPreflight {
+                    preparation: CommandPreparation::Ready(prepared),
+                    observation,
+                })
+            }
+        }
+    }
+
     fn try_mass_cancel_observation(
         &self,
         command: MassCancel,
         prepared: &mut PreparedCommand,
     ) -> Result<MassCancelObservation, OrderBookQueryError> {
-        let selected = prepared.selected_order_ids.as_mut().ok_or_else(|| {
-            InvariantViolation::new("accepted mass-cancel preparation has no selection storage")
-        })?;
-        if !selected.values().is_empty() {
-            return Err(InvariantViolation::new(
-                "mass-cancel preparation selection was populated more than once",
-            )
-            .into());
-        }
-        self.try_select_account_orders_into(
+        let orders = self.try_selected_account_order_states(
             command.account_id,
             command.scope,
-            selected.values_mut(),
-        )?;
-
-        let mut orders = reserve_order_book_query_vec(
-            selected.values().len(),
+            prepared,
             OrderBookQueryResource::MassCancelOrders,
         )?;
-        for &order_id in selected.values() {
-            let state = self
-                .try_active_order_observation(order_id)?
-                .state()
-                .ok_or_else(|| {
-                    InvariantViolation::new(format!(
-                        "mass-cancel selection references absent order {order_id}"
-                    ))
-                })?;
-            orders.push(state);
-        }
         MassCancelObservation::try_new(
             self.instrument_id(),
             self.instrument_version(),
@@ -9152,6 +9310,74 @@ impl OrderBook {
             orders,
         )
         .map_err(Into::into)
+    }
+
+    pub(crate) fn try_account_control_submission_observation(
+        &self,
+        command: AccountControl,
+        prepared: &mut PreparedCommand,
+    ) -> Result<AccountControlSubmissionObservation, OrderBookQueryError> {
+        let control = self.try_account_control_observation(command.account_id)?;
+        if control.revision() != command.expected_revision {
+            return Err(InvariantViolation::new(format!(
+                "prepared account control expected revision {} but observed {}",
+                command.expected_revision,
+                control.revision()
+            ))
+            .into());
+        }
+        let orders = match command.action {
+            AccountControlAction::BlockAndCancel => self.try_selected_account_order_states(
+                command.account_id,
+                MassCancelScope::All,
+                prepared,
+                OrderBookQueryResource::AccountControlOrders,
+            )?,
+            AccountControlAction::Enable => {
+                if prepared.selected_order_ids.is_some() {
+                    return Err(InvariantViolation::new(
+                        "account enable preparation unexpectedly owns selection storage",
+                    )
+                    .into());
+                }
+                Vec::new()
+            }
+        };
+        AccountControlSubmissionObservation::try_new(control, command.action, orders)
+            .map_err(Into::into)
+    }
+
+    fn try_selected_account_order_states(
+        &self,
+        account_id: AccountId,
+        scope: MassCancelScope,
+        prepared: &mut PreparedCommand,
+        resource: OrderBookQueryResource,
+    ) -> Result<Vec<ActiveOrderSnapshot>, OrderBookQueryError> {
+        let selected = prepared.selected_order_ids.as_mut().ok_or_else(|| {
+            InvariantViolation::new("accepted account selection has no preparation storage")
+        })?;
+        if !selected.values().is_empty() {
+            return Err(InvariantViolation::new(
+                "prepared account selection was populated more than once",
+            )
+            .into());
+        }
+        self.try_select_account_orders_into(account_id, scope, selected.values_mut())?;
+
+        let mut orders = reserve_order_book_query_vec(selected.values().len(), resource)?;
+        for &order_id in selected.values() {
+            let state = self
+                .try_active_order_observation(order_id)?
+                .state()
+                .ok_or_else(|| {
+                    InvariantViolation::new(format!(
+                        "prepared account selection references absent order {order_id}"
+                    ))
+                })?;
+            orders.push(state);
+        }
+        Ok(orders)
     }
 
     fn new_order_execution_observation(
@@ -11506,45 +11732,15 @@ impl OrderBook {
         mut events: EventTraceBuilder,
         mut selected: PooledOrderSelection,
     ) -> Result<ExecutionReport, MatchingError> {
-        let selected_count = self.account_active_order_count(command.account_id, command.scope);
-        debug_assert_eq!(events.maximum_events, selected_count + 1);
-        if selected.capacity() < selected_count {
-            return Err(MatchingError::InternalInvariantViolation);
-        }
-        let cancelled_order_count =
-            u64::try_from(selected_count).map_err(|_| MatchingError::SequenceExhausted)?;
-        let selected_values = selected.values_mut();
-        let selected_buffer = selected_values.as_ptr();
-        if selected_values.is_empty() {
-            self.try_select_account_orders_into(command.account_id, command.scope, selected_values)
-                .map_err(|_| MatchingError::InternalInvariantViolation)?;
-        } else {
-            self.try_validate_selected_account_orders(
-                command.account_id,
-                command.scope,
-                selected_values,
-            )
-            .map_err(|_| MatchingError::InternalInvariantViolation)?;
-        }
-        debug_assert_eq!(selected_values.len(), selected_count);
-        debug_assert_eq!(selected_values.as_ptr(), selected_buffer);
-        self.detach_account_order_scope(command.account_id, command.scope, selected_count);
-
-        let mut cancelled_quantity_lots = 0_u128;
-        for order_id in selected_values.drain(..) {
-            let removed = self.remove_order_preserving_account_index(order_id);
-            cancelled_quantity_lots = cancelled_quantity_lots
-                .checked_add(u128::from(removed.leaves))
-                .expect("u64-sized active-order set cannot overflow u128 total quantity");
-            self.push_cancelled(
-                &mut events,
-                command.command_id,
-                command.received_at,
-                order_id,
-                removed.leaves,
-                CancelReason::MassCancel,
-            )?;
-        }
+        let (cancelled_order_count, cancelled_quantity_lots) = self.cancel_account_orders(
+            command.account_id,
+            command.scope,
+            command.command_id,
+            command.received_at,
+            CancelReason::MassCancel,
+            &mut events,
+            &mut selected,
+        )?;
         self.push_event(
             &mut events,
             command.command_id,
@@ -11562,6 +11758,58 @@ impl OrderBook {
             events: events.finish(),
             replayed: false,
         })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared account cancellation primitive carries command/event provenance"
+    )]
+    fn cancel_account_orders(
+        &mut self,
+        account_id: AccountId,
+        scope: MassCancelScope,
+        command_id: CommandId,
+        received_at: TimestampNs,
+        reason: CancelReason,
+        events: &mut EventTraceBuilder,
+        selected: &mut PooledOrderSelection,
+    ) -> Result<(u64, u128), MatchingError> {
+        let selected_count = self.account_active_order_count(account_id, scope);
+        debug_assert_eq!(events.maximum_events, selected_count + 1);
+        if selected.capacity() < selected_count {
+            return Err(MatchingError::InternalInvariantViolation);
+        }
+        let cancelled_order_count =
+            u64::try_from(selected_count).map_err(|_| MatchingError::SequenceExhausted)?;
+        let selected_values = selected.values_mut();
+        let selected_buffer = selected_values.as_ptr();
+        if selected_values.is_empty() {
+            self.try_select_account_orders_into(account_id, scope, selected_values)
+                .map_err(|_| MatchingError::InternalInvariantViolation)?;
+        } else {
+            self.try_validate_selected_account_orders(account_id, scope, selected_values)
+                .map_err(|_| MatchingError::InternalInvariantViolation)?;
+        }
+        debug_assert_eq!(selected_values.len(), selected_count);
+        debug_assert_eq!(selected_values.as_ptr(), selected_buffer);
+        self.detach_account_order_scope(account_id, scope, selected_count);
+
+        let mut cancelled_quantity_lots = 0_u128;
+        for order_id in selected_values.drain(..) {
+            let removed = self.remove_order_preserving_account_index(order_id);
+            cancelled_quantity_lots = cancelled_quantity_lots
+                .checked_add(u128::from(removed.leaves))
+                .expect("u64-sized active-order set cannot overflow u128 total quantity");
+            self.push_cancelled(
+                events,
+                command_id,
+                received_at,
+                order_id,
+                removed.leaves,
+                reason,
+            )?;
+        }
+        Ok((cancelled_order_count, cancelled_quantity_lots))
     }
 
     fn apply_account_control(
@@ -11584,40 +11832,15 @@ impl OrderBook {
             AccountControlAction::BlockAndCancel => {
                 let mut selected =
                     selected.expect("block-and-cancel preparation owns selection storage");
-                let selected_count =
-                    self.account_active_order_count(command.account_id, MassCancelScope::All);
-                debug_assert_eq!(events.maximum_events, selected_count + 1);
-                if selected.capacity() < selected_count {
-                    return Err(MatchingError::InternalInvariantViolation);
-                }
-                let cancelled_order_count =
-                    u64::try_from(selected_count).map_err(|_| MatchingError::SequenceExhausted)?;
-                let selected_values = selected.values_mut();
-                let selected_buffer = selected_values.as_ptr();
-                self.take_account_orders_into(
+                self.cancel_account_orders(
                     command.account_id,
                     MassCancelScope::All,
-                    selected_values,
-                );
-                debug_assert_eq!(selected_values.len(), selected_count);
-                debug_assert_eq!(selected_values.as_ptr(), selected_buffer);
-
-                let mut cancelled_quantity_lots = 0_u128;
-                for order_id in selected_values.drain(..) {
-                    let removed = self.remove_order_preserving_account_index(order_id);
-                    cancelled_quantity_lots = cancelled_quantity_lots
-                        .checked_add(u128::from(removed.leaves))
-                        .expect("u64-sized active-order set cannot overflow u128 total quantity");
-                    self.push_cancelled(
-                        &mut events,
-                        command.command_id,
-                        command.received_at,
-                        order_id,
-                        removed.leaves,
-                        CancelReason::AccountControl,
-                    )?;
-                }
-                (cancelled_order_count, cancelled_quantity_lots)
+                    command.command_id,
+                    command.received_at,
+                    CancelReason::AccountControl,
+                    &mut events,
+                    &mut selected,
+                )?
             }
             AccountControlAction::Enable => {
                 assert!(
@@ -13170,17 +13393,6 @@ impl OrderBook {
                 }
             }
         }
-    }
-
-    fn take_account_orders_into(
-        &mut self,
-        account_id: AccountId,
-        scope: MassCancelScope,
-        selected: &mut Vec<OrderId>,
-    ) {
-        self.try_select_account_orders_into(account_id, scope, selected)
-            .expect("validated account list must remain queryable");
-        self.detach_account_order_scope(account_id, scope, selected.len());
     }
 
     fn levels_mut(&mut self, side: Side) -> &mut PriceLevels {
@@ -15719,6 +15931,65 @@ mod price_level_index_tests {
         assert_eq!(book.last_event_sequence(), sequence_before);
         assert_eq!(book.retained_command_count(), 2);
         assert_eq!(book.active_order_count(), 2);
+        assert_eq!(book.order_selection_pool_status(), pool_before);
+    }
+
+    #[test]
+    fn conditional_account_control_propagates_selection_corruption_and_returns_its_lease() {
+        let mut book = OrderBook::new(reserve_definition());
+        let account_id = AccountId::new(1).unwrap();
+        for (command_id, order_id, price) in [(1_u64, 1_u64, 100_i64), (2, 2, 99)] {
+            book.submit(Command::New(NewOrder {
+                command_id: CommandId::new(command_id).unwrap(),
+                order_id: OrderId::new(order_id).unwrap(),
+                account_id,
+                instrument_id: InstrumentId::new(1).unwrap(),
+                instrument_version: InstrumentVersion::new(1).unwrap(),
+                side: Side::Buy,
+                quantity: Quantity::new(1).unwrap(),
+                display: OrderDisplay::FullyDisplayed,
+                order_type: OrderType::Limit(Price::from_raw(price)),
+                time_in_force: TimeInForce::GoodTilCancelled,
+                self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                received_at: TimestampNs::from_unix_nanos(command_id),
+            }))
+            .unwrap();
+        }
+        book.orders
+            .get_mut(&OrderId::new(1).unwrap())
+            .unwrap()
+            .account_next = None;
+        let sequence_before = book.last_event_sequence();
+        let pool_before = book.order_selection_pool_status();
+
+        let error = book
+            .try_submit_account_control_if(
+                AccountControl {
+                    command_id: CommandId::new(3).unwrap(),
+                    account_id,
+                    instrument_id: InstrumentId::new(1).unwrap(),
+                    instrument_version: InstrumentVersion::new(1).unwrap(),
+                    expected_revision: 0,
+                    action: AccountControlAction::BlockAndCancel,
+                    received_at: TimestampNs::from_unix_nanos(3),
+                },
+                |_| panic!("selection corruption must bypass the predicate"),
+            )
+            .unwrap_err();
+
+        let ConditionalOrderError::Query(OrderBookQueryError::InvariantViolation(error)) = error
+        else {
+            panic!("selection corruption must remain a typed query failure");
+        };
+        assert!(
+            error
+                .detail()
+                .contains("list ended before its declared count")
+        );
+        assert_eq!(book.last_event_sequence(), sequence_before);
+        assert_eq!(book.retained_command_count(), 2);
+        assert_eq!(book.active_order_count(), 2);
+        assert_eq!(book.account_control(account_id).revision(), 0);
         assert_eq!(book.order_selection_pool_status(), pool_before);
     }
 

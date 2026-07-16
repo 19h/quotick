@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A146 are stable and are referenced from code comments and other
+identifiers A1-A147 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -5660,6 +5660,87 @@ release on noncommit or missing release on acceptance; interposed shard
 transition; durable protocol or recovery drift; or new wire value falsifies
 A146.
 
+## A147 — atomic conditional account-control observation
+
+**Assumption.** One `try_submit_account_control_if` call on an `OrderBook`,
+`RiskManagedOrderBook`, `DurableOrderBook`, or `DurableRiskOrderBook` holds the
+corresponding exclusive mutable shard borrow across ordinary `AccountControl`
+preparation, construction of one `AccountControlSubmissionObservation`, a
+borrowed local predicate, and commit of that same preparation. It reuses the
+ordinary revisioned fence, account-order cancellation, coupled-risk trace,
+report, persistence, and recovery paths.
+
+The observation contains the exact current A137 `AccountControlObservation`,
+requested action, and resulting fence state. For a core-admissible
+`BlockAndCancel` selecting `K` active orders, preparation performs the same
+expected A41 account lookup, selected-link validation, and ascending
+`OrderId` canonicalization as A146 inside its move-only A87 lease. It makes one
+exact fallible request for `K` caller-owned `ActiveOrderSnapshot` rows,
+validates every selected fully displayed, reserve, fully hidden, or dormant-
+stop state through A138, and reports the exact checked `u128` total leaves.
+`Enable` has no selected orders, requests no caller-owned selected output, and
+acquires no selection lease.
+
+Exact replay plus wrong-route, wrong-version, stale-revision, exhausted-
+revision, and other core business rejections return a reported
+`ConditionalCommandOutcome` without observation or predicate execution. On a
+coupled-risk shard, missing-profile authorization occurs before selected-state
+construction and predicate execution. A query failure, predicate decline, or
+unwind drops preparation and returns any lease before sequence, event,
+matching, risk, history, public, or WAL mutation. Acceptance validates and
+consumes the identical prepared IDs without another account-list traversal or
+sort, advances the account fence once, and releases exactly the selected
+reservations through the ordinary cancellation trace.
+
+Durable acceptance and business rejection retain command-before-state-before-
+report and append the existing two frames. Query failure, decline, unwind, and
+replay append zero frames. The observation and callback decision are process-
+local, unencoded, unauthenticated, and valid only within the call. Existing
+command, report, checkpoint, market-data, and wire values are unchanged.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A7, A9, A10, A12, A15, A18,
+A19, A20, A22, A37, A38, A39, A41, A48, A52, A54, A57, A72, A77, A80,
+A81, A82, A84, A87, A103, A117, A137, A138, A146, A147] Let `A` be ordinary
+account-control preparation cost, `K` selected orders, `F` predicate cost,
+and `M` ordinary account-control commit cost. Block-and-cancel selection,
+canonicalization, and complete selected-state validation cost expected
+`O(K log K)` after the expected `O(1)` account lookup. Acceptance costs
+`O(A + K log K + F + M)` and decline costs `O(A + K log K + F)`. Accepted
+commit reuses the prepared IDs and does not repeat account-list selection or
+sorting. The fixed prepared lease owns `O(K)` selected-ID scratch, the returned
+or retained observation owns `O(K)` rows, and evaluator auxiliary state is
+`O(1)`. Enable acceptance is `O(A + F + M)`, decline is `O(A + F)`, and its
+observation has `O(1)` state with no selected-output allocation or lease.
+Core/risk rejection and replay retain their existing preparation/gate path and
+skip selected output and `F`. Coupled acceptance releases `K` reservations in
+expected `O(K)` time. Durable acceptance and business rejection append two
+existing frames; query failure, decline, unwind, and replay append zero. Count,
+revision, and quantity arithmetic is exact integer arithmetic; approximation
+error is zero.
+
+**Falsification probe.** Across all four surfaces, exercise block-and-cancel
+over mixed fully displayed, reserve, fully hidden, dormant stop-market, and
+dormant stop-limit state with nonmonotonic identities, plus enable from a
+current blocked fence. Run accepting, declining, and unwinding predicates.
+Require exact instrument/version/sequence/account/current-fence/action/
+resulting-fence provenance, ascending IDs, complete snapshots, selected count,
+`u128` total leaves, unchanged unrelated orders, and empty allocation-free
+enable selection. Exercise wrong route/version, stale and exhausted revisions,
+every core rejection, unprofiled coupled risk, exact retry, command-ID
+collision, selected-output reservation failure, account-list corruption,
+selection-pool exhaustion, and durable write/report failure.
+
+Count predicate and allocation calls; compare selection-pool availability,
+private/public book, fence revision, risk positions/reservations/exposures,
+command history, WAL frames, and plain/coupled-risk reopen state. Any selected
+output or predicate on rejection or replay; selected work before risk
+authorization; enable lease/output allocation; unrelated-order scan;
+noncanonical, incomplete, aliased, or provenance-drifted observation; second
+selection at commit; partial fence/cancellation mutation; WAL growth before
+acceptance; lease loss; reservation release on noncommit or missing release on
+acceptance; interposed shard transition; durable protocol or recovery drift;
+or new wire value falsifies A147.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -5912,6 +5993,29 @@ capability, a remaining risk, or an opportunity.
   decision. It adds no remote or asynchronous validity, callback
   authentication or durability, cross-shard firm/session kill coordination,
   delegated cancel-on-behalf authorization, or completion aggregation.
+
+- **High impact:** A147 closes the account-fence/order-query-to-control race
+  inside one local call. A block-and-cancel predicate receives the exact
+  current fence, requested action, resulting blocked state, and canonical
+  selected resting/dormant order set that acceptance removes. Enable binds the
+  current and resulting fence without selected-order output or a lease.
+
+- **Medium impact opportunity:** one account-control predicate can gate on the
+  current revision/state and exact cancellation set, including per-order
+  leaves, display, expiry, dormant trigger state, aggregate quantity, and book
+  sequence, without correlating separate fence and account-order queries.
+
+- **Medium impact risk:** conditional block-and-cancel materializes `O(K)`
+  private caller output and executes its predicate synchronously while the
+  shard is exclusively borrowed. Allocation, validation, callback latency, and
+  external blocking extend local control latency; no callback deadline or
+  scheduling isolation is provided. Conditional enable avoids that output.
+
+- **High impact boundary:** A147 is one process-local synchronous account
+  control. It adds no remote or asynchronous validity, callback authentication
+  or durability, controller authorization, cross-shard firm/session kill
+  coordination, delegated cancel-on-behalf authority, or completion
+  aggregation.
 
 - **Medium impact opportunity:** one predicate can gate immediate slippage,
   per-price concentration, passive resting admission, reserve/hidden residual

@@ -21,14 +21,14 @@ use crate::journal::{
     SegmentedJournalError, SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
 };
 use crate::matching::{
-    ActiveOrderObservation, CancelOrder, Command, CommandPreparation, ConditionalCommandOutcome,
-    ConditionalExecutionPreflight, ConditionalExecutionPreparation, ConditionalOrderOutcome,
-    ExecutionReport, ImmediateExecutionCurve, ImmediateExecutionCurveOutcome,
-    ImmediateExecutionOutcome, ImmediateExecutionQuote, ImmediateExecutionSubmission,
-    InvariantViolation, MassCancel, MassCancelObservation, MatchingError, NewOrder, OrderBook,
-    OrderBookCheckpoint, OrderBookCheckpointCapture, OrderBookCheckpointError, OrderBookLimits,
-    OrderBookQueryError, OrderExecution, PreparedCommand, ReplaceOrder,
-    evaluate_conditional_execution,
+    AccountControl, AccountControlSubmissionObservation, ActiveOrderObservation, CancelOrder,
+    Command, CommandPreparation, ConditionalCommandOutcome, ConditionalExecutionPreflight,
+    ConditionalExecutionPreparation, ConditionalOrderOutcome, ExecutionReport,
+    ImmediateExecutionCurve, ImmediateExecutionCurveOutcome, ImmediateExecutionOutcome,
+    ImmediateExecutionQuote, ImmediateExecutionSubmission, InvariantViolation, MassCancel,
+    MassCancelObservation, MatchingError, NewOrder, OrderBook, OrderBookCheckpoint,
+    OrderBookCheckpointCapture, OrderBookCheckpointError, OrderBookLimits, OrderBookQueryError,
+    OrderExecution, PreparedCommand, ReplaceOrder, evaluate_conditional_execution,
 };
 use crate::snapshot::{
     CheckpointAnchor, CheckpointCutoverReceipt, CheckpointSlot, SnapshotError, SnapshotFile,
@@ -879,6 +879,27 @@ impl DurableOrderBook {
         self.submit_conditional_mass_cancel(command, |_, observation| Ok(observation), accept)
     }
 
+    /// Durably observes and conditionally applies one account control.
+    ///
+    /// Replay and core rejection bypass observation and `accept`. Otherwise
+    /// the predicate borrows the frozen current fence and complete canonical
+    /// block-and-cancel selection before WAL append. Enable observations are
+    /// selection-free. Observation failure, decline, or unwind changes neither
+    /// WAL nor semantic state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] for poison, preparation, observation, journal,
+    /// or commit failure. A post-acknowledgement failure poisons the instance
+    /// for deterministic reopen recovery.
+    pub fn try_submit_account_control_if(
+        &mut self,
+        command: AccountControl,
+        accept: impl FnOnce(&AccountControlSubmissionObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<AccountControlSubmissionObservation>, DurableError> {
+        self.submit_conditional_account_control(command, |_, observation| Ok(observation), accept)
+    }
+
     /// Durably and atomically quotes and conditionally submits one canonical IOC order.
     ///
     /// Replay and core rejection bypass `accept`. A declined quote is returned
@@ -1005,6 +1026,21 @@ impl DurableOrderBook {
         let preflight = self
             .book
             .prepare_conditional_mass_cancel::<DurableError>(command)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_account_control<T>(
+        &mut self,
+        command: AccountControl,
+        observe: impl FnOnce(&OrderBook, AccountControlSubmissionObservation) -> Result<T, DurableError>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, DurableError> {
+        if self.is_poisoned() {
+            return Err(DurableError::Poisoned);
+        }
+        let preflight = self
+            .book
+            .prepare_conditional_account_control::<DurableError>(command)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 
