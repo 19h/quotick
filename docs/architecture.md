@@ -430,6 +430,18 @@ shard, from command admission through checkpoint capture.
       drive prefix retirement without another replay: cutover synchronizes the
       current head, copies only frames after that cursor behind `anchor(G)`,
       and advances the epoch after physical publication.
+36. Live retained command/report history is a borrowed view of the existing
+    bounded idempotency cache, not a second history store.
+    - Lookup by `CommandId` returns the exact retained command and canonical
+      report in expected `O(1)` time. The report remains `replayed = false`;
+      only the response clone produced for an exact retry is marked replayed.
+    - Complete iteration follows committed command-sequence order because
+      reports enter the append-only dense cache only after commit. Accepted
+      and business-rejected commands each contribute one row; exact retries
+      contribute none.
+    - Both interfaces borrow cache storage. They allocate no output, clone no
+      command or report, copy no event trace, construct no checkpoint, and
+      mutate no matching state.
 
 ### Storage layout and complexity
 
@@ -844,6 +856,18 @@ process-local call-auction engine.
     and ledger-settlement adapters consume its exact report boundary; the engine
     itself infers no risk, publication, calendar/session scheduling, controller
     authentication, reference/dynamic-band source, or venue-conformance rule.
+11. Live retained command/report history is a borrowed view of the existing
+    bounded idempotency cache, not a second history store.
+    - Lookup by `CommandId` returns the exact retained command and canonical
+      report in expected `O(1)` time. The report remains `replayed = false`;
+      only the response clone produced for an exact retry is marked replayed.
+    - Complete iteration follows committed command-sequence order, includes
+      accepted commands and business rejections, and excludes exact retries.
+      The dense order is the same order independently audited under invariant
+      8 and restored by checkpoint and WAL recovery.
+    - Both interfaces borrow cache storage. They allocate no output, clone no
+      command or report, copy no event trace, construct no checkpoint, and
+      mutate no auction state.
 
 ## Coupled call-auction risk invariants
 
@@ -1953,6 +1977,12 @@ Call-auction engine audit tests corrupt event grammar, including canonical
 mass-cancel removal/completion traces, and deliberately remove/reinsert an
 early report-cache entry, proving that the allocation-free dense-history pass
 rejects both semantic and chronological reordering.
+Continuous and call-auction retained-history query tests cover accepted and
+business-rejected rows, exact lookup and missing identity, canonical commit
+order, exact-size exhaustion, report address identity between lookup and
+iteration, retry non-insertion, unchanged capacity telemetry, and structural
+validation. Durable reopen tests require the same canonical history to be
+available through the recovered live engine.
 Call-auction risk unit tests corrupt account-list cycles and unlink an otherwise
 valid reservation, then exercise middle removal, partial decrement, head
 removal, and final removal while auditing after every transition.
@@ -2291,6 +2321,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Security boundary | authenticated principals, authorization policy, secret management, audit export, and abuse controls |
 | Medium | Gateways and schemas | versioned binary protocol, FIX adapter, backpressure, session recovery, and conformance fixtures |
 | Medium | Market-data distribution | constructor-reserved per-instrument short-gap replay for continuous updates and complete call-auction command batches, with typed gap/collision/eviction/boundary handling and snapshot fallback, is implemented; remaining work is authenticated transport framing, entitlement, fanout, remote retransmission sessions, bandwidth control, and conformance fixtures |
+| Medium | Order-management history | bounded zero-copy live lookup and chronological iteration over continuous and call-auction command/report history are implemented and survive WAL/checkpoint recovery; remaining work is authenticated account-scoped authorization, filtering, remote pagination/transport, audit export, and fenced history-generation rollover |
 | Medium | Operations | metrics, traces, structured logs, health, capacity limits, alert rules, and runbooks |
 | Medium | Performance evidence | pinned-hardware benchmarks, allocation counts, tail latency, saturation, and regression thresholds |
 | Medium | Verification expansion | model-based/property tests, fuzzing, crash simulation, concurrency model checking, and long soak tests |

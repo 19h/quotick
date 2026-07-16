@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A119 are stable and are referenced from code comments and other
+identifiers A1-A120 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -149,14 +149,17 @@ or silent identity/control/event eviction falsifies A9.
 
 ## A10 — unobservable hash iteration order
 
-**Assumption.** Hash iteration order is never externally observable; all
-exposed ordered data comes from price trees, FIFO links, or journal vectors.
+**Assumption.** Hash bucket/probe order and process-key hash order are never
+externally observable. Exposed ordered data comes from price trees, FIFO links,
+journal vectors, or the insertion-ordered dense command-history component of
+bounded retry caches under A75/A84/A120; no output is derived from bucket
+order.
 
 **Dependent results.** Deterministic public outputs across process seeds.
 
 **Falsification probe.** Replay identical command streams under varied hash
-seeds and byte-compare reports, depth, and journal order. Any difference
-falsifies A10.
+seeds and byte-compare reports, depth, journal order, and retained-history
+iteration. Any difference falsifies A10.
 
 ## A11 — once-only trade settlement
 
@@ -2196,7 +2199,7 @@ Checkpoint semantic validation proves chronological history before restoration
 inserts it in that same order. Dense order is therefore an audited engine
 invariant rather than an unordered projection.
 
-**Dependent results.** [A75] A successful engine audit checks cache
+**Dependent results.** [A75, A120] A successful engine audit checks cache
 layout/identity, command and event continuity, report grammar, phase replay,
 capacity, and the complete A74 book directly in `O(H + E)` history work and
 `O(1)` auxiliary space for `H` retained commands containing `E` events, with no
@@ -4025,6 +4028,46 @@ contradiction, partial inverse/replacement effect, matching/risk state mutation,
 second retry effect, split frame/checkpoint record, recovery divergence, or
 inferred authorization/reason/external synchronization falsifies A119.
 
+## A120 — zero-copy live command/report history
+
+**Assumption.** The continuous `OrderBook` and sequenced
+`CallAuctionEngine` retain one bounded, append-only command/report cache per
+generation. A completed accepted command or business rejection is inserted
+only at its exact next command sequence; exact retries do not insert. A84 and
+A75 audit the continuous and auction dense orders, respectively. Full-WAL
+replay and checkpoint restoration rebuild those rows in the same chronological
+order. The cached canonical report remains `replayed = false`; replay marking
+is applied only to the response clone returned by an exact retry.
+
+`retained_command_report` and `retained_history` borrow this existing cache
+under one immutable engine borrow. They create neither a second authoritative
+store nor an owned output collection. The local interfaces provide no
+principal authentication, account filtering, entitlement, remote pagination,
+transport framing, eviction, or generation rollover.
+
+**Dependent results.** [A3, A4, A9, A10, A12, A49, A65, A66, A75, A84,
+A85, A120] Lookup by `CommandId` is expected `O(1)` outside adversarial hash
+clusters. Complete iteration is `O(C)` for `C` retained commands with `O(1)`
+iterator state. Both operations allocate no output storage, clone no command
+or report, copy no event, construct no checkpoint, and perform no matching,
+risk, auction, WAL, snapshot, sequence, or capacity mutation. The borrowed row
+contains the exact cached command and report, includes accepted and rejected
+outcomes, and remains available after direct, full-WAL, or checkpoint-plus-
+suffix recovery. No wire version changes because no persisted value changes.
+
+**Falsification probe.** Insert accepted and business-rejected continuous and
+auction commands, perform exact retries and differing-content collisions, and
+query missing and present identities at ordinary and total history capacity.
+Compare lookup and iteration addresses, commands, reports, replay flags,
+command/event sequences, exact iterator length, cache/event telemetry, and
+complete state bytes before and after every query. Repeat after full-WAL,
+direct-checkpoint, and checkpoint-plus-suffix restoration, including a source
+suffix after capture. Deliberately reorder dense history or corrupt its event-
+arena ranges and require the existing structural audits to fail. Any query
+allocation, copy, reordered/duplicated/omitted row, `replayed = true` cached
+report, retry insertion, state or capacity mutation, recovery difference, or
+borrowed view surviving a mutable engine transition falsifies A120.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -4052,6 +4095,19 @@ capability, a remaining risk, or an opportunity.
   account-list corruption, and large caller-owned results. Target-hardware
   allocator latency, resident memory, and sustained 250,000-order snapshot
   cadence remain unknown until measured.
+
+- **Medium impact:** continuous and call-auction live command/report history
+  now supports expected constant-time exact lookup and zero-copy chronological
+  iteration over the bounded idempotency cache under A120. Accepted and
+  rejected outcomes remain queryable after WAL/checkpoint recovery without a
+  checkpoint allocation. Target-hardware cache behavior for full-history scans
+  remains unknown until measured.
+
+- **High impact risk:** the local history view exposes complete private
+  command/report content to its in-process caller. Authentication,
+  account-scoped authorization/filtering, entitlement, remote pagination and
+  transport, audit export, eviction, and fenced generation rollover remain
+  separate interfaces or lifecycle protocols.
 
 - **High impact:** continuous FOK and minimum-quantity IOC now have atomic
   behavior under all four STP policies. FOK decrement-and-cancel requires the

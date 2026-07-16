@@ -67,6 +67,7 @@ verify deterministic replay during recovery.
 | `domain` | Validated identifiers, integer fixed-point `Price` and `Quantity`, timestamps, accounting dates |
 | `instrument` | Effective-time-versioned instrument catalog, per-version admission rules, settlement conventions |
 | `calendar` | Immutable versioned UTC session schedules, day/session TIF normalization, expiry controls |
+| `history` | Zero-copy borrowed views over bounded continuous and call-auction command/report history |
 | `matching` | Bounded price-time-priority `OrderBook` with prepare/commit split, event traces, and checkpoints |
 | `auction`, `auction_book`, `auction_engine` | Pure clearing-price and allocation kernels, bounded collection book, sequenced phase engine |
 | `risk`, `auction_risk` | Immutable account profiles, conservative reservations, coupled matching and auction shards |
@@ -277,6 +278,10 @@ Run any program with `cargo run --example <name>`.
 - Exact-command idempotency: retries replay the cached report without
   consuming capacity, and `CommandId` reuse with different content is a typed
   collision error; event and trade sequences are strictly monotonic.
+- Zero-copy live history lookup by `CommandId` and exact-size chronological
+  iteration over accepted and business-rejected command/report rows. Both
+  interfaces borrow the bounded retry cache, allocate no output collection,
+  and leave canonical cached reports marked `replayed = false`.
 - A `prepare()`/`commit()` split that validates a command once against an
   immutable borrow so it can be persisted before mutating the book; stale or
   foreign preparations cannot commit.
@@ -328,6 +333,9 @@ Run any program with `cargo run --example <name>`.
   guaranteeing that currently valid individual/non-empty mass cancellation,
   freeze/close, and uncross commands remain possible for a full book even at
   exhausted ordinary capacity.
+- Zero-copy exact lookup and chronological iteration over the engine's bounded
+  command/report history, including accepted commands and business rejections;
+  exact retries add no row and do not change the canonical cached report.
 
 ### Pre-trade risk
 
@@ -441,7 +449,9 @@ Run any program with `cargo run --example <name>`.
   coupled auction/risk record every command before committing the in-memory
   transition, verify deterministic replay on recovery, complete at most one
   interrupted report, and rebuild exact-retry caches without appending retry
-  frames. `DurableLedger` follows the same discipline per ledger event: each
+  frames. Recovered continuous and call-auction engines expose the same
+  zero-copy live command/report history in canonical sequence order.
+  `DurableLedger` follows the same discipline per ledger event: each
   entry, correction, or batch is one atomic WAL frame recorded before balances
   commit. Complete auction settlement reuses those entry/batch WAL and exact-
   retry paths without a second persistence protocol, including complete
@@ -497,6 +507,10 @@ market-data transport, administrative interfaces, or reporting systems.
 Continuous and call-auction market data include process-local bounded suffix
 replay rings, but no remote request/session, authentication, fanout, or
 entitlement layer.
+Live continuous and call-auction command/report history is likewise a local
+borrowed order-management interface; it provides no authenticated remote
+transport, account filtering, entitlement, pagination, audit export, eviction,
+or generation rollover.
 
 The matching model is a continuous price-time-priority book with sequenced
 instrument-wide trading-state controls, plus a separate bounded call-auction
@@ -534,7 +548,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 119 tagged assumptions (A1–A119), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 120 tagged assumptions (A1–A120), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -605,7 +619,10 @@ includes:
   policy, atomic FOK decrement-and-cancel barriers and exact minimum-quantity
   decrement-and-cancel execution through direct and dormant paths, coupled-risk
   checkpoints, durable recovery, risk rejection and reservation release, and
-  capacity behavior at every configured bound.
+  capacity behavior at every configured bound. Retained-history queries cover
+  accepted and rejected rows, chronological exact-size iteration, zero-copy
+  address identity, retry non-insertion, unchanged capacity telemetry, and
+  durable recovery.
 - **Trading calendars:** schedule chronology and identity validation, exact
   half-open entry boundaries, multi-session trading dates, day/session TIF
   normalization, boundary-checked expiry controls, malformed payload rejection,
@@ -623,8 +640,11 @@ includes:
   risk, public-feed, replay, snapshot, and WAL recovery, and a 10,000-command
   engine phase-model run. Fail-closed self-trade abort is covered across
   canonical pairing, sequencing, risk neutrality, public no-change projection,
-  stable codecs, and durable exact retry. Settlement coverage proves one-entry
-  and multi-entry mappings, canonical explicit fee binding, instrument/version
+  stable codecs, and durable exact retry. Retained auction-history queries
+  cover accepted and rejected rows, exact lookup, zero-copy chronological
+  iteration, retry stability, unchanged resource telemetry, and durable
+  recovery. Settlement coverage proves one-entry and multi-entry mappings,
+  canonical explicit fee binding, instrument/version
   mismatch, invalid fee and same-account rejection, overflow/capacity
   atomicity, partial-prior-commit detection, one-frame recovery, checkpoint
   cutover, and WAL-free exact retry. Full-settlement correction coverage adds

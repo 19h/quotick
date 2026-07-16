@@ -170,6 +170,12 @@ fn immutable_matching_checkpoint_clones_share_row_and_event_storage() {
     drop(report);
     drop(book);
     let mut restored = OrderBook::from_checkpoint(&clone).unwrap();
+    let retained = restored
+        .retained_command_report(CommandId::new(1).unwrap())
+        .unwrap();
+    assert_eq!(retained.command(), &command);
+    assert_eq!(retained.report(), clone.history()[0].report());
+    assert_eq!(restored.retained_history().len(), 1);
     let retry = restored.submit(command).unwrap();
     assert!(retry.replayed);
     assert_eq!(retry.events, clone.history()[0].report().events);

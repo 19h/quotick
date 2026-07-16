@@ -221,6 +221,14 @@ fn submit_writes_command_then_report_and_reopen_reconstructs_state() {
         reopened.book().best_bid().expect("bid restored").quantity,
         5
     );
+    let retained = reopened
+        .book()
+        .retained_command_report(CommandId::new(1).unwrap())
+        .unwrap();
+    assert_eq!(retained.command(), &value);
+    assert_eq!(retained.report(), &first);
+    assert!(!retained.report().replayed);
+    assert_eq!(reopened.book().retained_history().len(), 1);
     reopened.book().validate().expect("restored book validates");
 }
 

@@ -26,6 +26,7 @@ use crate::auction_book::{
     PreparedCallAuctionUncross,
 };
 use crate::bounded_hash::{BoundedHashMap, BoundedHashSet};
+use crate::history::RetainedCommandReport;
 use crate::instrument::{AdmissionError, InstrumentDefinition};
 use crate::matching::MassCancelScope;
 use crate::trace_arena::AppendOnlyTraceArena;
@@ -2995,6 +2996,36 @@ impl CallAuctionEngine {
     #[must_use]
     pub const fn next_event_sequence(&self) -> u64 {
         self.next_event_sequence
+    }
+
+    /// Returns one retained command and its canonical non-replayed report.
+    ///
+    /// Lookup is expected `O(1)` in the bounded command-history index and
+    /// borrows the exact idempotency storage without allocation or trace copy.
+    #[must_use]
+    pub fn retained_command_report(
+        &self,
+        command_id: CommandId,
+    ) -> Option<RetainedCommandReport<'_, CallAuctionCommand, CallAuctionExecutionReport>> {
+        self.reports
+            .get(&command_id)
+            .map(|cached| RetainedCommandReport::new(&cached.command, &cached.report))
+    }
+
+    /// Iterates complete retained command/report history in commit order.
+    ///
+    /// The iterator is zero-copy, allocation-free, and exact-size. Exact retry
+    /// does not add a row; retained reports remain canonical with
+    /// `replayed = false`.
+    #[must_use]
+    pub fn retained_history(
+        &self,
+    ) -> impl ExactSizeIterator<
+        Item = RetainedCommandReport<'_, CallAuctionCommand, CallAuctionExecutionReport>,
+    > + '_ {
+        self.reports
+            .values()
+            .map(|cached| RetainedCommandReport::new(&cached.command, &cached.report))
     }
 
     /// Returns command-cache occupancy and capacity.

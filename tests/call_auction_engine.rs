@@ -1483,3 +1483,53 @@ fn engine_limits_derive_terminal_and_report_bounds() {
     );
     assert!(make(7, 4, 9, 5).is_ok());
 }
+
+#[test]
+fn retained_auction_history_is_zero_copy_chronological_and_retry_stable() {
+    let mut engine =
+        CallAuctionEngine::try_with_limits(definition(), engine_limits(4, 8, 16)).unwrap();
+    let phase = phase_command(1, 1, 0, CallAuctionPhase::Collecting);
+    let submit = submit_command(
+        2,
+        order(10, 11, Side::Buy, AuctionOrderConstraint::Market, 5),
+    );
+    let reject = cancel_command(3, 11, 99);
+    let phase_report = engine.submit(phase).unwrap();
+    let submit_report = engine.submit(submit).unwrap();
+    let rejected_report = engine.submit(reject).unwrap();
+    assert_eq!(
+        rejected_report.outcome,
+        CallAuctionCommandOutcome::Rejected(CallAuctionRejectReason::UnknownOrder)
+    );
+    assert!(engine.submit(submit).unwrap().replayed);
+    let resources = engine.resource_status();
+
+    let lookup = engine
+        .retained_command_report(CommandId::new(2).unwrap())
+        .unwrap();
+    assert_eq!(lookup.command(), &submit);
+    assert_eq!(lookup.report(), &submit_report);
+    assert!(!lookup.report().replayed);
+    assert!(
+        engine
+            .retained_command_report(CommandId::new(99).unwrap())
+            .is_none()
+    );
+
+    let mut history = engine.retained_history();
+    assert_eq!(history.len(), 3);
+    let first = history.next().unwrap();
+    let second = history.next().unwrap();
+    let third = history.next().unwrap();
+    assert_eq!(first.command(), &phase);
+    assert_eq!(first.report(), &phase_report);
+    assert_eq!(second.command(), &submit);
+    assert_eq!(third.command(), &reject);
+    assert_eq!(third.report(), &rejected_report);
+    assert!(std::ptr::eq(lookup.command(), second.command()));
+    assert!(std::ptr::eq(lookup.report(), second.report()));
+    assert!(history.next().is_none());
+    assert_eq!(engine.resource_status().retained_commands, 3);
+    assert_eq!(engine.resource_status(), resources);
+    engine.validate().unwrap();
+}

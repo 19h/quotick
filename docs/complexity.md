@@ -158,6 +158,13 @@ and `R = T - S` resting orders, `try_active_orders` costs
 orders. All three reserve before copying, perform no authoritative mutation,
 and drop any private partial construction on an invariant failure.
 
+For `C` retained commands, `retained_command_report` performs one expected
+`O(1)` bounded-hash lookup and returns one borrowed command/report view.
+`retained_history` has `O(1)` setup and exact-size iterator state; consuming
+all rows is `O(C)` time. Neither path allocates output, clones a command or
+report, copies an event trace, or mutates the book. An adversarial full hash
+collision cluster can make exact lookup `O(C)` without changing storage.
+
 ## Call-auction discovery and allocation
 
 For `B` canonical aggregate bid levels and `A` canonical aggregate ask
@@ -256,6 +263,13 @@ applies the underlying collection-book bound above. Checkpoint capture reuses
 the same canonical order and does not sort the retained history. Engine state
 occupies `O(H_max + I_max + O_max + P_max)` memory, including the mass-cancel
 scratch vector.
+
+Exact retained-report lookup performs one expected `O(1)` bounded-hash access
+and returns one borrowed command/report view. Complete retained-history
+iteration has `O(1)` setup, `O(H)` traversal time, and `O(1)` iterator state.
+It allocates no output, clones no command or report, copies no event trace, and
+does not mutate auction state. An adversarial full collision cluster can make
+exact lookup `O(H)` without changing the finite cache bound.
 
 ## Auction risk
 

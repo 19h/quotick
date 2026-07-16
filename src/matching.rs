@@ -29,6 +29,7 @@ use crate::domain::{
     AccountId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
     StopReferenceSequence, StopReferenceSourceId, StopReferenceSourceVersion, TimestampNs, TradeId,
 };
+use crate::history::RetainedCommandReport;
 use crate::indexed_avl::{IndexedAvlHandle, IndexedAvlMap};
 use crate::instrument::{AdmissionError, InstrumentDefinition, TradingState};
 use crate::trace_arena::AppendOnlyTraceArena;
@@ -6567,6 +6568,35 @@ impl OrderBook {
     #[must_use]
     pub fn retained_command_count(&self) -> usize {
         self.reports.len()
+    }
+
+    /// Returns one retained command and its canonical non-replayed report.
+    ///
+    /// Lookup is expected `O(1)` in the bounded command-history index and
+    /// borrows the exact idempotency storage without allocation or trace copy.
+    #[must_use]
+    pub fn retained_command_report(
+        &self,
+        command_id: CommandId,
+    ) -> Option<RetainedCommandReport<'_, Command, ExecutionReport>> {
+        self.reports
+            .get(&command_id)
+            .map(|cached| RetainedCommandReport::new(&cached.command, &cached.report))
+    }
+
+    /// Iterates complete retained command/report history in commit order.
+    ///
+    /// The iterator is zero-copy, allocation-free, and exact-size. Exact retry
+    /// does not add a row; retained reports remain canonical with
+    /// `replayed = false`.
+    #[must_use]
+    pub fn retained_history(
+        &self,
+    ) -> impl ExactSizeIterator<Item = RetainedCommandReport<'_, Command, ExecutionReport>> + '_
+    {
+        self.reports
+            .values()
+            .map(|cached| RetainedCommandReport::new(&cached.command, &cached.report))
     }
 
     /// Returns one account's effective admission fence and revision.

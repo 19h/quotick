@@ -24,6 +24,7 @@ pub mod durable_auction;
 pub mod durable_ledger;
 pub mod durable_risk;
 mod durable_storage;
+pub mod history;
 mod indexed_avl;
 pub mod instrument;
 pub mod journal;

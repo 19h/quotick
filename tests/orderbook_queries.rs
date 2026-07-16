@@ -3,8 +3,9 @@ use quotick::instrument::{
     QuantityRules, ReserveOrderRules, TradingState,
 };
 use quotick::matching::{
-    Command, MassCancelScope, NewOrder, OrderBook, OrderBookQueryError, OrderBookQueryResource,
-    OrderDisplay, OrderType, SelfTradePrevention, TimeInForce,
+    Command, CommandOutcome, MassCancelScope, MatchingHashIndex, NewOrder, OrderBook,
+    OrderBookQueryError, OrderBookQueryResource, OrderDisplay, OrderType, RejectReason,
+    SelfTradePrevention, TimeInForce,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -144,4 +145,50 @@ fn query_failures_carry_the_exact_output_resource_and_bound() {
         "order-book active-order output could not reserve 250000 entries"
     );
     assert!(std::error::Error::source(&error).is_none());
+}
+
+#[test]
+fn retained_command_history_is_zero_copy_chronological_and_retry_stable() {
+    let first = order(1, 10, 11, Side::Buy, 100, 5, OrderDisplay::FullyDisplayed);
+    let duplicate_order = order(2, 10, 12, Side::Buy, 90, 7, OrderDisplay::FullyDisplayed);
+    let mut book = OrderBook::new(definition());
+    let accepted = book.submit(first).unwrap();
+    let rejected = book.submit(duplicate_order).unwrap();
+    assert_eq!(
+        rejected.outcome,
+        CommandOutcome::Rejected(RejectReason::DuplicateOrder)
+    );
+    assert!(book.submit(first).unwrap().replayed);
+    let history_index = book.hash_index_status(MatchingHashIndex::CommandHistory);
+
+    let first_lookup = book
+        .retained_command_report(CommandId::new(1).unwrap())
+        .unwrap();
+    assert_eq!(first_lookup.command(), &first);
+    assert_eq!(first_lookup.report(), &accepted);
+    assert!(!first_lookup.report().replayed);
+    assert!(
+        book.retained_command_report(CommandId::new(99).unwrap())
+            .is_none()
+    );
+
+    let mut history = book.retained_history();
+    assert_eq!(history.len(), 2);
+    let first_history = history.next().unwrap();
+    let second_history = history.next().unwrap();
+    assert_eq!(first_history.command(), &first);
+    assert_eq!(second_history.command(), &duplicate_order);
+    assert_eq!(second_history.report(), &rejected);
+    assert!(std::ptr::eq(
+        first_lookup.command(),
+        first_history.command()
+    ));
+    assert!(std::ptr::eq(first_lookup.report(), first_history.report()));
+    assert!(history.next().is_none());
+    assert_eq!(book.retained_command_count(), 2);
+    assert_eq!(
+        book.hash_index_status(MatchingHashIndex::CommandHistory),
+        history_index
+    );
+    book.validate().unwrap();
 }

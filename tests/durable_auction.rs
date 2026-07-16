@@ -759,6 +759,14 @@ fn durable_auction_round_trip_recovers_phase_book_trades_and_exact_retry() {
     );
     assert_eq!(reopened.engine().book().active_order_count(), 0);
     assert_eq!(reopened.engine().book().next_trade_id(), 2);
+    let retained = reopened
+        .engine()
+        .retained_command_report(CommandId::new(5).unwrap())
+        .unwrap();
+    assert_eq!(retained.command(), &uncross(5));
+    assert_eq!(retained.report().command_sequence, 5);
+    assert!(!retained.report().replayed);
+    assert_eq!(reopened.engine().retained_history().len(), 5);
     reopened.engine().validate().unwrap();
     let reopened_frames = frame_kinds(file.path());
     let reopened_retry = reopened.submit(uncross(5)).unwrap();
@@ -1225,6 +1233,12 @@ fn auction_checkpoint_has_stable_kind_codec_and_direct_restore() {
     assert_eq!(restored.phase_snapshot(), engine.phase_snapshot());
     assert_eq!(restored.book().active_order_count(), 0);
     assert_eq!(restored.book().next_trade_id(), 2);
+    let retained = restored
+        .retained_command_report(CommandId::new(5).unwrap())
+        .unwrap();
+    assert_eq!(retained.command(), &uncross(5));
+    assert_eq!(retained.report(), shared.history()[4].report());
+    assert_eq!(restored.retained_history().len(), 5);
     assert!(restored.submit(uncross(5)).unwrap().replayed);
     restored.validate().unwrap();
 
