@@ -71,7 +71,7 @@ verify deterministic replay during recovery.
 | `auction`, `auction_book`, `auction_engine` | Pure clearing-price and allocation kernels, bounded collection book, sequenced phase engine |
 | `risk`, `auction_risk` | Immutable account profiles, conservative reservations, coupled matching and auction shards |
 | `market_data`, `auction_market_data` | Anonymized L2 publishers and gap-detecting replicas for both trading models |
-| `ledger` | Atomic multi-asset double-entry ledger with DVP trade settlement |
+| `ledger` | Atomic multi-asset double-entry ledger with continuous-trade and complete call-auction DVP settlement |
 | `journal`, `snapshot` | CRC-32C WAL (single-file and segmented), `QSNP` semantic snapshots, A/B checkpoint-cutover primitives |
 | `durable`, `durable_risk`, `durable_auction`, `durable_ledger` | Crash-recoverable single-writer runtimes |
 | `codec` | Stable little-endian `BinaryCodec` implementations for durable records and calendar images |
@@ -194,7 +194,7 @@ printing a summary.
 | [`versioned_universe`](examples/versioned_universe.rs) | Effective-time instrument selection and version-bound shard routing |
 | [`order_lifecycle`](examples/order_lifecycle.rs) | Reserve priority, hidden liquidity, sourced stop activation, GTD expiry, account fences, and instrument controls |
 | [`indicative_cross`](examples/indicative_cross.rs) | Risk-managed call-auction collection, sequenced indicative publication, deterministic uncross, and complete-batch public replay |
-| [`auction_restart`](examples/auction_restart.rs) | Durable auction checkpoint cutover, phase-transition suffix replay, and exact retry |
+| [`auction_restart`](examples/auction_restart.rs) | Durable auction checkpoint cutover, suffix replay, exact retry, and atomic report settlement |
 | [`signed_price_discovery`](examples/signed_price_discovery.rs) | Banded negative-price discovery, pressure policy, and exact order allocation |
 | [`feed_repair`](examples/feed_repair.rs) | Sequence-gap detection, retained replay, snapshot fallback, and incremental continuation |
 | [`clearing_ledger`](examples/clearing_ledger.rs) | Atomic funding, trade settlement, correction, period controls, trial balance, and reconciliation |
@@ -204,6 +204,7 @@ printing a summary.
 | [`state_handoff`](examples/state_handoff.rs) | Off-thread checkpoint verification, stable encoding, direct restore, and deterministic continuation |
 
 Run any program with `cargo run --example <name>`.
+
 
 ## Capabilities
 
@@ -310,7 +311,8 @@ Run any program with `cargo run --example <name>`.
   remainder policies (`RetainAll`, `CancelMarket`, `CancelAll`); the only
   represented self-trade policies are explicit `Permit` and fail-closed
   `Abort`, which rejects the first canonical same-account pair without
-  re-pairing or mutation.
+  re-pairing or mutation. Every committed trade carries the collection book's
+  immutable instrument ID and definition version.
 - A sequenced `CallAuctionEngine` with explicit `Closed`/`Collecting`/`Frozen`
   phases, contiguous `AuctionId` cycles, revision-checked controls, exact
   command idempotency, exact one-event amendment and two-event replacement
@@ -392,6 +394,11 @@ Run any program with `cargo run --example <name>`.
 - Explicit signed epoch-day effective dates, nondecreasing UTC booking
   timestamps, and delivery-versus-payment settlement bound to the exact
   instrument version.
+- A complete accepted call-auction uncross maps one caller-supplied global
+  transaction ID per trade, in report order, to one entry for a single pair or
+  one atomic ledger batch for multiple pairs. Report grammar, instrument
+  identity/version, clearing price, counts, and aggregate quantity are proved
+  before ledger mutation.
 - Entry-before-balance durability with prepared, generation-checked commits;
   exact-entry idempotency and typed transaction-ID collision detection.
 - First-class reversals with exact posting-inverse proof and append-only
@@ -405,7 +412,7 @@ Run any program with `cargo run --example <name>`.
 
 ### Durability and recovery
 
-- Versioned CRC-32C WAL frames (format 17) with bounded payloads and
+- Versioned CRC-32C WAL frames (format 19) with bounded payloads and
   contiguous sequences, as a single-file `Journal` or a size-bounded
   `SegmentedJournal` rotating whole frames and batches under one global
   sequence.
@@ -415,7 +422,7 @@ Run any program with `cargo run --example <name>`.
   writer leases with explicit abandoned-writer recovery.
 - Strict corruption detection: only a physically incomplete final frame may be
   repaired, and closed segments are always scanned strictly.
-- Versioned, bounded `QSNP` semantic snapshots (format 17) with monotonic
+- Versioned, bounded `QSNP` semantic snapshots (format 19) with monotonic
   exact-prefix lineage and synchronized atomic replacement.
 - Durable runtimes for matching, coupled risk/matching, call auctions, and
   coupled auction/risk record every command before committing the in-memory
@@ -423,7 +430,8 @@ Run any program with `cargo run --example <name>`.
   interrupted report, and rebuild exact-retry caches without appending retry
   frames. `DurableLedger` follows the same discipline per ledger event: each
   entry, correction, or batch is one atomic WAL frame recorded before balances
-  commit.
+  commit. Complete auction settlement reuses those entry/batch WAL and exact-
+  retry paths without a second persistence protocol.
 - Staged checkpoints for every durable runtime except the ledger: a
   WAL-barriered `capture_checkpoint_candidate` returns an immutable,
   non-encodable candidate whose consuming `verify()` performs the full
@@ -491,10 +499,12 @@ interruption trigger logic, or venue-specific priority rule sets. Immutable
 calendar images and day/session-to-GTD normalization are implemented, but
 authoritative calendar ingestion, signed distribution, atomic activation,
 original-request audit durability, and sequenced session-state transitions are
-external. The auction path additionally provides no ledger effects, reference
-or dynamic-band derivation, alternative-counterparty STP rearrangement,
-cancel/decrement STP policies, calendar-driven phase scheduling, or
-venue-specific uncross rules.
+external. The auction path provides instrument-bound atomic DVP settlement for
+a complete accepted uncross report. Clearing lifecycle authorization,
+allocation/fee workflows, settlement-date derivation, reference or dynamic-
+band derivation, alternative-counterparty STP rearrangement, cancel/decrement
+STP policies, calendar-driven phase scheduling, and venue-specific uncross
+rules remain external.
 
 The complete boundary, the failure model, and the register of environmental
 assumptions are documented in
@@ -506,12 +516,12 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 115 tagged assumptions (A1–A115), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 116 tagged assumptions (A1–A116), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
-| [WAL format v18](docs/wal-v18.md) | Current write-ahead-log frame and record schema |
-| [Snapshot format v18](docs/snapshot-v18.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
+| [WAL format v19](docs/wal-v19.md) | Current write-ahead-log frame and record schema |
+| [Snapshot format v19](docs/snapshot-v19.md) | Current `QSNP` semantic snapshot envelope and payload kinds |
 | [Market-data payload v3](docs/market-data-v3.md) | Current continuous market-data update/snapshot payloads |
 | [Auction market-data payload v5](docs/auction-market-data-v5.md) | Current call-auction market-data payloads |
 | [Auction-risk checkpoint payload v1](docs/auction-risk-checkpoint-v1.md) | Current coupled call-auction risk checkpoint payload |
@@ -532,6 +542,7 @@ byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/wal-v15.md](docs/wal-v15.md),
 [docs/wal-v16.md](docs/wal-v16.md),
 [docs/wal-v17.md](docs/wal-v17.md),
+[docs/wal-v18.md](docs/wal-v18.md),
 [docs/snapshot-v2.md](docs/snapshot-v2.md),
 [docs/snapshot-v3.md](docs/snapshot-v3.md),
 [docs/snapshot-v4.md](docs/snapshot-v4.md),
@@ -547,7 +558,8 @@ byte-level provenance: [docs/wal-v3.md](docs/wal-v3.md),
 [docs/snapshot-v14.md](docs/snapshot-v14.md),
 [docs/snapshot-v15.md](docs/snapshot-v15.md),
 [docs/snapshot-v16.md](docs/snapshot-v16.md),
-[docs/snapshot-v17.md](docs/snapshot-v17.md), continuous
+[docs/snapshot-v17.md](docs/snapshot-v17.md),
+[docs/snapshot-v18.md](docs/snapshot-v18.md), continuous
 [market-data v2](docs/market-data-v2.md), and call-auction
 [market-data v1](docs/auction-market-data-v1.md) and
 [market-data v2](docs/auction-market-data-v2.md) and
@@ -593,11 +605,15 @@ includes:
   risk, public-feed, replay, snapshot, and WAL recovery, and a 10,000-command
   engine phase-model run. Fail-closed self-trade abort is covered across
   canonical pairing, sequencing, risk neutrality, public no-change projection,
-  stable codecs, and durable exact retry.
+  stable codecs, and durable exact retry. Settlement coverage proves one-entry
+  and multi-entry mappings, instrument/version mismatch, same-account
+  rejection, overflow atomicity, partial-prior-commit detection, one-frame
+  recovery, checkpoint cutover, and WAL-free exact retry.
 - **Market data and accounting:** continuous and complete-batch auction depth
   reconstruction, replay-first gap repair, snapshot fallback,
-  allocation-stable ring wrap, settlement, reversals, corrections, batches,
-  period controls, reconciliation, and signed `i128` boundaries.
+  allocation-stable ring wrap, continuous and auction settlement, reversals,
+  corrections, batches, period controls, reconciliation, and signed `i128`
+  boundaries.
 - **Storage, recovery, and checkpoints:** stable wire layouts, segment
   rotation, corruption and torn-tail handling, injected write/sync/cutover
   failures, concurrent-writer exclusion, replay-divergence detection,

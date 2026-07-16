@@ -5,7 +5,7 @@ use crate::auction::{
 use crate::auction_book::{
     CallAuctionCancellation, CallAuctionOrder, CallAuctionOrderSnapshot,
     CallAuctionRemainderPolicy, CallAuctionSelfTradePolicy, CallAuctionTrade,
-    CallAuctionUncrossPolicy,
+    CallAuctionTradeParticipants, CallAuctionUncrossPolicy,
 };
 use crate::auction_engine::{
     CallAuctionAction, CallAuctionAmendOrder, CallAuctionCancelOrder,
@@ -615,6 +615,8 @@ impl BinaryCodec for CallAuctionCommand {
 
 fn encode_trade(encoder: &mut Encoder, trade: CallAuctionTrade) {
     encoder.u64(trade.trade_id().get());
+    encoder.u64(trade.instrument_id().get());
+    encoder.u64(trade.instrument_version().get());
     encoder.u64(trade.buy_order_id().get());
     encoder.u64(trade.buy_account_id().get());
     encoder.u64(trade.sell_order_id().get());
@@ -626,10 +628,14 @@ fn encode_trade(encoder: &mut Encoder, trade: CallAuctionTrade) {
 fn decode_trade(decoder: &mut Decoder<'_>) -> Result<CallAuctionTrade, CodecError> {
     CallAuctionTrade::from_decoded(
         trade_id(decoder)?,
-        order(decoder)?,
-        account(decoder)?,
-        order(decoder)?,
-        account(decoder)?,
+        instrument(decoder)?,
+        instrument_version(decoder)?,
+        CallAuctionTradeParticipants {
+            buy_order: order(decoder)?,
+            buy_account: account(decoder)?,
+            sell_order: order(decoder)?,
+            sell_account: account(decoder)?,
+        },
         Price::from_raw(decoder.i64()?),
         quantity(decoder)?,
     )

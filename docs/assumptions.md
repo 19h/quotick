@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A115 are stable and are referenced from code comments and other
+identifiers A1-A116 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -160,17 +160,20 @@ falsifies A10.
 
 ## A11 — once-only trade settlement
 
-**Assumption.** A trade is durably settled once using a caller-supplied
-globally unique transaction ID and the definition-correlated settlement path;
-the lower-level convention API is not an authorization boundary.
+**Assumption.** A continuous trade is durably settled once using a caller-
+supplied globally unique transaction ID and the definition-correlated path. A
+complete accepted call-auction uncross instead supplies exactly one such ID per
+trade in report order and settles as one entry or atomic batch under A116. The
+lower-level convention API is not an authorization boundary.
 
 **Dependent results.** Delivery-versus-payment balances, WAL reconstruction,
 and retry behavior.
 
 **Falsification probe.** Submit exact retries, transaction collisions,
-mismatched instrument versions, and terminate between WAL append and balance
-commit. Any mismatched-version posting, duplicate economic effect, or lost
-acknowledged entry falsifies A11.
+partially precommitted auction groups, mismatched instrument versions, and
+terminate between WAL append and balance commit. Any mismatched-version
+posting, duplicate economic effect, split auction group, or lost acknowledged
+entry falsifies A11.
 
 ## A12 — allocation-failure boundaries
 
@@ -195,8 +198,9 @@ reserves its derived session-ID index before publication.
 Successful continuous-book/risk, call-auction-book/engine/risk, and indexed-AVL
 structural audits allocate no scratch; continuous matching/risk,
 call-auction/risk, and ledger checkpoint capture/semantic/capacity resources,
-codec collections/output, and WAL frame/batch/read buffers reserve fallibly
-with typed resource identity. Arc control blocks, caller-owned command/entry
+call-auction settlement-entry construction, codec collections/output, and WAL
+frame/batch/read buffers reserve fallibly with typed resource identity. Arc
+control blocks, caller-owned command/entry
 objects, decoded/caller-built event traces and checkpoints, snapshot-file
 ownership, path/string construction, ledger diagnostic/reconciliation
 collections, failure-detail formatting, caller-owned or cloned generic auction
@@ -267,11 +271,16 @@ integrity; concern about the second requires authenticated records.
 
 ## A15 — format version immutability
 
-**Assumption.** WAL format version 18, snapshot format version 18, continuous
+**Assumption.** WAL format version 19, snapshot format version 19, continuous
 market-data payload version 3, call-auction market-data payload version 5, and
 trading-calendar payload version 1 are immutable. WAL and snapshot versions
-`1` through `17` are expired and rejected explicitly rather than inferred or
-migrated. WAL v18 preserves v17 values and changes minimum-quantity IOC under
+`1` through `18` are expired and rejected explicitly rather than inferred or
+migrated. WAL v19 preserves v18 values except that each private call-auction
+trade grows from 56 B to 72 B by inserting its immutable instrument ID and
+definition version before order/account/price/quantity fields. Snapshot v19
+preserves v18 direct rows and embeds WAL-v19 values in chronological histories;
+call-auction kinds `4` and `5` therefore contain the instrument-bound trade
+value. WAL v18 preserved v17 values and changed minimum-quantity IOC under
 decrement-and-cancel from unsupported to the A115 exact two-counter execution
 interpretation. Snapshot v18 preserves v17 direct rows and embeds WAL-v18
 values in chronological histories. WAL v17 preserves v16 values and changes
@@ -310,16 +319,17 @@ authoritative predecessors exist.
 recovery, anchor interpretation, stable auction records/images, stable calendar
 images, and fail-closed format boundaries.
 
-**Falsification probe.** Byte-compare golden WAL-v18, snapshot-v18,
+**Falsification probe.** Byte-compare golden WAL-v19, snapshot-v19,
 market-data-v3, auction-market-data-v5, and trading-calendar-v1 fixtures through
 every supported release; mutate valid WAL frames and images to versions `1`
-through `17`; verify definition booleans, every display, TIF, rejection, and
+through `18`; verify definition booleans, every display, TIF, rejection, and
 cancellation tag, continuous expiry/stop/source tags, raw auction record tags
 `9`/`10`, replacement, mass-cancel, amendment, and allocation-policy tags,
-priority-class scalars, uncross self-trade tags, rejection tag `23`, indicative
-command/action/event/update tags and nullable state, snapshot kinds `1` through
-`5`, hidden-maker trade application, auction replacement and mass-cancel
-projection, and every calendar scalar/row offset.
+priority-class scalars, auction-trade instrument ID/version fields, uncross
+self-trade tags, rejection tag `23`, indicative command/action/event/update
+tags and nullable state, snapshot kinds `1` through `5`, hidden-maker trade
+application, auction replacement and mass-cancel projection, and every calendar
+scalar/row offset.
 Any changed supported bytes/interpretation or acceptance across an expired
 envelope boundary falsifies A15.
 
@@ -687,7 +697,7 @@ effect, accepted partial state, or incorrect final balance falsifies A36.
 
 **Assumption.** The reserve-, mass-cancel-, account-control-, GTD-, stop-, fully
 hidden, and minimum-quantity command/report variants defined through version 8
-remain explicit variants inside deployable WAL version 18. Version 9 added
+remain explicit variants inside deployable WAL version 19. Version 9 added
 durable stop-reference source identity, source version, source sequence, and
 typed discontinuity/collision outcomes; it does not infer them from WAL version
 8. No earlier matching WAL requires runtime compatibility. Expired envelopes
@@ -698,10 +708,10 @@ minimum-quantity, or anchor semantics.
 **Dependent results.** Explicit fully displayed/reserve/fully hidden/GTD/stop
 state, refresh, expiry, and trigger events, canonical mass cancellation,
 revisioned account fencing, and anchored cutover under WAL envelope version
-`18`.
+`19`.
 
 **Falsification probe.** Inventory every persisted matching WAL and decode
-golden version-18 fixtures before deployment. Reject version-17 artifacts with
+golden version-19 fixtures before deployment. Reject version-18 artifacts with
 and without re-labelled headers, and mutate every hidden/minimum-quantity/
 expiry/stop/source tag, definition flag, threshold, deadline, watermark,
 reference, trigger, activation, aggregate, and ordering relation.
@@ -1634,9 +1644,10 @@ adds `K + 1` event construction. Indicative discovery is `O(B + A)` time and
 state. State is
 `O(H_max + E_max + I_max + P O_max + P_max)`. Stable
 wire/full-WAL recovery are supplied by A65 and semantic checkpoint/cutover by
-A66; risk/ledger effects, publication transport, settlement, calendar,
-controller authentication, reference/dynamic-band derivation, and venue
-conformance do not follow.
+A66; coupled risk, market-data projection, and the A116 atomic settlement
+adapter consume the report as separate boundaries. Publication transport,
+clearing lifecycle policy, calendar, controller authentication, reference/
+dynamic-band derivation, and venue conformance do not follow.
 
 **Falsification probe.** Exercise every phase edge and invalid edge,
 exact/stale revisions, delayed prior-cycle/reopen submissions, amendments, and
@@ -1665,7 +1676,7 @@ continuity is bounded by A65/A66.
 ## A65 — durable auction WAL grammar
 
 **Assumption.** One `DurableCallAuctionEngine` owns the only writer lease for
-one WAL-version-18 single-file or marker-selected segmented auction shard. Its
+one WAL-version-19 single-file or marker-selected segmented auction shard. Its
 uncut grammar is one immutable definition followed by command/report pairs and
 at most one final dangling command. Submission prepares before command append,
 commits the same token, then appends the exact report; acknowledgement strength
@@ -1691,7 +1702,9 @@ reconstruction.
 **Falsification probe.** Byte-compare every command/event shape and raw kind
 tags; reject invalid tags, lengths, booleans, identities, inverted bands, zero
 clearing execution, contradictory report grammar, trade self-pairing, and
-overflowed cancellation source quantity. Terminate after definition, command
+overflowed cancellation source quantity. Corrupt a trade instrument ID or
+definition version independently of its owning definition. Terminate after
+definition, command
 append, engine commit, partial/full report append, rotation, and sync; repair
 only a torn active tail; replay exact state/trade IDs/cache identity; retry
 before/after reopen and prove zero frame growth. Inject definition drift,
@@ -1701,14 +1714,14 @@ retention, mass-cancel account/scope/order/count/quantity/revision corruption,
 amendment owner/quantity/immutable-field/priority/revision corruption,
 indicative auction/phase/book/band/reference/policy/presence corruption,
 abort policy/rejection mismatch, segment corruption, insufficient limits, and
-frame versions `1` through `17`. Any accepted
+frame versions `1` through `18`. Any accepted
 divergent/noncanonical history,
 duplicate transition, retry frame, cross-layout semantic difference, or
 unaudited dangling completion falsifies A65.
 
 ## A66 — auction checkpoint lineage
 
-**Assumption.** A snapshot-version-18 call-auction checkpoint and its recovery
+**Assumption.** A snapshot-version-19 call-auction checkpoint and its recovery
 WAL represent one immutable A65 command/report lineage. The image retains the
 definition/WAL origin, completed report boundary, phase/cycle, book revision,
 next priority/trade counters, canonical accepted identities and active orders,
@@ -1718,7 +1731,7 @@ row. A completed checkpoint is released only after
 independent replay requires exact direct-state equality; A97/A98 separate
 non-replaying capture from that proof. Numeric generation is never accepted
 without exact uncut prefix equality or a kind/checksum/generation/slot-bound
-version-18 anchor. Capture/validation resource or temporary-constructor failure
+version-19 anchor. Capture/validation resource or temporary-constructor failure
 under A78 occurs before snapshot/cutover mutation and leaves the durable shard
 unpoisoned; semantic contradiction poisons it.
 
@@ -2544,9 +2557,10 @@ slot initialization, range gap/overlap, invalid terminal admission, stale-token
 consumption, accepted oversized checkpoint, or replay divergence falsifies A85.
 
 The current default is 73,730 slots; on measured `aarch64-apple-darwin`,
-`size_of::<OnceLock<CallAuctionEvent>>() = 176 B`, so slots occupy `12,976,480
-B` (`12.976480 MB`) before vector/Arc/allocator overhead. Externally retained
-live traces keep the complete arena alive.
+`size_of::<OnceLock<CallAuctionEvent>>() = 192 B`, so slots occupy `14,156,160
+B` (`14.156160 MB`) before vector/Arc/allocator overhead. The event itself
+remains 176 B; the aligned `OnceLock` slot is the retained-arena capacity term.
+Externally retained live traces keep the complete arena alive.
 
 ## A86 — uncross buffer pool
 
@@ -2568,9 +2582,9 @@ sequencing, WAL append, event initialization, or authoritative book mutation.
 The constructor's minimum element-storage request is `P O (2 S_fill + S_trade +
 S_cancel)` bytes before four vector headers per set, the pool vector,
 Arc/mutex, allocator over-reservation/rounding, and resident-page effects. On
-the measured `aarch64-apple-darwin` build, `S_fill = 24 B`, `S_trade = 56 B`,
+the measured `aarch64-apple-darwin` build, `S_fill = 24 B`, `S_trade = 72 B`,
 and `S_cancel = 56 B`; defaults therefore request at least `2 × 4,096 × (2 × 24
-B + 56 B + 56 B) = 1,310,720 B = 1.310720 MB` of element storage. The `Arc`
+B + 72 B + 56 B) = 1,441,792 B = 1.441792 MB` of element storage. The `Arc`
 control-block allocation remains under A12.
 
 **Falsification probe.** Reject `P = 0`; force unrepresentable reservation
@@ -3303,7 +3317,7 @@ venue-specific rules.
 **Dependent results.** [A1, A5, A9, A15, A20, A21, A22, A37, A39, A45, A50,
 A70, A83, A88, A102, A103, A105, A115] Allocation-free `O(1)`-space threshold
 inspection, atomic failure, reserve/hidden-aware eligibility, stop activation,
-no-change public projection, risk release, stable WAL-v18/snapshot-v18 bytes,
+no-change public projection, risk release, stable WAL-v19/snapshot-v19 bytes,
 checkpoint/WAL recovery, and exact retry are deterministic. The specialized
 A115 scan has the time bound stated there; other policies retain the one-pass
 FOK eligibility bound.
@@ -3468,7 +3482,7 @@ aggregate reduction. It emits one replayable `OrderAmended` event in the
 ordinary history lane. Coupled risk removes the exact quantity and conservative
 notional delta without a new entry gate. Public payload v5 emits one anonymous
 `Amended` aggregate delta with unchanged order count and invalidates any prior
-indication. WAL/snapshot v18 preserve
+indication. WAL/snapshot v19 preserve
 exact retry and checkpoint-plus-suffix recovery.
 
 **Falsification probe.** Exercise market and limit orders at head, middle, and
@@ -3512,7 +3526,7 @@ construction. Validation and fill construction are `O(B + A)` time with
 instrument quantity increment, the engine emits the resulting deterministic
 trade/remainder trace, risk consumes that trace without an independent
 allocation inference, and auction market-data payload v5 projects the same
-events while adding A112. WAL v18 and snapshot v18 persist the explicit policy
+events while adding A112. WAL v19 and snapshot v19 persist the explicit policy
 for
 full replay, checkpoint recovery, and exact retry. A61 price-time behavior
 remains separately selectable and byte-tagged.
@@ -3553,7 +3567,7 @@ queues remain mutation-time FIFO structures; rebuilding caller-owned order
 scratch resolves their identities and performs an allocation-free unstable
 sort in `O(O log O + P)` time. Both `PriceTime` and `ProRataTime` therefore
 honor market/price/class/time/ID order. Risk consumes the resulting execution
-trace without independently inferring class. WAL v18 and snapshot v18 preserve
+trace without independently inferring class. WAL v19 and snapshot v19 preserve
 the class through full replay, direct checkpoint restore, suffix recovery, and
 exact retry.
 
@@ -3599,8 +3613,8 @@ constructor-owned scratch and the existing allocation-free kernel. One command
 adds one fixed-size event and one optional fixed-size live state. Risk
 authorization and application are `O(1)` no-ops.
 
-WAL v18 retains command/action tag `7` and event-kind tag `9`; nullable reports
-are 98 B or 138 B. Snapshot v18 derives the current value from accepted
+WAL v19 retains command/action tag `7` and event-kind tag `9`; nullable reports
+are 98 B or 138 B. Snapshot v19 derives the current value from accepted
 history and checkpoint-plus-suffix invalidation. Auction market-data v5 uses
 kind tag `6`, 84 B or 124 B updates, complete one-update replay batches, and an
 optional snapshot value. Publisher, replica, direct restore, full-WAL recovery,
@@ -3664,8 +3678,8 @@ the current indication. Exact retry reuses the report. Coupled risk changes no
 reservation, exposure, position, or netting scratch. Public payload version 5
 emits `NoPublicChange` for the original rejection and no retry update.
 
-WAL v18 encodes self-trade policy tag `1` and rejection tag `23`; its generic
-one-event rejected report is 49 B. Snapshot v18 retains the command/report row
+WAL v19 encodes self-trade policy tag `1` and rejection tag `23`; its generic
+one-event rejected report is 49 B. Snapshot v19 retains the command/report row
 without changing direct order, counter, phase, indication, or risk rows. An
 accepted `Abort` uncross is valid only when all canonical pairs have unequal
 account IDs. `Permit` retains the prior same-account trade and coupled net-zero
@@ -3722,7 +3736,7 @@ levels, uses `O(1)` auxiliary space, and allocates nothing.
 before, within, and after sufficient external liquidity at the same and worse
 prices. Exercise partial current reserve slices, multiple refreshes, direct and
 dormant entry, both sides, risk reservations, public no-change/trade
-projection, stable WAL-v18/snapshot-v18 recovery, exact retry, and later
+projection, stable WAL-v19/snapshot-v19 recovery, exact retry, and later
 successful external continuation. Differentially compare at least 20,000
 generated books with a literal slice/requeue reference queue. Any accepted
 partial FOK, counted self decrement, reachable self STP event, mutation on
@@ -3761,7 +3775,7 @@ most `R_p` remaining reserve rounds there, the scan costs
 space, and zero allocations. Instrument admission bounds each replenishment
 count by `u32`, so the binary search performs at most 32 aggregate passes per
 price. Direct and dormant entry, risk, private/public projection, checkpoint,
-WAL-v18, snapshot-v18, exact retry, and subsequent execution reproduce the
+WAL-v19, snapshot-v19, exact retry, and subsequent execution reproduce the
 same result. Legacy rejection tag `51` remains decodable but is not emitted for
 a well-formed A115 command.
 
@@ -3778,6 +3792,76 @@ queue. Any self threshold credit, priority inversion, skipped or duplicated
 refresh, hidden-before-displayed execution, maker/STP/risk/public mutation on
 failure, threshold-capped success, allocation, nontermination, replay
 divergence, or current emission of rejection tag `51` falsifies A115.
+
+## A116 — instrument-bound atomic call-auction settlement
+
+**Assumption.** One settlement input is a complete accepted A64 uncross report,
+not a selected trade subset or an indicative result. Its command sequence and
+all event sequences are positive; event sequences are contiguous; every event
+has the report command ID; and the final event is `UncrossCompleted`. Its
+positive trade count and cancellation count exactly partition the preceding
+trade prefix and remainder-cancellation suffix. Every trade uses the declared
+clearing price, their checked quantity sum equals the declared executable
+quantity, and every trade carries the supplied immutable A1 instrument ID and
+definition version.
+
+The caller supplies exactly one globally unique `TransactionId` per trade in
+report order plus one authoritative A33 effective date and A34 nonregressing
+booking timestamp. For raw signed price `p`, lot quantity `q`, base units per
+lot `b`, and quote units per price unit `c`, the shared DVP constructor computes
+`base = q × b` and `quote = p × q × c` in checked signed `i128`. Buyer and
+seller receive exact opposite base and quote postings; a zero quote value omits
+both zero legs. A same-account pair is rejected even when A113's separate
+auction policy is `Permit`.
+
+All entries are constructed before ledger mutation. One trade maps to one
+ordinary entry; multiple trades map to one ordered A42 batch. The in-memory and
+durable APIs reuse A11 transaction idempotency, A29/A89 checkpoints, A42/A79
+batch atomicity, A65/A66 auction recovery, and the existing entry/batch WAL
+append-before-commit paths. No clearing lifecycle authorization, novation,
+allocation account, fee, settlement-date derivation, custody, money-settlement,
+or legal-finality rule is inferred. The linked-obligation boundary is
+consistent with [CPSS-IOSCO PFMI Principle 12](https://www.bis.org/cpmi/publ/d101.htm)
+and the [CPMI DvP report](https://www.bis.org/cpmi/publ/d06.htm); the exact
+mapping and arithmetic are Quotick internal contracts.
+
+**Dependent results.** [A1, A6, A7, A11, A12, A15, A17, A29, A33, A34,
+A42, A43, A64, A65, A66, A69, A79, A89, A90, A113, A116] For `T` trades,
+`C` cancellations, `L <= 4T` non-zero posting legs, and `U` affected
+`(AccountId, AssetId)` keys, report validation is `O(T + C)` time and `O(1)`
+auxiliary space. Settlement construction fallibly reserves exactly `T` entry
+handles and owns `O(T + L)` result storage. The single-trade path uses ordinary
+entry preparation. The multi-trade path adds expected `O(T)` construction time
+and `O(T)` identity storage, followed by A79's `O(L log L)` preparation,
+`O(T + L + U)` auxiliary storage, and expected `O(T + U)` commit. A full
+adversarial transaction-hash collision cluster can make batch identity and
+overlay work `O(T²)` without storage growth.
+
+WAL/snapshot version 19 preserves trade identity before settlement. One
+multi-trade settlement occupies one kind-`7` frame and one batch checkpoint
+record. Exact retry appends no frame and applies no second effect. A separately
+committed subset or different grouping is a typed nonmutating partial-commit or
+collision failure. Construction, arithmetic, period, timestamp, balance,
+capacity, append, and recovery failure cannot expose a committed trade prefix.
+
+**Falsification probe.** Exercise single- and multi-trade uncross reports,
+multiple pairs at one price, signed and zero prices, maximum factors, identical
+accounts under `Permit`, duplicate transaction IDs, instrument/version drift,
+too few/many transaction IDs, rejected and non-uncross reports, missing or
+reordered events, corrupted command/event sequences, wrong body counts,
+non-trade prefix values, wrong clearing price, and aggregate-quantity mismatch.
+Precommit no, one, and all member transactions both separately and under a
+different batch. Force settlement-entry reservation failure, final `i128`
+overflow, every ledger-capacity boundary, a closed date, and timestamp
+regression; compare all balances, indexes, records, sequence, and WAL length
+before and after failure.
+
+For durable settlement, terminate at every frame-write/barrier/commit boundary;
+repair a torn final frame; recover from uncut WAL and both A/B checkpoint slots;
+continue through a suffix; and retry before and after reopen. Any accepted
+report contradiction, mismatched definition, self-settlement, partial economic
+effect, split WAL/checkpoint grouping, retry frame growth, recovery divergence,
+or venue/clearing policy inference falsifies A116.
 
 ## Bounded scope expansion
 
@@ -3808,6 +3892,14 @@ capability, a remaining risk, or an opportunity.
   inside the checkpoint, so snapshot bytes, capture pause, validation work,
   idempotency lifetime, and supervisory shard-generation rollover remain
   unbounded by the cutover protocol.
+- **High impact:** every private call-auction trade now carries immutable
+  instrument identity/version, and one complete accepted uncross report maps to
+  one DVP ledger entry or atomic batch with one global transaction ID per trade.
+  Entry construction, exact retry, collision/partial-commit detection, durable
+  one-frame recovery, and ledger checkpoint cutover reuse the existing bounded
+  ledger paths. Clearing authorization, novation/allocation accounts, fees,
+  settlement dates, custody, external money settlement, and legal finality
+  remain separate lifecycle boundaries.
 - **High impact:** call-auction collection now supports atomic new-identity
   replacement with full priority loss, saturated active/price-level capacity
   reuse subject to fresh accepted-ID headroom, risk reservation substitution,
@@ -3819,7 +3911,7 @@ capability, a remaining risk, or an opportunity.
 - **High impact:** call-auction uncross now selects explicit price-time or
   price/class-tier pro-rata-time allocation. Pro-rata shares use exact
   instrument-increment floors, FIFO residual quanta, deterministic trade
-  pairing, and WAL-v18/snapshot-v18 recovery. Every live order carries one
+  pairing, and WAL-v19/snapshot-v19 recovery. Every live order carries one
   authoritative typed priority-class scalar used by both policies after
   market/price ordering and before time. An authenticated venue-category-to-
   scalar mapping remains adapter conformance work. Venue algorithms that rank by
@@ -3829,7 +3921,7 @@ capability, a remaining risk, or an opportunity.
 - **High impact:** call-auction self-trade policy now supports fail-closed
   `Abort` on the first canonical equal-`AccountId` pair. The complete uncross
   is rejected before book, trade-ID, phase, risk, or public-depth mutation and
-  recovers exactly through WAL/snapshot version 18. Authenticated beneficial-
+  recovers exactly through WAL/snapshot version 19. Authenticated beneficial-
   owner mapping, alternative-counterparty rearrangement, and venue-specific
   cancel/decrement or aggressor/resting instructions remain external.
 - **High impact:** call-auction collection and sequencing now support bounded
@@ -3837,7 +3929,7 @@ capability, a remaining risk, or an opportunity.
   command selects `K` orders independently of unrelated active interest, emits
   canonical ascending removals plus one aggregate completion, increments the
   book revision exactly once when `K > 0`, releases each risk reservation, and
-  recovers under WAL/snapshot version 18. Public payload version 5 projects the
+  recovers under WAL/snapshot version 19. Public payload version 5 projects the
   same complete batch without account or scope identity. Authenticated firm,
   session, or cross-shard scope and completion aggregation remain external.
 - **High impact risk:** the auction writer lease is local ownership, not a
@@ -3942,9 +4034,9 @@ capability, a remaining risk, or an opportunity.
   indication cadence/filtering,
   auction display and venue-specific size-ranked, time-weighted, minimum-share,
   or hybrid allocation policies, venue-specific self-trade cancellation,
-  decrement, and alternative-pairing policies, auction-ledger integration,
-  settlement, authenticated
-  public/private transport, market-on-auction and imbalance-only order types,
+  decrement, and alternative-pairing policies, clearing-lifecycle authorization,
+  fee/allocation and settlement-date derivation, authenticated public/private
+  transport, market-on-auction and imbalance-only order types,
   authoritative external continuous stop-reference ingestion, pegged triggers,
   discretionary ranges,
   authoritative calendar distribution/activation, ingress-provenance
@@ -4077,7 +4169,7 @@ capability, a remaining risk, or an opportunity.
   `max_retained_events × size_of::<OnceLock<Event>>()` before allocator rounding;
   the current `aarch64-apple-darwin` layouts are
   `262,144 × 144 B = 37,748,736 B` (`37.748736 MB`) for continuous matching and
-  `73,730 × 176 B = 12,976,480 B` (`12.976480 MB`) for call auction, excluding
+  `73,730 × 192 B = 14,156,160 B` (`14.156160 MB`) for call auction, excluding
   vector/Arc/allocator overhead. Other target ABI sizes, resident-page behavior, cache locality
   relative to contiguous per-report vectors, and constructor first-touch cost
   require measurement. One

@@ -163,6 +163,13 @@ fn prepare_pairs_priority_fills_and_commit_removes_every_filled_order_atomically
     );
     assert_eq!(prepared.trades()[0].buy_account_id(), account(1));
     assert_eq!(prepared.trades()[0].sell_account_id(), account(1));
+    assert!(
+        prepared
+            .trades()
+            .iter()
+            .all(|trade| trade.instrument_id() == instrument()
+                && trade.instrument_version() == version())
+    );
 
     let result = book.commit_uncross(prepared).unwrap();
     assert_eq!(result.state_revision(), 5);

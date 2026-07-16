@@ -441,6 +441,8 @@ impl CallAuctionRiskEngine {
                     self.decrement_reservation(order.order_id, delta_lots);
                 }
                 CallAuctionEventKind::Trade(trade) => {
+                    debug_assert_eq!(trade.instrument_id(), self.definition.instrument_id());
+                    debug_assert_eq!(trade.instrument_version(), self.definition.version());
                     self.decrement_reservation(trade.buy_order_id(), trade.quantity().lots());
                     self.decrement_reservation(trade.sell_order_id(), trade.quantity().lots());
                     self.add_execution(trade.buy_account_id(), Side::Buy, trade.quantity().lots());

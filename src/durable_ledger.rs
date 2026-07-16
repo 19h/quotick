@@ -11,7 +11,8 @@ use crate::journal::{
     SegmentedJournalError, SegmentedJournalOptions, StorageRecoveryReport, normalize_journal_path,
 };
 use crate::ledger::{
-    BatchPreparation, BatchReceipt, CorrectionPreparation, CorrectionReceipt, JournalEntry, Ledger,
+    BatchPreparation, BatchReceipt, CallAuctionSettlement, CallAuctionSettlementReceipt,
+    CallAuctionSettlementRecord, CorrectionPreparation, CorrectionReceipt, JournalEntry, Ledger,
     LedgerBatch, LedgerCheckpoint, LedgerCheckpointCaptureError, LedgerCheckpointError,
     LedgerConstructionError, LedgerCorrection, LedgerError, LedgerInvariantViolation,
     LedgerLimitsSpec, LedgerRecord, PostReceipt, PostingPreparation, SettlementConvention,
@@ -647,6 +648,26 @@ impl DurableLedger {
                 self.poisoned = true;
                 Err(DurableLedgerError::Ledger(error))
             }
+        }
+    }
+
+    /// Durably commits every DVP entry from one accepted call-auction uncross.
+    ///
+    /// Multi-trade settlements use one batch WAL frame and one indivisible
+    /// ledger event. Exact retries return the original receipt without WAL
+    /// growth.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableLedgerError`] for ledger preparation, WAL, or commit
+    /// failure. Ambiguous I/O or post-append failure poisons the runtime.
+    pub fn settle_call_auction(
+        &mut self,
+        settlement: CallAuctionSettlement,
+    ) -> Result<CallAuctionSettlementReceipt, DurableLedgerError> {
+        match settlement.into_record() {
+            CallAuctionSettlementRecord::Entry(entry) => self.post(entry).map(Into::into),
+            CallAuctionSettlementRecord::Batch(batch) => self.post_batch(batch).map(Into::into),
         }
     }
 

@@ -393,7 +393,7 @@ buffer sets.
   typed unsequenced preparation failure, and `Drop` returns the storage.
 - On the current `aarch64-apple-darwin` build, the minimum requested element
   payload is
-  `2 × 4,096 × (2 × 24 B + 56 B + 56 B) = 1,310,720 B = 1.310720 MB`
+  `2 × 4,096 × (2 × 24 B + 72 B + 56 B) = 1,441,792 B = 1.441792 MB`
   before vector headers, the pool vector, Arc/mutex, allocator rounding, and
   resident pages.
 
@@ -440,8 +440,10 @@ On the current `aarch64-apple-darwin` build:
   `262,144 × 144 B = 37,748,736 B = 37.748736 MB` before vector, Arc, and
   allocator overhead.
 - The corresponding call-auction layout is
-  `size_of::<OnceLock<CallAuctionEvent>>() = 176 B`, or
-  `73,730 × 176 B = 12,976,480 B = 12.976480 MB` before the same overheads.
+  `size_of::<OnceLock<CallAuctionEvent>>() = 192 B`, or
+  `73,730 × 192 B = 14,156,160 B = 14.156160 MB` before the same overheads.
+  `size_of::<CallAuctionEvent>()` remains 176 B; the larger alignment-sensitive
+  slot is the authoritative retained-arena capacity term.
 
 ### Constructor reservations
 
@@ -800,6 +802,18 @@ make overlay work `O(N²)` without growing storage. Commit is expected
 and mutates only affected fixed-capacity indexes plus one pre-reserved record
 slot. Initial entry/batch construction creates one shared-owner control block
 after validation; that stable-Rust allocator boundary remains A12.
+
+For one accepted call-auction uncross with `T` trades and `C` remainder
+cancellations, report validation is `O(T + C)` time and `O(1)` auxiliary
+space. Settlement construction fallibly reserves exactly `T` entry handles,
+constructs at most `L = 4T` non-zero posting legs with checked `i128`
+arithmetic, and uses `O(T + L)` owned result storage before ledger mutation.
+The `T = 1` case uses ordinary entry preparation. For `T >= 2`, batch
+construction adds expected `O(T)` time and `O(T)` identity storage, after
+which the existing batch bounds above apply: `O(L log L)` preparation,
+`O(T + L + U)` auxiliary memory, and expected `O(T + U)` commit. Durable
+settlement adds one entry or batch frame; exact replay is resolved without
+frame growth.
 
 For `A` internal non-zero balances, `V` asset denominations, and `W` spilled
 `u64` magnitude limbs, fallible trial-balance construction reserves one flat

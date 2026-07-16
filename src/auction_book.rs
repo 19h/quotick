@@ -820,6 +820,8 @@ impl CallAuctionUncrossPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CallAuctionTrade {
     trade_id: TradeId,
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
     buy_order_id: OrderId,
     buy_account_id: AccountId,
     sell_order_id: OrderId,
@@ -828,25 +830,34 @@ pub struct CallAuctionTrade {
     quantity: Quantity,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct CallAuctionTradeParticipants {
+    pub(crate) buy_order: OrderId,
+    pub(crate) buy_account: AccountId,
+    pub(crate) sell_order: OrderId,
+    pub(crate) sell_account: AccountId,
+}
+
 impl CallAuctionTrade {
     pub(crate) const fn from_decoded(
         trade_id: TradeId,
-        buy_order_id: OrderId,
-        buy_account_id: AccountId,
-        sell_order_id: OrderId,
-        sell_account_id: AccountId,
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        participants: CallAuctionTradeParticipants,
         price: Price,
         quantity: Quantity,
     ) -> Option<Self> {
-        if buy_order_id.get() == sell_order_id.get() {
+        if participants.buy_order.get() == participants.sell_order.get() {
             return None;
         }
         Some(Self {
             trade_id,
-            buy_order_id,
-            buy_account_id,
-            sell_order_id,
-            sell_account_id,
+            instrument_id,
+            instrument_version,
+            buy_order_id: participants.buy_order,
+            buy_account_id: participants.buy_account,
+            sell_order_id: participants.sell_order,
+            sell_account_id: participants.sell_account,
             price,
             quantity,
         })
@@ -856,6 +867,18 @@ impl CallAuctionTrade {
     #[must_use]
     pub const fn trade_id(self) -> TradeId {
         self.trade_id
+    }
+
+    /// Returns the immutable instrument identifier settled by this trade.
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version used by the uncross.
+    #[must_use]
+    pub const fn instrument_version(self) -> InstrumentVersion {
+        self.instrument_version
     }
 
     /// Returns the allocated buy order.
@@ -2959,6 +2982,8 @@ impl CallAuctionBook {
                 .map_err(|_| CallAuctionPrepareError::InternalInvariantViolation)?;
             trades.push(CallAuctionTrade {
                 trade_id,
+                instrument_id: self.definition.instrument_id(),
+                instrument_version: self.definition.version(),
                 buy_order_id: buy_fill.order_id(),
                 buy_account_id: buy_order.account_id,
                 sell_order_id: sell_fill.order_id(),

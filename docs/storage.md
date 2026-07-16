@@ -233,7 +233,7 @@ semantic generation plus exact history lineage. It decides as follows:
   size exceeds the caller's configured limit is preserved.
 
 The complete wire and decision contract is
-[Semantic snapshot format version 18](snapshot-v18.md).
+[Semantic snapshot format version 19](snapshot-v19.md).
 
 Direct users must dedicate the target and its two sidecars to snapshots.
 `DurableOrderBook`, `DurableRiskOrderBook`, `DurableLedger`, and
@@ -409,6 +409,9 @@ and how reopen interprets the resulting bytes.
 | correction is complete but either member collides, is invalid, or was committed separately | durable ledger correction/open fails | balances, indexes, and event sequence remain unchanged; no one-member state is accepted |
 | ledger-batch frame is torn | poisoned | strict open fails; repair removes the incomplete frame, so no batch member is recovered |
 | ledger batch is complete but a member/order/lifecycle transition is invalid or members were committed under another grouping | durable ledger batch/open fails | balances, indexes, period/reversal state, and event sequence remain unchanged; no member prefix is accepted |
+| call-auction settlement report, instrument/version, transaction count, arithmetic, or entry construction is invalid | settlement fails before ledger append | WAL, balances, indexes, lifecycle state, and event sequence remain unchanged |
+| call-auction settlement transactions were partly committed or regrouped earlier | settlement fails with the existing partial-commit/collision result | no remaining trade is posted and no WAL frame is appended |
+| complete multi-trade call-auction settlement frame is torn | poisoned | strict open fails; repair removes the incomplete kind-`7` frame, so every auction trade is retained or none is recovered |
 | financial effective date is closed, booking time regresses, or close/reopen progression is invalid | durable ledger post/open fails before commit | balances, period boundary, booking timestamp, and WAL remain unchanged for live validation failures; an invalid persisted suffix is rejected during recovery |
 
 ### Test coverage
@@ -441,6 +444,10 @@ and how reopen interprets the resulting bytes.
   exact retry suppression, its suffix invalidation, uncut prefix forks/ahead
   state, corrupt/wrong A/B slots, and dangling suffix completion after an
   anchor.
+- **Auction-settlement coverage** proves one-entry and multi-entry DVP
+  mappings, report/instrument/version/count rejection, same-account rejection,
+  arithmetic-overflow atomicity, partial-prior-commit detection, one-frame
+  durable recovery, A/B checkpoint cutover, and exact retry without WAL growth.
 - **Cutover tests** additionally cover repeated A/B replacement, non-genesis
   physical sequences, anchor/snapshot divergence, missing checkpoint context,
   suffix continuation, occupied and abandoned staging paths, path aliasing,

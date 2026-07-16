@@ -1955,6 +1955,8 @@ impl CallAuctionMarketDataPublisher {
         };
         if self.phase.phase() != CallAuctionPhase::Frozen
             || self.phase.active_auction_id() != Some(source.auction_id)
+            || trade.instrument_id() != self.instrument_id
+            || trade.instrument_version() != self.instrument_version
             || trade.price().raw() < source.price_band.minimum().raw()
             || trade.price().raw() > source.price_band.maximum().raw()
         {

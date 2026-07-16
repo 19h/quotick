@@ -1,5 +1,8 @@
 # WAL Format Version 18
 
+> **Expired.** Runtime version 19 rejects this envelope. The current schema is
+> [WAL format version 19](wal-v19.md). Historical bytes below are unchanged.
+
 This document is the authoritative byte-level schema for Quotick WAL version
 18. All multibyte integers are little-endian. Rust enum layout, padding,
 pointer identity, collection capacity, and platform ABI are never persisted.

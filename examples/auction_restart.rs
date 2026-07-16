@@ -10,12 +10,16 @@ use quotick::auction_book::{
     CallAuctionUncrossPolicy,
 };
 use quotick::auction_engine::{
-    CallAuctionCommand, CallAuctionEventKind, CallAuctionPhase, CallAuctionPhaseControl,
-    CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionCommand, CallAuctionEventKind, CallAuctionExecutionReport, CallAuctionPhase,
+    CallAuctionPhaseControl, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
 };
 use quotick::durable_auction::DurableCallAuctionEngine;
+use quotick::instrument::InstrumentDefinition;
+use quotick::ledger::{CallAuctionSettlement, Ledger};
 use quotick::snapshot::{CheckpointSlot, SnapshotOptions};
-use quotick::{AuctionId, CommandId, OrderId, Price, Quantity, Side};
+use quotick::{
+    AccountingDate, AuctionId, CommandId, OrderId, Price, Quantity, Side, TransactionId,
+};
 
 use support::{
     ScratchArea, account, auction_engine_limits, definition, journal_options, timestamp,
@@ -69,6 +73,30 @@ fn order(
         ),
         received_at: timestamp(command_id),
     })
+}
+
+fn settle_report(
+    report: &CallAuctionExecutionReport,
+    definition: InstrumentDefinition,
+) -> (usize, usize) {
+    let trade_count = report
+        .events
+        .iter()
+        .filter(|event| matches!(event.kind, CallAuctionEventKind::Trade(_)))
+        .count();
+    let settlement = CallAuctionSettlement::from_report(
+        vec![TransactionId::new(1).unwrap()],
+        AccountingDate::UNIX_EPOCH,
+        timestamp(7),
+        report,
+        definition,
+    )
+    .unwrap();
+    let mut ledger = Ledger::new();
+    let receipt = ledger.settle_call_auction(settlement).unwrap();
+    assert_eq!(receipt.transaction_count(), trade_count);
+    ledger.validate().unwrap();
+    (trade_count, receipt.transaction_count())
 }
 
 fn main() {
@@ -134,11 +162,7 @@ fn main() {
         received_at: timestamp(6),
     });
     let report = durable.submit(uncross).unwrap();
-    let trade_count = report
-        .events
-        .iter()
-        .filter(|event| matches!(event.kind, CallAuctionEventKind::Trade(_)))
-        .count();
+    let (trade_count, settled_transactions) = settle_report(&report, definition);
     assert_eq!(trade_count, 1);
     durable.close().unwrap();
 
@@ -169,10 +193,11 @@ fn main() {
     recovered.close().unwrap();
 
     println!(
-        "checkpointed_commands={} replayed_suffix={} trades={} retained_orders={} retry_wal_growth={}",
+        "checkpointed_commands={} replayed_suffix={} trades={} settled_transactions={} retained_orders={} retry_wal_growth={}",
         recovery.checkpointed_commands,
         recovery.replayed_commands,
         trade_count,
+        settled_transactions,
         retained_orders,
         bytes_after_retry - bytes_before_retry
     );

@@ -513,6 +513,20 @@ fn every_call_auction_event_shape_round_trips() {
 }
 
 #[test]
+fn call_auction_trade_has_a_stable_instrument_identity_layout() {
+    let report = representative_reports().remove(11);
+    let encoded = report.encode().unwrap();
+    assert_eq!(encoded[45], 3);
+    assert_eq!(&encoded[46..54], &1_u64.to_le_bytes());
+    assert_eq!(&encoded[54..62], &7_u64.to_le_bytes());
+    assert_eq!(&encoded[62..70], &2_u64.to_le_bytes());
+    assert_eq!(
+        CallAuctionExecutionReport::decode(&encoded).unwrap(),
+        report
+    );
+}
+
+#[test]
 fn call_auction_phase_report_has_a_stable_little_endian_layout() {
     let report = representative_reports().remove(0);
     let encoded = report.encode().unwrap();
@@ -612,7 +626,7 @@ fn call_auction_codecs_reject_invalid_tags_lengths_bands_and_report_grammar() {
 
     let uncross = representative_reports().remove(11).encode().unwrap();
     let mut self_pair = uncross.clone();
-    self_pair[70..78].copy_from_slice(&uncross[54..62]);
+    self_pair[86..94].copy_from_slice(&uncross[70..78]);
     assert_eq!(
         CallAuctionExecutionReport::decode(&self_pair),
         Err(CodecError::InvalidValue(
@@ -631,7 +645,7 @@ fn call_auction_codecs_reject_invalid_tags_lengths_bands_and_report_grammar() {
     );
 
     let mut cancellation_overflow = uncross.clone();
-    cancellation_overflow[153..161].copy_from_slice(&u64::MAX.to_le_bytes());
+    cancellation_overflow[169..177].copy_from_slice(&u64::MAX.to_le_bytes());
     assert_eq!(
         CallAuctionExecutionReport::decode(&cancellation_overflow),
         Err(CodecError::InvalidValue(

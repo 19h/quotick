@@ -11,9 +11,14 @@ use std::fmt;
 use std::hash::Hash;
 use std::sync::Arc;
 
+use crate::auction_book::CallAuctionTrade;
+use crate::auction_engine::{
+    CallAuctionCommandOutcome, CallAuctionEventKind, CallAuctionExecutionReport,
+};
 use crate::bounded_hash::{BoundedHashError, BoundedHashMap, BoundedHashSet};
 use crate::domain::{
-    AccountId, AccountingDate, AssetId, ReconciliationId, TimestampNs, TransactionId,
+    AccountId, AccountingDate, AssetId, Price, Quantity, ReconciliationId, TimestampNs,
+    TransactionId,
 };
 use crate::instrument::InstrumentDefinition;
 use crate::matching::Trade;
@@ -52,6 +57,8 @@ pub enum LedgerResource {
 pub enum LedgerPreparationResource {
     /// Posting vector for a generated exact reversal.
     ReversalPostings,
+    /// DVP entries constructed for one complete call-auction report.
+    CallAuctionSettlementEntries,
     /// Identity set used to validate one batch.
     BatchIdentitySet,
     /// Pending transaction lookup for ordered batch semantics.
@@ -113,6 +120,7 @@ impl fmt::Display for LedgerPreparationResource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::ReversalPostings => "reversal posting preparation",
+            Self::CallAuctionSettlementEntries => "call-auction settlement-entry preparation",
             Self::BatchIdentitySet => "batch identity validation",
             Self::PendingTransactions => "batch pending-transaction preparation",
             Self::PendingReversals => "batch pending-reversal preparation",
@@ -495,6 +503,22 @@ pub struct LedgerBatch {
     entries: Arc<Vec<JournalEntry>>,
 }
 
+/// One complete accepted call-auction uncross mapped to one ledger event.
+///
+/// A single counterparty pair is represented by one journal entry. Two or
+/// more pairs are represented by one atomic ordered batch, so ledger readers
+/// never observe a partially settled uncross.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallAuctionSettlement {
+    record: CallAuctionSettlementRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CallAuctionSettlementRecord {
+    Entry(JournalEntry),
+    Batch(LedgerBatch),
+}
+
 /// One sequenced ledger event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LedgerRecord {
@@ -571,6 +595,15 @@ pub enum LedgerError {
     SettlementInstrumentMismatch,
     /// Trade and settlement definition versions differed.
     SettlementVersionMismatch,
+    /// The report was not a complete accepted uncross event trace.
+    CallAuctionSettlementReportInvalid,
+    /// Global transaction identifiers did not cover every emitted trade.
+    CallAuctionSettlementTransactionCountMismatch {
+        /// Supplied global transaction identifiers.
+        transaction_count: usize,
+        /// Counterparty pairs declared by the uncross completion event.
+        trade_count: usize,
+    },
     /// Ledger state changed after an entry was prepared and before commit.
     StalePreparation,
     /// The transaction targeted by a reversal was not present.
@@ -674,18 +707,14 @@ impl fmt::Display for LedgerError {
                     "transaction identifier {id} was reused with different content"
                 )
             }
-            Self::SelfSettlement => formatter.write_str("buyer and seller accounts must differ"),
-            Self::IdenticalSettlementAssets => {
-                formatter.write_str("base and quote settlement assets must differ")
-            }
-            Self::ZeroSettlementMultiplier => {
-                formatter.write_str("settlement conversion multipliers must be non-zero")
-            }
-            Self::SettlementInstrumentMismatch => {
-                formatter.write_str("trade and settlement definition instruments differ")
-            }
-            Self::SettlementVersionMismatch => {
-                formatter.write_str("trade and settlement definition versions differ")
+            settlement_error @ (Self::SelfSettlement
+            | Self::IdenticalSettlementAssets
+            | Self::ZeroSettlementMultiplier
+            | Self::SettlementInstrumentMismatch
+            | Self::SettlementVersionMismatch
+            | Self::CallAuctionSettlementReportInvalid
+            | Self::CallAuctionSettlementTransactionCountMismatch { .. }) => {
+                format_settlement_error(settlement_error, formatter)
             }
             Self::StalePreparation => formatter.write_str("prepared journal entry is stale"),
             Self::ReversalTargetMissing(transaction_id) => write!(
@@ -776,6 +805,34 @@ fn format_ledger_resource_error(
     }
 }
 
+fn format_settlement_error(error: &LedgerError, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match error {
+        LedgerError::SelfSettlement => formatter.write_str("buyer and seller accounts must differ"),
+        LedgerError::IdenticalSettlementAssets => {
+            formatter.write_str("base and quote settlement assets must differ")
+        }
+        LedgerError::ZeroSettlementMultiplier => {
+            formatter.write_str("settlement conversion multipliers must be non-zero")
+        }
+        LedgerError::SettlementInstrumentMismatch => {
+            formatter.write_str("trade and settlement definition instruments differ")
+        }
+        LedgerError::SettlementVersionMismatch => {
+            formatter.write_str("trade and settlement definition versions differ")
+        }
+        LedgerError::CallAuctionSettlementReportInvalid => formatter
+            .write_str("call-auction settlement requires one complete accepted uncross report"),
+        LedgerError::CallAuctionSettlementTransactionCountMismatch {
+            transaction_count,
+            trade_count,
+        } => write!(
+            formatter,
+            "call-auction settlement supplied {transaction_count} transaction identifiers for {trade_count} trades"
+        ),
+        _ => unreachable!("settlement formatter received a non-settlement error"),
+    }
+}
+
 fn format_accounting_period_error(
     error: &LedgerError,
     formatter: &mut fmt::Formatter<'_>,
@@ -852,6 +909,15 @@ fn format_unbalanced_ledger_error(
         formatter,
         "asset {asset_id} has positive total {positive_total} and negative total {negative_total}"
     )
+}
+
+#[derive(Clone, Copy)]
+struct SettlementExecution {
+    reference: u64,
+    buyer_account_id: AccountId,
+    seller_account_id: AccountId,
+    price: Price,
+    quantity: Quantity,
 }
 
 impl JournalEntry {
@@ -1081,7 +1147,29 @@ impl JournalEntry {
         trade: &Trade,
         convention: SettlementConvention,
     ) -> Result<Self, LedgerError> {
-        if trade.buyer_account_id == trade.seller_account_id {
+        Self::from_settlement_execution(
+            transaction_id,
+            effective_date,
+            recorded_at,
+            SettlementExecution {
+                reference: trade.trade_id.get(),
+                buyer_account_id: trade.buyer_account_id,
+                seller_account_id: trade.seller_account_id,
+                price: trade.price,
+                quantity: trade.quantity,
+            },
+            convention,
+        )
+    }
+
+    fn from_settlement_execution(
+        transaction_id: TransactionId,
+        effective_date: AccountingDate,
+        recorded_at: TimestampNs,
+        execution: SettlementExecution,
+        convention: SettlementConvention,
+    ) -> Result<Self, LedgerError> {
+        if execution.buyer_account_id == execution.seller_account_id {
             return Err(LedgerError::SelfSettlement);
         }
         if convention.base_asset_id == convention.quote_asset_id {
@@ -1091,11 +1179,11 @@ impl JournalEntry {
             return Err(LedgerError::ZeroSettlementMultiplier);
         }
 
-        let base_amount = i128::from(trade.quantity.lots())
+        let base_amount = i128::from(execution.quantity.lots())
             .checked_mul(i128::from(convention.base_units_per_lot))
             .ok_or(LedgerError::ArithmeticOverflow)?;
-        let notional = i128::from(trade.price.raw())
-            .checked_mul(i128::from(trade.quantity.lots()))
+        let notional = i128::from(execution.price.raw())
+            .checked_mul(i128::from(execution.quantity.lots()))
             .and_then(|value| value.checked_mul(i128::from(convention.quote_units_per_price_unit)))
             .ok_or(LedgerError::ArithmeticOverflow)?;
         let opposite_notional = notional
@@ -1103,12 +1191,12 @@ impl JournalEntry {
             .ok_or(LedgerError::ArithmeticOverflow)?;
         let mut postings = vec![
             Posting {
-                account_id: trade.buyer_account_id,
+                account_id: execution.buyer_account_id,
                 asset_id: convention.base_asset_id,
                 amount: base_amount,
             },
             Posting {
-                account_id: trade.seller_account_id,
+                account_id: execution.seller_account_id,
                 asset_id: convention.base_asset_id,
                 amount: -base_amount,
             },
@@ -1116,12 +1204,12 @@ impl JournalEntry {
         if notional != 0 {
             postings.extend([
                 Posting {
-                    account_id: trade.buyer_account_id,
+                    account_id: execution.buyer_account_id,
                     asset_id: convention.quote_asset_id,
                     amount: opposite_notional,
                 },
                 Posting {
-                    account_id: trade.seller_account_id,
+                    account_id: execution.seller_account_id,
                     asset_id: convention.quote_asset_id,
                     amount: notional,
                 },
@@ -1129,10 +1217,38 @@ impl JournalEntry {
         }
         Self::new(
             transaction_id,
-            trade.trade_id.get(),
+            execution.reference,
             effective_date,
             recorded_at,
             postings,
+        )
+    }
+
+    fn from_call_auction_trade(
+        transaction_id: TransactionId,
+        effective_date: AccountingDate,
+        recorded_at: TimestampNs,
+        trade: CallAuctionTrade,
+        definition: InstrumentDefinition,
+    ) -> Result<Self, LedgerError> {
+        if trade.instrument_id() != definition.instrument_id() {
+            return Err(LedgerError::SettlementInstrumentMismatch);
+        }
+        if trade.instrument_version() != definition.version() {
+            return Err(LedgerError::SettlementVersionMismatch);
+        }
+        Self::from_settlement_execution(
+            transaction_id,
+            effective_date,
+            recorded_at,
+            SettlementExecution {
+                reference: trade.trade_id().get(),
+                buyer_account_id: trade.buy_account_id(),
+                seller_account_id: trade.sell_account_id(),
+                price: trade.price(),
+                quantity: trade.quantity(),
+            },
+            definition.settlement_convention(),
         )
     }
 
@@ -1320,6 +1436,161 @@ impl LedgerBatch {
     }
 }
 
+impl CallAuctionSettlement {
+    /// Constructs one DVP ledger event from a complete accepted uncross report.
+    ///
+    /// Global transaction identifiers bind to trade events in report order.
+    /// The immutable instrument definition must match every trade. Report
+    /// structure, aggregate executable quantity, and all entries are validated
+    /// before a settlement value is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] for a non-uncross or incomplete report, a
+    /// transaction-count or definition mismatch, self settlement, invalid
+    /// settlement factors, arithmetic overflow, or batch construction failure.
+    pub fn from_report(
+        transaction_ids: Vec<TransactionId>,
+        effective_date: AccountingDate,
+        recorded_at: TimestampNs,
+        report: &CallAuctionExecutionReport,
+        definition: InstrumentDefinition,
+    ) -> Result<Self, LedgerError> {
+        let trade_count = validate_call_auction_settlement_report(report, definition)?;
+        if transaction_ids.len() != trade_count {
+            return Err(LedgerError::CallAuctionSettlementTransactionCountMismatch {
+                transaction_count: transaction_ids.len(),
+                trade_count,
+            });
+        }
+
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(trade_count).map_err(|_| {
+            LedgerError::PreparationAllocationFailed(
+                LedgerPreparationResource::CallAuctionSettlementEntries,
+            )
+        })?;
+        for (transaction_id, event) in transaction_ids
+            .into_iter()
+            .zip(report.events.iter().take(trade_count))
+        {
+            let CallAuctionEventKind::Trade(trade) = event.kind else {
+                unreachable!("validated call-auction trade prefix changed")
+            };
+            entries.push(JournalEntry::from_call_auction_trade(
+                transaction_id,
+                effective_date,
+                recorded_at,
+                trade,
+                definition,
+            )?);
+        }
+        let record = if entries.len() == 1 {
+            let Some(entry) = entries.pop() else {
+                return Err(LedgerError::CallAuctionSettlementReportInvalid);
+            };
+            CallAuctionSettlementRecord::Entry(entry)
+        } else {
+            CallAuctionSettlementRecord::Batch(LedgerBatch::new(entries)?)
+        };
+        Ok(Self { record })
+    }
+
+    /// Returns the number of global transactions in the atomic ledger event.
+    #[must_use]
+    pub fn transaction_count(&self) -> usize {
+        match &self.record {
+            CallAuctionSettlementRecord::Entry(_) => 1,
+            CallAuctionSettlementRecord::Batch(batch) => batch.entries().len(),
+        }
+    }
+
+    pub(crate) fn into_record(self) -> CallAuctionSettlementRecord {
+        self.record
+    }
+}
+
+fn validate_call_auction_settlement_report(
+    report: &CallAuctionExecutionReport,
+    definition: InstrumentDefinition,
+) -> Result<usize, LedgerError> {
+    if report.command_sequence == 0 || report.outcome != CallAuctionCommandOutcome::Accepted {
+        return Err(LedgerError::CallAuctionSettlementReportInvalid);
+    }
+    let Some(completion) = report.events.last() else {
+        return Err(LedgerError::CallAuctionSettlementReportInvalid);
+    };
+    let CallAuctionEventKind::UncrossCompleted {
+        clearing,
+        trade_count,
+        cancellation_count,
+        ..
+    } = completion.kind
+    else {
+        return Err(LedgerError::CallAuctionSettlementReportInvalid);
+    };
+    let (Ok(trade_count), Ok(cancellation_count)) = (
+        usize::try_from(trade_count),
+        usize::try_from(cancellation_count),
+    ) else {
+        return Err(LedgerError::CallAuctionSettlementReportInvalid);
+    };
+    let Some(expected_event_count) = trade_count
+        .checked_add(cancellation_count)
+        .and_then(|count| count.checked_add(1))
+    else {
+        return Err(LedgerError::CallAuctionSettlementReportInvalid);
+    };
+    if trade_count == 0 || report.events.len() != expected_event_count {
+        return Err(LedgerError::CallAuctionSettlementReportInvalid);
+    }
+    let Some(first_event) = report.events.first() else {
+        return Err(LedgerError::CallAuctionSettlementReportInvalid);
+    };
+    let mut expected_sequence = first_event.sequence;
+    if expected_sequence == 0 {
+        return Err(LedgerError::CallAuctionSettlementReportInvalid);
+    }
+    for event in &report.events {
+        if event.sequence != expected_sequence || event.command_id != report.command_id {
+            return Err(LedgerError::CallAuctionSettlementReportInvalid);
+        }
+        expected_sequence = expected_sequence
+            .checked_add(1)
+            .ok_or(LedgerError::CallAuctionSettlementReportInvalid)?;
+    }
+
+    let mut executed_quantity = 0_u128;
+    for event in report.events.iter().take(trade_count) {
+        let CallAuctionEventKind::Trade(trade) = event.kind else {
+            return Err(LedgerError::CallAuctionSettlementReportInvalid);
+        };
+        if trade.instrument_id() != definition.instrument_id() {
+            return Err(LedgerError::SettlementInstrumentMismatch);
+        }
+        if trade.instrument_version() != definition.version() {
+            return Err(LedgerError::SettlementVersionMismatch);
+        }
+        if trade.price() != clearing.price() {
+            return Err(LedgerError::CallAuctionSettlementReportInvalid);
+        }
+        executed_quantity = executed_quantity
+            .checked_add(u128::from(trade.quantity().lots()))
+            .ok_or(LedgerError::ArithmeticOverflow)?;
+    }
+    if report
+        .events
+        .iter()
+        .skip(trade_count)
+        .take(cancellation_count)
+        .any(|event| !matches!(event.kind, CallAuctionEventKind::RemainderCancelled(_)))
+        || executed_quantity != clearing.executable_quantity()
+    {
+        return Err(LedgerError::CallAuctionSettlementReportInvalid);
+    }
+    Ok(trade_count)
+}
+
 /// Defines how an execution maps into base and quote ledger units.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SettlementConvention {
@@ -1364,6 +1635,54 @@ pub struct BatchReceipt {
     pub replayed: bool,
     /// Number of transaction entries committed by the event.
     pub transaction_count: usize,
+}
+
+/// Result of committing one complete call-auction settlement event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionSettlementReceipt {
+    sequence: u64,
+    replayed: bool,
+    transaction_count: usize,
+}
+
+impl CallAuctionSettlementReceipt {
+    /// Returns the strictly increasing ledger-event sequence.
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    /// Returns whether this exact settlement event was already committed.
+    #[must_use]
+    pub const fn replayed(self) -> bool {
+        self.replayed
+    }
+
+    /// Returns the number of settled counterparty pairs.
+    #[must_use]
+    pub const fn transaction_count(self) -> usize {
+        self.transaction_count
+    }
+}
+
+impl From<PostReceipt> for CallAuctionSettlementReceipt {
+    fn from(receipt: PostReceipt) -> Self {
+        Self {
+            sequence: receipt.sequence,
+            replayed: receipt.replayed,
+            transaction_count: 1,
+        }
+    }
+}
+
+impl From<BatchReceipt> for CallAuctionSettlementReceipt {
+    fn from(receipt: BatchReceipt) -> Self {
+        Self {
+            sequence: receipt.sequence,
+            replayed: receipt.replayed,
+            transaction_count: receipt.transaction_count,
+        }
+    }
 }
 
 /// Result of validating an entry against a specific ledger generation.
@@ -2546,6 +2865,26 @@ impl Ledger {
         match self.prepare_batch(batch)? {
             BatchPreparation::Replay(receipt) => Ok(receipt),
             BatchPreparation::Ready(prepared) => self.commit_batch(prepared),
+        }
+    }
+
+    /// Atomically commits every DVP entry from one accepted call-auction uncross.
+    ///
+    /// A one-trade uncross is one ordinary ledger entry. A multi-trade uncross
+    /// is one batch event, with exact-retry and collision semantics delegated
+    /// to the same canonical posting paths as direct ledger use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] for collision, partial prior commitment,
+    /// accounting-period, timestamp, capacity, or final-balance failure.
+    pub fn settle_call_auction(
+        &mut self,
+        settlement: CallAuctionSettlement,
+    ) -> Result<CallAuctionSettlementReceipt, LedgerError> {
+        match settlement.record {
+            CallAuctionSettlementRecord::Entry(entry) => self.post(entry).map(Into::into),
+            CallAuctionSettlementRecord::Batch(batch) => self.post_batch(batch).map(Into::into),
         }
     }
 
