@@ -1015,6 +1015,15 @@ fn fallible_depth_is_public_only_market_ordered_and_bounded() {
     );
     assert_eq!(book.try_depth(Side::Sell, 1).unwrap()[0].price.raw(), 120);
     assert!(book.try_depth(Side::Buy, 0).unwrap().is_empty());
+    assert_eq!(book.try_best_bid().unwrap(), book.best_bid());
+    assert_eq!(book.try_best_ask().unwrap(), book.best_ask());
+    assert_eq!(
+        book.try_depth_iter(Side::Buy)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        bids
+    );
     assert_eq!(bids, book.depth(Side::Buy, usize::MAX));
     assert_eq!(bids, book.depth_iter(Side::Buy).collect::<Vec<_>>());
     assert_eq!(book.depth_iter(Side::Buy).size_hint(), (0, Some(3)));
@@ -1032,6 +1041,16 @@ fn fallible_depth_range_is_inclusive_market_ordered_and_public_only() {
     let book = populated_book();
 
     let bid_band = Price::from_raw(90)..=Price::from_raw(100);
+    assert_eq!(
+        book.try_depth_range_iter(Side::Buy, bid_band.clone())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .map(|level| level.price.raw())
+            .collect::<Vec<_>>(),
+        [100, 90]
+    );
     assert_eq!(
         book.depth_range_iter(Side::Buy, bid_band.clone())
             .map(|level| level.price.raw())

@@ -219,8 +219,14 @@ fn assert_mirrors(book: &OrderBook, replica: &MarketDataReplica) {
         replica.try_best_bid_offer().unwrap(),
         book.try_best_bid_offer().unwrap()
     );
-    assert_eq!(replica.try_best_bid().unwrap(), book.best_bid());
-    assert_eq!(replica.try_best_ask().unwrap(), book.best_ask());
+    assert_eq!(
+        replica.try_best_bid().unwrap(),
+        book.try_best_bid().unwrap()
+    );
+    assert_eq!(
+        replica.try_best_ask().unwrap(),
+        book.try_best_ask().unwrap()
+    );
     for side in [Side::Buy, Side::Sell] {
         for raw_price in [-1_000, -100, 0, 90, 100, 120, 1_000] {
             let price = Price::from_raw(raw_price);
@@ -259,7 +265,10 @@ fn assert_mirrors(book: &OrderBook, replica: &MarketDataReplica) {
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
-            book.depth_iter(side).collect::<Vec<_>>()
+            book.try_depth_iter(side)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
         );
         let exact_best = match side {
             Side::Buy => book.best_ask(),

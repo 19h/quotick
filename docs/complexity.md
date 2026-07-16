@@ -150,13 +150,16 @@ allocation. Human-readable failure-detail formatting may allocate after
 corruption is detected.
 
 Read-only order-book output has an explicit caller-owned allocation boundary.
-For `P` occupied execution prices, `V <= P` public prices, and requested depth
-limit `L`, `try_depth` reserves at most `min(P, L)` entries before traversal,
-costs `O(P)` time in the hidden-only worst case, and returns
-`O(min(V, L))` space. `depth_iter` has `O(log(P + 1))` setup, streams the same
-market-priority public projection in `O(P)` complete-traversal time, and uses
-`O(1)` auxiliary space without caller-owned output. For `T` active identities
-including `S` dormant stops and `R = T - S` resting orders,
+For `P` occupied execution prices, `V <= P` visible prices, requested limit
+`L`, and `K_L <= P` occupied prices inspected to select
+`S = min(V, L)` visible rows, `try_depth` performs one validation/count pass and
+one copy pass in `O(log(P + 1) + K_L)` time overall, requests exactly `S`
+slots, and owns `O(S)` output. Constant factors include the two traversals.
+`try_depth_iter` has `O(log(P + 1))` gated setup, streams the same market-
+priority public projection in `O(P)` complete-traversal time, and uses `O(1)`
+iterator state without caller-owned output. Each selected row adds `O(1)`
+aggregate validation. For `T` active identities including `S_o` dormant stops
+and `R = T - S_o` resting orders,
 `try_active_orders` costs `O(T + R log R)` time and `O(R)` output space. For
 one account selection of `K` orders, `try_account_active_order_ids` costs
 expected
@@ -166,18 +169,21 @@ and drop any private partial construction on an invariant failure.
 
 For an inclusive price band, let `K` be the occupied execution-price levels
 inspected inside the band and `V_b <= K` the selected visible rows after
-applying the requested limit. `depth_range_iter` costs
+applying the requested limit. `try_depth_range_iter` costs
 `O(log(P + 1) + K)` total time and
 `O(1)` auxiliary space; hidden-only in-band prices contribute to `K` but not
-`V_b`. `try_depth_range` performs one allocation-free count and one copy pass,
+`V_b`. Each selected candidate adds `O(1)` validation. `try_depth_range`
+performs one allocation-free validation/count pass and one validated copy pass,
 so the constant doubles without changing the asymptotic bound. It requests
-exactly `V_b` slots and owns `O(V_b)` caller output. An inverted band is empty.
-Full and band iterators each retain two 128-index stacks:
+exactly `V_b` slots and owns `O(V_b)` caller output. An inverted band is empty
+after the `O(1)` coherent-extrema gate. Full and band iterators each retain two
+128-index stacks:
 `2 × 128 × size_of::<usize>() = 2,048 B` on a 64-bit target, plus scalar
 fields. The bound is independent of configured or occupied level count.
 
-`try_depth_range_summary` performs one checked fold over the shared directional
-price-range descent. For `K` occupied execution prices in the selected band,
+`try_depth_range_summary` performs the `O(1)` coherent-extrema gate and one
+checked fold over the typed directional price-range descent. For `K` occupied
+execution prices in the selected band,
 including hidden-only prices, it is `O(log(P + 1) + K)` time and `O(1)` fixed
 result/state, and allocates no output. Only visible rows contribute to the
 level, displayed-order, and displayed-quantity totals. The full-side
@@ -207,6 +213,8 @@ across the complete signed `i64` price domain; exact midpoint numerator
 `a + b` fits `i128` and retains denominator two. Empty and one-sided books
 perform the same bounded work. Human-readable invariant detail may allocate
 only after a zero aggregate/count or locked/crossed pair is detected.
+`try_best_bid` and `try_best_ask` select one optional side from this same value
+without another traversal, retaining `O(1)` time and space.
 
 `try_public_level` performs the authoritative `O(1)` coherent-extrema check,
 one `O(log(P + 1))` execution-level lookup, and one
@@ -222,7 +230,8 @@ execution prices inspected through filled, price-limit, or public-book-
 exhausted termination among `P` occupied prices. Hidden-only prices can be
 inspected but do not enter the quote. `try_displayed_liquidity_quote` costs
 `O(log(P + 1) + K)` time and `O(1)` fixed output/state, allocates no output,
-and performs no mutation. Each contributing public price adds one constant-time
+and performs no mutation. Its coherent-extrema gate is `O(1)` before traversal.
+Each contributing public price adds one constant-time
 checked quantity/notional update; at most one level is partial. Quoted quantity
 is bounded by the requested `u64`, so the exact signed `i128` notional covers
 the full `i64` price domain. The shared accumulator is also used by the private

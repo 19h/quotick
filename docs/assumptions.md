@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A134 are stable and are referenced from code comments and other
+identifiers A1-A135 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -4907,10 +4907,99 @@ poisoned output, unchecked contradiction, panic in the typed path, mutation,
 successful-path allocation, recovery/parity difference, or wire-byte change
 falsifies A134.
 
+## A135 — fail-closed authoritative public-depth boundary
+
+**Assumption.** One public query holds one immutable continuous `OrderBook`
+borrow. `try_best_bid`, `try_best_ask`, `try_depth_iter`,
+`try_depth_range_iter`, `try_depth`, `try_depth_range`,
+`try_depth_range_summary`, and `try_depth_summary` compose the A128 coherent-
+extrema gate before returning a side, iterator, vector, or summary. The A131
+displayed-liquidity quote now applies the same gate before its bounded sweep;
+A133 imbalance and A134 exact-level observations retain their existing gate.
+
+The outer iterator result rejects a zero aggregate/count at either cached
+public extremum and rejects locked/crossed extrema before a traversal is
+exposed, including for a zero limit, inverted range, empty selected band, or
+opposite-side request. Each streamed execution-price candidate with either a
+non-zero displayed quantity or displayed-order count must have both values
+positive. A both-zero row is hidden-only at this local public boundary and is
+omitted. Bids remain descending, asks ascending, and full/range iterators
+remain double-ended. A valid prefix may therefore be consumed before a later
+non-extremum contradiction returns typed `InvariantViolation`; a contradiction
+outside the consumed prefix or inclusive range is not inspected.
+
+`try_depth` and `try_depth_range` first validate and count the exact selected
+visible prefix without allocation, reserve that complete cardinality, and copy
+through a second identical traversal under the same immutable borrow. An
+invariant or reservation failure returns no caller-owned partial vector.
+`try_depth_range_summary` folds the same typed range traversal, and any row or
+cumulative-arithmetic failure discards its fixed-size local partial value.
+
+The `best_bid`, `best_ask`, `depth`, `depth_range`, `depth_iter`, and
+`depth_range_iter` convenience methods delegate to the fallible boundary and
+panic on typed failure. Diagnostic resource telemetry, private observations,
+and the crate-private publisher projection remain separate interfaces. Per-row
+stream validation does not prove complete A45 private FIFO or redundant
+public-index topology; A134 proves membership at one exact key and
+`OrderBook::validate` remains the complete structural audit.
+
+No successful iterator, best-side, summary, quote, or imbalance query allocates
+or mutates state. Successful materialization owns only its exactly reserved
+output vector. No query adds a command, event, risk, WAL, checkpoint, snapshot,
+market-data payload, or wire-version field.
+
+**Dependent results.** [A1, A3, A10, A12, A22, A44, A45, A55, A70, A72, A83,
+A103, A123, A128, A129, A130, A131, A132, A133, A134, A135] Best-side and
+outer-gate work is `O(1)`. Full iterator setup is `O(log(P + 1))`; consuming
+`K` occupied execution prices is `O(K)` with `O(1)` iterator state. Range setup
+and traversal are `O(log(P + 1) + K)`. Each candidate adds `O(1)` validation.
+Materializers make two bounded traversals and own `O(S)` output for `S`
+selected visible rows; no error returns partial output. Direct checkpoint
+restoration and caught-up incremental, retry, repaired-snapshot, and durable-
+bootstrap replicas preserve healthy source/replica parity. No wire change
+follows.
+
+**Falsification probe.** Exercise both sides; empty, one-sided, two-sided,
+hidden-only, reserve, signed-price, full, narrow, outside, singleton, and
+inverted bands; limits `0`, `1`, exact visible depth, and `usize::MAX`; and
+forward, reverse, and mixed-end traversal. Corrupt each extremum and a deeper
+row independently to zero quantity or count; lock/cross the sides; place the
+deeper row immediately inside and outside the selected prefix/range. Require
+outer failure before exposure for extremum corruption irrespective of the
+selection, exact per-item failure for a reached deeper row, success when that
+row is not reached, exact reservation, no partial vector, unchanged telemetry
+and state, and convenience/fallible parity. Compare checkpoint source and
+healthy incremental, exact-retry, snapshot-repaired, and durable-bootstrap
+replicas after every command class. Any invalid selected row omitted, economic
+state exposed through incoherent extrema, direction/range drift, hidden
+disclosure, partial ownership, successful-path streaming allocation, mutation,
+recovery/parity difference, panic in a typed path, or wire-byte change
+falsifies A135.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** authoritative continuous public-depth observations now
+  share the same coherent-extrema and selected-row validation semantics as
+  healthy replicas. Full/range streaming remains allocation-free and double-
+  ended; materializers reserve exact output and return no partial vector.
+
+- **Medium impact risk:** a fallible stream may yield a valid prefix before a
+  later non-extremum contradiction is reached. Consumers requiring all-or-
+  nothing ownership must use the vector materializers or a fixed-size summary.
+  Convenience methods panic on typed corruption and are not recovery APIs.
+
+- **Medium impact boundary:** selected-row validation proves displayed
+  quantity/count consistency but not the complete private FIFO or redundant
+  public-index topology. Exact-key membership is available through A134;
+  complete topology proof remains the explicit A45 structural audit.
+
+- **Medium impact opportunity:** authoritative and replica full/range readers
+  now have structurally parallel fallible contracts, allowing one consumer
+  adapter to process live source state, repaired replicas, and deterministic
+  replay without an infallible source-only branch.
 
 - **Medium impact:** authoritative books and healthy continuous public replicas
   now expose fixed-size exact-price observations whose present or absent state

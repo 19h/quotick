@@ -2339,7 +2339,7 @@ pub enum OrderBookQueryError {
         /// Maximum number of output entries required by the query.
         maximum: usize,
     },
-    /// Private account or resting-order state contradicted its invariants.
+    /// Selected order-book state contradicted its invariants.
     InvariantViolation(InvariantViolation),
 }
 
@@ -7601,13 +7601,14 @@ impl OrderBook {
     ///
     /// # Errors
     ///
-    /// Returns [`InvariantViolation`] if an inspected public level has a zero
-    /// aggregate or displayed-order count, or its contributing-level count is
-    /// not representable.
+    /// Returns [`InvariantViolation`] if public extrema are invalid or locked/
+    /// crossed, an inspected public level has a zero aggregate or displayed-
+    /// order count, or its contributing-level count is not representable.
     pub fn try_displayed_liquidity_quote(
         &self,
         request: DisplayedLiquidityRequest,
     ) -> Result<DisplayedLiquidityQuote, InvariantViolation> {
+        self.try_best_bid_offer()?;
         DisplayedLiquidityQuote::try_from_depth(
             self.definition.instrument_id(),
             self.definition.version(),
@@ -7762,17 +7763,13 @@ impl OrderBook {
         quote.finish(self_trade_decrement_quantity_lots, termination)
     }
 
-    /// Returns the current best bid.
-    #[must_use]
-    pub fn best_bid(&self) -> Option<LevelSnapshot> {
+    fn raw_best_bid(&self) -> Option<LevelSnapshot> {
         self.bids
             .best_visible_level()
             .map(|(price, level)| Self::level_snapshot(price, &level))
     }
 
-    /// Returns the current best ask.
-    #[must_use]
-    pub fn best_ask(&self) -> Option<LevelSnapshot> {
+    fn raw_best_ask(&self) -> Option<LevelSnapshot> {
         self.asks
             .best_visible_level()
             .map(|(price, level)| Self::level_snapshot(price, &level))
@@ -7790,8 +7787,8 @@ impl OrderBook {
     /// Returns [`InvariantViolation`] if a cached visible level has a zero
     /// aggregate/count or the two cached sides are locked or crossed.
     pub fn try_best_bid_offer(&self) -> Result<BestBidOffer, InvariantViolation> {
-        let bid = self.best_bid();
-        let offer = self.best_ask();
+        let bid = self.raw_best_bid();
+        let offer = self.raw_best_ask();
         BestBidOffer::try_new(
             self.definition.instrument_id(),
             self.definition.version(),
@@ -7799,6 +7796,54 @@ impl OrderBook {
             bid,
             offer,
         )
+    }
+
+    /// Fallibly returns the current displayed best bid after validating both
+    /// public extrema as one coherent state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] if either public extremum has a zero
+    /// aggregate/count or the two sides are locked or crossed.
+    pub fn try_best_bid(&self) -> Result<Option<LevelSnapshot>, InvariantViolation> {
+        Ok(self.try_best_bid_offer()?.bid())
+    }
+
+    /// Fallibly returns the current displayed best ask after validating both
+    /// public extrema as one coherent state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] if either public extremum has a zero
+    /// aggregate/count or the two sides are locked or crossed.
+    pub fn try_best_ask(&self) -> Result<Option<LevelSnapshot>, InvariantViolation> {
+        Ok(self.try_best_bid_offer()?.offer())
+    }
+
+    /// Returns the current displayed best bid using the fallible production
+    /// path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if public extrema are invalid or locked/crossed. Use
+    /// [`Self::try_best_bid`] when failure must remain typed.
+    #[must_use]
+    pub fn best_bid(&self) -> Option<LevelSnapshot> {
+        self.try_best_bid()
+            .expect("order-book best bid is not queryable")
+    }
+
+    /// Returns the current displayed best ask using the fallible production
+    /// path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if public extrema are invalid or locked/crossed. Use
+    /// [`Self::try_best_ask`] when failure must remain typed.
+    #[must_use]
+    pub fn best_ask(&self) -> Option<LevelSnapshot> {
+        self.try_best_ask()
+            .expect("order-book best ask is not queryable")
     }
 
     /// Returns one exact-price displayed public-level observation.
@@ -7953,8 +7998,9 @@ impl OrderBook {
     ///
     /// # Errors
     ///
-    /// Returns [`InvariantViolation`] if a selected public level has a zero
-    /// aggregate/count or a cumulative count/quantity cannot fit its output.
+    /// Returns [`InvariantViolation`] if public extrema are invalid or locked/
+    /// crossed, a selected public level has a zero aggregate/count, or a
+    /// cumulative count/quantity cannot fit its output.
     pub fn try_depth_summary(&self, side: Side) -> Result<DepthSummary, InvariantViolation> {
         let price_rules = self.definition.price_rules();
         self.try_depth_range_summary(side, price_rules.minimum()..=price_rules.maximum())
@@ -7970,8 +8016,9 @@ impl OrderBook {
     ///
     /// # Errors
     ///
-    /// Returns [`InvariantViolation`] if a selected public level has a zero
-    /// aggregate/count or a cumulative count/quantity cannot fit its output.
+    /// Returns [`InvariantViolation`] if public extrema are invalid or locked/
+    /// crossed, a selected public level has a zero aggregate/count, or a
+    /// cumulative count/quantity cannot fit its output.
     pub fn try_depth_range_summary(
         &self,
         side: Side,
@@ -7987,34 +8034,39 @@ impl OrderBook {
             range_start,
             range_end,
         );
-        for (&price, level) in self.price_levels_range_iter(side, range) {
-            if level.total_quantity == 0 && level.visible_order_count == 0 {
-                continue;
-            }
-            summary.try_include(Self::level_snapshot(price, level))?;
+        for level in self.try_depth_range_iter(side, range)? {
+            summary.try_include(level?)?;
         }
         Ok(summary)
     }
 
     /// Fallibly returns up to `limit` public levels in market-priority order.
     ///
-    /// The result reserves no more than the side's bounded occupied-price
-    /// cardinality before copying any level. Fully hidden-only prices remain
-    /// absent from output.
+    /// The query validates and counts the exact selected prefix, reserves that
+    /// complete semantic cardinality, then copies through an identical second
+    /// pass. Fully hidden-only prices remain absent from output.
     ///
     /// # Errors
     ///
-    /// Returns [`OrderBookQueryError::ReservationFailed`] without partial output
-    /// if the caller-owned result vector cannot be reserved.
+    /// Returns [`OrderBookQueryError::InvariantViolation`] for incoherent
+    /// public extrema or a selected invalid aggregate, or
+    /// [`OrderBookQueryError::ReservationFailed`] if the complete caller-owned
+    /// result cannot be reserved. No error returns partial output.
     pub fn try_depth(
         &self,
         side: Side,
         limit: usize,
     ) -> Result<Vec<LevelSnapshot>, OrderBookQueryError> {
-        let maximum = self.levels(side).len().min(limit);
+        let mut output_len = 0_usize;
+        for level in self.try_depth_iter(side)?.take(limit) {
+            level?;
+            output_len += 1;
+        }
         let mut output =
-            reserve_order_book_query_vec(maximum, OrderBookQueryResource::DepthLevels)?;
-        output.extend(self.depth_iter(side).take(limit));
+            reserve_order_book_query_vec(output_len, OrderBookQueryResource::DepthLevels)?;
+        for level in self.try_depth_iter(side)?.take(limit) {
+            output.push(level?);
+        }
         Ok(output)
     }
 
@@ -8027,21 +8079,26 @@ impl OrderBook {
     ///
     /// # Errors
     ///
-    /// Returns [`OrderBookQueryError::ReservationFailed`] without partial output
-    /// if the caller-owned result vector cannot be reserved.
+    /// Returns [`OrderBookQueryError::InvariantViolation`] for incoherent
+    /// public extrema or a selected invalid aggregate, or
+    /// [`OrderBookQueryError::ReservationFailed`] if the complete caller-owned
+    /// result cannot be reserved. No error returns partial output.
     pub fn try_depth_range(
         &self,
         side: Side,
         range: RangeInclusive<Price>,
         limit: usize,
     ) -> Result<Vec<LevelSnapshot>, OrderBookQueryError> {
-        let maximum = self
-            .depth_range_iter(side, range.clone())
-            .take(limit)
-            .count();
+        let mut output_len = 0_usize;
+        for level in self.try_depth_range_iter(side, range.clone())?.take(limit) {
+            level?;
+            output_len += 1;
+        }
         let mut output =
-            reserve_order_book_query_vec(maximum, OrderBookQueryResource::DepthLevels)?;
-        output.extend(self.depth_range_iter(side, range).take(limit));
+            reserve_order_book_query_vec(output_len, OrderBookQueryResource::DepthLevels)?;
+        for level in self.try_depth_range_iter(side, range)?.take(limit) {
+            output.push(level?);
+        }
         Ok(output)
     }
 
@@ -8049,8 +8106,9 @@ impl OrderBook {
     ///
     /// # Panics
     ///
-    /// Panics only if result-vector allocation fails. Use [`Self::try_depth`]
-    /// when allocation failure must remain typed.
+    /// Panics if public state is incoherent, a selected aggregate is invalid,
+    /// or result-vector allocation fails. Use [`Self::try_depth`] when failure
+    /// must remain typed.
     #[must_use]
     pub fn depth(&self, side: Side, limit: usize) -> Vec<LevelSnapshot> {
         self.try_depth(side, limit)
@@ -8062,8 +8120,9 @@ impl OrderBook {
     ///
     /// # Panics
     ///
-    /// Panics only if result-vector allocation fails. Use
-    /// [`Self::try_depth_range`] when allocation failure must remain typed.
+    /// Panics if public state is incoherent, a selected aggregate is invalid,
+    /// or result-vector allocation fails. Use [`Self::try_depth_range`] when
+    /// failure must remain typed.
     #[must_use]
     pub fn depth_range(
         &self,
@@ -8075,37 +8134,85 @@ impl OrderBook {
             .expect("order-book price-range depth output allocation failed")
     }
 
-    /// Iterates public aggregate levels in market-priority order without
-    /// allocating.
+    /// Fallibly iterates public aggregate levels in market-priority order.
     ///
     /// Bids are descending and asks are ascending. Prices containing only
-    /// hidden liquidity are omitted. The iterator is double-ended; its upper
-    /// size hint is the occupied execution-price count because hidden-only
-    /// levels can be skipped. Creating it is `O(log(P + 1))`; consuming it is
-    /// `O(P)` time for `P` occupied execution prices and `O(1)` auxiliary
-    /// space.
-    #[must_use]
-    pub fn depth_iter(&self, side: Side) -> impl DoubleEndedIterator<Item = LevelSnapshot> + '_ {
-        DirectionalIter::new(self.depth_levels(side), side == Side::Buy)
+    /// hidden liquidity are omitted. The outer result validates coherent
+    /// extrema before exposing the double-ended iterator; each item validates
+    /// the selected aggregate. Creating it is `O(log(P + 1))`; consuming `P`
+    /// occupied execution prices is `O(P)` time with `O(1)` iterator state and
+    /// no allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] before iterator exposure for invalid or
+    /// locked/crossed public extrema. A streamed item returns the same type for
+    /// a zero aggregate or displayed-order count at its exact price.
+    pub fn try_depth_iter(
+        &self,
+        side: Side,
+    ) -> Result<
+        impl DoubleEndedIterator<Item = Result<LevelSnapshot, InvariantViolation>> + '_,
+        InvariantViolation,
+    > {
+        self.try_best_bid_offer()?;
+        Ok(self.fallible_public_depth_candidates(side))
     }
 
-    /// Iterates public aggregate levels inside an inclusive price range without
-    /// allocating.
+    /// Iterates public aggregate levels using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if public extrema or a streamed aggregate are invalid. Use
+    /// [`Self::try_depth_iter`] when failure must remain typed.
+    #[must_use]
+    pub fn depth_iter(&self, side: Side) -> impl DoubleEndedIterator<Item = LevelSnapshot> + '_ {
+        self.try_depth_iter(side)
+            .expect("order-book public depth is not queryable")
+            .map(|level| level.expect("order-book public depth level is invalid"))
+    }
+
+    /// Fallibly iterates public aggregate levels inside an inclusive range.
     ///
     /// Bids are descending and asks are ascending. Prices containing only
-    /// hidden liquidity are omitted, and an inverted range is empty. Creating
-    /// the iterator is `O(log(P + 1))`; inspecting `K` in-range occupied
-    /// execution prices is `O(K + log(P + 1))` total time with `O(1)`
-    /// auxiliary space. Hidden-only prices contribute to `K` but not output.
+    /// hidden liquidity are omitted, and an inverted range is empty. The outer
+    /// result validates coherent extrema before exposure; each item validates
+    /// its selected aggregate. Creating and consuming `K` in-range occupied
+    /// execution prices among `P` side prices costs
+    /// `O(log(P + 1) + K)` time with `O(1)` iterator state and no allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] before iterator exposure for invalid or
+    /// locked/crossed public extrema. A streamed item returns the same type for
+    /// a zero aggregate or displayed-order count at its exact price.
+    pub fn try_depth_range_iter(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+    ) -> Result<
+        impl DoubleEndedIterator<Item = Result<LevelSnapshot, InvariantViolation>> + '_,
+        InvariantViolation,
+    > {
+        self.try_best_bid_offer()?;
+        Ok(self.fallible_public_depth_range_candidates(side, range))
+    }
+
+    /// Iterates one inclusive range using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if public extrema or a streamed aggregate are invalid. Use
+    /// [`Self::try_depth_range_iter`] when failure must remain typed.
     #[must_use]
     pub fn depth_range_iter(
         &self,
         side: Side,
         range: RangeInclusive<Price>,
     ) -> impl DoubleEndedIterator<Item = LevelSnapshot> + '_ {
-        self.price_levels_range_iter(side, range)
-            .filter(|(_, level)| level.total_quantity != 0)
-            .map(|(&price, level)| Self::level_snapshot(price, level))
+        self.try_depth_range_iter(side, range)
+            .expect("order-book public depth range is not queryable")
+            .map(|level| level.expect("order-book public depth level is invalid"))
     }
 
     /// Iterates aggregate levels in ascending price order without allocating.
@@ -8126,6 +8233,42 @@ impl OrderBook {
         DirectionalIter::new(self.levels(side).iter(), side == Side::Buy)
             .filter(|(_, level)| level.total_quantity != 0 || level.visible_order_count != 0)
             .map(|(&price, level)| Self::level_snapshot(price, level))
+    }
+
+    fn fallible_public_depth_candidates(
+        &self,
+        side: Side,
+    ) -> impl DoubleEndedIterator<Item = Result<LevelSnapshot, InvariantViolation>> + '_ {
+        DirectionalIter::new(self.levels(side).iter(), side == Side::Buy)
+            .filter_map(move |(&price, level)| Self::try_public_depth_candidate(side, price, level))
+    }
+
+    fn fallible_public_depth_range_candidates(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+    ) -> impl DoubleEndedIterator<Item = Result<LevelSnapshot, InvariantViolation>> + '_ {
+        self.price_levels_range_iter(side, range)
+            .filter_map(move |(&price, level)| Self::try_public_depth_candidate(side, price, level))
+    }
+
+    fn try_public_depth_candidate(
+        side: Side,
+        price: Price,
+        level: &PriceLevel,
+    ) -> Option<Result<LevelSnapshot, InvariantViolation>> {
+        if level.total_quantity == 0 && level.visible_order_count == 0 {
+            return None;
+        }
+        let snapshot = Self::level_snapshot(price, level);
+        Some(if snapshot.has_valid_public_aggregate() {
+            Ok(snapshot)
+        } else {
+            Err(InvariantViolation::new(format!(
+                "public {side:?} depth level at {} has a zero aggregate or order count",
+                price.raw()
+            )))
+        })
     }
 
     fn price_levels_range_iter(
@@ -12382,6 +12525,104 @@ mod price_level_index_tests {
             .try_public_level(Side::Buy, Price::from_raw(80))
             .unwrap_err();
         assert!(error.detail().contains("zero aggregate or order count"));
+    }
+
+    #[test]
+    fn authoritative_depth_streams_reject_invalid_selected_rows() {
+        let full_range = Price::from_raw(i64::MIN)..=Price::from_raw(i64::MAX);
+        let mut book = OrderBook::new(reserve_definition());
+        book.bids.insert(Price::from_raw(100), level(1));
+        book.bids.insert(Price::from_raw(90), level(2));
+        book.asks.insert(Price::from_raw(120), level(3));
+
+        book.bids
+            .update(Price::from_raw(90), |level| {
+                level.visible_order_count = 0;
+            })
+            .unwrap();
+        assert_eq!(
+            book.try_best_bid().unwrap(),
+            Some(LevelSnapshot {
+                price: Price::from_raw(100),
+                quantity: 1,
+                order_count: 1,
+            })
+        );
+        let mut depth = book.try_depth_iter(Side::Buy).unwrap();
+        assert!(matches!(depth.next(), Some(Ok(_))));
+        let error = depth.next().unwrap().unwrap_err();
+        assert!(error.detail().contains("zero aggregate or order count"));
+        drop(depth);
+        let error = book
+            .try_depth_iter(Side::Buy)
+            .unwrap()
+            .next_back()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.detail().contains("zero aggregate or order count"));
+        assert_eq!(
+            book.try_depth(Side::Buy, 1).unwrap(),
+            [LevelSnapshot {
+                price: Price::from_raw(100),
+                quantity: 1,
+                order_count: 1,
+            }]
+        );
+        let OrderBookQueryError::InvariantViolation(error) =
+            book.try_depth(Side::Buy, 2).unwrap_err()
+        else {
+            panic!("selected aggregate corruption must be typed");
+        };
+        assert!(error.detail().contains("zero aggregate or order count"));
+        assert_eq!(
+            book.try_depth_range(Side::Buy, Price::from_raw(100)..=Price::from_raw(100), 2)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(matches!(
+            book.try_depth_range(Side::Buy, Price::from_raw(90)..=Price::from_raw(100), 2),
+            Err(OrderBookQueryError::InvariantViolation(_))
+        ));
+        let mut ranged = book
+            .try_depth_range_iter(Side::Buy, Price::from_raw(90)..=Price::from_raw(100))
+            .unwrap();
+        assert!(matches!(ranged.next(), Some(Ok(_))));
+        assert!(matches!(ranged.next(), Some(Err(_))));
+        drop(ranged);
+
+        book.asks
+            .update(Price::from_raw(120), |level| {
+                level.visible_order_count = 0;
+            })
+            .unwrap();
+        assert!(book.try_best_ask().is_err());
+        assert!(book.try_best_bid().is_err());
+        assert!(book.try_depth_iter(Side::Buy).is_err());
+        assert!(book.try_depth_range_iter(Side::Buy, full_range).is_err());
+        assert!(matches!(
+            book.try_depth(Side::Buy, 0),
+            Err(OrderBookQueryError::InvariantViolation(_))
+        ));
+        assert!(matches!(
+            book.try_depth_range(Side::Buy, Price::from_raw(1)..=Price::from_raw(0), 0,),
+            Err(OrderBookQueryError::InvariantViolation(_))
+        ));
+        assert!(book.try_depth_summary(Side::Buy).is_err());
+        assert!(
+            book.try_depth_range_summary(
+                Side::Buy,
+                Price::from_raw(-1_000)..=Price::from_raw(-900),
+            )
+            .is_err()
+        );
+        let request = DisplayedLiquidityRequest::new(
+            Side::Sell,
+            Quantity::new(1).unwrap(),
+            StopActivation::Market,
+        );
+        assert!(book.try_displayed_liquidity_quote(request).is_err());
+        assert!(book.try_public_depth_imbalance(0).is_err());
     }
 
     #[test]

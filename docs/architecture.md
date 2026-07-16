@@ -498,25 +498,27 @@ account insertion/removal is `O(1)`; canonical account selection traverses the
 selected links and sorts unique `OrderId` values in the already-prepared vector.
 
 Read-only extraction is a separate caller-owned allocation boundary.
-`try_depth` reserves at most `min(P, L)` levels for `P` occupied execution
-prices and requested limit `L`, then returns only public prices in market
-priority. `depth_iter` exposes the same market-priority projection without
-allocating caller-owned output and supports traversal from either end.
-`depth_range_iter` applies the same projection to exact inclusive endpoints
-with one shared AVL band descent; bids remain descending, asks ascending,
-hidden-only levels absent, and inverted ranges empty. `try_depth_range` first
-counts the selected public rows without allocation, reserves exactly that
-semantic cardinality, and then copies through the same iterator. For `K`
-in-band occupied execution prices inspected, traversal is
+`try_depth_iter` applies the coherent public-extrema gate before exposing its
+double-ended market-priority traversal; each item validates the exact selected
+aggregate. `try_depth_range_iter` applies the same contract to exact inclusive
+endpoints with one shared AVL band descent. Bids remain descending, asks
+ascending, hidden-only levels absent, and inverted ranges empty after the
+outer gate. The convenience iterators compose these fallible paths and panic
+on invalid state rather than silently omitting a contradictory row.
+`try_depth` and `try_depth_range` validate and count only the selected visible
+prefix, reserve exactly that semantic cardinality, and copy through an
+identical second immutable pass. A zero limit still applies the outer gate.
+Neither materializer returns partial ownership on invariant or reservation
+failure. For `K` in-band occupied execution prices inspected, traversal is
 `O(log(P + 1) + K)` time and `O(1)` auxiliary space.
-`try_depth_range_summary` composes that same range descent and directional
-projection into one fixed-size, provenance-bound `DepthSummary`: exact caller
-endpoints, side, market-priority best/worst selected prices, visible-level
-count, displayed-order count, and displayed lots. `try_depth_summary` supplies
-the definition's complete price domain to the same checked fold. Each included
-row must have positive public
-quantity/count, cumulative counts and quantity use checked arithmetic, and any
-failure discards the local partial value. Hidden-only prices remain absent.
+`try_depth_range_summary` composes that same typed range traversal into one
+fixed-size, provenance-bound `DepthSummary`: exact caller endpoints, side,
+market-priority best/worst selected prices, visible-level count, displayed-
+order count, and displayed lots. `try_depth_summary` supplies the definition's
+complete price domain to the same checked fold. Each included row must have
+positive public quantity/count, cumulative counts and quantity use checked
+arithmetic, and any failure discards the local partial value. Hidden-only
+prices remain absent.
 For `K` in-band occupied prices, the summary is `O(log(P + 1) + K)` time and
 `O(1)` space with no successful-path allocation or mutation.
 `try_public_depth_imbalance` applies one caller-supplied visible-level limit
@@ -542,8 +544,8 @@ that cardinality during dense traversal, and sorts by `OrderId`.
 reserves the selected intrusive-list count, validates owner, side, list length,
 and duplicate identity, then sorts by `OrderId`. Any reservation or private-
 topology failure returns before output ownership changes hands, and none of the
-three queries mutates authoritative state. Source-compatible convenience
-wrappers retain the A12 allocation-failure boundary.
+three queries mutates authoritative state. Convenience wrappers retain the A12
+panic boundary for typed invariant and allocation failures.
 
 `try_best_bid_offer` composes both existing displayed best-level caches into
 one fixed-size `BestBidOffer` bound to instrument, definition version, and last
@@ -554,6 +556,10 @@ For a two-sided quote, exact raw spread uses `u64` and the exact midpoint
 numerator uses `i128` with denominator two, covering the complete signed `i64`
 price domain without rounding. Query time and space are `O(1)` with no
 successful-path allocation or mutation.
+`try_best_bid` and `try_best_ask` select one side from that same coherent value,
+so an invalid opposite extremum or locked/crossed pair still rejects the
+observation. Their convenience methods delegate to the typed path and panic on
+corruption rather than return a partially validated side.
 
 `try_public_level` performs one exact `(Side, Price)` public observation after
 the same coherent-extrema check. `PublicLevelObservation` retains the queried
@@ -572,6 +578,7 @@ path and panics on corruption rather than silently returning absence.
 `try_displayed_liquidity_quote` traverses opposite-side public aggregates in
 market priority under a typed aggressor side, positive quantity, and the same
 market-or-limit `StopActivation` crossing rule used by private execution.
+The coherent-extrema gate rejects invalid top-of-book state before the sweep.
 `DisplayedLiquidityQuote` binds the request and exact instrument/version/event-
 sequence provenance, partitions requested lots into quoted and unquoted
 quantity, and returns exact signed raw-price notional, worst quoted price,
@@ -2667,7 +2674,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Snapshots and compaction | single-file and segmented matching/risk/ledger/call-auction WAL cutover plus off-thread direct and WAL-synchronized plain/coupled continuous-matching and call-auction replay verification are implemented; verified matching/risk/auction handles can retire an older prefix by cursor-streaming only its synchronized suffix. Remaining evidence is bounded checkpoint memory and writer audit-copy/projection/direct-reconstruction pause, bounded suffix-copy pause, semantic generation rollover, and externally retained audit/idempotency proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
-| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, sourced explicit-reference stop-market/stop-limit activation with durable source identity/version/sequence and gap/reset validation, native reserve and fully hidden continuous queue classes, atomic minimum-quantity IOC, atomic FOK under all four continuous self-trade policies, coherent provenance-bound BBO, exact-price provenance-bound public levels, checked cumulative public-depth summaries, exact top-N displayed public-depth imbalance, and exact displayed-liquidity sweep quotes on authoritative books and continuous public replicas, exact state-bound private immediate-execution economics, resting-order queue position, and prevalidated price-level order traversal, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, authoritative typed priority classes, account/side mass cancellation, atomic new-identity replacement with full priority loss, full and inclusive price-band aggregate depth queries on authoritative books and public replicas, banded discovery, sequenced nullable indicative publication, explicit price-time and price/class-tier pro-rata-time allocation, deterministic pairing/atomic uncross with fail-closed self-trade abort, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, plain/coupled-risk full-WAL plus cutover recovery, instrument-bound atomic DVP settlement of complete accepted uncross reports, and explicit trade-bound fee transfers in the same atomic ledger event are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authenticated external stop-reference acquisition/normalization and missed-reference recovery, auction reference and dynamic-band derivation, authenticated venue-category-to-class and beneficial-owner mapping, venue-specific display/allocation policies, venue-specific call-auction self-trade cancellation/decrement and alternative-pairing policies, clearing lifecycle authorization, fee calculation/authorization, settlement-date derivation, volatility/interruption auctions, pegged, discretionary, venue-specific in-place amendment/uncross/publication cadence/filtering semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
+| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, sourced explicit-reference stop-market/stop-limit activation with durable source identity/version/sequence and gap/reset validation, native reserve and fully hidden continuous queue classes, atomic minimum-quantity IOC, atomic FOK under all four continuous self-trade policies, coherent provenance-bound BBO, exact-price provenance-bound public levels, checked cumulative public-depth summaries, exact top-N displayed public-depth imbalance, and exact displayed-liquidity sweep quotes on authoritative books and continuous public replicas, exact state-bound private immediate-execution economics, resting-order queue position, and prevalidated price-level order traversal, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, authoritative typed priority classes, account/side mass cancellation, atomic new-identity replacement with full priority loss, fail-closed full and inclusive price-band aggregate depth queries on authoritative books and public replicas, banded discovery, sequenced nullable indicative publication, explicit price-time and price/class-tier pro-rata-time allocation, deterministic pairing/atomic uncross with fail-closed self-trade abort, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, plain/coupled-risk full-WAL plus cutover recovery, instrument-bound atomic DVP settlement of complete accepted uncross reports, and explicit trade-bound fee transfers in the same atomic ledger event are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authenticated external stop-reference acquisition/normalization and missed-reference recovery, auction reference and dynamic-band derivation, authenticated venue-category-to-class and beneficial-owner mapping, venue-specific display/allocation policies, venue-specific call-auction self-trade cancellation/decrement and alternative-pairing policies, clearing lifecycle authorization, fee calculation/authorization, settlement-date derivation, volatility/interruption auctions, pegged, discretionary, venue-specific in-place amendment/uncross/publication cadence/filtering semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
 | High | Instrument lifecycle expansion | authoritative calendar ingestion/distribution/activation, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |
