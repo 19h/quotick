@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A136 are stable and are referenced from code comments and other
+identifiers A1-A137 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -5025,6 +5025,56 @@ state, revision-ahead success, stale poisoned value, mutation, successful-path
 allocation, publisher panic, recovery/parity difference, or wire-byte change
 falsifies A136.
 
+## A137 — provenance-bound account admission-fence observation
+
+**Assumption.** One account-fence query holds one immutable continuous
+`OrderBook` borrow. The fixed-size `AccountControlObservation` binds one
+`AccountControlSnapshot` to account, instrument, immutable definition version,
+and final matching event sequence. An account absent from retained control
+state is enabled at revision zero. A retained control must use a non-zero
+revision no greater than the event sequence, and a blocked account must have no
+entry in the active-account order index.
+
+The shared A136 revision validator enforces the sequence bound. The single-
+account query performs one expected bounded-hash control lookup and, for a
+retained blocked state, one expected bounded-hash active-account lookup. The
+snapshot-returning fallible method composes the observation path; the
+convenience method panics on typed corruption. Matching preparation,
+application, and structural validation retain a private raw accessor so a
+diagnostic corruption check cannot recurse through that panic boundary.
+
+Market-data publisher bootstrap and complete source cross-audit validate every
+retained control through the same account-local helper before copying or
+comparing the private mirror. Corrupt source state maps to static typed source
+divergence. Account identity remains absent from public market-data payloads;
+no command, event, checkpoint, snapshot, replay, codec, or wire field changes.
+The local observation does not prove complete retained-history derivation;
+checkpoint capture's live-lineage comparison and checkpoint reconstruction
+remain that proof.
+
+**Dependent results.** [A1, A3, A10, A12, A18, A57, A70, A72, A136, A137]
+One account observation is expected `O(1)` time and `O(1)` fixed space. A full
+publisher control-source validation is expected `O(T)` for `T` retained
+controls. Successful paths allocate and mutate nothing. Genesis, accepted
+block/enable, business rejection, exact retry, direct checkpoint restoration,
+plain-WAL recovery, coupled-risk recovery, and publisher bootstrap retain exact
+account/instrument/version/sequence/state/revision semantics. No wire change
+follows.
+
+**Falsification probe.** Query controlled and absent accounts at genesis and
+after accepted block-and-cancel and enable commands. Exercise empty and
+non-empty cancellation scopes, business rejection, exact retry, direct
+checkpoint restoration, plain and coupled-risk WAL recovery, publisher
+bootstrap, and complete source cross-audit. Require exact provenance, revision
+stability with sequence advance on rejection, complete observation stability
+on retry, no blocked-account index membership, and no query mutation. Inject a
+retained zero revision, a revision ahead of the event sequence, and a blocked
+state with active account membership. Require typed failure before any value
+and typed publisher construction failure. Any identity drift, impossible
+genesis retention, revision-ahead success, blocked-membership success,
+mutation, successful-path allocation, recovery difference, public account
+disclosure, publisher panic, or wire-byte change falsifies A137.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -5039,6 +5089,22 @@ capability, a remaining risk, or an opportunity.
   fixed-size trading-state observation bound to instrument, immutable
   definition version, final source sequence, and accepted control revision.
   The shared constructor rejects a revision ahead of that sequence.
+
+- **High impact:** authoritative books now expose one fixed-size account-fence
+  observation bound to account, instrument, immutable definition version,
+  final event sequence, effective admission state, and accepted revision.
+  Retained genesis revisions, sequence-ahead revisions, and blocked accounts
+  with active membership fail before a value is returned.
+
+- **Medium impact risk:** the observation proves one local shard fence and its
+  local active-membership consequence. Controller authentication,
+  authorization, cross-instrument kill coordination, and complete history
+  derivation remain external or checkpoint-lineage boundaries.
+
+- **Medium impact opportunity:** exact account/state/revision/source-sequence
+  fences support deterministic gateway admission, control propagation,
+  recovery comparison, and account-scoped operational visualization without
+  correlating separate state and sequence reads.
 
 - **Medium impact risk:** provenance and the local revision bound do not prove
   controller/session authorization, remote freshness, venue-specific state-

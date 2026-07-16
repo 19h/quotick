@@ -223,6 +223,16 @@ its snapshot without another traversal. Successful source queries allocate no
 output, use `O(1)` space, and perform no mutation; failure-detail formatting
 may allocate only after corruption is detected.
 
+For `T` retained account controls and `A` active-account index entries,
+`try_account_control_observation` performs one expected `O(1)` control lookup
+and at most one expected `O(1)` active-account lookup. It returns one fixed-
+size account/instrument/version/sequence/state/revision value without
+successful-path allocation or mutation. A full adversarial collision cluster
+can increase one query to `O(T + A)` without changing finite storage.
+Publisher bootstrap and complete source cross-audit prevalidate all retained
+controls in expected `O(T)` time; adversarial active-account collisions can
+increase the blocked-control component to `O(T A)`.
+
 `try_public_level` performs the authoritative `O(1)` coherent-extrema check,
 one `O(log(P + 1))` execution-level lookup, and one
 `O(log(P + 1))` redundant public-membership lookup at the exact key. Constant

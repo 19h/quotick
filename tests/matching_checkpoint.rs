@@ -562,6 +562,15 @@ fn checkpoint_restores_account_fence_revision_and_atomic_cancellation() {
     assert_eq!(
         recovered
             .book()
+            .try_account_control_observation(AccountId::new(101).unwrap())
+            .unwrap(),
+        direct
+            .try_account_control_observation(AccountId::new(101).unwrap())
+            .unwrap()
+    );
+    assert_eq!(
+        recovered
+            .book()
             .account_control(AccountId::new(101).unwrap())
             .revision(),
         1

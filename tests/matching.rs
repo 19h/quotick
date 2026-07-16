@@ -3,10 +3,10 @@ use quotick::instrument::{
     QuantityRules, TradingState,
 };
 use quotick::matching::{
-    AccountAdmissionState, AccountControl, AccountControlAction, CancelOrder, CancelReason,
-    Command, CommandOutcome, CommandPreparation, Event, EventKind, EventTrace, ExpirySweep,
-    MatchingError, NewOrder, OrderBook, OrderType, RejectReason, ReplaceOrder, SelfTradePrevention,
-    TimeInForce, Trade,
+    AccountAdmissionState, AccountControl, AccountControlAction, AccountControlObservation,
+    CancelOrder, CancelReason, Command, CommandOutcome, CommandPreparation, Event, EventKind,
+    EventTrace, ExpirySweep, MatchingError, NewOrder, OrderBook, OrderType, RejectReason,
+    ReplaceOrder, SelfTradePrevention, TimeInForce, Trade,
 };
 use quotick::{
     AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity, Side,
@@ -143,6 +143,7 @@ fn trades(report: &quotick::matching::ExecutionReport) -> Vec<Trade> {
 fn event_trace_is_send_and_sync() {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<EventTrace>();
+    assert_send_sync::<AccountControlObservation>();
 }
 
 #[test]
@@ -167,6 +168,17 @@ fn event_trace_from_vec_retains_the_event_buffer() {
 )]
 fn account_block_is_revision_checked_atomic_and_exactly_replayable() {
     let mut book = OrderBook::new(definition());
+    let genesis = book.try_account_control_observation(account(11)).unwrap();
+    assert_eq!(genesis.instrument_id(), instrument());
+    assert_eq!(genesis.instrument_version(), version());
+    assert_eq!(genesis.book_event_sequence(), 0);
+    assert_eq!(genesis.account_id(), account(11));
+    assert_eq!(genesis.state(), AccountAdmissionState::Enabled);
+    assert_eq!(genesis.revision(), 0);
+    assert_eq!(
+        genesis.snapshot(),
+        book.try_account_control(account(11)).unwrap()
+    );
     for (command, order, side, price, quantity) in
         [(1, 1, Side::Buy, 100, 3), (2, 2, Side::Sell, 110, 5)]
     {
@@ -196,6 +208,14 @@ fn account_block_is_revision_checked_atomic_and_exactly_replayable() {
         AccountAdmissionState::Blocked
     );
     assert_eq!(book.account_control(account(11)).revision(), 1);
+    let blocked_control = book.try_account_control_observation(account(11)).unwrap();
+    assert_eq!(
+        blocked_control.book_event_sequence(),
+        book.last_event_sequence()
+    );
+    assert_eq!(blocked_control.account_id(), account(11));
+    assert_eq!(blocked_control.state(), AccountAdmissionState::Blocked);
+    assert_eq!(blocked_control.revision(), 1);
     assert!(report.events.iter().take(2).all(|event| matches!(
         event.kind,
         EventKind::OrderCancelled {
@@ -231,12 +251,22 @@ fn account_block_is_revision_checked_atomic_and_exactly_replayable() {
         blocked.outcome,
         CommandOutcome::Rejected(RejectReason::AccountAdmissionBlocked)
     );
+    let rejected_control = book.try_account_control_observation(account(11)).unwrap();
+    assert_eq!(rejected_control.snapshot(), blocked_control.snapshot());
+    assert_eq!(
+        rejected_control.book_event_sequence(),
+        book.last_event_sequence()
+    );
 
     let event_sequence = book.last_event_sequence();
     let replay = book.submit(block).unwrap();
     assert!(replay.replayed);
     assert_eq!(book.last_event_sequence(), event_sequence);
     assert_eq!(book.account_control(account(11)).revision(), 1);
+    assert_eq!(
+        book.try_account_control_observation(account(11)).unwrap(),
+        rejected_control
+    );
 
     let stale = book
         .submit(account_control(5, 11, 0, AccountControlAction::Enable))
@@ -258,6 +288,13 @@ fn account_block_is_revision_checked_atomic_and_exactly_replayable() {
         AccountAdmissionState::Enabled
     );
     assert_eq!(book.account_control(account(11)).revision(), 2);
+    let enabled_control = book.try_account_control_observation(account(11)).unwrap();
+    assert_eq!(enabled_control.state(), AccountAdmissionState::Enabled);
+    assert_eq!(enabled_control.revision(), 2);
+    assert_eq!(
+        enabled_control.book_event_sequence(),
+        book.last_event_sequence()
+    );
     assert_eq!(
         book.submit(limit_order(
             7,

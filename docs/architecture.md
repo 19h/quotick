@@ -575,6 +575,18 @@ complete authoritative history derivation remains a checkpoint-lineage
 capture/semantic-validation responsibility, separate from the live structural
 audit.
 
+`try_account_control_observation(account_id)` returns one fixed-size
+`AccountControlObservation` containing account, instrument, immutable
+definition version, final matching event sequence, effective admission state,
+and accepted control revision. An absent retained control is enabled at
+revision zero. A retained revision must be non-zero and no greater than the
+event sequence; a blocked account cannot retain active-account membership.
+`try_account_control` selects the embedded snapshot, and `account_control`
+delegates to that typed path. Publisher bootstrap and complete source parity
+validate every retained control through the same helper before copying or
+comparing the private mirror. Account identity remains absent from public
+market-data payloads, and no wire version changes.
+
 `try_public_level` performs one exact `(Side, Price)` public observation after
 the same coherent-extrema check. `PublicLevelObservation` retains the queried
 key, optional `LevelSnapshot`, and exact instrument/version/event-sequence

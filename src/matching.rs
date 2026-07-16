@@ -573,6 +573,19 @@ impl TradingStateSnapshot {
     }
 }
 
+fn validate_control_revision(
+    control: &'static str,
+    revision: u64,
+    book_event_sequence: u64,
+) -> Result<(), InvariantViolation> {
+    if revision > book_event_sequence {
+        return Err(InvariantViolation::new(format!(
+            "{control} revision {revision} exceeds event sequence {book_event_sequence}"
+        )));
+    }
+    Ok(())
+}
+
 /// One revisioned trading-state observation bound to matching-book provenance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TradingStateObservation {
@@ -589,13 +602,7 @@ impl TradingStateObservation {
         book_event_sequence: u64,
         snapshot: TradingStateSnapshot,
     ) -> Result<Self, InvariantViolation> {
-        if snapshot.revision() > book_event_sequence {
-            return Err(InvariantViolation::new(format!(
-                "trading-state revision {} exceeds event sequence {}",
-                snapshot.revision(),
-                book_event_sequence
-            )));
-        }
+        validate_control_revision("trading-state", snapshot.revision(), book_event_sequence)?;
         Ok(Self {
             instrument_id,
             instrument_version,
@@ -663,6 +670,77 @@ impl AccountControlSnapshot {
     #[must_use]
     pub const fn revision(self) -> u64 {
         self.revision
+    }
+}
+
+/// One account admission-fence observation bound to matching-book provenance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccountControlObservation {
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    book_event_sequence: u64,
+    account_id: AccountId,
+    snapshot: AccountControlSnapshot,
+}
+
+impl AccountControlObservation {
+    pub(crate) fn try_new(
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        book_event_sequence: u64,
+        account_id: AccountId,
+        snapshot: AccountControlSnapshot,
+    ) -> Result<Self, InvariantViolation> {
+        validate_control_revision("account-control", snapshot.revision(), book_event_sequence)?;
+        Ok(Self {
+            instrument_id,
+            instrument_version,
+            book_event_sequence,
+            account_id,
+            snapshot,
+        })
+    }
+
+    /// Returns the instrument whose account fence was observed.
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version.
+    #[must_use]
+    pub const fn instrument_version(self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the final matching event sequence included in the observation.
+    #[must_use]
+    pub const fn book_event_sequence(self) -> u64 {
+        self.book_event_sequence
+    }
+
+    /// Returns the account whose admission fence was observed.
+    #[must_use]
+    pub const fn account_id(self) -> AccountId {
+        self.account_id
+    }
+
+    /// Returns the revisioned effective account-fence snapshot.
+    #[must_use]
+    pub const fn snapshot(self) -> AccountControlSnapshot {
+        self.snapshot
+    }
+
+    /// Returns the effective account admission state.
+    #[must_use]
+    pub const fn state(self) -> AccountAdmissionState {
+        self.snapshot.state()
+    }
+
+    /// Returns the last accepted account-control revision.
+    #[must_use]
+    pub const fn revision(self) -> u64 {
+        self.snapshot.revision()
     }
 }
 
@@ -6777,7 +6855,8 @@ impl OrderBook {
                 if self.seen_order_ids.contains(&command.order_id) {
                     return Err(RejectReason::DuplicateOrder);
                 }
-                if self.account_control(command.account_id).state == AccountAdmissionState::Blocked
+                if self.raw_account_control(command.account_id).state
+                    == AccountAdmissionState::Blocked
                 {
                     return Err(RejectReason::AccountAdmissionBlocked);
                 }
@@ -6879,7 +6958,8 @@ impl OrderBook {
                 if order.account_id != command.account_id {
                     return Err(RejectReason::NotOrderOwner);
                 }
-                if self.account_control(command.account_id).state == AccountAdmissionState::Blocked
+                if self.raw_account_control(command.account_id).state
+                    == AccountAdmissionState::Blocked
                 {
                     return Err(RejectReason::AccountAdmissionBlocked);
                 }
@@ -6909,7 +6989,7 @@ impl OrderBook {
                 self.definition
                     .admit(Command::AccountControl(command))
                     .map_err(RejectReason::from)?;
-                let current = self.account_control(command.account_id);
+                let current = self.raw_account_control(command.account_id);
                 if current.revision != command.expected_revision {
                     return Err(RejectReason::AccountControlRevisionMismatch);
                 }
@@ -8769,25 +8849,115 @@ impl OrderBook {
             .map(|cached| RetainedCommandReport::new(&cached.command, &cached.report))
     }
 
-    /// Returns one account's effective admission fence and revision.
-    ///
-    /// Accounts without an accepted control command are enabled at revision zero.
-    #[must_use]
-    pub fn account_control(&self, account_id: AccountId) -> AccountControlSnapshot {
+    fn raw_account_control(&self, account_id: AccountId) -> AccountControlSnapshot {
         self.account_controls
             .get(&account_id)
             .copied()
             .unwrap_or_default()
     }
 
-    /// Iterates retained account-control state without allocation.
+    fn try_retained_account_control_observation(
+        &self,
+        account_id: AccountId,
+        snapshot: AccountControlSnapshot,
+    ) -> Result<AccountControlObservation, InvariantViolation> {
+        if snapshot.revision() == 0 {
+            return Err(InvariantViolation::new(
+                "retained account-control state uses reserved genesis revision",
+            ));
+        }
+        let observation = AccountControlObservation::try_new(
+            self.instrument_id(),
+            self.instrument_version(),
+            self.last_event_sequence(),
+            account_id,
+            snapshot,
+        )?;
+        if snapshot.state() == AccountAdmissionState::Blocked
+            && self.account_orders.contains_key(&account_id)
+        {
+            return Err(InvariantViolation::new(
+                "blocked account retains active-account membership",
+            ));
+        }
+        Ok(observation)
+    }
+
+    /// Fallibly returns one provenance-bound account admission-fence observation.
+    ///
+    /// An account without retained control state is enabled at revision zero.
+    /// The fixed-size result carries account, instrument, immutable definition
+    /// version, final event sequence, effective state, and accepted revision.
+    /// The successful path performs expected `O(1)` bounded-hash work without
+    /// allocation or mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] if retained state uses reserved revision
+    /// zero, its revision is ahead of the book event sequence, or a blocked
+    /// account retains active-account membership.
+    pub fn try_account_control_observation(
+        &self,
+        account_id: AccountId,
+    ) -> Result<AccountControlObservation, InvariantViolation> {
+        if let Some(snapshot) = self.account_controls.get(&account_id).copied() {
+            return self.try_retained_account_control_observation(account_id, snapshot);
+        }
+        AccountControlObservation::try_new(
+            self.instrument_id(),
+            self.instrument_version(),
+            self.last_event_sequence(),
+            account_id,
+            AccountControlSnapshot::default(),
+        )
+    }
+
+    /// Fallibly returns one account's effective admission fence and revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvariantViolation`] under the same conditions as
+    /// [`Self::try_account_control_observation`].
+    pub fn try_account_control(
+        &self,
+        account_id: AccountId,
+    ) -> Result<AccountControlSnapshot, InvariantViolation> {
+        Ok(self.try_account_control_observation(account_id)?.snapshot())
+    }
+
+    /// Returns one account's effective admission fence and revision.
+    ///
+    /// Accounts without an accepted control command are enabled at revision
+    /// zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics if retained account-control state is inconsistent with the book.
+    /// Use [`Self::try_account_control`] when failure must remain typed.
     #[must_use]
-    pub fn account_controls(
+    pub fn account_control(&self, account_id: AccountId) -> AccountControlSnapshot {
+        self.try_account_control(account_id)
+            .expect("order-book account control is not queryable")
+    }
+
+    fn raw_account_controls(
         &self,
     ) -> impl ExactSizeIterator<Item = (AccountId, AccountControlSnapshot)> + '_ {
         self.account_controls
             .iter()
             .map(|(&account_id, &snapshot)| (account_id, snapshot))
+    }
+
+    pub(crate) fn try_account_controls(
+        &self,
+    ) -> Result<
+        impl ExactSizeIterator<Item = (AccountId, AccountControlSnapshot)> + '_,
+        InvariantViolation,
+    > {
+        for (&account_id, &snapshot) in self.account_controls.iter() {
+            self.try_retained_account_control_observation(account_id, snapshot)?;
+        }
+        Ok(self.raw_account_controls())
     }
 
     /// Returns the active-order count for one account and optional side.
@@ -8965,7 +9135,7 @@ impl OrderBook {
         self.validate_expiry_index()?;
         self.validate_stop_indexes()?;
         if self.orders.values().any(|order| {
-            self.account_control(order.account_id).state == AccountAdmissionState::Blocked
+            self.raw_account_control(order.account_id).state == AccountAdmissionState::Blocked
         }) {
             return Err(InvariantViolation::new(
                 "a blocked account retains an active order",
@@ -9761,7 +9931,7 @@ impl OrderBook {
         mut events: EventTraceBuilder,
         selected: Option<PooledOrderSelection>,
     ) -> Result<ExecutionReport, MatchingError> {
-        let previous = self.account_control(command.account_id);
+        let previous = self.raw_account_control(command.account_id);
         assert_eq!(
             previous.revision, command.expected_revision,
             "account-control revision was checked during preparation"
@@ -11824,15 +11994,16 @@ mod price_level_index_tests {
     use std::sync::Arc;
 
     use super::{
-        AccountAdmissionState, AccountControl, AccountControlAction, AccountControlSnapshot,
-        BuyStopKey, Command, CommandOutcome, CommandPreparation, DisplayedLiquidityQuote,
-        DisplayedLiquidityRequest, DisplayedLiquidityTermination, EventTraceBuilder,
-        ImmediateExecutionQuote, ImmediateExecutionRequest, ImmediateExecutionTermination,
-        IncomingPreview, InvariantViolation, LevelSnapshot, MassCancel, MassCancelScope,
-        MatchingCapacity, MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsSpec,
-        OrderBookQueryError, OrderDisplay, OrderQueueClass, OrderSelectionPool, OrderType,
-        PriceLevel, PriceLevels, PublicLevelObservation, RejectReason, ReplaceOrder, RestingOrder,
-        SelfTradePrevention, StopActivation, TimeInForce, TradingStateObservation, try_event_arena,
+        AccountAdmissionState, AccountControl, AccountControlAction, AccountControlObservation,
+        AccountControlSnapshot, BuyStopKey, Command, CommandOutcome, CommandPreparation,
+        DisplayedLiquidityQuote, DisplayedLiquidityRequest, DisplayedLiquidityTermination,
+        EventTraceBuilder, ImmediateExecutionQuote, ImmediateExecutionRequest,
+        ImmediateExecutionTermination, IncomingPreview, InvariantViolation, LevelSnapshot,
+        MassCancel, MassCancelScope, MatchingCapacity, MatchingError, NewOrder, OrderBook,
+        OrderBookLimits, OrderBookLimitsSpec, OrderBookQueryError, OrderDisplay, OrderQueueClass,
+        OrderSelectionPool, OrderType, PriceLevel, PriceLevels, PublicLevelObservation,
+        RejectReason, ReplaceOrder, RestingOrder, SelfTradePrevention, StopActivation, TimeInForce,
+        TradingStateObservation, try_event_arena,
     };
     use crate::instrument::{
         InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -13846,7 +14017,92 @@ mod price_level_index_tests {
             report.outcome,
             CommandOutcome::Rejected(RejectReason::AccountControlRevisionExhausted)
         );
-        assert_eq!(book.account_control(account_id).revision(), u64::MAX);
+        assert_eq!(book.raw_account_control(account_id).revision(), u64::MAX);
+    }
+
+    #[test]
+    fn account_control_observation_rejects_revision_and_active_membership_corruption() {
+        let instrument_id = InstrumentId::new(1).unwrap();
+        let instrument_version = InstrumentVersion::new(1).unwrap();
+        let account_id = AccountId::new(1).unwrap();
+        let invalid = AccountControlObservation::try_new(
+            instrument_id,
+            instrument_version,
+            0,
+            account_id,
+            AccountControlSnapshot::from_parts(AccountAdmissionState::Blocked, 1),
+        )
+        .unwrap_err();
+        assert!(
+            invalid
+                .detail()
+                .contains("account-control revision 1 exceeds event sequence 0")
+        );
+
+        let mut book = OrderBook::new(reserve_definition());
+        let genesis = book.try_account_control_observation(account_id).unwrap();
+        assert_eq!(genesis.account_id(), account_id);
+        assert_eq!(genesis.revision(), 0);
+
+        book.account_controls.insert(
+            account_id,
+            AccountControlSnapshot::from_parts(AccountAdmissionState::Enabled, 0),
+        );
+        let error = book
+            .try_account_control_observation(account_id)
+            .unwrap_err();
+        assert!(error.detail().contains("reserved genesis revision"));
+
+        book.account_controls.insert(
+            account_id,
+            AccountControlSnapshot::from_parts(AccountAdmissionState::Blocked, 1),
+        );
+        let error = book
+            .try_account_control_observation(account_id)
+            .unwrap_err();
+        assert!(
+            error
+                .detail()
+                .contains("account-control revision 1 exceeds event sequence 0")
+        );
+        assert!(matches!(
+            crate::market_data::MarketDataPublisher::from_book(&book),
+            Err(crate::market_data::MarketDataConstructionError::Source(
+                crate::market_data::MarketDataError::SourceDivergence(
+                    "matching book account-control state is invalid"
+                )
+            ))
+        ));
+
+        let mut book = OrderBook::new(reserve_definition());
+        book.submit(Command::New(NewOrder {
+            command_id: CommandId::new(1).unwrap(),
+            order_id: OrderId::new(1).unwrap(),
+            account_id,
+            instrument_id,
+            instrument_version,
+            side: Side::Buy,
+            quantity: Quantity::new(1).unwrap(),
+            display: OrderDisplay::FullyDisplayed,
+            order_type: OrderType::Limit(Price::from_raw(100)),
+            time_in_force: TimeInForce::GoodTilCancelled,
+            self_trade_prevention: SelfTradePrevention::CancelAggressor,
+            received_at: TimestampNs::from_unix_nanos(1),
+        }))
+        .unwrap();
+        book.account_controls.insert(
+            account_id,
+            AccountControlSnapshot::from_parts(AccountAdmissionState::Blocked, 1),
+        );
+        let error = book
+            .try_account_control_observation(account_id)
+            .unwrap_err();
+        assert!(
+            error
+                .detail()
+                .contains("blocked account retains active-account membership")
+        );
+        assert!(book.try_account_control(account_id).is_err());
     }
 
     #[test]

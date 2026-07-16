@@ -238,12 +238,23 @@ fn durable_account_control_recovers_the_fence_revision_and_atomic_cancellation()
         CommandOutcome::Accepted
     );
     assert_eq!(durable.managed().risk().reservation_count(), 0);
+    let expected_control = durable
+        .managed()
+        .book()
+        .try_account_control_observation(account(11))
+        .unwrap();
     let frame_count = frames(file.path()).len();
     durable.close().unwrap();
 
     let mut recovered =
         DurableRiskOrderBook::open(file.path(), definition(), &profiles(), options()).unwrap();
-    let control = recovered.managed().book().account_control(account(11));
+    let control = recovered
+        .managed()
+        .book()
+        .try_account_control_observation(account(11))
+        .unwrap();
+    assert_eq!(control, expected_control);
+    assert_eq!(control.account_id(), account(11));
     assert_eq!(control.state(), AccountAdmissionState::Blocked);
     assert_eq!(control.revision(), 1);
     assert_eq!(recovered.managed().risk().reservation_count(), 0);

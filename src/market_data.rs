@@ -994,7 +994,9 @@ impl MarketDataPublisher {
                     ))
                 })?;
         }
-        for (account_id, snapshot) in book.account_controls() {
+        for (account_id, snapshot) in
+            source_account_controls(book).map_err(MarketDataConstructionError::Source)?
+        {
             publisher.account_controls.insert(account_id, snapshot);
         }
         publisher
@@ -1278,8 +1280,9 @@ impl MarketDataPublisher {
                 "publisher active-order count differs from the matching book",
             ));
         }
-        if self.account_controls.len() != book.account_controls().len()
-            || book.account_controls().any(|(account_id, snapshot)| {
+        let mut source_account_controls = source_account_controls(book)?;
+        if self.account_controls.len() != source_account_controls.len()
+            || source_account_controls.any(|(account_id, snapshot)| {
                 self.account_controls.get(&account_id) != Some(&snapshot)
             })
         {
@@ -4217,6 +4220,15 @@ fn ensure_source_limits(
 fn source_trading_state(book: &OrderBook) -> Result<TradingStateSnapshot, MarketDataError> {
     book.try_trading_state()
         .map_err(|_| MarketDataError::SourceDivergence("matching book trading state is invalid"))
+}
+
+fn source_account_controls(
+    book: &OrderBook,
+) -> Result<impl ExactSizeIterator<Item = (AccountId, AccountControlSnapshot)> + '_, MarketDataError>
+{
+    book.try_account_controls().map_err(|_| {
+        MarketDataError::SourceDivergence("matching book account-control state is invalid")
+    })
 }
 
 const fn side_resource(side: Side) -> MarketDataResource {
