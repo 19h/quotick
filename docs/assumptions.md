@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A122 are stable and are referenced from code comments and other
+identifiers A1-A123 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -1249,7 +1249,10 @@ from semantic equality/WAL/checkpoints.
 predecessor, and successor; `O(P)` ordered traversal; A83 expected-key handles
 provide `O(1)` direct value access until their key is removed; no heap
 allocation after book construction for price-level mutation; deterministic
-rebuild under different insertion orders. The structural auditor validates
+rebuild under different insertion orders. An inclusive range initializes in
+`O(log(P + 1))`, visits `K` in-range occupied keys in `O(K)` additional time,
+supports double-ended traversal, and uses only the existing fixed stacks. The
+structural auditor validates
 every child reference once, requires exactly `P - 1` tree edges, resolves every
 occupied key to its exact stable slot, and then validates reachability,
 ordering, balance, cached height, and free-list coverage in `O(P log(P + 1))`
@@ -1267,14 +1270,18 @@ size_of::<usize>()`-byte stack (2,048 B on a 64-bit target).
 **Falsification probe.** Exercise LL/RR/LR/RL rotations; leaf, one-child, and
 physical two-child deletion while retaining every surviving handle; differently
 keyed slot reuse; zero-comparison handle access; deletion/reinsertion at full
-initialized length; forward/reverse iteration; replacement;
+initialized length; forward/reverse iteration; inclusive, outside, and
+inverted ranges; mixed front/back consumption; fused exhaustion; a narrow-
+range comparison bound; replacement;
 topology-independent equality; unrepresentable constructor reservation; direct
 height/order/root-reachable and disconnected
 cycle/shared-child/reachability/free-list corruption; and at least 20,000
-deterministic insert/remove operations differentially against `BTreeMap`,
-validating after every mutation. Any moved surviving key/value, model
+deterministic insert/remove operations and inclusive ranges differentially
+against `BTreeMap`, validating after every mutation. Any moved surviving
+key/value, model
 divergence, balance/order violation, unreachable/duplicate slot,
-post-construction arena growth, noncanonical traversal, topology-dependent
+post-construction arena growth, noncanonical or duplicate range traversal,
+topology-dependent
 semantic equality, validation scratch allocation, or untyped reservation
 failure falsifies A55.
 
@@ -1518,6 +1525,10 @@ and exposes a double-ended exact-size iterator without allocating output;
 allocation. `try_limit_depth` reserves at most the lesser of occupied side
 prices and the requested limit before copying, returns typed reservation
 failure without partial output, and changes no book state.
+`limit_depth_range_iter` applies the same market order to exact inclusive
+endpoints using the shared AVL band traversal; an inverted range is empty.
+`try_limit_depth_range` counts selected rows without allocation, reserves that
+exact semantic cardinality, and copies through a second identical traversal.
 One retained-priority amendment accepts only a strictly smaller positive,
 lot-aligned active quantity. It preserves identity, owner, side, constraint,
 price, queue links, priority class, and priority sequence; changes queue and
@@ -1549,6 +1560,10 @@ free depth iteration has `O(log(P + 1))` setup, `O(P)` complete traversal, and
 `O(1)` auxiliary space. For depth limit `L`, fallible materialization costs
 `O(log(P + 1) + min(P, L))` time and `O(min(P, L))` output space; it reserves
 before traversal and does not mutate the book.
+For `K` selected occupied limit prices inside an inclusive band, range
+traversal costs `O(log(P + 1) + K)` time and `O(1)` auxiliary space. Fallible
+range materialization makes two traversals with the same asymptotic bound and
+owns `O(K)` output after reserving exactly `K` rows.
 
 **Falsification probe.** Exercise routing/version and every instrument
 boundary; locked/crossed/market-only interest; middle/head/tail cancellation
@@ -1564,7 +1579,8 @@ failure, account-link corruption, canonical IDs, and nonmutation;
 empty/one/two-sided aggregate depth, direct and missing-level lookup, best
 lookup, market-only interest, both market-priority directions, limits `0`, `1`,
 occupied cardinality, and `usize::MAX`, iterator/materialized equality, typed
-depth allocation failure, and nonmutation;
+depth allocation failure, inclusive and inverted ranges, forward/reverse range
+traversal, exact selected-row materialization, and nonmutation;
 foreign/stale indicative results; exact capacity telemetry; 20,000 mixed
 insert/remove/amend/replace/mass-cancel operations against independent
 aggregate and priority models;
@@ -3910,6 +3926,11 @@ lesser of the requested limit and occupied execution-price count before
 traversal. `depth_iter` exposes the same market-priority sequence without
 caller-owned output allocation. It is double-ended and retains occupied-price
 cardinality as an upper size hint because hidden-only prices remain absent.
+`depth_range_iter` restricts that projection to exact inclusive price
+endpoints through the shared AVL band traversal; an inverted range is empty.
+`try_depth_range` counts the selected visible rows without allocation,
+reserves that exact semantic cardinality, and copies through a second
+identical traversal.
 `try_active_orders` reserves the exact indexed non-dormant count, rejects any
 traversal/cardinality contradiction before vector growth, validates every
 snapshot, and sorts the complete private result by `OrderId`.
@@ -3930,6 +3951,11 @@ costs `O(P)` time in the hidden-only worst case, returns
 `O(min(V, L))` rows, and requests at most `min(P, L)` capacity.
 Depth-iterator setup is `O(log(P + 1))`; complete traversal is `O(P)` time and
 `O(1)` auxiliary space.
+For an inclusive band containing `K` occupied execution prices, range setup
+and inspection cost `O(log(P + 1) + K)` time and `O(1)` auxiliary space;
+hidden-only prices may be inspected but are not returned. Fallible range
+materialization makes two such passes, owns `O(V_b)` output for the selected
+visible count `V_b <= K`, and reserves exactly `V_b` rows.
 For `T` active
 identities, `S` dormant stops, and `R = T - S` resting orders, complete private
 output costs `O(T + R log R)` time and `O(R)` result space. For `K` selected
@@ -3941,9 +3967,11 @@ changes no WAL or snapshot state and therefore requires no wire-version change.
 **Falsification probe.** Compare fallible and convenience results for empty,
 one-sided, crossed, reserve, and fully hidden books; both sides; limits `0`, `1`,
 occupied cardinality, and `usize::MAX`; unknown accounts; side/all account
-scope; and noncanonical dense/hash iteration order. Require market-priority
+scope; inclusive, outside, and inverted price bands; forward/reverse range
+consumption; and noncanonical dense/hash iteration order. Require market-priority
 public depth, hidden-only exclusion, canonical ascending private identities,
-exact reported reservation resources and maxima, and byte-identical book state
+exact selected-row range reservation, exact reported reservation resources and
+maxima, and byte-identical book state
 before and after every success and failure. Corrupt dormant/resting counts,
 account heads, tails, counts, links, owners, sides, and duplicate membership in
 white-box fixtures. Inject every output-reservation failure and exercise at
@@ -4192,6 +4220,46 @@ Any observable member boundary, false transaction-order overflow, silent
 history contradiction, current-index divergence, allocation, mutation, or
 recovery difference falsifies A122.
 
+## A123 — allocation-free inclusive price-band depth
+
+**Assumption.** The caller's `RangeInclusive<Price>` endpoints are exact and
+inclusive. A lower endpoint greater than its upper endpoint denotes an empty
+band. One immutable continuous or call-auction book borrow remains stable for
+the complete query. Both books compose one A55 stable-slot AVL range
+primitive, which initializes independent forward and reverse fixed stacks and
+does not linearly traverse occupied keys outside the band.
+
+Bid results remain descending and ask results ascending. Continuous output
+contains only non-zero public displayed aggregates, so an in-band hidden-only
+execution price is inspected but omitted. Call-auction output contains only
+limit-constrained aggregates; market-constrained interest remains separate.
+Iterator construction and traversal allocate no output or auxiliary heap
+storage. Each fallible materializer first counts selected rows without
+allocation, reserves exactly that semantic cardinality, and copies through a
+second equivalent traversal; no partial vector is returned.
+
+**Dependent results.** [A1, A3, A12, A55, A62, A72, A74, A117, A123] For
+`P` occupied side prices, `K` in-band occupied prices inspected, and `V <= K`
+selected output rows, iterator work is `O(log(P + 1) + K)` time and `O(1)`
+auxiliary space. Fallible materialization makes two traversals with the same
+asymptotic bound, requests exactly `V` output slots, and owns `O(V)` result
+space. The two fixed 128-index stacks retain A55's
+`256 × size_of::<usize>()` traversal bound. The query changes no matching,
+auction, WAL, snapshot, or wire state.
+
+**Falsification probe.** Exercise empty, singleton, full, outside, absent-
+endpoint, and inverted bands after every rotation and deletion shape. Consume
+forward, reverse, and mixed ends through exhaustion and require fused empty
+behavior without duplicates. Bound ordered comparisons for a narrow band in a
+1,023-key tree and differentially compare at least 20,000 generated mutation/
+range steps with `BTreeMap`. At both public APIs, test both sides, limits `0`,
+`1`, and `usize::MAX`, hidden-only continuous levels, separate auction market
+interest, exact fallible/convenience parity, typed reservation failure,
+unchanged resource telemetry, and complete post-query validation. Any
+out-of-band row, missed inclusive endpoint, duplicate, non-market ordering,
+outside-band linear scan, output/traversal allocation, partial failure output,
+state mutation, or model divergence falsifies A123.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -4217,12 +4285,15 @@ capability, a remaining risk, or an opportunity.
   extraction, call-auction aggregate limit depth, plus continuous and
   call-auction account-scoped identifier extraction now have typed fallible
   output under A117 and A62. Both authoritative books also expose
-  allocation-free market-priority aggregate iterators; the call-auction book
-  exposes direct and best aggregate-level lookup. Bounds and canonical ordering
-  are covered through hidden/market interest, account-list corruption, typed
-  allocation failure, and large caller-owned results. Target-hardware iterator
-  latency, allocator latency, resident memory, and sustained 250,000-order
-  snapshot cadence remain unknown until measured.
+  allocation-free full and inclusive price-band market-priority aggregate
+  iterators under A123; the call-auction book exposes direct and best
+  aggregate-level lookup. A localized heatmap or surveillance window can now
+  replace repeated point queries or a full-depth traversal with one logarithmic
+  band descent plus linear in-band work. Bounds and canonical ordering are
+  covered through hidden/market interest, account-list corruption, typed
+  allocation failure, and large caller-owned results. Target-hardware narrow-
+  band latency, allocator latency for materialized results, resident memory,
+  and sustained 250,000-order snapshot cadence remain unknown until measured.
 
 - **Medium impact:** continuous and call-auction live command/report history
   now supports expected constant-time exact lookup and zero-copy chronological
@@ -4414,7 +4485,8 @@ capability, a remaining risk, or an opportunity.
   auction identity, sequenced business outcomes, idempotency, and protected
   terminal history. Stable auction wire schemas,
   semantic checkpoints, exact prefix proof, full-WAL plus cutover
-  single/segmented recovery, aggregate-depth queries, and anonymized
+  single/segmented recovery, full and inclusive-band aggregate-depth queries,
+  and anonymized
   phase/trade/final-clearing publication with retained complete-batch replay
   and gap-repair snapshots, including sequenced nullable indication, are
   implemented. Reference/dynamic-band construction and venue-specific

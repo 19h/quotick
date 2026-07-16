@@ -163,6 +163,18 @@ expected
 orders. All three reserve before copying, perform no authoritative mutation,
 and drop any private partial construction on an invariant failure.
 
+For an inclusive price band, let `K` be the occupied execution-price levels
+inspected inside the band and `V_b <= K` the selected visible rows after
+applying the requested limit. `depth_range_iter` costs
+`O(log(P + 1) + K)` total time and
+`O(1)` auxiliary space; hidden-only in-band prices contribute to `K` but not
+`V_b`. `try_depth_range` performs one allocation-free count and one copy pass,
+so the constant doubles without changing the asymptotic bound. It requests
+exactly `V_b` slots and owns `O(V_b)` caller output. An inverted band is empty.
+Full and band iterators each retain two 128-index stacks:
+`2 × 128 × size_of::<usize>() = 2,048 B` on a 64-bit target, plus scalar
+fields. The bound is independent of configured or occupied level count.
+
 For `C` retained commands, `retained_command_report` performs one expected
 `O(1)` bounded-hash lookup and returns one borrowed command/report view.
 `retained_history` has `O(1)` setup and exact-size iterator state; consuming
@@ -217,6 +229,12 @@ orders, and `P` occupied limit prices:
   `L`, `try_limit_depth` reserves before traversal and costs
   `O(log(P + 1) + min(P, L))` time with `O(min(P, L))` caller-owned output.
   Market-constrained interest is excluded and queried separately.
+- For an inclusive band and requested output limit, let `K` be the returned
+  occupied limit prices. `limit_depth_range_iter` costs
+  `O(log(P + 1) + K)` total time and `O(1)`
+  auxiliary space. `try_limit_depth_range` counts and copies in two such
+  passes, exactly reserves `K` output rows, and owns `O(K)` caller output. An
+  inverted band is empty, and market-constrained interest remains separate.
 - Aggregate scratch construction and discovery are `O(B + A)`.
 - Canonical order scratch construction is `O(O log O + P)`: intrusive arrival-
   FIFO identities are resolved through a stable AVL, then both caller-owned

@@ -11,6 +11,7 @@
 //! responsibilities.
 
 use std::fmt;
+use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -1622,6 +1623,13 @@ impl AuctionPriceLevels {
         self.by_price.iter()
     }
 
+    fn range(
+        &self,
+        range: RangeInclusive<Price>,
+    ) -> impl DoubleEndedIterator<Item = (&Price, &AuctionQueue)> + '_ {
+        self.by_price.range(range)
+    }
+
     fn best(&self) -> Option<(Price, AuctionQueue)> {
         match self.side {
             Side::Buy => self
@@ -1985,6 +1993,33 @@ impl CallAuctionBook {
         Ok(output)
     }
 
+    /// Fallibly returns anonymized limit depth inside an inclusive price range
+    /// in best-to-worst order.
+    ///
+    /// An inverted range is empty. Market-constrained interest remains
+    /// separate. The query counts selected levels without allocation, then
+    /// reserves that exact semantic cardinality before the first copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionBookQueryError::ReservationFailed`] without partial
+    /// output if the caller-owned result vector cannot be reserved.
+    pub fn try_limit_depth_range(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+        limit: usize,
+    ) -> Result<Vec<CallAuctionLevelSnapshot>, CallAuctionBookQueryError> {
+        let maximum = self
+            .limit_depth_range_iter(side, range.clone())
+            .take(limit)
+            .count();
+        let mut output =
+            reserve_call_auction_book_query_vec(maximum, CallAuctionBookQueryResource::LimitDepth)?;
+        output.extend(self.limit_depth_range_iter(side, range).take(limit));
+        Ok(output)
+    }
+
     /// Returns anonymized limit depth using the fallible production path.
     ///
     /// # Panics
@@ -1995,6 +2030,24 @@ impl CallAuctionBook {
     pub fn limit_depth(&self, side: Side, limit: usize) -> Vec<CallAuctionLevelSnapshot> {
         self.try_limit_depth(side, limit)
             .expect("call-auction book limit-depth output allocation failed")
+    }
+
+    /// Returns anonymized limit depth inside an inclusive price range using
+    /// the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if result-vector allocation fails. Use
+    /// [`Self::try_limit_depth_range`] when allocation failure must remain typed.
+    #[must_use]
+    pub fn limit_depth_range(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+        limit: usize,
+    ) -> Vec<CallAuctionLevelSnapshot> {
+        self.try_limit_depth_range(side, range, limit)
+            .expect("call-auction price-range depth output allocation failed")
     }
 
     /// Iterates anonymized limit depth in market-priority order without
@@ -2012,6 +2065,25 @@ impl CallAuctionBook {
         DirectionalIter::new(self.limit_depth_levels(side), side == Side::Buy)
     }
 
+    /// Iterates anonymized limit depth inside an inclusive price range without
+    /// allocating.
+    ///
+    /// Bids are descending and asks are ascending. Market-constrained interest
+    /// is excluded, and an inverted range is empty. Creating the iterator is
+    /// `O(log(P + 1))`; consuming `K` in-range levels is
+    /// `O(K + log(P + 1))` total time with `O(1)` auxiliary space.
+    #[must_use]
+    pub fn limit_depth_range_iter(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+    ) -> impl DoubleEndedIterator<Item = CallAuctionLevelSnapshot> + '_ {
+        DirectionalIter::new(
+            self.limit_depth_levels_range(side, range),
+            side == Side::Buy,
+        )
+    }
+
     /// Iterates aggregate limit depth in ascending price order without allocating.
     pub(crate) fn limit_depth_levels(
         &self,
@@ -2019,6 +2091,16 @@ impl CallAuctionBook {
     ) -> impl DoubleEndedIterator<Item = CallAuctionLevelSnapshot> + ExactSizeIterator + '_ {
         self.levels(side)
             .iter()
+            .map(move |(&price, queue)| Self::limit_level_snapshot(side, price, *queue))
+    }
+
+    fn limit_depth_levels_range(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+    ) -> impl DoubleEndedIterator<Item = CallAuctionLevelSnapshot> + '_ {
+        self.levels(side)
+            .range(range)
             .map(move |(&price, queue)| Self::limit_level_snapshot(side, price, *queue))
     }
 

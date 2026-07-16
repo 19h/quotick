@@ -228,6 +228,10 @@ impl<K: Ord + Copy, V: Copy> IndexedAvlMap<K, V> {
         Iter::new(self)
     }
 
+    pub(crate) fn range(&self, range: std::ops::RangeInclusive<K>) -> RangeIter<'_, K, V> {
+        RangeIter::new(self, *range.start(), *range.end())
+    }
+
     /// Audits the complete tree/arena/free-list structure without allocation.
     ///
     /// Every child reference is checked once, the tree must have exactly one
@@ -770,6 +774,147 @@ impl<K: Ord + Copy, V: Copy> DoubleEndedIterator for Iter<'_, K, V> {
 
 impl<K: Ord + Copy, V: Copy> ExactSizeIterator for Iter<'_, K, V> {}
 
+pub(crate) struct RangeIter<'a, K, V> {
+    map: &'a IndexedAvlMap<K, V>,
+    minimum: K,
+    maximum: K,
+    front: [usize; MAX_AVL_HEIGHT],
+    front_depth: usize,
+    back: [usize; MAX_AVL_HEIGHT],
+    back_depth: usize,
+    last_front: Option<K>,
+    last_back: Option<K>,
+    upper_bound: usize,
+    finished: bool,
+}
+
+impl<'a, K: Ord + Copy, V: Copy> RangeIter<'a, K, V> {
+    fn new(map: &'a IndexedAvlMap<K, V>, minimum: K, maximum: K) -> Self {
+        let mut iterator = Self {
+            map,
+            minimum,
+            maximum,
+            front: [0; MAX_AVL_HEIGHT],
+            front_depth: 0,
+            back: [0; MAX_AVL_HEIGHT],
+            back_depth: 0,
+            last_front: None,
+            last_back: None,
+            upper_bound: map.len,
+            finished: minimum > maximum,
+        };
+        if iterator.finished {
+            iterator.upper_bound = 0;
+        } else {
+            iterator.push_front(map.root);
+            iterator.push_back(map.root);
+            if iterator.front_depth == 0 {
+                iterator.finish();
+            }
+        }
+        iterator
+    }
+
+    fn push_front(&mut self, mut current: Option<usize>) {
+        while let Some(index) = current {
+            let node = self.map.node(index);
+            if node.key < self.minimum {
+                current = node.right;
+            } else if node.key > self.maximum {
+                current = node.left;
+            } else {
+                assert!(
+                    self.front_depth < MAX_AVL_HEIGHT,
+                    "indexed AVL range iterator exceeds its valid height bound"
+                );
+                self.front[self.front_depth] = index;
+                self.front_depth += 1;
+                current = node.left;
+            }
+        }
+    }
+
+    fn push_back(&mut self, mut current: Option<usize>) {
+        while let Some(index) = current {
+            let node = self.map.node(index);
+            if node.key > self.maximum {
+                current = node.left;
+            } else if node.key < self.minimum {
+                current = node.right;
+            } else {
+                assert!(
+                    self.back_depth < MAX_AVL_HEIGHT,
+                    "indexed AVL range iterator exceeds its valid height bound"
+                );
+                self.back[self.back_depth] = index;
+                self.back_depth += 1;
+                current = node.right;
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        self.front_depth = 0;
+        self.back_depth = 0;
+        self.upper_bound = 0;
+        self.finished = true;
+    }
+}
+
+impl<'a, K: Ord + Copy, V: Copy> Iterator for RangeIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished || self.front_depth == 0 {
+            self.finish();
+            return None;
+        }
+        self.front_depth -= 1;
+        let index = self.front[self.front_depth];
+        let node = self.map.node(index);
+        if self
+            .last_back
+            .is_some_and(|last_back| node.key >= last_back)
+        {
+            self.finish();
+            return None;
+        }
+        self.push_front(node.right);
+        self.last_front = Some(node.key);
+        self.upper_bound = self.upper_bound.saturating_sub(1);
+        Some((&node.key, &node.value))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.upper_bound))
+    }
+}
+
+impl<K: Ord + Copy, V: Copy> DoubleEndedIterator for RangeIter<'_, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.finished || self.back_depth == 0 {
+            self.finish();
+            return None;
+        }
+        self.back_depth -= 1;
+        let index = self.back[self.back_depth];
+        let node = self.map.node(index);
+        if self
+            .last_front
+            .is_some_and(|last_front| node.key <= last_front)
+        {
+            self.finish();
+            return None;
+        }
+        self.push_back(node.left);
+        self.last_back = Some(node.key);
+        self.upper_bound = self.upper_bound.saturating_sub(1);
+        Some((&node.key, &node.value))
+    }
+}
+
+impl<K: Ord + Copy, V: Copy> std::iter::FusedIterator for RangeIter<'_, K, V> {}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -885,6 +1030,73 @@ mod tests {
     }
 
     #[test]
+    fn inclusive_range_iteration_is_bounded_double_ended_and_fused() {
+        let mut map = IndexedAvlMap::try_with_capacity(9).unwrap();
+        for key in [5_i64, 3, 7, 2, 4, 6, 8, 1, 9] {
+            map.insert(key, key * 10);
+        }
+
+        assert_eq!(
+            map.range(3..=7)
+                .map(|(&key, &value)| (key, value))
+                .collect::<Vec<_>>(),
+            [(3, 30), (4, 40), (5, 50), (6, 60), (7, 70)]
+        );
+        assert_eq!(
+            map.range(3..=7)
+                .rev()
+                .map(|(&key, _)| key)
+                .collect::<Vec<_>>(),
+            [7, 6, 5, 4, 3]
+        );
+
+        let mut mixed = map.range(3..=7);
+        assert_eq!(mixed.next().map(|(&key, _)| key), Some(3));
+        assert_eq!(mixed.next_back().map(|(&key, _)| key), Some(7));
+        assert_eq!(mixed.next_back().map(|(&key, _)| key), Some(6));
+        assert_eq!(mixed.next().map(|(&key, _)| key), Some(4));
+        assert_eq!(mixed.next().map(|(&key, _)| key), Some(5));
+        assert_eq!(mixed.next_back(), None);
+        assert_eq!(mixed.next(), None);
+
+        assert!(map.range(10..=20).next().is_none());
+        let inverted_minimum = 7;
+        let inverted_maximum = 3;
+        assert!(
+            map.range(inverted_minimum..=inverted_maximum)
+                .next()
+                .is_none()
+        );
+        assert_eq!(
+            map.range(i64::MIN..=i64::MAX)
+                .map(|(&key, _)| key)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
+    }
+
+    #[test]
+    fn narrow_range_setup_and_traversal_are_logarithmic_plus_output() {
+        let mut map = IndexedAvlMap::try_with_capacity(1_023).unwrap();
+        for key in 0_i64..1_023 {
+            let key = ComparisonKey(key);
+            map.insert(key, key.0);
+        }
+
+        ORDER_COMPARISONS.set(0);
+        let selected = map
+            .range(ComparisonKey(500)..=ComparisonKey(502))
+            .map(|(key, &value)| (key.0, value))
+            .collect::<Vec<_>>();
+        let comparisons = ORDER_COMPARISONS.get();
+        assert_eq!(selected, [(500, 500), (501, 501), (502, 502)]);
+        assert!(
+            comparisons <= 64,
+            "narrow range used {comparisons} ordered comparisons"
+        );
+    }
+
+    #[test]
     fn leaf_one_child_and_two_child_deletion_rebalance_and_reuse_slots() {
         let mut map = IndexedAvlMap::try_with_capacity(8).unwrap();
         for key in [40_i64, 20, 60, 10, 30, 50, 70, 25] {
@@ -987,6 +1199,32 @@ mod tests {
                     .range((std::ops::Bound::Excluded(query), std::ops::Bound::Unbounded))
                     .next()
                     .map(|(&key, _)| key)
+            );
+
+            let other = i64::try_from(state.rotate_left(11) % 257).unwrap() - 128;
+            let minimum = query.min(other);
+            let maximum = query.max(other);
+            assert_eq!(
+                actual
+                    .range(minimum..=maximum)
+                    .map(|(&key, &value)| (key, value))
+                    .collect::<Vec<_>>(),
+                expected
+                    .range(minimum..=maximum)
+                    .map(|(&key, &value)| (key, value))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                actual
+                    .range(minimum..=maximum)
+                    .rev()
+                    .map(|(&key, &value)| (key, value))
+                    .collect::<Vec<_>>(),
+                expected
+                    .range(minimum..=maximum)
+                    .rev()
+                    .map(|(&key, &value)| (key, value))
+                    .collect::<Vec<_>>()
             );
         }
     }

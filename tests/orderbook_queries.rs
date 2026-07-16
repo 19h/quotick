@@ -101,6 +101,63 @@ fn fallible_depth_is_public_only_market_ordered_and_bounded() {
 }
 
 #[test]
+fn fallible_depth_range_is_inclusive_market_ordered_and_public_only() {
+    let book = populated_book();
+
+    let bid_band = Price::from_raw(90)..=Price::from_raw(100);
+    assert_eq!(
+        book.depth_range_iter(Side::Buy, bid_band.clone())
+            .map(|level| level.price.raw())
+            .collect::<Vec<_>>(),
+        [100, 90]
+    );
+    assert_eq!(
+        book.depth_range_iter(Side::Buy, bid_band.clone())
+            .rev()
+            .map(|level| level.price.raw())
+            .collect::<Vec<_>>(),
+        [90, 100]
+    );
+    assert_eq!(
+        book.try_depth_range(Side::Buy, bid_band.clone(), 1)
+            .unwrap()
+            .iter()
+            .map(|level| level.price.raw())
+            .collect::<Vec<_>>(),
+        [100]
+    );
+    assert_eq!(
+        book.depth_range(Side::Buy, bid_band.clone(), usize::MAX),
+        book.depth_range_iter(Side::Buy, bid_band)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        book.depth_range_iter(Side::Buy, Price::from_raw(100)..=Price::from_raw(110),)
+            .map(|level| level.price.raw())
+            .collect::<Vec<_>>(),
+        [100],
+        "the inclusive band must still omit hidden-only prices"
+    );
+    assert_eq!(
+        book.depth_range_iter(Side::Sell, Price::from_raw(100)..=Price::from_raw(125),)
+            .map(|level| level.price.raw())
+            .collect::<Vec<_>>(),
+        [120]
+    );
+    assert!(
+        book.depth_range_iter(Side::Buy, Price::from_raw(101)..=Price::from_raw(99),)
+            .next()
+            .is_none()
+    );
+    assert!(
+        book.try_depth_range(Side::Buy, Price::from_raw(90)..=Price::from_raw(100), 0,)
+            .unwrap()
+            .is_empty()
+    );
+    book.validate().unwrap();
+}
+
+#[test]
 fn fallible_private_queries_retain_canonical_identity_order() {
     let book = populated_book();
 

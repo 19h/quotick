@@ -734,8 +734,7 @@ fn account_order_queries_are_canonical_scoped_and_nonmutating() {
     book.validate().unwrap();
 }
 
-#[test]
-fn aggregate_limit_queries_are_market_ordered_bounded_and_nonmutating() {
+fn populated_limit_depth_book() -> CallAuctionBook {
     let mut book = CallAuctionBook::try_with_limits(definition(), limits(8, 8, 16)).unwrap();
     for command in [
         order(
@@ -778,6 +777,12 @@ fn aggregate_limit_queries_are_market_ordered_bounded_and_nonmutating() {
     ] {
         book.admit(command).unwrap();
     }
+    book
+}
+
+#[test]
+fn aggregate_limit_queries_are_market_ordered_bounded_and_nonmutating() {
+    let book = populated_limit_depth_book();
     let before = book.resource_status();
 
     let bids = book.try_limit_depth(Side::Buy, usize::MAX).unwrap();
@@ -828,6 +833,57 @@ fn aggregate_limit_queries_are_market_ordered_bounded_and_nonmutating() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn aggregate_limit_range_queries_are_inclusive_market_ordered_and_nonmutating() {
+    let book = populated_limit_depth_book();
+    let before = book.resource_status();
+    let bid_band = Price::from_raw(90)..=Price::from_raw(100);
+    assert_eq!(
+        book.limit_depth_range_iter(Side::Buy, bid_band.clone())
+            .map(|level| level.price().raw())
+            .collect::<Vec<_>>(),
+        [100, 90]
+    );
+    assert_eq!(
+        book.limit_depth_range_iter(Side::Buy, bid_band.clone())
+            .rev()
+            .map(|level| level.price().raw())
+            .collect::<Vec<_>>(),
+        [90, 100]
+    );
+    assert_eq!(
+        book.try_limit_depth_range(Side::Buy, bid_band.clone(), 1)
+            .unwrap()
+            .iter()
+            .map(|level| level.price().raw())
+            .collect::<Vec<_>>(),
+        [100]
+    );
+    assert_eq!(
+        book.limit_depth_range(Side::Buy, bid_band.clone(), usize::MAX),
+        book.limit_depth_range_iter(Side::Buy, bid_band)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        book.limit_depth_range_iter(Side::Sell, Price::from_raw(100)..=Price::from_raw(115),)
+            .map(|level| level.price().raw())
+            .collect::<Vec<_>>(),
+        [110]
+    );
+    assert!(
+        book.limit_depth_range_iter(Side::Sell, Price::from_raw(115)..=Price::from_raw(100),)
+            .next()
+            .is_none()
+    );
+    assert!(
+        book.try_limit_depth_range(Side::Buy, Price::from_raw(90)..=Price::from_raw(100), 0,)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(book.resource_status(), before);
+    book.validate().unwrap();
 }
 
 #[test]

@@ -20,7 +20,7 @@
 use std::cmp::Reverse;
 use std::fmt;
 use std::hash::Hash;
-use std::ops::Index;
+use std::ops::{Index, RangeInclusive};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -4217,6 +4217,13 @@ impl PriceLevels {
         self.by_price.iter()
     }
 
+    fn range(
+        &self,
+        range: RangeInclusive<Price>,
+    ) -> impl DoubleEndedIterator<Item = (&Price, &PriceLevel)> + '_ {
+        self.by_price.range(range)
+    }
+
     fn values(&self) -> impl Iterator<Item = &PriceLevel> {
         self.by_price.iter().map(|(_, level)| level)
     }
@@ -6366,6 +6373,33 @@ impl OrderBook {
         Ok(output)
     }
 
+    /// Fallibly returns public levels inside an inclusive price range in
+    /// market-priority order.
+    ///
+    /// An inverted range is empty. The query counts the selected visible
+    /// levels without allocation, then reserves that exact semantic cardinality
+    /// before copying any level. Fully hidden-only prices remain absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrderBookQueryError::ReservationFailed`] without partial output
+    /// if the caller-owned result vector cannot be reserved.
+    pub fn try_depth_range(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+        limit: usize,
+    ) -> Result<Vec<LevelSnapshot>, OrderBookQueryError> {
+        let maximum = self
+            .depth_range_iter(side, range.clone())
+            .take(limit)
+            .count();
+        let mut output =
+            reserve_order_book_query_vec(maximum, OrderBookQueryResource::DepthLevels)?;
+        output.extend(self.depth_range_iter(side, range).take(limit));
+        Ok(output)
+    }
+
     /// Returns up to `limit` public levels using the fallible production path.
     ///
     /// # Panics
@@ -6376,6 +6410,24 @@ impl OrderBook {
     pub fn depth(&self, side: Side, limit: usize) -> Vec<LevelSnapshot> {
         self.try_depth(side, limit)
             .expect("order-book depth output allocation failed")
+    }
+
+    /// Returns public levels inside an inclusive price range using the
+    /// fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if result-vector allocation fails. Use
+    /// [`Self::try_depth_range`] when allocation failure must remain typed.
+    #[must_use]
+    pub fn depth_range(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+        limit: usize,
+    ) -> Vec<LevelSnapshot> {
+        self.try_depth_range(side, range, limit)
+            .expect("order-book price-range depth output allocation failed")
     }
 
     /// Iterates public aggregate levels in market-priority order without
@@ -6392,6 +6444,23 @@ impl OrderBook {
         DirectionalIter::new(self.depth_levels(side), side == Side::Buy)
     }
 
+    /// Iterates public aggregate levels inside an inclusive price range without
+    /// allocating.
+    ///
+    /// Bids are descending and asks are ascending. Prices containing only
+    /// hidden liquidity are omitted, and an inverted range is empty. Creating
+    /// the iterator is `O(log(P + 1))`; inspecting `K` in-range occupied
+    /// execution prices is `O(K + log(P + 1))` total time with `O(1)`
+    /// auxiliary space. Hidden-only prices contribute to `K` but not output.
+    #[must_use]
+    pub fn depth_range_iter(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+    ) -> impl DoubleEndedIterator<Item = LevelSnapshot> + '_ {
+        DirectionalIter::new(self.depth_levels_range(side, range), side == Side::Buy)
+    }
+
     /// Iterates aggregate levels in ascending price order without allocating.
     pub(crate) fn depth_levels(
         &self,
@@ -6399,6 +6468,17 @@ impl OrderBook {
     ) -> impl DoubleEndedIterator<Item = LevelSnapshot> + '_ {
         self.levels(side)
             .iter()
+            .filter(|(_, level)| level.total_quantity != 0)
+            .map(|(&price, level)| Self::level_snapshot(price, level))
+    }
+
+    fn depth_levels_range(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+    ) -> impl DoubleEndedIterator<Item = LevelSnapshot> + '_ {
+        self.levels(side)
+            .range(range)
             .filter(|(_, level)| level.total_quantity != 0)
             .map(|(&price, level)| Self::level_snapshot(price, level))
     }

@@ -233,6 +233,11 @@ shard, from command admission through checkpoint capture.
       intrusive free-list coverage without transient vectors. This costs
       `O(P log(P + 1))` time over `P` initialized slots and `O(1)` auxiliary
       space.
+    - One shared inclusive-range descent initializes independent forward and
+      reverse fixed stacks. After logarithmic boundary descent it traverses
+      only occupied keys inside the band, supports mixed double-ended
+      consumption without duplicates, treats an inverted band as empty, and
+      allocates no output or traversal storage.
 24. FOK and minimum-quantity IOC inspection never mutate state or materialize
     reserve slices. At a crossed price without self liquidity, every external
     total leaf is eligible. Cancel-resting excludes self orders and retains all
@@ -481,6 +486,13 @@ Read-only extraction is a separate caller-owned allocation boundary.
 prices and requested limit `L`, then returns only public prices in market
 priority. `depth_iter` exposes the same market-priority projection without
 allocating caller-owned output and supports traversal from either end.
+`depth_range_iter` applies the same projection to exact inclusive endpoints
+with one shared AVL band descent; bids remain descending, asks ascending,
+hidden-only levels absent, and inverted ranges empty. `try_depth_range` first
+counts the selected public rows without allocation, reserves exactly that
+semantic cardinality, and then copies through the same iterator. For `K`
+in-band occupied execution prices inspected, traversal is
+`O(log(P + 1) + K)` time and `O(1)` auxiliary space.
 `try_active_orders` reserves the exact indexed resting cardinality, validates
 that cardinality during dense traversal, and sorts by `OrderId`.
 `try_account_active_order_ids` performs one expected `O(1)` account lookup,
@@ -685,10 +697,14 @@ interest for discovery, allocation, and uncross preparation.
    - Read-only aggregate inspection exposes direct and best occupied limit
      levels without allocation. `limit_depth_iter` is a double-ended exact-size
      view that traverses bids descending or asks ascending without caller-owned
-     output. `try_limit_depth` reserves at most `min(P, L)` levels before
-     copying and returns typed allocation failure without partial output; its
-     convenience wrapper retains A12's panic boundary. Market-constrained
-     interest remains separate.
+     output. `limit_depth_range_iter` applies the same order to exact inclusive
+     endpoints, treats an inverted range as empty, and visits only in-band
+     occupied prices. `try_limit_depth_range` counts the selected rows without
+     allocation and reserves exactly that cardinality before copying.
+     `try_limit_depth` reserves at most `min(P, L)` levels before copying.
+     Either fallible query returns typed allocation failure without partial
+     output; convenience wrappers retain A12's panic boundary.
+     Market-constrained interest remains separate.
 6. Indicative discovery rebuilds canonical aggregate scratch and invokes the
    A60 kernel with current market totals. Allocation-plan construction rebuilds
    canonical market/price/class/time/ID order scratch under A111 and invokes
@@ -711,6 +727,9 @@ interest for discovery, allocation, and uncross preparation.
    `O(log(P + 1))` setup, `O(P)` complete traversal, and `O(1)` auxiliary
    space. Fallible output of limit `L` costs
    `O(log(P + 1) + min(P, L))` time and `O(min(P, L))` result space.
+   An inclusive band containing `K` selected occupied prices costs
+   `O(log(P + 1) + K)` traversal time and `O(1)` iterator space; its fallible
+   materialization makes two such passes and owns `O(K)` selected output.
    Aggregate scratch plus discovery is `O(B + A)`.
    Order scratch is `O(O log O + P)` because intrusive links contain stable
    order identities resolved through the AVL and the preallocated slices are
@@ -1655,8 +1674,13 @@ This section defines the public call-auction market-data stream and its
 replica contract.
 
 1. `CallAuctionBook::limit_depth_iter`,
-   `CallAuctionBook::try_limit_depth`, and `CallAuctionBook::limit_depth`
+   `CallAuctionBook::limit_depth_range_iter`,
+   `CallAuctionBook::try_limit_depth`,
+   `CallAuctionBook::limit_depth`,
+   `CallAuctionBook::try_limit_depth_range`, and
+   `CallAuctionBook::limit_depth_range`
    expose anonymized occupied limit aggregates in best-to-worst order;
+   range endpoints are inclusive and an inverted range is empty.
    `CallAuctionBook::limit_level` and `CallAuctionBook::best_limit_level`
    expose one aggregate without output allocation. Market-constrained quantity
    and order count are separate side-specific values. Locked and crossed
@@ -2023,12 +2047,14 @@ and repeated best deletion, deliberate cached-price and cached-aggregate
 corruption, repricing, full execution, STP removal, empty-side transitions, and
 direct checkpoint reconstruction.
 Indexed-AVL tests cover all four rotation shapes, forward/reverse traversal,
+inclusive range endpoints, outside and inverted ranges, mixed front/back range
+consumption, fused exhaustion, comparison-bounded narrow descent,
 leaf/one-child/two-child deletion, slot reuse without capacity growth,
 topology-independent equality, tree/free-list corruption, unrepresentable arena
 reservation, shared-child and disconnected-cycle corruption, unlinked vacant
-slots, and 20,000 generated operations differentially checked against
-`BTreeMap` after every mutation. Matching audit tests independently corrupt
-price-FIFO and account-list cycles while exercising the allocation-free
+slots, and 20,000 generated operations and ranges differentially checked
+against `BTreeMap` after every mutation. Matching audit tests independently
+corrupt price-FIFO and account-list cycles while exercising the allocation-free
 cardinality guards.
 
 Continuous-risk unit tests corrupt account-list cycles and unlink an otherwise
@@ -2040,11 +2066,14 @@ cycles, account-index links and aggregates, and remove active orders from every
 queue while exercising the equivalent allocation-free coverage guards. Live
 account-order query tests cover canonical all/side selection, unknown owners,
 typed unrepresentable output, private-index corruption, and nonmutation. Live
-aggregate-depth query tests cover direct/best lookup, market-priority streaming,
-bounded materialization, separate market interest, typed unrepresentable
-output, and nonmutation. Continuous depth-query tests cover allocation-free
-market-priority streaming and hidden-only exclusion. Live allocation tests
-invert class and arrival order, place the class boundary at price-time and
+aggregate-depth query tests cover direct/best lookup, market-priority
+streaming, inclusive and inverted bands, forward/reverse band traversal,
+bounded exact-reservation materialization, separate market interest, typed
+unrepresentable output, and nonmutation. Continuous depth-query tests cover
+allocation-free market-priority full/band streaming, inclusive and inverted
+bands, exact selected-row materialization, and hidden-only exclusion. Live
+allocation tests invert class and arrival order, place the class boundary at
+price-time and
 pro-rata marginal tiers, prove amendment retention and replacement
 reassignment, and compare 20,000 four-class mutations with an independent
 literal priority comparator.
@@ -2398,7 +2427,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Snapshots and compaction | single-file and segmented matching/risk/ledger/call-auction WAL cutover plus off-thread direct and WAL-synchronized plain/coupled continuous-matching and call-auction replay verification are implemented; verified matching/risk/auction handles can retire an older prefix by cursor-streaming only its synchronized suffix. Remaining evidence is bounded checkpoint memory and writer audit-copy/projection/direct-reconstruction pause, bounded suffix-copy pause, semantic generation rollover, and externally retained audit/idempotency proofs |
 | High | Replication and failover | deterministic leader change; duplicate/lost-command fault injection; recovery-point objective evidence |
 | High | Portfolio/collateral risk expansion | cross-instrument netting, currency conversion, margin models, ledger-backed availability, scenario stress, and replicated reservation ownership |
-| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, sourced explicit-reference stop-market/stop-limit activation with durable source identity/version/sequence and gap/reset validation, native reserve and fully hidden continuous queue classes, atomic minimum-quantity IOC, atomic FOK under all four continuous self-trade policies, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, authoritative typed priority classes, account/side mass cancellation, atomic new-identity replacement with full priority loss, aggregate depth queries, banded discovery, sequenced nullable indicative publication, explicit price-time and price/class-tier pro-rata-time allocation, deterministic pairing/atomic uncross with fail-closed self-trade abort, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, plain/coupled-risk full-WAL plus cutover recovery, instrument-bound atomic DVP settlement of complete accepted uncross reports, and explicit trade-bound fee transfers in the same atomic ledger event are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authenticated external stop-reference acquisition/normalization and missed-reference recovery, auction reference and dynamic-band derivation, authenticated venue-category-to-class and beneficial-owner mapping, venue-specific display/allocation policies, venue-specific call-auction self-trade cancellation/decrement and alternative-pairing policies, clearing lifecycle authorization, fee calculation/authorization, settlement-date derivation, volatility/interruption auctions, pegged, discretionary, venue-specific in-place amendment/uncross/publication cadence/filtering semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
+| High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, sourced explicit-reference stop-market/stop-limit activation with durable source identity/version/sequence and gap/reset validation, native reserve and fully hidden continuous queue classes, atomic minimum-quantity IOC, atomic FOK under all four continuous self-trade policies, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, authoritative typed priority classes, account/side mass cancellation, atomic new-identity replacement with full priority loss, full and inclusive price-band aggregate depth queries, banded discovery, sequenced nullable indicative publication, explicit price-time and price/class-tier pro-rata-time allocation, deterministic pairing/atomic uncross with fail-closed self-trade abort, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, plain/coupled-risk full-WAL plus cutover recovery, instrument-bound atomic DVP settlement of complete accepted uncross reports, and explicit trade-bound fee transfers in the same atomic ledger event are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authenticated external stop-reference acquisition/normalization and missed-reference recovery, auction reference and dynamic-band derivation, authenticated venue-category-to-class and beneficial-owner mapping, venue-specific display/allocation policies, venue-specific call-auction self-trade cancellation/decrement and alternative-pairing policies, clearing lifecycle authorization, fee calculation/authorization, settlement-date derivation, volatility/interruption auctions, pegged, discretionary, venue-specific in-place amendment/uncross/publication cadence/filtering semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
 | High | Instrument lifecycle expansion | authoritative calendar ingestion/distribution/activation, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |
