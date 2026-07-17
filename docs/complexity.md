@@ -168,6 +168,14 @@ source-version, and source-sequence transition validation is `O(1)` time and
 space. Each command/event reference occupies 32 B in retained history; live
 book and publisher state retain one optional reference independent of `O`.
 
+Conditional stop-trigger sweeping fills the ordinary prepared selection during
+preparation and constructs complete caller-owned dormant-state output. For `S`
+dormant stops in the selected side index, exact trigger-index validation adds
+`O(K log(S + 1))` work after ordinary preparation. Accepted commit validates
+and drains those same IDs without a second eligible-prefix selection or sort.
+The lease and caller output each retain `O(K)` rows; a valid empty prefix uses
+neither and still invokes its predicate.
+
 Active matching state uses `O(O + P + C + T)` memory for `O` resting or
 dormant orders, `C` retained idempotency reports, and `T` never-evicted
 controlled accounts; the fixed GTD index and two stop-trigger indexes each
@@ -758,6 +766,28 @@ acceptance and business rejection append the existing two frames; query
 failure, decline, unwind, and replay append zero. Count, quantity, and
 nanosecond-watermark arithmetic has zero approximation error, and no wire
 value or fixed authoritative state changes.
+
+`try_submit_stop_trigger_sweep_if` composes ordinary `StopTriggerSweep`
+preparation with canonical selection into the existing lease, exactly reserved
+complete dormant-stop output, a predicate, and ordinary trigger-sweep commit.
+Let `A` be ordinary preparation cost, `K` selected stops, `S` dormant stops in
+the selected side index, `F` predicate cost, and `M` ordinary trigger-sweep
+commit cost. Exact trigger-index and dormant-state validation costs
+`O(K log(S + 1))` after `A`.
+
+Acceptance is `O(A + K log(S + 1) + F + M)` time; decline is
+`O(A + K log(S + 1) + F)`. Accepted commit reuses the prepared IDs and performs
+no second eligible-prefix selection or sort. The constructor-owned lease
+retains `O(K)` ID scratch, caller output owns `O(K)`
+`DormantStopSnapshot` rows, and evaluator auxiliary state is `O(1)`. Core
+rejection and exact replay skip selection, output reservation, and `F`; a valid
+empty prefix invokes `F` without a lease or selected output. Coupled acceptance
+applies ordinary risk transitions for exactly the selected activations and
+their execution/cancellation/residual traces. Durable acceptance and business
+rejection append the existing two frames; query failure, decline, unwind, and
+replay append zero. Count, quantity, price, and source-coordinate arithmetic
+has zero approximation error, and no wire value or fixed authoritative state
+changes.
 
 ## Default matching limits and memory
 

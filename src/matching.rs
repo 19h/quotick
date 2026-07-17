@@ -1600,11 +1600,12 @@ impl OrderSelectionPool {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn acquire(self: &Arc<Self>) -> Option<PooledOrderSelection> {
+    fn acquire(self: &Arc<Self>, required: usize) -> Option<PooledOrderSelection> {
         let selected = self.lock_available().pop()?;
         Some(PooledOrderSelection {
             pool: Some(Arc::clone(self)),
             selected: Some(selected),
+            required,
         })
     }
 
@@ -1626,6 +1627,7 @@ impl OrderSelectionPool {
 struct PooledOrderSelection {
     pool: Option<Arc<OrderSelectionPool>>,
     selected: Option<Vec<OrderId>>,
+    required: usize,
 }
 
 impl PooledOrderSelection {
@@ -1633,7 +1635,12 @@ impl PooledOrderSelection {
         Self {
             pool: None,
             selected: Some(Vec::new()),
+            required: 0,
         }
+    }
+
+    const fn required(&self) -> usize {
+        self.required
     }
 
     fn values(&self) -> &[OrderId] {
@@ -1660,6 +1667,7 @@ impl fmt::Debug for PooledOrderSelection {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PooledOrderSelection")
+            .field("required", &self.required())
             .field("length", &self.values().len())
             .field("capacity", &self.capacity())
             .finish()
@@ -2487,6 +2495,8 @@ pub enum OrderBookQueryResource {
     TradingStateControlOrders,
     /// Complete active-order states selected by one conditional expiry sweep.
     ExpirySweepOrders,
+    /// Complete dormant-stop states selected by one conditional trigger sweep.
+    StopTriggerSweepOrders,
 }
 
 impl fmt::Display for OrderBookQueryResource {
@@ -2500,6 +2510,7 @@ impl fmt::Display for OrderBookQueryResource {
             Self::AccountControlOrders => "account-control-order output",
             Self::TradingStateControlOrders => "trading-state-control-order output",
             Self::ExpirySweepOrders => "expiry-sweep-order output",
+            Self::StopTriggerSweepOrders => "stop-trigger-sweep-order output",
         })
     }
 }
@@ -4141,6 +4152,168 @@ impl ExpirySweepObservation {
     }
 }
 
+/// Frozen source transition and canonical dormant stops selected by one trigger sweep.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StopTriggerSweepObservation {
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    book_event_sequence: u64,
+    previous_reference: Option<StopReference>,
+    reference: StopReference,
+    maximum_orders: u32,
+    stops: Vec<DormantStopSnapshot>,
+    triggered_quantity_lots: u128,
+    remaining_eligible_order_count: usize,
+}
+
+impl StopTriggerSweepObservation {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the observation validates one complete trigger-sweep contract"
+    )]
+    fn try_new(
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        book_event_sequence: u64,
+        previous_reference: Option<StopReference>,
+        reference: StopReference,
+        maximum_orders: u32,
+        stops: Vec<DormantStopSnapshot>,
+        remaining_eligible_order_count: usize,
+    ) -> Result<Self, InvariantViolation> {
+        let maximum = usize::try_from(maximum_orders).map_err(|_| {
+            InvariantViolation::new("stop-trigger-sweep maximum does not fit process address space")
+        })?;
+        if maximum == 0 {
+            return Err(InvariantViolation::new(
+                "stop-trigger-sweep observation has an empty maximum",
+            ));
+        }
+        if stops.len() > maximum {
+            return Err(InvariantViolation::new(format!(
+                "stop-trigger-sweep selection length {} exceeds maximum {maximum}",
+                stops.len()
+            )));
+        }
+        let mut previous_key = None;
+        let mut selected_side = None;
+        let mut triggered_quantity_lots = 0_u128;
+        for stop in &stops {
+            let eligible = match stop.side {
+                Side::Buy => stop.trigger_price <= reference.price(),
+                Side::Sell => stop.trigger_price >= reference.price(),
+            };
+            if !eligible {
+                return Err(InvariantViolation::new(format!(
+                    "stop-trigger-sweep selection contains ineligible order {}",
+                    stop.order_id
+                )));
+            }
+            if selected_side.is_some_and(|side| side != stop.side) {
+                return Err(InvariantViolation::new(
+                    "stop-trigger-sweep selection contains both stop sides",
+                ));
+            }
+            selected_side = Some(stop.side);
+            let key = stop_priority_sort_key(
+                stop.side,
+                stop.trigger_price,
+                stop.priority_sequence,
+                stop.order_id,
+            );
+            if previous_key.is_some_and(|previous| previous >= key) {
+                return Err(InvariantViolation::new(format!(
+                    "stop-trigger-sweep selection is not strictly ordered at order {}",
+                    stop.order_id
+                )));
+            }
+            previous_key = Some(key);
+            triggered_quantity_lots = triggered_quantity_lots
+                .checked_add(u128::from(stop.leaves_quantity.lots()))
+                .ok_or_else(|| {
+                    InvariantViolation::new("selected stop-trigger quantity is exhausted")
+                })?;
+        }
+        Ok(Self {
+            instrument_id,
+            instrument_version,
+            book_event_sequence,
+            previous_reference,
+            reference,
+            maximum_orders,
+            stops,
+            triggered_quantity_lots,
+            remaining_eligible_order_count,
+        })
+    }
+
+    /// Returns the selected instrument.
+    #[must_use]
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version used by preparation.
+    #[must_use]
+    pub const fn instrument_version(&self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the last committed event sequence visible to preparation.
+    #[must_use]
+    pub const fn book_event_sequence(&self) -> u64 {
+        self.book_event_sequence
+    }
+
+    /// Returns the committed reference visible before the proposed sweep.
+    #[must_use]
+    pub const fn previous_reference(&self) -> Option<StopReference> {
+        self.previous_reference
+    }
+
+    /// Returns the proposed authoritative source reference.
+    #[must_use]
+    pub const fn reference(&self) -> StopReference {
+        self.reference
+    }
+
+    /// Returns the reference committed by acceptance.
+    #[must_use]
+    pub const fn current_reference(&self) -> StopReference {
+        self.reference
+    }
+
+    /// Returns the command's maximum trigger batch size.
+    #[must_use]
+    pub const fn maximum_orders(&self) -> u32 {
+        self.maximum_orders
+    }
+
+    /// Returns complete selected dormant states in canonical trigger order.
+    #[must_use]
+    pub fn stops(&self) -> &[DormantStopSnapshot] {
+        &self.stops
+    }
+
+    /// Returns the number of dormant stops selected for activation.
+    #[must_use]
+    pub fn triggered_order_count(&self) -> usize {
+        self.stops.len()
+    }
+
+    /// Returns exact selected total leaves in lots.
+    #[must_use]
+    pub const fn triggered_quantity_lots(&self) -> u128 {
+        self.triggered_quantity_lots
+    }
+
+    /// Returns qualifying dormant stops left after the selected prefix.
+    #[must_use]
+    pub const fn remaining_eligible_order_count(&self) -> usize {
+        self.remaining_eligible_order_count
+    }
+}
+
 /// Complete private state of one resting order in a semantic checkpoint.
 ///
 /// Entries are stored in canonical side/price order and FIFO order within a
@@ -5677,16 +5850,25 @@ fn validate_checkpoint_order(
 }
 
 fn dormant_checkpoint_sort_key(order: DormantStopCheckpoint) -> (u8, i128, u64, OrderId) {
-    let trigger = match order.side {
-        Side::Buy => i128::from(order.trigger_price.raw()),
-        Side::Sell => -i128::from(order.trigger_price.raw()),
-    };
-    (
-        side_wire_order(order.side),
-        trigger,
+    stop_priority_sort_key(
+        order.side,
+        order.trigger_price,
         order.priority_sequence,
         order.order_id,
     )
+}
+
+fn stop_priority_sort_key(
+    side: Side,
+    trigger_price: Price,
+    priority_sequence: u64,
+    order_id: OrderId,
+) -> (u8, i128, u64, OrderId) {
+    let trigger = match side {
+        Side::Buy => i128::from(trigger_price.raw()),
+        Side::Sell => -i128::from(trigger_price.raw()),
+    };
+    (side_wire_order(side), trigger, priority_sequence, order_id)
 }
 
 fn validate_stop_reference_transition(
@@ -8384,7 +8566,7 @@ impl OrderBook {
         if required == 0 {
             return Ok(PooledOrderSelection::empty());
         }
-        let selected = self.order_selection_pool.acquire().ok_or(
+        let selected = self.order_selection_pool.acquire(required).ok_or(
             MatchingError::PreparationCapacityExhausted {
                 maximum: self.limits.max_prepared_order_selections(),
             },
@@ -8659,6 +8841,122 @@ impl OrderBook {
             .map(|(_, order_id)| order_id)
         {
             visit(order_id)?;
+        }
+        Ok(())
+    }
+
+    fn try_select_triggered_orders_into(
+        &self,
+        reference_price: Price,
+        limit: usize,
+        selected: &mut Vec<OrderId>,
+    ) -> Result<(), InvariantViolation> {
+        if !selected.is_empty() {
+            return Err(InvariantViolation::new(
+                "stop-trigger-sweep selection output is not empty",
+            ));
+        }
+        if selected.capacity() < limit {
+            return Err(InvariantViolation::new(format!(
+                "stop-trigger-sweep selection capacity {} is below required count {limit}",
+                selected.capacity()
+            )));
+        }
+        self.for_each_eligible_stop(reference_price, limit, |order_id| {
+            self.try_indexed_dormant_stop(order_id)?;
+            selected.push(order_id);
+            Ok::<(), InvariantViolation>(())
+        })?;
+        if selected.len() != limit {
+            return Err(InvariantViolation::new(format!(
+                "stop-trigger-sweep selection length {} differs from required count {limit}",
+                selected.len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn try_indexed_dormant_stop(
+        &self,
+        order_id: OrderId,
+    ) -> Result<DormantStopSnapshot, InvariantViolation> {
+        let order = self.orders.get(&order_id).copied().ok_or_else(|| {
+            InvariantViolation::new(format!(
+                "stop trigger index references absent active order {order_id}"
+            ))
+        })?;
+        if order.order_id != order_id {
+            return Err(InvariantViolation::new(format!(
+                "stop trigger index order {order_id} resolves to embedded order {}",
+                order.order_id
+            )));
+        }
+        let snapshot = order.try_stop_snapshot()?.ok_or_else(|| {
+            InvariantViolation::new(format!(
+                "stop trigger index references nondormant order {order_id}"
+            ))
+        })?;
+        let indexed = match snapshot.side {
+            Side::Buy => self.buy_stops.get(&BuyStopKey {
+                trigger_price: snapshot.trigger_price,
+                priority_sequence: snapshot.priority_sequence,
+                order_id,
+            }),
+            Side::Sell => self.sell_stops.get(&SellStopKey {
+                trigger_price: Reverse(snapshot.trigger_price),
+                priority_sequence: snapshot.priority_sequence,
+                order_id,
+            }),
+        };
+        if indexed.copied() != Some(order_id) {
+            return Err(InvariantViolation::new(format!(
+                "dormant stop {order_id} has no exact trigger-index entry"
+            )));
+        }
+        Ok(snapshot)
+    }
+
+    fn try_validate_selected_triggered_orders(
+        &self,
+        reference_price: Price,
+        expected_count: usize,
+        selected: &[OrderId],
+    ) -> Result<(), InvariantViolation> {
+        if selected.len() != expected_count {
+            return Err(InvariantViolation::new(format!(
+                "prepared stop-trigger selection length {} differs from prepared count {expected_count}",
+                selected.len()
+            )));
+        }
+        let mut position = 0;
+        self.for_each_eligible_stop(reference_price, expected_count, |expected_order_id| {
+            let selected_order_id = selected.get(position).copied().ok_or_else(|| {
+                InvariantViolation::new(
+                    "prepared stop-trigger selection omits its canonical prefix",
+                )
+            })?;
+            if selected_order_id != expected_order_id {
+                return Err(InvariantViolation::new(format!(
+                    "prepared stop-trigger selection has order {selected_order_id} where canonical prefix requires {expected_order_id}"
+                )));
+            }
+            let stop = self.try_indexed_dormant_stop(selected_order_id)?;
+            let eligible = match stop.side {
+                Side::Buy => stop.trigger_price <= reference_price,
+                Side::Sell => stop.trigger_price >= reference_price,
+            };
+            if !eligible {
+                return Err(InvariantViolation::new(format!(
+                    "prepared stop-trigger selection contains ineligible order {selected_order_id}"
+                )));
+            }
+            position += 1;
+            Ok::<(), InvariantViolation>(())
+        })?;
+        if position != expected_count {
+            return Err(InvariantViolation::new(format!(
+                "canonical stop-trigger prefix length {position} differs from prepared count {expected_count}"
+            )));
         }
         Ok(())
     }
@@ -9274,6 +9572,31 @@ impl OrderBook {
         self.submit_conditional_expiry_sweep(command, |_, observation| Ok(observation), accept)
     }
 
+    /// Atomically observes and conditionally applies one bounded stop-trigger sweep.
+    ///
+    /// Replay and core rejection bypass observation and predicate execution.
+    /// Otherwise the predicate borrows the exact canonical eligible dormant
+    /// prefix stored in the preparation later committed. Query failure,
+    /// decline, or unwind precedes semantic mutation. An empty valid prefix
+    /// still invokes the predicate without consuming a selection lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConditionalOrderError::Matching`] for preparation or commit
+    /// failure and [`ConditionalOrderError::Query`] when complete caller-owned
+    /// selected state cannot be reserved or validated.
+    pub fn try_submit_stop_trigger_sweep_if(
+        &mut self,
+        command: StopTriggerSweep,
+        accept: impl FnOnce(&StopTriggerSweepObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<StopTriggerSweepObservation>, ConditionalOrderError> {
+        self.submit_conditional_stop_trigger_sweep(
+            command,
+            |_, observation| Ok(observation),
+            accept,
+        )
+    }
+
     /// Atomically quotes and conditionally submits one canonical IOC order.
     ///
     /// Core matching rejection and exact replay bypass `accept` and return a
@@ -9443,6 +9766,19 @@ impl OrderBook {
         E: From<MatchingError> + From<OrderBookQueryError>,
     {
         let preflight = self.prepare_conditional_expiry_sweep::<E>(command)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_stop_trigger_sweep<T, E>(
+        &mut self,
+        command: StopTriggerSweep,
+        observe: impl FnOnce(&Self, StopTriggerSweepObservation) -> Result<T, E>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, E>
+    where
+        E: From<MatchingError> + From<OrderBookQueryError>,
+    {
+        let preflight = self.prepare_conditional_stop_trigger_sweep::<E>(command)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 
@@ -9682,6 +10018,38 @@ impl OrderBook {
         }
     }
 
+    pub(crate) fn prepare_conditional_stop_trigger_sweep<E>(
+        &self,
+        command: StopTriggerSweep,
+    ) -> Result<ConditionalExecutionPreflight<StopTriggerSweepObservation>, E>
+    where
+        E: From<MatchingError> + From<OrderBookQueryError>,
+    {
+        match self
+            .prepare(Command::StopTriggerSweep(command))
+            .map_err(E::from)?
+        {
+            preparation @ CommandPreparation::Replay(_) => Ok(ConditionalExecutionPreflight {
+                preparation,
+                observation: None,
+            }),
+            CommandPreparation::Ready(mut prepared) => {
+                let observation = if prepared.core_rejection().is_none() {
+                    Some(
+                        self.try_stop_trigger_sweep_observation(command, &mut prepared)
+                            .map_err(E::from)?,
+                    )
+                } else {
+                    None
+                };
+                Ok(ConditionalExecutionPreflight {
+                    preparation: CommandPreparation::Ready(prepared),
+                    observation,
+                })
+            }
+        }
+    }
+
     fn try_mass_cancel_observation(
         &self,
         command: MassCancel,
@@ -9809,6 +10177,51 @@ impl OrderBook {
         .map_err(Into::into)
     }
 
+    pub(crate) fn try_stop_trigger_sweep_observation(
+        &self,
+        command: StopTriggerSweep,
+        prepared: &mut PreparedCommand,
+    ) -> Result<StopTriggerSweepObservation, OrderBookQueryError> {
+        let selected_count = prepared
+            .selected_order_ids
+            .as_ref()
+            .ok_or_else(|| {
+                InvariantViolation::new("accepted stop-trigger sweep has no preparation storage")
+            })?
+            .required();
+        let eligible_count = self.eligible_stop_count(command.reference.price());
+        let remaining_eligible_order_count = eligible_count
+            .checked_sub(selected_count)
+            .ok_or_else(|| {
+                InvariantViolation::new(format!(
+                    "prepared stop-trigger count {selected_count} exceeds eligible count {eligible_count}"
+                ))
+            })?;
+        let stops = self.try_selected_values(
+            prepared,
+            OrderBookQueryResource::StopTriggerSweepOrders,
+            |book, selected| {
+                book.try_select_triggered_orders_into(
+                    command.reference.price(),
+                    selected_count,
+                    selected,
+                )
+            },
+            OrderBook::try_indexed_dormant_stop,
+        )?;
+        StopTriggerSweepObservation::try_new(
+            self.instrument_id(),
+            self.instrument_version(),
+            self.last_event_sequence(),
+            self.stop_reference,
+            command.reference,
+            command.maximum_orders,
+            stops,
+            remaining_eligible_order_count,
+        )
+        .map_err(Into::into)
+    }
+
     fn try_selected_account_order_states(
         &self,
         account_id: AccountId,
@@ -9827,6 +10240,24 @@ impl OrderBook {
         resource: OrderBookQueryResource,
         select: impl FnOnce(&Self, &mut Vec<OrderId>) -> Result<(), InvariantViolation>,
     ) -> Result<Vec<ActiveOrderSnapshot>, OrderBookQueryError> {
+        self.try_selected_values(prepared, resource, select, |book, order_id| {
+            book.try_active_order_observation(order_id)?
+                .state()
+                .ok_or_else(|| {
+                    InvariantViolation::new(format!(
+                        "prepared selection references absent order {order_id}"
+                    ))
+                })
+        })
+    }
+
+    fn try_selected_values<T>(
+        &self,
+        prepared: &mut PreparedCommand,
+        resource: OrderBookQueryResource,
+        select: impl FnOnce(&Self, &mut Vec<OrderId>) -> Result<(), InvariantViolation>,
+        mut value: impl FnMut(&Self, OrderId) -> Result<T, InvariantViolation>,
+    ) -> Result<Vec<T>, OrderBookQueryError> {
         let selected = prepared.selected_order_ids.as_mut().ok_or_else(|| {
             InvariantViolation::new("accepted order selection has no preparation storage")
         })?;
@@ -9837,20 +10268,20 @@ impl OrderBook {
             .into());
         }
         select(self, selected.values_mut())?;
-
-        let mut orders = reserve_order_book_query_vec(selected.values().len(), resource)?;
-        for &order_id in selected.values() {
-            let state = self
-                .try_active_order_observation(order_id)?
-                .state()
-                .ok_or_else(|| {
-                    InvariantViolation::new(format!(
-                        "prepared selection references absent order {order_id}"
-                    ))
-                })?;
-            orders.push(state);
+        if selected.values().len() != selected.required() {
+            return Err(InvariantViolation::new(format!(
+                "prepared selection length {} differs from leased count {}",
+                selected.values().len(),
+                selected.required()
+            ))
+            .into());
         }
-        Ok(orders)
+
+        let mut values = reserve_order_book_query_vec(selected.values().len(), resource)?;
+        for &order_id in selected.values() {
+            values.push(value(self, order_id)?);
+        }
+        Ok(values)
     }
 
     fn new_order_execution_observation(
@@ -12562,20 +12993,30 @@ impl OrderBook {
     ) -> Result<ExecutionReport, MatchingError> {
         let previous_reference = self.stop_reference;
         let reference_price = command.reference.price();
-        let selected_count = self.eligible_stop_count(reference_price).min(
+        let selected_count = selected.required();
+        let current_selected_count = self.eligible_stop_count(reference_price).min(
             usize::try_from(command.maximum_orders)
                 .map_err(|_| MatchingError::InternalInvariantViolation)?,
         );
+        if current_selected_count != selected_count {
+            return Err(MatchingError::InternalInvariantViolation);
+        }
         if selected.capacity() < selected_count {
             return Err(MatchingError::InternalInvariantViolation);
         }
         let selected_values = selected.values_mut();
         let selected_buffer = selected_values.as_ptr();
-        self.for_each_eligible_stop(reference_price, selected_count, |order_id| {
-            selected_values.push(order_id);
-            Ok::<(), MatchingError>(())
-        })?;
-        debug_assert_eq!(selected_values.len(), selected_count);
+        if selected_values.is_empty() {
+            self.try_select_triggered_orders_into(reference_price, selected_count, selected_values)
+                .map_err(|_| MatchingError::InternalInvariantViolation)?;
+        } else {
+            self.try_validate_selected_triggered_orders(
+                reference_price,
+                selected_count,
+                selected_values,
+            )
+            .map_err(|_| MatchingError::InternalInvariantViolation)?;
+        }
         debug_assert_eq!(selected_values.as_ptr(), selected_buffer);
 
         for order_id in selected_values.drain(..) {
@@ -14600,8 +15041,9 @@ mod price_level_index_tests {
         OrderBookQueryError, OrderBookQueryResource, OrderDisplay, OrderQueueClass,
         OrderSelectionPool, OrderSnapshot, OrderType, PriceLevel, PriceLevels,
         PublicLevelObservation, RejectReason, ReplaceOrder, RestingOrder, SelfTradePrevention,
-        StopActivation, TimeInForce, TradingStateControl, TradingStateControlAction,
-        TradingStateObservation, reserve_order_book_query_vec, try_event_arena,
+        StopActivation, StopReference, StopReferenceCursor, StopTriggerSweep, TimeInForce,
+        TradingStateControl, TradingStateControlAction, TradingStateObservation,
+        reserve_order_book_query_vec, try_event_arena,
     };
     use crate::instrument::{
         InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -14609,7 +15051,8 @@ mod price_level_index_tests {
     };
     use crate::{
         AccountId, AssetId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity,
-        Side, TimestampNs,
+        Side, StopReferenceSequence, StopReferenceSourceId, StopReferenceSourceVersion,
+        TimestampNs,
     };
 
     struct Generator(u64);
@@ -14667,8 +15110,8 @@ mod price_level_index_tests {
     #[test]
     fn order_selection_leases_are_isolated_and_returned_after_drop() {
         let pool = OrderSelectionPool::try_new(2, 4).unwrap();
-        let mut first = pool.acquire().unwrap();
-        let mut second = pool.acquire().unwrap();
+        let mut first = pool.acquire(1).unwrap();
+        let mut second = pool.acquire(1).unwrap();
         assert_eq!(pool.available(), 0);
         assert_ne!(first.values().as_ptr(), second.values().as_ptr());
         first.values_mut().push(OrderId::new(1).unwrap());
@@ -16768,6 +17211,91 @@ mod price_level_index_tests {
         assert_eq!(book.retained_command_count(), 2);
         assert_eq!(book.active_order_count(), 2);
         assert_eq!(book.expiry_watermark(), None);
+        assert_eq!(book.order_selection_pool_status(), pool_before);
+    }
+
+    #[test]
+    fn conditional_stop_trigger_sweep_propagates_index_corruption_and_returns_its_lease() {
+        let mut book = OrderBook::new(reserve_definition());
+        let source_id = StopReferenceSourceId::new(1).unwrap();
+        let source_version = StopReferenceSourceVersion::new(1).unwrap();
+        let reference = |sequence, price| {
+            StopReference::new(
+                StopReferenceCursor::new(
+                    source_id,
+                    source_version,
+                    StopReferenceSequence::new(sequence).unwrap(),
+                ),
+                Price::from_raw(price),
+            )
+        };
+        book.submit(Command::StopTriggerSweep(StopTriggerSweep {
+            command_id: CommandId::new(1).unwrap(),
+            instrument_id: InstrumentId::new(1).unwrap(),
+            instrument_version: InstrumentVersion::new(1).unwrap(),
+            reference: reference(1, 100),
+            maximum_orders: 1,
+            received_at: TimestampNs::from_unix_nanos(1),
+        }))
+        .unwrap();
+        let order_id = OrderId::new(1).unwrap();
+        book.submit(Command::New(NewOrder {
+            command_id: CommandId::new(2).unwrap(),
+            order_id,
+            account_id: AccountId::new(1).unwrap(),
+            instrument_id: InstrumentId::new(1).unwrap(),
+            instrument_version: InstrumentVersion::new(1).unwrap(),
+            side: Side::Buy,
+            quantity: Quantity::new(5).unwrap(),
+            display: OrderDisplay::FullyDisplayed,
+            order_type: OrderType::Stop {
+                trigger_price: Price::from_raw(110),
+                activation: StopActivation::Limit(Price::from_raw(120)),
+            },
+            time_in_force: TimeInForce::GoodTilCancelled,
+            self_trade_prevention: SelfTradePrevention::CancelAggressor,
+            received_at: TimestampNs::from_unix_nanos(2),
+        }))
+        .unwrap();
+        book.orders
+            .get_mut(&order_id)
+            .unwrap()
+            .stop
+            .as_mut()
+            .unwrap()
+            .trigger_price = Price::from_raw(109);
+        let sequence_before = book.last_event_sequence();
+        let pool_before = book.order_selection_pool_status();
+
+        let error = book
+            .try_submit_stop_trigger_sweep_if(
+                StopTriggerSweep {
+                    command_id: CommandId::new(3).unwrap(),
+                    instrument_id: InstrumentId::new(1).unwrap(),
+                    instrument_version: InstrumentVersion::new(1).unwrap(),
+                    reference: reference(2, 110),
+                    maximum_orders: 1,
+                    received_at: TimestampNs::from_unix_nanos(3),
+                },
+                |_| panic!("stop-index corruption must bypass the predicate"),
+            )
+            .unwrap_err();
+
+        let ConditionalOrderError::Query(OrderBookQueryError::InvariantViolation(error)) = error
+        else {
+            panic!("stop-index corruption must remain a typed query failure");
+        };
+        assert!(
+            error
+                .detail()
+                .contains("dormant stop 1 has no exact trigger-index entry"),
+            "{}",
+            error.detail()
+        );
+        assert_eq!(book.last_event_sequence(), sequence_before);
+        assert_eq!(book.retained_command_count(), 2);
+        assert_eq!(book.active_order_count(), 1);
+        assert_eq!(book.stop_reference(), Some(reference(1, 100)));
         assert_eq!(book.order_selection_pool_status(), pool_before);
     }
 

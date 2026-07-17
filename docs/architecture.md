@@ -165,6 +165,17 @@ shard, from command admission through checkpoint capture.
       canonical trigger/priority/ID order. Eligible backlog must drain through
       exact-reference sweeps before the cursor can advance. Matching trades do
       not advance this reference implicitly.
+    - Conditional stop-trigger-sweep preparation fills the ordinary move-only
+      selection lease once with the exact bounded eligible side prefix. Buy
+      priority is `(trigger ascending, priority sequence, OrderId)` and sell
+      priority is `(trigger descending, priority sequence, OrderId)`. Every
+      selected trigger-index entry is validated against its exact dormant
+      state. The observation binds the prior optional and requested sourced
+      references, positive maximum, complete dormant snapshots, exact count,
+      checked `u128` leaves, and remaining eligible backlog. Accepted commit
+      validates and drains those same IDs without a second trigger-prefix
+      selection or sort. An empty eligible prefix invokes the predicate
+      without a lease or selected-order output.
 
 ### Display classes and reserve orders
 
@@ -451,6 +462,21 @@ shard, from command admission through checkpoint capture.
     history, or WAL state. Durable acceptance and business rejection use the
     existing two frames; query failure, decline, unwind, and replay append
     zero. No wire value changes.
+    `try_submit_stop_trigger_sweep_if` composes ordinary `StopTriggerSweep`
+    preparation with one `StopTriggerSweepObservation`, a borrowed local
+    predicate, and commit of that same preparation. The observation binds
+    instrument, definition version, event sequence, prior optional reference,
+    requested sourced reference, positive maximum, exact canonical eligible
+    dormant-stop states, checked `u128` total leaves, and remaining eligible
+    count. Selection fills the ordinary trigger lease once; accepted commit
+    validates and drains those IDs without another trigger-prefix selection or
+    sort. A valid empty prefix invokes the predicate without a lease or
+    selected-order output. Replay and core rejection bypass selection, output,
+    and predicate; coupled risk performs its account-independent trigger-sweep
+    authorization before observation. Query failure, decline, or unwind
+    changes no matching, risk, reference, history, or WAL state. Durable
+    acceptance and business rejection use the existing two frames; query
+    failure, decline, unwind, and replay append zero. No wire value changes.
     A separate displayed-liquidity quote folds the current public aggregate
     projection under the same market-or-limit crossing rule. It excludes fully
     hidden leaves and undisplayed reserve leaves, reports exact quoted and
@@ -488,7 +514,8 @@ shard, from command admission through checkpoint capture.
     configured maxima. It also constructs every configured isolated order-
     selection vector.
     - `PreparedCommand` owns an optional lease for a non-empty
-      mass-cancel/expiry/account-control/instrument-control selection;
+      mass-cancel/expiry/stop-trigger/account-control/instrument-control
+      selection;
       preparation borrows matching and coupled-risk state immutably, performs
       no allocation, and changes no semantic state.
     - Durable wrappers complete that preflight before appending a command
@@ -891,10 +918,10 @@ GTD-expiry and stop-trigger arenas, active orders, active accounts, accepted
 IDs, retained account controls, retained reports, retained-event slots,
 registered profiles, and coupled-risk reservations. Construction also creates
 `max_prepared_order_selections` vectors, each requesting `max_active_orders`
-`OrderId` elements. Non-empty mass-cancel, expiry-sweep, block-and-cancel, and
-transition-and-cancel preparation leases one vector; zero-cardinality
-selection bypasses the pool. Read-only pool telemetry exposes configured,
-available, and per-lease allocated cardinalities.
+`OrderId` elements. Non-empty mass-cancel, expiry-sweep, stop-trigger-sweep,
+block-and-cancel, or transition-and-cancel preparation leases one vector;
+zero-cardinality selection bypasses the pool. Read-only pool telemetry exposes
+configured, available, and per-lease allocated cardinalities.
 
 Each hash index initializes a power-of-two bucket
 array at least twice its semantic maximum, keeping load at or below 0.5; values
@@ -940,6 +967,15 @@ output. Accepted commit validates and drains those same IDs without another
 prefix traversal or sort. For `K` selected orders and `X` active GTD orders,
 the added preparation work is `O(K log(X + 1))`, leased ID scratch and caller
 output are each `O(K)`, and an empty prefix uses neither resource.
+
+Conditional stop-trigger-sweep preparation fills the ordinary lease with the
+exact canonical eligible prefix, validates each selected dormant row through
+its exact side trigger-index entry, and constructs exactly reserved caller
+output. Accepted commit validates and drains those same IDs without a second
+prefix selection or sort. For `K` selected stops and `S` dormant stops in the
+selected side index, the added exact-index work is `O(K log(S + 1))`, leased ID
+scratch and caller output are each `O(K)`, and an empty prefix uses neither
+resource.
 
 For `E` events, event construction and binary encoding remain `O(E)`, while
 builder finalization is `O(1)` and publishes the exact arena range. Preparation
@@ -1976,6 +2012,12 @@ accounting for the continuous-matching risk layer.
     performs that existing authorization before constructing selected-order
     output or invoking its predicate. Accepted commit releases only the
     reservations represented by the canonical observed expiry set.
+    Stop-trigger control is account-independent; conditional trigger-sweep
+    preparation performs that existing authorization before constructing
+    dormant-stop output or invoking its predicate. Accepted commit transitions
+    exactly the observed reservations through ordinary activation, execution,
+    cancellation, and residual reservation application. Noncommit changes no
+    reservation, exposure, or position.
 
 ## Market-data publication invariants
 
@@ -2681,6 +2723,16 @@ noncommit and replay; two-frame business rejection and acceptance; and plain/
 coupled-risk reopen parity. An internal expiry-index corruption test requires a
 typed query failure before predicate execution or semantic mutation and proves
 the selection lease is returned.
+Conditional stop-trigger-sweep tests cover prior/requested sourced-reference
+provenance; empty, bounded, and remaining-backlog prefixes; equal triggers with
+nonmonotonic IDs; canonical buy and sell trigger/priority/ID order; complete
+dormant snapshots; exact count and `u128` leaves; predicate acceptance,
+decline, and unwind; wrong-version, discontinuous reference, unfinished-backlog
+advance, and exact-replay predicate bypass; coupled reservation transitions;
+zero-frame durable noncommit and replay; two-frame business rejection and
+acceptance; and plain/coupled-risk reopen parity. An internal trigger-index
+corruption test requires a typed query failure before predicate execution or
+semantic mutation and proves the selection lease is returned.
 Displayed-liquidity quote tests cover both aggressor directions, empty and
 one-/multi-level books, market and limit constraints, filled, price-limit, and
 public-book-exhaustion outcomes, current reserve slices, fully hidden
@@ -3051,6 +3103,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Matching lifecycle expansion | basic revisioned instrument state changes, continuous GTD sweeps, frozen-best continuous market-to-limit with GTC/GTD residuals, sourced explicit-reference stop-market/stop-limit activation with durable source identity/version/sequence and gap/reset validation, native reserve and fully hidden continuous queue classes, atomic minimum-quantity IOC, atomic FOK under all four continuous self-trade policies, coherent provenance-bound BBO, exact-price provenance-bound public levels, checked cumulative public-depth summaries, exact top-N displayed public-depth imbalance, and exact displayed-liquidity sweep quotes on authoritative books and continuous public replicas, exact state-bound private immediate-execution economics and per-price curves, atomic local conditional quote/curve binding for canonical IOC, every new-order shape, continuous replacement, continuous cancellation, continuous mass cancellation, and revisioned account control, active-order identity observations, resting-order queue position, and prevalidated price-level order traversal, immutable UTC calendar images, active-session lookup, day/session-to-GTD normalization, boundary-checked expiry controls, bounded crossed call-auction collection, authoritative typed priority classes, account/side mass cancellation, atomic new-identity replacement with full priority loss, fail-closed full and inclusive price-band aggregate depth queries on authoritative books and public replicas, banded discovery, sequenced nullable indicative publication, explicit price-time and price/class-tier pro-rata-time allocation, deterministic pairing/atomic uncross with fail-closed self-trade abort, sequenced auction phase/idempotency, live/durable risk, versioned private/public schemas, gap-repair snapshots, semantic checkpoints, plain/coupled-risk full-WAL plus cutover recovery, instrument-bound atomic DVP settlement of complete accepted uncross reports, and explicit trade-bound fee transfers in the same atomic ledger event are implemented; remaining work is authoritative calendar distribution/activation and ingress-provenance durability, sequenced session-state transitions, authenticated external stop-reference acquisition/normalization and missed-reference recovery, auction reference and dynamic-band derivation, authenticated venue-category-to-class and beneficial-owner mapping, venue-specific display/allocation policies, venue-specific call-auction self-trade cancellation/decrement and alternative-pairing policies, clearing lifecycle authorization, fee calculation/authorization, settlement-date derivation, volatility/interruption auctions, pegged, discretionary, venue-specific in-place amendment/uncross/publication cadence/filtering semantics, authenticated market-data transport, and cross-instrument/multi-leg execution with atomic ownership and replay proofs |
 | High | Conditional instrument control | Atomic revisioned trading-state control with exact current/target/resulting state and one canonical all-order cancellation set is implemented across plain, coupled-risk, durable, and durable-risk books; remaining work is authenticated controller authorization, sequenced session/calendar scheduling, cross-shard coordination, and completion aggregation |
 | High | Conditional expiry control | Atomic expiry control with exact prior/resulting watermarks and one canonical qualifying GTD set is implemented across plain, coupled-risk, durable, and durable-risk books; remaining work is authenticated controller authorization, sequenced clock/calendar scheduling, cross-shard coordination, and completion aggregation |
+| High | Conditional stop-reference control | Atomic bounded stop-reference control with exact prior/requested sourced references and one canonical qualifying dormant-stop prefix is implemented across plain, coupled-risk, durable, and durable-risk books; remaining work is authenticated source/controller authorization, raw-feed normalization and gap recovery, cross-shard coordination, and completion aggregation |
 | High | Instrument lifecycle expansion | authoritative calendar ingestion/distribution/activation, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |

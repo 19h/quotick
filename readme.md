@@ -340,6 +340,15 @@ Run any program with `cargo run --example <name>`.
   or sort; core rejection and replay bypass observation and predicate, while
   query failure, decline, or unwind changes no matching, risk, history, or WAL
   state. Plain, coupled-risk, and both durable paths share the contract.
+- Conditional stop-trigger sweeping binds the prior and requested sourced
+  reference to the exact bounded canonical eligible dormant-stop prefix that
+  the ordinary sweep activates. The observation contains complete dormant
+  snapshots, the positive maximum, exact count and checked `u128` leaves, and
+  the remaining eligible backlog. Acceptance consumes those same prepared
+  identifiers without a second trigger-prefix selection or sort; core
+  rejection and replay bypass observation and predicate, while query failure,
+  decline, or unwind changes no matching, risk, history, reference, or WAL
+  state. Plain, coupled-risk, and both durable paths share the contract.
 - A fallible private immediate-execution curve uses that same reserve/hidden/
   STP scanner to return one exact market-ordered aggregate per contributing
   price. It requests capacity for the exact row count before copying, then
@@ -437,6 +446,10 @@ Run any program with `cargo run --example <name>`.
   Conditional expiry performs its account-independent coupled gate before
   observation and releases exactly the canonical observed expiring
   reservations only on commit.
+  Conditional stop-trigger sweeping performs its account-independent coupled
+  gate before observation. Acceptance transitions exactly the observed
+  dormant reservations through the ordinary trigger, trade, cancellation, and
+  residual lifecycle; noncommit leaves every reservation unchanged.
 - Reservation lifecycle derived from the sequenced trace across fills,
   cancellation, GTD expiry, stop arming/activation, replacement, mass
   cancellation, account controls, and self-trade prevention; dormant stops
@@ -604,6 +617,8 @@ Conditional trading-state-control predicates have the same process-local
 boundary and are not persisted, authenticated, or transported.
 Conditional expiry-sweep predicates have the same process-local boundary and
 are not persisted, authenticated, clock-scheduled, or transported.
+Conditional stop-trigger-sweep predicates have the same process-local boundary
+and are not persisted, authenticated, source-authorized, or transported.
 Their synchronous execution extends the exclusive local shard borrow. A
 dormant-stop observation contains no activation-time forecast, and active
 minimum-quantity IOC observations must be interpreted with the submitted
@@ -648,7 +663,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 149 tagged assumptions (A1–A149), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 150 tagged assumptions (A1–A150), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -727,7 +742,9 @@ includes:
   order observation across all four book surfaces,
   revisioned instrument trading-state control with current/target/resulting
   state, transition without selected output, and exact all-order cancellation,
-  dormant stop intake, canonical bounded trigger sweeps,
+  dormant stop intake, canonical bounded trigger sweeps, including conditional
+  prior/requested sourced-reference and exact canonical trigger-prefix
+  observation across all four book surfaces,
   activation-time failures,
   mass cancellation, account and trading-state controls, every self-trade
   policy, atomic FOK decrement-and-cancel barriers and exact minimum-quantity

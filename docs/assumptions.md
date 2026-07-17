@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A149 are stable and are referenced from code comments and other
+identifiers A1-A150 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -5905,6 +5905,94 @@ lease loss; reservation release on noncommit or missing release on acceptance;
 interposed shard transition; durable protocol or recovery drift; or new wire
 value falsifies A149.
 
+## A150 — atomic conditional stop-trigger-sweep observation
+
+**Assumption.** One `try_submit_stop_trigger_sweep_if` call on an `OrderBook`,
+`RiskManagedOrderBook`, `DurableOrderBook`, or `DurableRiskOrderBook` holds the
+corresponding exclusive mutable shard borrow across ordinary
+`StopTriggerSweep` preparation, construction of one
+`StopTriggerSweepObservation`, a borrowed local predicate, and commit of that
+same preparation. It reuses the ordinary sourced-reference transition,
+bounded activation, coupled-risk trace, report, persistence, and recovery
+paths.
+
+For a core-admissible reference selecting `K` dormant stops, observation fills
+the same move-only A87 lease acquired by ordinary preparation exactly once
+with the canonical eligible side prefix. Buy priority is `(trigger ascending,
+priority sequence, OrderId)`; sell priority is `(trigger descending, priority
+sequence, OrderId)`. Each selected trigger-index entry is checked against its
+exact dormant stop before one exact fallible request for `K` caller-owned
+`DormantStopSnapshot` rows. The result binds instrument ID, immutable
+definition version, last visible book event sequence, previous optional
+reference, requested sourced reference, positive maximum batch size, complete
+selected dormant states, selected count, checked exact `u128` total leaves,
+and remaining eligible count. Accepted commit validates and drains those
+identical prepared IDs without another trigger-prefix selection or sort. An
+empty valid prefix acquires no lease, allocates no selected-order output, and
+still invokes the predicate with the reference transition.
+
+Exact replay plus wrong-route, wrong-version, zero maximum, invalid source
+continuity, an advance while an eligible backlog remains, and other core
+business rejections return a reported `ConditionalCommandOutcome` without
+selection, observation, or predicate execution. Coupled risk performs its
+existing account-independent trigger-sweep authorization before observation.
+A query failure, predicate decline, or unwind drops preparation and returns
+any lease before sequence, event, reference, matching, risk, history, public,
+or WAL mutation. Acceptance advances the reference and transitions exactly
+the selected reservations through the ordinary canonical trigger, trade,
+cancellation, and residual trace.
+
+Durable acceptance and business rejection retain command-before-state-before-
+report and append the existing two frames. Query failure, decline, unwind, and
+replay append zero frames. The observation and callback decision are process-
+local, unencoded, unauthenticated, and valid only within the call. Existing
+command, report, checkpoint, market-data, and wire values are unchanged.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A9, A10, A12, A15, A20, A21,
+A22, A37, A39, A48, A50, A52, A55, A72, A77, A80, A81, A82, A84, A87, A102,
+A103, A106, A117, A138, A145, A146, A147, A148, A149, A150] Let `A` be
+ordinary trigger-sweep preparation cost, `K` selected stops, `S` dormant stops
+in the selected side index, `F` predicate cost, and `M` ordinary trigger-sweep
+commit cost. Canonical selection and exact trigger-index validation cost
+`O(K log(S + 1))` after ordinary preparation; complete selected-state
+validation adds expected `O(K)` dormant-order work. Acceptance costs
+`O(A + K log(S + 1) + F + M)` and decline costs
+`O(A + K log(S + 1) + F)`. Accepted commit reuses the prepared IDs and does
+not repeat trigger-prefix selection or sorting. The constructor-owned lease
+retains `O(K)` ID scratch, caller output owns `O(K)`
+`DormantStopSnapshot` rows, and evaluator auxiliary state is `O(1)`. Core
+rejection and replay retain their existing preparation path and skip selection,
+output, and `F`; a valid empty prefix invokes `F` without a lease or selected
+output. Coupled acceptance applies the ordinary risk trace for exactly the
+selected activations and their resulting lifecycle. Durable acceptance and
+business rejection append two existing frames; query failure, decline, unwind,
+and replay append zero. Count, quantity, price, and source-coordinate
+arithmetic is exact integer arithmetic; approximation error is zero.
+
+**Falsification probe.** Across all four surfaces, exercise empty, truncated,
+and remaining-backlog selections containing fully displayed, reserve, fully
+hidden, stop-market, stop-limit, GTC, and GTD state. Cover buy and sell sides,
+equal triggers with nonmonotonic identities, and multiple priority sequences.
+Run accepting, declining, and unwinding predicates. Require exact instrument/
+version/sequence/prior-reference/requested-reference/maximum provenance,
+canonical side-specific rows, complete snapshots, selected count, `u128` total
+leaves, remaining eligible count, unchanged ineligible stops, and one predicate
+call for a valid empty prefix. Exercise wrong route/version, zero maximum,
+source discontinuity, source regression, advance with backlog, every core
+rejection, exact retry, command-ID collision, selected-output reservation
+failure, trigger-index corruption, selection-pool exhaustion, and durable
+write/report failure.
+
+Count predicate and allocation calls; compare selection-pool availability,
+private/public book, stop reference and backlog, risk positions/reservations/
+exposures, command history, WAL frames, and plain/coupled-risk reopen state.
+Any selection, output, or predicate on rejection or replay; mixed-side,
+noncanonical, incomplete, aliased, or provenance-drifted observation; second
+trigger-prefix selection or sort at commit; partial reference/activation
+mutation; WAL growth before acceptance; lease loss; reservation change on
+noncommit or trace divergence on acceptance; interposed shard transition;
+durable protocol or recovery drift; or new wire value falsifies A150.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -6223,6 +6311,28 @@ capability, a remaining risk, or an opportunity.
   decision. It adds no remote or asynchronous validity, callback
   authentication or durability, clock or calendar scheduling, controller
   authorization, cross-shard coordination, or completion aggregation.
+
+- **High impact:** A150 closes the stop-reference-query-to-trigger race inside
+  one local call. The predicate receives the exact prior/requested sourced
+  reference and canonical bounded dormant-stop prefix that acceptance activates
+  across plain, coupled-risk, durable, and durable-risk books.
+
+- **Medium impact opportunity:** one trigger predicate can gate on exact source
+  coordinates, trigger priority, dormant state, leaves, activation shape,
+  aggregate quantity, and remaining eligible backlog without correlating a
+  separate stop or reference query.
+
+- **Medium impact risk:** conditional stop triggering materializes `O(K)`
+  private caller output and executes its predicate synchronously while the
+  shard is exclusively borrowed. Allocation, trigger-index validation,
+  callback latency, and external blocking extend local sweep latency; no
+  callback deadline or scheduling isolation is provided.
+
+- **High impact boundary:** A150 is one process-local synchronous reference
+  decision. It adds no remote or asynchronous validity, callback or source
+  authentication or durability, raw-feed normalization or gap recovery,
+  controller authorization, cross-shard coordination, or completion
+  aggregation.
 
 - **Medium impact opportunity:** one predicate can gate immediate slippage,
   per-price concentration, passive resting admission, reserve/hidden residual

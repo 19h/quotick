@@ -25,8 +25,8 @@ use crate::matching::{
     ExpirySweepObservation, ImmediateExecutionCurve, ImmediateExecutionCurveOutcome,
     ImmediateExecutionOutcome, ImmediateExecutionQuote, ImmediateExecutionSubmission, MassCancel,
     MassCancelObservation, MatchingError, NewOrder, OrderBook, OrderBookQueryError, OrderExecution,
-    PreparedCommand, ReplaceOrder, TradingStateControl, TradingStateControlSubmissionObservation,
-    evaluate_conditional_execution,
+    PreparedCommand, ReplaceOrder, StopTriggerSweep, StopTriggerSweepObservation,
+    TradingStateControl, TradingStateControlSubmissionObservation, evaluate_conditional_execution,
 };
 use crate::risk::{
     AccountRiskDefinition, RiskError, RiskInvariantViolation, RiskManagedCheckpoint,
@@ -1078,6 +1078,31 @@ impl DurableRiskOrderBook {
         self.submit_conditional_expiry_sweep(command, |_, observation| Ok(observation), accept)
     }
 
+    /// Durably risk-gates, observes, and conditionally applies one stop-trigger sweep.
+    ///
+    /// Replay plus core or risk rejection bypass observation and `accept`.
+    /// Otherwise the predicate borrows the exact canonical dormant-stop prefix
+    /// before WAL append. Decline, observation failure, or unwind changes
+    /// neither WAL, matching, nor risk state. Acceptance persists and commits
+    /// the same prepared identifiers and applies their risk trace once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableRiskError`] for poison, preparation, observation,
+    /// journal, or coupled commit failure. A post-acknowledgement failure
+    /// poisons the instance for deterministic reopen recovery.
+    pub fn try_submit_stop_trigger_sweep_if(
+        &mut self,
+        command: StopTriggerSweep,
+        accept: impl FnOnce(&StopTriggerSweepObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<StopTriggerSweepObservation>, DurableRiskError> {
+        self.submit_conditional_stop_trigger_sweep(
+            command,
+            |_, observation| Ok(observation),
+            accept,
+        )
+    }
+
     /// Durably risk-gates, quotes, and conditionally submits one canonical IOC order.
     ///
     /// Replay plus core or risk rejection bypass `accept`. Decline occurs
@@ -1257,6 +1282,21 @@ impl DurableRiskOrderBook {
         let preflight = self
             .managed
             .prepare_conditional_expiry_sweep::<DurableRiskError>(command)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_stop_trigger_sweep<T>(
+        &mut self,
+        command: StopTriggerSweep,
+        observe: impl FnOnce(&OrderBook, StopTriggerSweepObservation) -> Result<T, DurableRiskError>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, DurableRiskError> {
+        if self.is_poisoned() {
+            return Err(DurableRiskError::Poisoned);
+        }
+        let preflight = self
+            .managed
+            .prepare_conditional_stop_trigger_sweep::<DurableRiskError>(command)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 

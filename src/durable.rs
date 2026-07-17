@@ -28,8 +28,9 @@ use crate::matching::{
     ImmediateExecutionOutcome, ImmediateExecutionQuote, ImmediateExecutionSubmission,
     InvariantViolation, MassCancel, MassCancelObservation, MatchingError, NewOrder, OrderBook,
     OrderBookCheckpoint, OrderBookCheckpointCapture, OrderBookCheckpointError, OrderBookLimits,
-    OrderBookQueryError, OrderExecution, PreparedCommand, ReplaceOrder, TradingStateControl,
-    TradingStateControlSubmissionObservation, evaluate_conditional_execution,
+    OrderBookQueryError, OrderExecution, PreparedCommand, ReplaceOrder, StopTriggerSweep,
+    StopTriggerSweepObservation, TradingStateControl, TradingStateControlSubmissionObservation,
+    evaluate_conditional_execution,
 };
 use crate::snapshot::{
     CheckpointAnchor, CheckpointCutoverReceipt, CheckpointSlot, SnapshotError, SnapshotFile,
@@ -947,6 +948,31 @@ impl DurableOrderBook {
         self.submit_conditional_expiry_sweep(command, |_, observation| Ok(observation), accept)
     }
 
+    /// Durably observes and conditionally applies one bounded stop-trigger sweep.
+    ///
+    /// Replay and core rejection bypass observation and `accept`. Otherwise
+    /// the predicate borrows the exact canonical dormant-stop prefix before
+    /// WAL append. Observation failure, decline, or unwind changes neither WAL
+    /// nor semantic state. Acceptance persists and commits the same prepared
+    /// identifiers under the ordinary poison/recovery protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] for poison, preparation, observation, journal,
+    /// or commit failure. A post-acknowledgement failure poisons the instance
+    /// for deterministic reopen recovery.
+    pub fn try_submit_stop_trigger_sweep_if(
+        &mut self,
+        command: StopTriggerSweep,
+        accept: impl FnOnce(&StopTriggerSweepObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<StopTriggerSweepObservation>, DurableError> {
+        self.submit_conditional_stop_trigger_sweep(
+            command,
+            |_, observation| Ok(observation),
+            accept,
+        )
+    }
+
     /// Durably and atomically quotes and conditionally submits one canonical IOC order.
     ///
     /// Replay and core rejection bypass `accept`. A declined quote is returned
@@ -1121,6 +1147,21 @@ impl DurableOrderBook {
         let preflight = self
             .book
             .prepare_conditional_expiry_sweep::<DurableError>(command)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_stop_trigger_sweep<T>(
+        &mut self,
+        command: StopTriggerSweep,
+        observe: impl FnOnce(&OrderBook, StopTriggerSweepObservation) -> Result<T, DurableError>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, DurableError> {
+        if self.is_poisoned() {
+            return Err(DurableError::Poisoned);
+        }
+        let preflight = self
+            .book
+            .prepare_conditional_stop_trigger_sweep::<DurableError>(command)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 

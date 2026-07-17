@@ -25,8 +25,8 @@ use crate::matching::{
     MatchingCapacity, MatchingError, NewOrder, OrderBook, OrderBookCheckpoint,
     OrderBookCheckpointError, OrderBookLimits, OrderBookLimitsSpec, OrderBookQueryError,
     OrderExecution, OrderType, PreparedCommand, RejectReason, ReplaceOrder, SelfTradePrevention,
-    Trade, TradingStateControl, TradingStateControlSubmissionObservation,
-    evaluate_conditional_execution,
+    StopTriggerSweep, StopTriggerSweepObservation, Trade, TradingStateControl,
+    TradingStateControlSubmissionObservation, evaluate_conditional_execution,
 };
 
 /// Account-level order-entry state.
@@ -2212,6 +2212,31 @@ impl RiskManagedOrderBook {
         self.submit_conditional_expiry_sweep(command, |_, observation| Ok(observation), accept)
     }
 
+    /// Atomically risk-gates, observes, and conditionally applies one stop-trigger sweep.
+    ///
+    /// Core or risk rejection and replay bypass `accept`. Otherwise the
+    /// predicate borrows the exact canonical dormant-stop prefix selected by
+    /// matching. Decline, observation failure, or unwind changes neither
+    /// matching nor risk state. Acceptance transitions only the reservations
+    /// represented by the committed trigger trace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConditionalOrderError::Matching`] for preparation or coupled
+    /// commit failure and [`ConditionalOrderError::Query`] when the complete
+    /// observation cannot be validated or reserved.
+    pub fn try_submit_stop_trigger_sweep_if(
+        &mut self,
+        command: StopTriggerSweep,
+        accept: impl FnOnce(&StopTriggerSweepObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<StopTriggerSweepObservation>, ConditionalOrderError> {
+        self.submit_conditional_stop_trigger_sweep(
+            command,
+            |_, observation| Ok(observation),
+            accept,
+        )
+    }
+
     /// Atomically risk-gates, quotes, and conditionally submits one canonical IOC order.
     ///
     /// Core or risk rejection and exact replay bypass `accept`. For a command
@@ -2372,6 +2397,19 @@ impl RiskManagedOrderBook {
         E: From<MatchingError> + From<OrderBookQueryError>,
     {
         let preflight = self.prepare_conditional_expiry_sweep::<E>(command)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_stop_trigger_sweep<T, E>(
+        &mut self,
+        command: StopTriggerSweep,
+        observe: impl FnOnce(&OrderBook, StopTriggerSweepObservation) -> Result<T, E>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, E>
+    where
+        E: From<MatchingError> + From<OrderBookQueryError>,
+    {
+        let preflight = self.prepare_conditional_stop_trigger_sweep::<E>(command)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 
@@ -2559,6 +2597,46 @@ impl RiskManagedOrderBook {
                     Some(
                         self.book
                             .try_expiry_sweep_observation(command, &mut prepared)
+                            .map_err(E::from)?,
+                    )
+                } else {
+                    None
+                };
+                ConditionalExecutionPreflight {
+                    preparation: CommandPreparation::Ready(prepared),
+                    observation,
+                }
+            }
+        };
+        Ok(self.apply_conditional_risk_gate(preflight))
+    }
+
+    pub(crate) fn prepare_conditional_stop_trigger_sweep<E>(
+        &self,
+        command: StopTriggerSweep,
+    ) -> Result<ConditionalExecutionPreflight<StopTriggerSweepObservation>, E>
+    where
+        E: From<MatchingError> + From<OrderBookQueryError>,
+    {
+        let preparation = self
+            .book
+            .prepare(Command::StopTriggerSweep(command))
+            .map_err(E::from)?;
+        let preflight = match preparation {
+            preparation @ CommandPreparation::Replay(_) => ConditionalExecutionPreflight {
+                preparation,
+                observation: None,
+            },
+            CommandPreparation::Ready(mut prepared) => {
+                let observation = if prepared.core_rejection().is_none()
+                    && self
+                        .risk
+                        .authorize(Command::StopTriggerSweep(command))
+                        .is_ok()
+                {
+                    Some(
+                        self.book
+                            .try_stop_trigger_sweep_observation(command, &mut prepared)
                             .map_err(E::from)?,
                     )
                 } else {
