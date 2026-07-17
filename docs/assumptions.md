@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A156 are stable and are referenced from code comments and other
+identifiers A1-A157 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -6488,10 +6488,104 @@ priority, partial mutation, noncommit effect, incorrect reservation, WAL growth
 before acceptance, interposed transition, recovery divergence, successful-
 path allocation, or new wire value falsifies A156.
 
+## A157 — atomic conditional call-auction indicative publication
+
+**Assumption.** One `try_submit_indicative_if` call on a
+`CallAuctionEngine`, `CallAuctionRiskManagedEngine`,
+`DurableCallAuctionEngine`, or `DurableCallAuctionRiskEngine` holds the
+corresponding exclusive shard borrow across ordinary indicative preparation,
+one synchronous predicate, and publication of that same-generation prepared
+state. Ordinary preparation validates route/version, non-closed phase, phase
+revision, active cycle, price band, and reference price. It reconstructs
+canonical bid/ask aggregate scratch in constructor-reserved storage and applies
+the shared bounded discovery kernel once. The resulting nullable
+`CallAuctionIndicativeState` exactly binds cycle, phase revision, book revision,
+band, reference, price policy, and clearing result. The prepared action also
+binds the complete phase snapshot and engine/history/event generation.
+
+Before the predicate, the engine rejects foreign or stale preparation and
+proves current book revision and phase snapshot equality. One shared validator
+checks instrument, phase/cycle lineage, command/state coordinates, structural
+price validity, and any previous still-current indication. The fixed-size
+owned `CallAuctionIndicativeObservation` binds command identity/time,
+instrument ID/version, prospective command and publication-event sequences,
+phase/cycle, unchanged source/resulting book revision, exact previous
+indication, and exact state acceptance will publish.
+
+Exact replay and every core business rejection bypass observation and predicate
+and return the ordinary report. Decline returns the owned observation without
+consuming a sequence or event, changing the latest indication, book, history,
+or risk, or appending WAL. Unwind has the same semantic result. Acceptance
+reuses the shared validator at commit, stores the exact prepared indication,
+emits one equal `IndicativePublished` event, and leaves collection-book state
+unchanged. Coupled authorization is account-independent and occurs before
+observation; all outcomes are risk-neutral.
+
+Durable acceptance and core business rejection retain the existing
+command/report two-frame grammar; decline, unwind, and replay append zero
+frames. The observation and decision are not encoded, authenticated,
+authorized, remotely transported, retained after the call, or coordinated
+across shards. A157 adds no wire value or version.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A9, A10, A12, A15, A22, A37,
+A39, A41, A52, A60, A64, A65, A68, A74, A76, A80, A81, A82, A85, A97,
+A109, A111, A112, A151, A152, A153, A154, A155, A156, A157] For `B`
+occupied bid prices, `A` occupied ask prices, and predicate cost `F`, ordinary
+preparation is `O(B + A)`, observation validation and accepted commit are each
+`O(1)`, and decline, unwind, and acceptance are `O(B + A + F)`. Reused
+aggregate reconstruction uses existing constructor-owned `O(P_max)` scratch
+without growth. The observation and evaluator add `O(1)` state and allocate no
+output.
+Coupled authorization and one-event risk-neutral trace application are `O(1)`.
+Durable acceptance and business rejection append two existing frames;
+decline, unwind, and replay append zero. Sequence, revision, price, and
+quantity arithmetic is exact integer arithmetic; approximation error is zero.
+
+**Falsification probe.** Across all four surfaces, publish from `Collecting`
+and `Frozen` phases with present/absent previous indications, present/absent
+clearing, market/limit interest, signed prices, multiple bands, references, and
+price policies. Run accepting, declining, and unwinding predicates. Require
+exact command/instrument/sequence/time/phase/book provenance, previous and
+prepared state equality, unchanged book revision, one equal publication event
+only on acceptance, and exact nullable clearing preservation.
+
+Exercise wrong route/version, phase/revision, cycle, closed phase, invalid band
+or reference, exact retry, command-ID collision, counter/history/event
+exhaustion, journal failure, and reopen. Through internal white-box paths,
+change the book or phase after preparation and require rejection before the
+predicate; change the book after predicate acceptance and require commit
+rejection. Compare sequences, event storage, latest indication, collection
+state, risk profiles/reservations/exposure, history, WAL frames, and plain/
+coupled recovered state. Any predicate on rejection or replay, stale-state
+publication, recomputed or drifting observation, noncommit effect, risk change,
+WAL growth before acceptance, recovery divergence, successful-path allocation,
+or new wire value falsifies A157.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** A157 closes the local gap between observing one exact
+  revision-bound indicative result and publishing it. The predicate owns both
+  previous and prepared nullable clearing states with phase, book, and sequence
+  provenance; acceptance publishes the unchanged generation across plain,
+  coupled-risk, and both durable engines.
+
+- **Medium impact opportunity:** deterministic auction-quality, surveillance,
+  publication-cadence, and price-collar controls can condition one publication
+  on exact private-book economics without correlating separate phase, depth,
+  indication, and sequence queries.
+
+- **Medium impact risk:** the A157 predicate is synchronous under the exclusive
+  shard borrow after `O(B + A)` aggregate reconstruction and discovery.
+  Maximum-capacity discovery, callback, and cache latency is unknown pending
+  pinned-hardware measurement.
+
+- **High impact boundary:** A157 adds no authenticated controller, reference-
+  price or dynamic-band source authority, entitlement/disclosure policy,
+  durable policy-decision evidence before command append, callback deadline,
+  asynchronous validity, remote publication protocol, or cross-shard cadence.
 
 - **High impact:** A156 closes the local gap between observing exact
   call-auction admission state and committing it. The fixed-size predicate

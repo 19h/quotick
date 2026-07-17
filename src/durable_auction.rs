@@ -16,13 +16,14 @@ use crate::auction_engine::{
     CallAuctionCheckpointError, CallAuctionCommand, CallAuctionCommandPreparation,
     CallAuctionEngine, CallAuctionEngineConstructionError, CallAuctionEngineError,
     CallAuctionEngineInvariantViolation, CallAuctionEngineLimits, CallAuctionExecutionReport,
-    CallAuctionMassCancel, CallAuctionMassCancelObservation, CallAuctionReplaceObservation,
-    CallAuctionReplaceOrder, CallAuctionSubmitObservation, CallAuctionSubmitOrder,
-    CallAuctionUncrossCommand, CallAuctionUncrossObservation, ConditionalCallAuctionCommandOutcome,
+    CallAuctionIndicativeCommand, CallAuctionIndicativeObservation, CallAuctionMassCancel,
+    CallAuctionMassCancelObservation, CallAuctionReplaceObservation, CallAuctionReplaceOrder,
+    CallAuctionSubmitObservation, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionUncrossObservation, ConditionalCallAuctionCommandOutcome,
     ConditionalCallAuctionCommandPreparation, ConditionalCallAuctionOutcome,
     ConditionalCallAuctionPreparation, PreparedCallAuctionCommand, evaluate_conditional_amend,
-    evaluate_conditional_cancel, evaluate_conditional_mass_cancel, evaluate_conditional_replace,
-    evaluate_conditional_submit, evaluate_conditional_uncross,
+    evaluate_conditional_cancel, evaluate_conditional_indicative, evaluate_conditional_mass_cancel,
+    evaluate_conditional_replace, evaluate_conditional_submit, evaluate_conditional_uncross,
 };
 use crate::auction_risk::{
     CallAuctionRiskCheckpoint, CallAuctionRiskCheckpointCapture, CallAuctionRiskCheckpointError,
@@ -1212,6 +1213,50 @@ impl DurableCallAuctionEngine {
         }
     }
 
+    /// Durably observes and conditionally publishes one indicative state.
+    ///
+    /// Replay and deterministic business rejection bypass `accept`. Decline or
+    /// unwind changes neither WAL nor auction state. Acceptance persists and
+    /// publishes the same phase/book-bound state under the ordinary poison and
+    /// recovery protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, preparation,
+    /// fail-closed generation validation, journal, or commit failure.
+    pub fn try_submit_indicative_if(
+        &mut self,
+        command: CallAuctionIndicativeCommand,
+        accept: impl FnOnce(&CallAuctionIndicativeObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionIndicativeObservation>,
+        DurableCallAuctionError,
+    > {
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        let preparation = self
+            .engine
+            .prepare(CallAuctionCommand::Indicative(command))?;
+        match evaluate_conditional_indicative(&self.engine, preparation, accept)? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => {
+                if self.is_poisoned() {
+                    return Err(DurableCallAuctionError::Poisoned);
+                }
+                Ok(outcome)
+            }
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => self.commit_prepared(prepared).map(|report| {
+                ConditionalCallAuctionCommandOutcome::Reported {
+                    observation: if report.replayed { None } else { observation },
+                    report,
+                }
+            }),
+        }
+    }
+
     /// Durably observes and conditionally commits one frozen-cycle uncross.
     ///
     /// Replay and business rejection bypass `accept`. The predicate borrows
@@ -2056,6 +2101,52 @@ impl DurableCallAuctionRiskEngine {
             observe_authorized,
             accept,
         )? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => {
+                if self.is_poisoned() {
+                    return Err(DurableCallAuctionError::Poisoned);
+                }
+                Ok(outcome)
+            }
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => self.commit_prepared(prepared).map(|report| {
+                ConditionalCallAuctionCommandOutcome::Reported {
+                    observation: if report.replayed { None } else { observation },
+                    report,
+                }
+            }),
+        }
+    }
+
+    /// Durably risk-gates, observes, and conditionally publishes one
+    /// indicative state.
+    ///
+    /// Replay plus core rejection bypass `accept`. Decline or unwind changes
+    /// neither WAL, auction, nor risk state. Acceptance persists and publishes
+    /// the exact prepared state while leaving coupled risk unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, preparation,
+    /// fail-closed generation validation, journal, or coupled commit failure.
+    pub fn try_submit_indicative_if(
+        &mut self,
+        command: CallAuctionIndicativeCommand,
+        accept: impl FnOnce(&CallAuctionIndicativeObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionIndicativeObservation>,
+        DurableCallAuctionError,
+    > {
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        let preparation = self
+            .managed
+            .prepare(CallAuctionCommand::Indicative(command))?;
+        self.managed
+            .validate_conditional_indicative_authorization(&preparation)?;
+        match evaluate_conditional_indicative(self.managed.engine(), preparation, accept)? {
             ConditionalCallAuctionCommandPreparation::Complete(outcome) => {
                 if self.is_poisoned() {
                     return Err(DurableCallAuctionError::Poisoned);

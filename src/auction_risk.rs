@@ -21,12 +21,13 @@ use crate::auction_engine::{
     CallAuctionCommandOutcome, CallAuctionCommandPreparation, CallAuctionEngine,
     CallAuctionEngineConstructionError, CallAuctionEngineError, CallAuctionEngineLimits,
     CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionExecutionReport,
-    CallAuctionMassCancel, CallAuctionMassCancelObservation, CallAuctionRejectReason,
-    CallAuctionReplaceObservation, CallAuctionReplaceOrder, CallAuctionSubmitObservation,
-    CallAuctionSubmitOrder, CallAuctionUncrossCommand, CallAuctionUncrossObservation,
-    ConditionalCallAuctionCommandOutcome, ConditionalCallAuctionCommandPreparation,
-    ConditionalCallAuctionOutcome, ConditionalCallAuctionPreparation, PreparedCallAuctionCommand,
-    evaluate_conditional_amend, evaluate_conditional_cancel, evaluate_conditional_mass_cancel,
+    CallAuctionIndicativeCommand, CallAuctionIndicativeObservation, CallAuctionMassCancel,
+    CallAuctionMassCancelObservation, CallAuctionRejectReason, CallAuctionReplaceObservation,
+    CallAuctionReplaceOrder, CallAuctionSubmitObservation, CallAuctionSubmitOrder,
+    CallAuctionUncrossCommand, CallAuctionUncrossObservation, ConditionalCallAuctionCommandOutcome,
+    ConditionalCallAuctionCommandPreparation, ConditionalCallAuctionOutcome,
+    ConditionalCallAuctionPreparation, PreparedCallAuctionCommand, evaluate_conditional_amend,
+    evaluate_conditional_cancel, evaluate_conditional_indicative, evaluate_conditional_mass_cancel,
     evaluate_conditional_replace, evaluate_conditional_submit, evaluate_conditional_uncross,
 };
 use crate::bounded_hash::BoundedHashMap;
@@ -1595,6 +1596,15 @@ impl CallAuctionRiskManagedEngine {
         })
     }
 
+    pub(crate) fn validate_conditional_indicative_authorization(
+        &self,
+        preparation: &CallAuctionCommandPreparation,
+    ) -> Result<(), CallAuctionEngineError> {
+        self.validate_conditional_authorization(preparation, |command| {
+            matches!(command, CallAuctionCommand::Indicative(_))
+        })
+    }
+
     pub(crate) fn conditional_replace_observation_is_authorized(
         &self,
         preparation: &CallAuctionCommandPreparation,
@@ -1808,6 +1818,42 @@ impl CallAuctionRiskManagedEngine {
         let observe_authorized =
             self.conditional_replace_observation_is_authorized(&preparation)?;
         match evaluate_conditional_replace(&self.engine, preparation, observe_authorized, accept)? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => Ok(outcome),
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => {
+                self.commit(prepared)
+                    .map(|report| ConditionalCallAuctionCommandOutcome::Reported {
+                        observation: if report.replayed { None } else { observation },
+                        report,
+                    })
+            }
+        }
+    }
+
+    /// Atomically risk-gates, observes, and conditionally publishes one
+    /// indicative state.
+    ///
+    /// Replay plus core rejection bypass `accept`. Decline or unwind changes
+    /// neither publication nor risk state. Acceptance publishes the exact
+    /// prepared state in one event and is risk-neutral.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionEngineError`] for preparation, fail-closed
+    /// generation validation, or coupled commit failure.
+    pub fn try_submit_indicative_if(
+        &mut self,
+        command: CallAuctionIndicativeCommand,
+        accept: impl FnOnce(&CallAuctionIndicativeObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionIndicativeObservation>,
+        CallAuctionEngineError,
+    > {
+        let preparation = self.prepare(CallAuctionCommand::Indicative(command))?;
+        self.validate_conditional_indicative_authorization(&preparation)?;
+        match evaluate_conditional_indicative(&self.engine, preparation, accept)? {
             ConditionalCallAuctionCommandPreparation::Complete(outcome) => Ok(outcome),
             ConditionalCallAuctionCommandPreparation::Commit {
                 prepared,

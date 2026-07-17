@@ -495,6 +495,16 @@ aggregates and applies the shared discovery kernel in `O(B + A)` time with
 is present or absent. Retaining or invalidating the latest revision-bound
 state is `O(1)` time and space; an exact retry and a rejection preserve it.
 
+Conditional indicative publication performs that ordinary `O(B + A)`
+preparation once. For predicate cost `F`, fixed-size generation and coordinate
+validation adds `O(1)` before the predicate and at accepted commit, so decline,
+unwind, and acceptance are `O(B + A + F)`. Preparation reuses the existing
+constructor-owned `O(P_max)` aggregate scratch without growth; the owned
+observation and evaluator add `O(1)` space and allocate no output. Coupled
+authorization and one-event risk-neutral application add `O(1)`. Durable
+acceptance and business rejection append two existing frames; decline, unwind,
+and replay append zero.
+
 Mass-cancel preflight inherits the expected `O(1)` account lookup. Commit adds
 the collection-book `O(K(log K + log O + log P))` work plus `O(K)` event
 emission. It emits `K` removals and one completion; `K = 0` emits only the
