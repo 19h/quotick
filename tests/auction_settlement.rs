@@ -21,9 +21,10 @@ use quotick::instrument::{
 };
 use quotick::journal::{Durability, JournalOptions, JournalReader, RecordKind, RecoveryMode};
 use quotick::ledger::{
-    CallAuctionFee, CallAuctionSettlement, CallAuctionSettlementCorrection, JournalEntry, Ledger,
-    LedgerBatch, LedgerEntryKind, LedgerError, LedgerLimitsSpec, LedgerRecord, LedgerResource,
-    Posting,
+    CallAuctionFee, CallAuctionFeeAssessment, CallAuctionFeeBasis, CallAuctionFeeDirection,
+    CallAuctionFeeRounding, CallAuctionFeeRule, CallAuctionFeeSchedule, CallAuctionSettlement,
+    CallAuctionSettlementCorrection, JournalEntry, Ledger, LedgerBatch, LedgerEntryKind,
+    LedgerError, LedgerLimitsSpec, LedgerRecord, LedgerResource, Posting,
 };
 use quotick::snapshot::{CheckpointSlot, SnapshotFile, SnapshotOptions};
 use quotick::{
@@ -390,6 +391,443 @@ fn explicit_trade_fees_settle_in_the_same_atomic_event_as_dvp() {
     assert_eq!(rebate.postings()[0].amount, 2);
     assert_eq!(rebate.postings()[1].account_id, account(90));
     assert_eq!(rebate.postings()[1].amount, -2);
+    ledger.validate().unwrap();
+}
+
+#[test]
+fn fee_rules_validate_rates_rounding_and_clamps_exactly() {
+    let asset_id = AssetId::new(2).unwrap();
+    let convention = definition().settlement_convention();
+    let down = CallAuctionFeeRule::new(
+        asset_id,
+        CallAuctionFeeBasis::TradedLots,
+        1,
+        2,
+        CallAuctionFeeRounding::Down,
+        1,
+        None,
+    )
+    .unwrap();
+    let up = CallAuctionFeeRule::new(
+        asset_id,
+        CallAuctionFeeBasis::TradedLots,
+        1,
+        2,
+        CallAuctionFeeRounding::Up,
+        1,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        down.calculate_amount(Price::from_raw(0), Quantity::new(5).unwrap(), convention),
+        Ok(2)
+    );
+    assert_eq!(
+        up.calculate_amount(Price::from_raw(0), Quantity::new(5).unwrap(), convention),
+        Ok(3)
+    );
+    let nearest = CallAuctionFeeRule::new(
+        asset_id,
+        CallAuctionFeeBasis::TradedLots,
+        1,
+        2,
+        CallAuctionFeeRounding::NearestTiesToEven,
+        1,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        nearest.calculate_amount(Price::from_raw(0), Quantity::new(5).unwrap(), convention),
+        Ok(2)
+    );
+    assert_eq!(
+        nearest.calculate_amount(Price::from_raw(0), Quantity::new(7).unwrap(), convention),
+        Ok(4)
+    );
+    let minimum_numerator = CallAuctionFeeRule::new(
+        asset_id,
+        CallAuctionFeeBasis::TradedLots,
+        i64::MIN,
+        1,
+        CallAuctionFeeRounding::Down,
+        1,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        minimum_numerator.direction(),
+        CallAuctionFeeDirection::ParticipantReceives
+    );
+    assert_eq!(
+        minimum_numerator.calculate_amount(
+            Price::from_raw(0),
+            Quantity::new(1).unwrap(),
+            convention,
+        ),
+        Ok(1_i128 << 63)
+    );
+
+    let quote = CallAuctionFeeRule::new(
+        asset_id,
+        CallAuctionFeeBasis::QuoteNotionalMagnitude,
+        1,
+        10,
+        CallAuctionFeeRounding::Down,
+        1,
+        Some(20),
+    )
+    .unwrap();
+    assert_eq!(
+        quote.calculate_amount(Price::from_raw(-100), Quantity::new(3).unwrap(), convention,),
+        Ok(20)
+    );
+    assert_eq!(
+        quote.calculate_amount(Price::from_raw(0), Quantity::new(3).unwrap(), convention),
+        Ok(1)
+    );
+}
+
+#[test]
+fn fee_rule_overflow_is_rejected_or_capped_exactly() {
+    let asset_id = AssetId::new(2).unwrap();
+    let convention = definition().settlement_convention();
+    let lots = CallAuctionFeeRule::new(
+        asset_id,
+        CallAuctionFeeBasis::TradedLots,
+        1,
+        1,
+        CallAuctionFeeRounding::Down,
+        1,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        lots.calculate_amount(
+            Price::from_raw(i64::MAX),
+            Quantity::new(u64::MAX).unwrap(),
+            quotick::ledger::SettlementConvention {
+                quote_units_per_price_unit: u64::MAX,
+                ..convention
+            },
+        ),
+        Err(LedgerError::ArithmeticOverflow)
+    );
+    let large_convention = quotick::ledger::SettlementConvention {
+        base_units_per_lot: 1_u64 << 63,
+        ..convention
+    };
+    let uncapped = CallAuctionFeeRule::new(
+        asset_id,
+        CallAuctionFeeBasis::BaseAssetUnits,
+        3,
+        1,
+        CallAuctionFeeRounding::Down,
+        1,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        uncapped.calculate_amount(
+            Price::from_raw(0),
+            Quantity::new(u64::MAX).unwrap(),
+            large_convention,
+        ),
+        Err(LedgerError::ArithmeticOverflow)
+    );
+    let capped = CallAuctionFeeRule::new(
+        asset_id,
+        CallAuctionFeeBasis::BaseAssetUnits,
+        3,
+        1,
+        CallAuctionFeeRounding::Down,
+        1,
+        Some(10),
+    )
+    .unwrap();
+    assert_eq!(
+        capped.calculate_amount(
+            Price::from_raw(0),
+            Quantity::new(u64::MAX).unwrap(),
+            large_convention,
+        ),
+        Ok(10)
+    );
+}
+
+#[test]
+fn fee_rules_reject_invalid_rates_and_clamps() {
+    let asset_id = AssetId::new(2).unwrap();
+    assert_eq!(
+        CallAuctionFeeRule::new(
+            asset_id,
+            CallAuctionFeeBasis::TradedLots,
+            0,
+            1,
+            CallAuctionFeeRounding::Down,
+            1,
+            None,
+        ),
+        Err(LedgerError::FeeRateNumeratorZero)
+    );
+    assert_eq!(
+        CallAuctionFeeRule::new(
+            asset_id,
+            CallAuctionFeeBasis::TradedLots,
+            1,
+            0,
+            CallAuctionFeeRounding::Down,
+            1,
+            None,
+        ),
+        Err(LedgerError::FeeRateDenominatorZero)
+    );
+    assert_eq!(
+        CallAuctionFeeRule::new(
+            asset_id,
+            CallAuctionFeeBasis::TradedLots,
+            1,
+            1,
+            CallAuctionFeeRounding::Down,
+            0,
+            None,
+        ),
+        Err(LedgerError::FeeMinimumNotPositive(0))
+    );
+    assert_eq!(
+        CallAuctionFeeRule::new(
+            asset_id,
+            CallAuctionFeeBasis::TradedLots,
+            1,
+            1,
+            CallAuctionFeeRounding::Down,
+            2,
+            Some(1),
+        ),
+        Err(LedgerError::FeeMaximumBelowMinimum {
+            minimum: 2,
+            maximum: 1,
+        })
+    );
+}
+
+fn calculated_fee_schedule() -> CallAuctionFeeSchedule {
+    CallAuctionFeeSchedule::new(
+        7,
+        instrument(),
+        version(),
+        account(90),
+        Some(
+            CallAuctionFeeRule::new(
+                AssetId::new(2).unwrap(),
+                CallAuctionFeeBasis::QuoteNotionalMagnitude,
+                1,
+                128,
+                CallAuctionFeeRounding::Up,
+                2,
+                Some(10),
+            )
+            .unwrap(),
+        ),
+        Some(
+            CallAuctionFeeRule::new(
+                AssetId::new(1).unwrap(),
+                CallAuctionFeeBasis::BaseAssetUnits,
+                -1,
+                64,
+                CallAuctionFeeRounding::NearestTiesToEven,
+                1,
+                None,
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap()
+}
+
+#[test]
+fn fee_schedule_assessment_is_version_bound_and_canonically_side_ordered() {
+    let report = uncross_report(&[(1, 11, 3)], &[(2, 21, 3)]);
+    let schedule = calculated_fee_schedule();
+    let assessments: Vec<CallAuctionFeeAssessment> =
+        schedule.assess_report(&report, definition()).unwrap();
+    assert_eq!(assessments.len(), 2);
+    assert_eq!(assessments[0].schedule_revision(), 7);
+    assert_eq!(assessments[0].trade_id(), report_trade_id(&report, 0));
+    assert_eq!(assessments[0].side(), Side::Buy);
+    assert_eq!(assessments[0].participant_account_id(), account(11));
+    assert_eq!(assessments[0].fee_account_id(), account(90));
+    assert_eq!(assessments[0].basis_amount(), 300);
+    assert_eq!(assessments[0].amount(), 3);
+    assert_eq!(
+        assessments[0].direction(),
+        CallAuctionFeeDirection::ParticipantPays
+    );
+    assert_eq!(assessments[1].side(), Side::Sell);
+    assert_eq!(assessments[1].participant_account_id(), account(21));
+    assert_eq!(assessments[1].basis_amount(), 30);
+    assert_eq!(assessments[1].amount(), 1);
+    assert_eq!(
+        assessments[1].direction(),
+        CallAuctionFeeDirection::ParticipantReceives
+    );
+
+    assert_eq!(
+        CallAuctionFeeSchedule::new(
+            0,
+            instrument(),
+            version(),
+            account(90),
+            schedule.buy_rule(),
+            schedule.sell_rule(),
+        ),
+        Err(LedgerError::FeeScheduleRevisionZero)
+    );
+    assert_eq!(
+        CallAuctionFeeSchedule::new(1, instrument(), version(), account(90), None, None,),
+        Err(LedgerError::FeeScheduleEmpty)
+    );
+    assert_eq!(
+        schedule.assess_report(
+            &report,
+            definition_with_identity(InstrumentId::new(99).unwrap(), version()),
+        ),
+        Err(LedgerError::FeeScheduleInstrumentMismatch)
+    );
+    assert_eq!(
+        schedule.assess_report(
+            &report,
+            definition_with_identity(instrument(), InstrumentVersion::new(99).unwrap()),
+        ),
+        Err(LedgerError::FeeScheduleVersionMismatch)
+    );
+
+    let self_fee_schedule = CallAuctionFeeSchedule::new(
+        8,
+        instrument(),
+        version(),
+        account(11),
+        schedule.buy_rule(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        self_fee_schedule.assess_report(&report, definition()),
+        Err(LedgerError::FeeAccountsIdentical(account(11)))
+    );
+}
+
+#[test]
+fn calculated_fee_order_is_trade_then_buy_then_sell() {
+    let report = multi_trade_report();
+    let schedule = calculated_fee_schedule();
+    let assessments = schedule.assess_report(&report, definition()).unwrap();
+    assert_eq!(assessments.len(), 6);
+    for trade_index in 0..3 {
+        let trade_id = report_trade_id(&report, trade_index);
+        let assessment_index = trade_index * 2;
+        assert_eq!(assessments[assessment_index].trade_id(), trade_id);
+        assert_eq!(assessments[assessment_index].side(), Side::Buy);
+        assert_eq!(assessments[assessment_index + 1].trade_id(), trade_id);
+        assert_eq!(assessments[assessment_index + 1].side(), Side::Sell);
+    }
+
+    let value = CallAuctionSettlement::from_report_with_fee_schedule(
+        vec![transaction(101), transaction(102), transaction(103)],
+        vec![
+            transaction(201),
+            transaction(202),
+            transaction(203),
+            transaction(204),
+            transaction(205),
+            transaction(206),
+        ],
+        AccountingDate::UNIX_EPOCH,
+        TimestampNs::from_unix_nanos(100),
+        &report,
+        definition(),
+        &schedule,
+    )
+    .unwrap();
+    let mut ledger = Ledger::new();
+    ledger.settle_call_auction(value).unwrap();
+    let Some(LedgerRecord::Batch(batch)) = ledger.record(1) else {
+        panic!("calculated multi-trade fees must use one ledger batch");
+    };
+    let transaction_ids: Vec<_> = batch
+        .entries()
+        .iter()
+        .map(JournalEntry::transaction_id)
+        .collect();
+    assert_eq!(
+        transaction_ids,
+        [
+            transaction(101),
+            transaction(201),
+            transaction(202),
+            transaction(102),
+            transaction(203),
+            transaction(204),
+            transaction(103),
+            transaction(205),
+            transaction(206),
+        ]
+    );
+}
+
+#[test]
+fn calculated_fees_construct_and_settle_through_the_existing_atomic_batch() {
+    let report = uncross_report(&[(1, 11, 3)], &[(2, 21, 3)]);
+    let schedule = calculated_fee_schedule();
+    assert_eq!(
+        CallAuctionSettlement::from_report_with_fee_schedule(
+            vec![transaction(101)],
+            vec![transaction(201)],
+            AccountingDate::UNIX_EPOCH,
+            TimestampNs::from_unix_nanos(100),
+            &report,
+            definition(),
+            &schedule,
+        ),
+        Err(LedgerError::CallAuctionFeeTransactionCountMismatch {
+            transaction_count: 1,
+            assessment_count: 2,
+        })
+    );
+
+    let value = CallAuctionSettlement::from_report_with_fee_schedule(
+        vec![transaction(101)],
+        vec![transaction(201), transaction(202)],
+        AccountingDate::UNIX_EPOCH,
+        TimestampNs::from_unix_nanos(100),
+        &report,
+        definition(),
+        &schedule,
+    )
+    .unwrap();
+    assert_eq!(value.transaction_count(), 3);
+
+    let mut ledger = Ledger::new();
+    let receipt = ledger.settle_call_auction(value.clone()).unwrap();
+    assert_eq!(receipt.transaction_count(), 3);
+    assert!(!receipt.replayed());
+    assert!(ledger.settle_call_auction(value).unwrap().replayed());
+    assert_eq!(ledger.balance(account(11), AssetId::new(1).unwrap()), 30);
+    assert_eq!(ledger.balance(account(21), AssetId::new(1).unwrap()), -29);
+    assert_eq!(ledger.balance(account(90), AssetId::new(1).unwrap()), -1);
+    assert_eq!(ledger.balance(account(11), AssetId::new(2).unwrap()), -303);
+    assert_eq!(ledger.balance(account(21), AssetId::new(2).unwrap()), 300);
+    assert_eq!(ledger.balance(account(90), AssetId::new(2).unwrap()), 3);
+
+    let buy_fee = ledger.transaction(transaction(201)).unwrap();
+    assert_eq!(buy_fee.reference(), report_trade_id(&report, 0).get());
+    assert_eq!(buy_fee.postings()[0].account_id, account(11));
+    assert_eq!(buy_fee.postings()[0].amount, -3);
+    let sell_rebate = ledger.transaction(transaction(202)).unwrap();
+    assert_eq!(sell_rebate.reference(), report_trade_id(&report, 0).get());
+    assert_eq!(sell_rebate.postings()[0].account_id, account(21));
+    assert_eq!(sell_rebate.postings()[0].amount, 1);
+    assert_eq!(sell_rebate.postings()[1].account_id, account(90));
+    assert_eq!(sell_rebate.postings()[1].amount, -1);
     ledger.validate().unwrap();
 }
 

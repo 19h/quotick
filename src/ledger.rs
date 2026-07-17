@@ -17,8 +17,8 @@ use crate::auction_engine::{
 };
 use crate::bounded_hash::{BoundedHashError, BoundedHashMap, BoundedHashSet};
 use crate::domain::{
-    AccountId, AccountingDate, AssetId, Price, Quantity, ReconciliationId, TimestampNs, TradeId,
-    TransactionId,
+    AccountId, AccountingDate, AssetId, InstrumentId, InstrumentVersion, Price, Quantity,
+    ReconciliationId, Side, TimestampNs, TradeId, TransactionId,
 };
 use crate::instrument::InstrumentDefinition;
 use crate::matching::Trade;
@@ -59,6 +59,10 @@ pub enum LedgerPreparationResource {
     ReversalPostings,
     /// Two-leg posting vector for one explicit trade fee.
     CallAuctionFeePostings,
+    /// Canonical fee assessments for one complete call-auction report.
+    CallAuctionFeeAssessments,
+    /// Explicit fees calculated for one complete call-auction settlement.
+    CallAuctionCalculatedFees,
     /// DVP entries constructed for one complete call-auction report.
     CallAuctionSettlementEntries,
     /// Reversal and replacement entries for one call-auction correction.
@@ -258,6 +262,8 @@ impl fmt::Display for LedgerPreparationResource {
         formatter.write_str(match self {
             Self::ReversalPostings => "reversal posting preparation",
             Self::CallAuctionFeePostings => "call-auction fee-posting preparation",
+            Self::CallAuctionFeeAssessments => "call-auction fee-assessment preparation",
+            Self::CallAuctionCalculatedFees => "call-auction calculated-fee preparation",
             Self::CallAuctionSettlementEntries => "call-auction settlement-entry preparation",
             Self::CallAuctionCorrectionEntries => "call-auction correction-entry preparation",
             Self::BatchIdentitySet => "batch identity validation",
@@ -651,6 +657,84 @@ pub struct LedgerCorrection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LedgerBatch {
     entries: Arc<Vec<JournalEntry>>,
+}
+
+/// Economic quantity to which one call-auction fee rate is applied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallAuctionFeeBasis {
+    /// Executed quantity in instrument-defined lots.
+    TradedLots,
+    /// Delivered base asset in its smallest ledger unit.
+    BaseAssetUnits,
+    /// Absolute quote notional in its smallest ledger unit.
+    QuoteNotionalMagnitude,
+}
+
+/// Deterministic rounding applied to a non-negative fee-rate result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallAuctionFeeRounding {
+    /// Round toward zero.
+    Down,
+    /// Round away from zero when a fractional remainder exists.
+    Up,
+    /// Round to the nearest integer, resolving an exact tie to an even integer.
+    NearestTiesToEven,
+}
+
+/// Transfer direction derived from the sign of a call-auction fee rate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallAuctionFeeDirection {
+    /// The participant supplies an amount to the fee account.
+    ParticipantPays,
+    /// The fee account supplies the participant rebate.
+    ParticipantReceives,
+}
+
+/// One exact rational fee or rebate rule for one call-auction side.
+///
+/// A positive numerator charges the participant and a negative numerator pays
+/// the participant a rebate. The calculated magnitude is rounded and then
+/// clamped to the positive minimum and optional maximum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionFeeRule {
+    asset_id: AssetId,
+    basis: CallAuctionFeeBasis,
+    rate_numerator: i64,
+    rate_denominator: u64,
+    rounding: CallAuctionFeeRounding,
+    minimum_amount: i128,
+    maximum_amount: Option<i128>,
+}
+
+/// Immutable call-auction fee policy bound to one instrument definition.
+///
+/// The schedule revision is assessment provenance. Calculated transfers retain
+/// their trade references in ordinary ledger entries; distribution,
+/// authentication, authorization, and durable schedule-registry storage remain
+/// external lifecycle responsibilities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionFeeSchedule {
+    revision: u64,
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    fee_account_id: AccountId,
+    buy_rule: Option<CallAuctionFeeRule>,
+    sell_rule: Option<CallAuctionFeeRule>,
+}
+
+/// One calculated fee or rebate before assignment of a transaction identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionFeeAssessment {
+    schedule_revision: u64,
+    trade_id: TradeId,
+    side: Side,
+    participant_account_id: AccountId,
+    fee_account_id: AccountId,
+    asset_id: AssetId,
+    basis: CallAuctionFeeBasis,
+    basis_amount: u128,
+    direction: CallAuctionFeeDirection,
+    amount: i128,
 }
 
 /// One explicit positive fee transfer bound to one call-auction trade.
@@ -1089,6 +1173,34 @@ pub enum LedgerError {
     FeeAmountNotPositive(i128),
     /// A fee transfer used one account as both debit and credit.
     FeeAccountsIdentical(AccountId),
+    /// A fee rule used a zero signed rate numerator.
+    FeeRateNumeratorZero,
+    /// A fee rule used a zero rational denominator.
+    FeeRateDenominatorZero,
+    /// A fee rule used a zero or negative minimum amount.
+    FeeMinimumNotPositive(i128),
+    /// A fee rule maximum was below its positive minimum.
+    FeeMaximumBelowMinimum {
+        /// Positive minimum amount.
+        minimum: i128,
+        /// Invalid maximum amount.
+        maximum: i128,
+    },
+    /// A fee schedule used revision zero.
+    FeeScheduleRevisionZero,
+    /// A fee schedule configured neither a buy rule nor a sell rule.
+    FeeScheduleEmpty,
+    /// Fee schedule and settlement definition instrument identifiers differed.
+    FeeScheduleInstrumentMismatch,
+    /// Fee schedule and settlement definition versions differed.
+    FeeScheduleVersionMismatch,
+    /// Fee transaction identifiers did not cover every calculated assessment.
+    CallAuctionFeeTransactionCountMismatch {
+        /// Supplied global fee transaction identifiers.
+        transaction_count: usize,
+        /// Canonical fee assessments calculated from the report.
+        assessment_count: usize,
+    },
     /// A fee did not bind to the next trade in canonical report order.
     CallAuctionFeeTradeMismatch(TradeId),
     /// Reversal transaction identifiers did not cover the complete settlement.
@@ -1212,65 +1324,34 @@ impl fmt::Display for LedgerError {
             | Self::CallAuctionSettlementTransactionCountMismatch { .. }
             | Self::FeeAmountNotPositive(_)
             | Self::FeeAccountsIdentical(_)
+            | Self::FeeRateNumeratorZero
+            | Self::FeeRateDenominatorZero
+            | Self::FeeMinimumNotPositive(_)
+            | Self::FeeMaximumBelowMinimum { .. }
+            | Self::FeeScheduleRevisionZero
+            | Self::FeeScheduleEmpty
+            | Self::FeeScheduleInstrumentMismatch
+            | Self::FeeScheduleVersionMismatch
+            | Self::CallAuctionFeeTransactionCountMismatch { .. }
             | Self::CallAuctionFeeTradeMismatch(_)
             | Self::CallAuctionCorrectionTransactionCountMismatch { .. }
             | Self::CallAuctionCorrectionOriginalGroupingMismatch(_)) => {
                 format_settlement_error(settlement_error, formatter)
             }
-            Self::StalePreparation => formatter.write_str("prepared journal entry is stale"),
-            Self::ReversalTargetMissing(transaction_id) => write!(
-                formatter,
-                "reversal target transaction {transaction_id} is not committed"
-            ),
-            Self::TransactionAlreadyReversed {
-                original_transaction_id,
-                reversal_transaction_id,
-            } => write!(
-                formatter,
-                "transaction {original_transaction_id} was already reversed by {reversal_transaction_id}"
-            ),
-            Self::InvalidReversalPostings(transaction_id) => write!(
-                formatter,
-                "reversal postings are not the exact inverse of transaction {transaction_id}"
-            ),
-            Self::NonReversibleAmount {
-                original_transaction_id,
-                account_id,
-                asset_id,
-            } => write!(
-                formatter,
-                "transaction {original_transaction_id} has a non-reversible i128::MIN leg for account {account_id}, asset {asset_id}"
-            ),
-            Self::CorrectionReplacementNotStandard(transaction_id) => write!(
-                formatter,
-                "correction replacement transaction {transaction_id} is not a standard financial entry"
-            ),
-            Self::CorrectionFirstEntryNotReversal(transaction_id) => write!(
-                formatter,
-                "correction transaction {transaction_id} is not a reversal entry"
-            ),
-            Self::CorrectionTransactionIdsNotDistinct {
-                reversal_transaction_id,
-                replacement_transaction_id,
-            } => write!(
-                formatter,
-                "correction reversal {reversal_transaction_id} and replacement {replacement_transaction_id} must be distinct"
-            ),
-            Self::CorrectionAlreadyPartiallyCommitted(transaction_id) => write!(
-                formatter,
-                "correction transaction {transaction_id} is already committed outside the exact correction event"
-            ),
-            Self::BatchTooFewEntries => {
-                formatter.write_str("ledger batch requires at least two entries")
+            lifecycle_error @ (Self::StalePreparation
+            | Self::ReversalTargetMissing(_)
+            | Self::TransactionAlreadyReversed { .. }
+            | Self::InvalidReversalPostings(_)
+            | Self::NonReversibleAmount { .. }
+            | Self::CorrectionReplacementNotStandard(_)
+            | Self::CorrectionFirstEntryNotReversal(_)
+            | Self::CorrectionTransactionIdsNotDistinct { .. }
+            | Self::CorrectionAlreadyPartiallyCommitted(_)
+            | Self::BatchTooFewEntries
+            | Self::BatchDuplicateTransaction(_)
+            | Self::BatchAlreadyPartiallyCommitted(_)) => {
+                format_ledger_lifecycle_error(lifecycle_error, formatter)
             }
-            Self::BatchDuplicateTransaction(transaction_id) => write!(
-                formatter,
-                "ledger batch repeats transaction identifier {transaction_id}"
-            ),
-            Self::BatchAlreadyPartiallyCommitted(transaction_id) => write!(
-                formatter,
-                "batch transaction {transaction_id} is already committed outside the exact batch event"
-            ),
             period_error @ (Self::FinancialEntryMissingEffectiveDate
             | Self::ControlEntryHasEffectiveDate
             | Self::ControlEntryHasPostings
@@ -1283,6 +1364,69 @@ impl fmt::Display for LedgerError {
                 format_accounting_period_error(period_error, formatter)
             }
         }
+    }
+}
+
+fn format_ledger_lifecycle_error(
+    error: &LedgerError,
+    formatter: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    match error {
+        LedgerError::StalePreparation => formatter.write_str("prepared journal entry is stale"),
+        LedgerError::ReversalTargetMissing(transaction_id) => write!(
+            formatter,
+            "reversal target transaction {transaction_id} is not committed"
+        ),
+        LedgerError::TransactionAlreadyReversed {
+            original_transaction_id,
+            reversal_transaction_id,
+        } => write!(
+            formatter,
+            "transaction {original_transaction_id} was already reversed by {reversal_transaction_id}"
+        ),
+        LedgerError::InvalidReversalPostings(transaction_id) => write!(
+            formatter,
+            "reversal postings are not the exact inverse of transaction {transaction_id}"
+        ),
+        LedgerError::NonReversibleAmount {
+            original_transaction_id,
+            account_id,
+            asset_id,
+        } => write!(
+            formatter,
+            "transaction {original_transaction_id} has a non-reversible i128::MIN leg for account {account_id}, asset {asset_id}"
+        ),
+        LedgerError::CorrectionReplacementNotStandard(transaction_id) => write!(
+            formatter,
+            "correction replacement transaction {transaction_id} is not a standard financial entry"
+        ),
+        LedgerError::CorrectionFirstEntryNotReversal(transaction_id) => write!(
+            formatter,
+            "correction transaction {transaction_id} is not a reversal entry"
+        ),
+        LedgerError::CorrectionTransactionIdsNotDistinct {
+            reversal_transaction_id,
+            replacement_transaction_id,
+        } => write!(
+            formatter,
+            "correction reversal {reversal_transaction_id} and replacement {replacement_transaction_id} must be distinct"
+        ),
+        LedgerError::CorrectionAlreadyPartiallyCommitted(transaction_id) => write!(
+            formatter,
+            "correction transaction {transaction_id} is already committed outside the exact correction event"
+        ),
+        LedgerError::BatchTooFewEntries => {
+            formatter.write_str("ledger batch requires at least two entries")
+        }
+        LedgerError::BatchDuplicateTransaction(transaction_id) => write!(
+            formatter,
+            "ledger batch repeats transaction identifier {transaction_id}"
+        ),
+        LedgerError::BatchAlreadyPartiallyCommitted(transaction_id) => write!(
+            formatter,
+            "batch transaction {transaction_id} is already committed outside the exact batch event"
+        ),
+        _ => unreachable!("lifecycle formatter received a non-lifecycle ledger error"),
     }
 }
 
@@ -1336,6 +1480,38 @@ fn format_settlement_error(error: &LedgerError, formatter: &mut fmt::Formatter<'
         LedgerError::FeeAccountsIdentical(account_id) => write!(
             formatter,
             "fee transfer debit and credit account {account_id} are identical"
+        ),
+        LedgerError::FeeRateNumeratorZero => {
+            formatter.write_str("call-auction fee rate numerator must be non-zero")
+        }
+        LedgerError::FeeRateDenominatorZero => {
+            formatter.write_str("call-auction fee rate denominator must be non-zero")
+        }
+        LedgerError::FeeMinimumNotPositive(amount) => write!(
+            formatter,
+            "call-auction fee minimum amount {amount} is not positive"
+        ),
+        LedgerError::FeeMaximumBelowMinimum { minimum, maximum } => write!(
+            formatter,
+            "call-auction fee maximum amount {maximum} is below minimum {minimum}"
+        ),
+        LedgerError::FeeScheduleRevisionZero => {
+            formatter.write_str("call-auction fee schedule revision must be non-zero")
+        }
+        LedgerError::FeeScheduleEmpty => {
+            formatter.write_str("call-auction fee schedule requires a buy or sell rule")
+        }
+        LedgerError::FeeScheduleInstrumentMismatch => {
+            formatter.write_str("call-auction fee schedule and settlement instruments differ")
+        }
+        LedgerError::FeeScheduleVersionMismatch => formatter
+            .write_str("call-auction fee schedule and settlement definition versions differ"),
+        LedgerError::CallAuctionFeeTransactionCountMismatch {
+            transaction_count,
+            assessment_count,
+        } => write!(
+            formatter,
+            "call-auction settlement supplied {transaction_count} fee transaction identifiers for {assessment_count} assessments"
         ),
         LedgerError::CallAuctionFeeTradeMismatch(trade_id) => write!(
             formatter,
@@ -1709,23 +1885,8 @@ impl JournalEntry {
         if execution.buyer_account_id == execution.seller_account_id {
             return Err(LedgerError::SelfSettlement);
         }
-        if convention.base_asset_id == convention.quote_asset_id {
-            return Err(LedgerError::IdenticalSettlementAssets);
-        }
-        if convention.base_units_per_lot == 0 || convention.quote_units_per_price_unit == 0 {
-            return Err(LedgerError::ZeroSettlementMultiplier);
-        }
-
-        let base_amount = i128::from(execution.quantity.lots())
-            .checked_mul(i128::from(convention.base_units_per_lot))
-            .ok_or(LedgerError::ArithmeticOverflow)?;
-        let notional = i128::from(execution.price.raw())
-            .checked_mul(i128::from(execution.quantity.lots()))
-            .and_then(|value| value.checked_mul(i128::from(convention.quote_units_per_price_unit)))
-            .ok_or(LedgerError::ArithmeticOverflow)?;
-        let opposite_notional = notional
-            .checked_neg()
-            .ok_or(LedgerError::ArithmeticOverflow)?;
+        let (base_amount, notional, opposite_notional) =
+            settlement_amounts(execution.price, execution.quantity, convention)?;
         let mut postings = vec![
             Posting {
                 account_id: execution.buyer_account_id,
@@ -1914,6 +2075,35 @@ impl LedgerCorrection {
     }
 }
 
+fn validate_settlement_convention(convention: SettlementConvention) -> Result<(), LedgerError> {
+    if convention.base_asset_id == convention.quote_asset_id {
+        return Err(LedgerError::IdenticalSettlementAssets);
+    }
+    if convention.base_units_per_lot == 0 || convention.quote_units_per_price_unit == 0 {
+        return Err(LedgerError::ZeroSettlementMultiplier);
+    }
+    Ok(())
+}
+
+fn settlement_amounts(
+    price: Price,
+    quantity: Quantity,
+    convention: SettlementConvention,
+) -> Result<(i128, i128, i128), LedgerError> {
+    validate_settlement_convention(convention)?;
+    let base_amount = i128::from(quantity.lots())
+        .checked_mul(i128::from(convention.base_units_per_lot))
+        .ok_or(LedgerError::ArithmeticOverflow)?;
+    let notional = i128::from(price.raw())
+        .checked_mul(i128::from(quantity.lots()))
+        .and_then(|value| value.checked_mul(i128::from(convention.quote_units_per_price_unit)))
+        .ok_or(LedgerError::ArithmeticOverflow)?;
+    let opposite_notional = notional
+        .checked_neg()
+        .ok_or(LedgerError::ArithmeticOverflow)?;
+    Ok((base_amount, notional, opposite_notional))
+}
+
 impl LedgerBatch {
     /// Constructs an ordered atomic group of two or more distinct entries.
     ///
@@ -1970,6 +2160,446 @@ impl LedgerBatch {
     #[must_use]
     pub fn primary_transaction_id(&self) -> TransactionId {
         self.entries[0].transaction_id
+    }
+}
+
+impl CallAuctionFeeRule {
+    /// Constructs one exact rational fee or rebate rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] when the rate is zero or has a zero denominator,
+    /// the minimum is not positive, or the optional maximum is below the
+    /// minimum.
+    pub fn new(
+        asset_id: AssetId,
+        basis: CallAuctionFeeBasis,
+        rate_numerator: i64,
+        rate_denominator: u64,
+        rounding: CallAuctionFeeRounding,
+        minimum_amount: i128,
+        maximum_amount: Option<i128>,
+    ) -> Result<Self, LedgerError> {
+        if rate_numerator == 0 {
+            return Err(LedgerError::FeeRateNumeratorZero);
+        }
+        if rate_denominator == 0 {
+            return Err(LedgerError::FeeRateDenominatorZero);
+        }
+        if minimum_amount <= 0 {
+            return Err(LedgerError::FeeMinimumNotPositive(minimum_amount));
+        }
+        if let Some(maximum) = maximum_amount {
+            if maximum < minimum_amount {
+                return Err(LedgerError::FeeMaximumBelowMinimum {
+                    minimum: minimum_amount,
+                    maximum,
+                });
+            }
+        }
+        Ok(Self {
+            asset_id,
+            basis,
+            rate_numerator,
+            rate_denominator,
+            rounding,
+            minimum_amount,
+            maximum_amount,
+        })
+    }
+
+    /// Returns the fee or rebate asset denomination.
+    #[must_use]
+    pub const fn asset_id(self) -> AssetId {
+        self.asset_id
+    }
+
+    /// Returns the economic quantity to which the rational rate is applied.
+    #[must_use]
+    pub const fn basis(self) -> CallAuctionFeeBasis {
+        self.basis
+    }
+
+    /// Returns the signed rational rate numerator.
+    #[must_use]
+    pub const fn rate_numerator(self) -> i64 {
+        self.rate_numerator
+    }
+
+    /// Returns the positive rational rate denominator.
+    #[must_use]
+    pub const fn rate_denominator(self) -> u64 {
+        self.rate_denominator
+    }
+
+    /// Returns the deterministic rounding rule.
+    #[must_use]
+    pub const fn rounding(self) -> CallAuctionFeeRounding {
+        self.rounding
+    }
+
+    /// Returns the positive post-rounding minimum amount.
+    #[must_use]
+    pub const fn minimum_amount(self) -> i128 {
+        self.minimum_amount
+    }
+
+    /// Returns the optional post-rounding maximum amount.
+    #[must_use]
+    pub const fn maximum_amount(self) -> Option<i128> {
+        self.maximum_amount
+    }
+
+    /// Returns the transfer direction encoded by the signed numerator.
+    #[must_use]
+    pub const fn direction(self) -> CallAuctionFeeDirection {
+        if self.rate_numerator > 0 {
+            CallAuctionFeeDirection::ParticipantPays
+        } else {
+            CallAuctionFeeDirection::ParticipantReceives
+        }
+    }
+
+    /// Calculates the positive transfer magnitude for one execution.
+    ///
+    /// The result uses exact integer arithmetic, applies the configured rounding
+    /// once, and then applies the minimum and optional maximum.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] for an invalid settlement convention or when an
+    /// uncapped intermediate or result is not representable.
+    pub fn calculate_amount(
+        self,
+        price: Price,
+        quantity: Quantity,
+        convention: SettlementConvention,
+    ) -> Result<i128, LedgerError> {
+        let basis_amount = self.calculate_basis_amount(price, quantity, convention)?;
+        self.calculate_amount_from_basis(basis_amount)
+    }
+
+    fn calculate_basis_amount(
+        self,
+        price: Price,
+        quantity: Quantity,
+        convention: SettlementConvention,
+    ) -> Result<u128, LedgerError> {
+        let (base_amount, notional, _) = settlement_amounts(price, quantity, convention)?;
+        match self.basis {
+            CallAuctionFeeBasis::TradedLots => Ok(u128::from(quantity.lots())),
+            CallAuctionFeeBasis::BaseAssetUnits => {
+                u128::try_from(base_amount).map_err(|_| LedgerError::ArithmeticOverflow)
+            }
+            CallAuctionFeeBasis::QuoteNotionalMagnitude => {
+                let magnitude = notional
+                    .checked_abs()
+                    .ok_or(LedgerError::ArithmeticOverflow)?;
+                u128::try_from(magnitude).map_err(|_| LedgerError::ArithmeticOverflow)
+            }
+        }
+    }
+
+    fn calculate_amount_from_basis(self, basis_amount: u128) -> Result<i128, LedgerError> {
+        let numerator = u128::from(self.rate_numerator.unsigned_abs());
+        let denominator = u128::from(self.rate_denominator);
+        let whole = basis_amount / denominator;
+        let basis_remainder = basis_amount % denominator;
+        let maximum = self
+            .maximum_amount
+            .map(u128::try_from)
+            .transpose()
+            .map_err(|_| LedgerError::ArithmeticOverflow)?;
+        let minimum =
+            u128::try_from(self.minimum_amount).map_err(|_| LedgerError::ArithmeticOverflow)?;
+
+        let Some(whole_product) = whole.checked_mul(numerator) else {
+            return capped_fee_overflow(maximum);
+        };
+        let fractional_product = basis_remainder
+            .checked_mul(numerator)
+            .ok_or(LedgerError::ArithmeticOverflow)?;
+        let Some(quotient) = whole_product.checked_add(fractional_product / denominator) else {
+            return capped_fee_overflow(maximum);
+        };
+        let remainder = fractional_product % denominator;
+        let increment = match self.rounding {
+            CallAuctionFeeRounding::Down => false,
+            CallAuctionFeeRounding::Up => remainder != 0,
+            CallAuctionFeeRounding::NearestTiesToEven => {
+                let complement = denominator - remainder;
+                remainder > complement || (remainder == complement && quotient % 2 != 0)
+            }
+        };
+        let rounded = if increment {
+            let Some(rounded) = quotient.checked_add(1) else {
+                return capped_fee_overflow(maximum);
+            };
+            rounded
+        } else {
+            quotient
+        };
+        let clamped = rounded.max(minimum).min(maximum.unwrap_or(u128::MAX));
+        i128::try_from(clamped).map_err(|_| LedgerError::ArithmeticOverflow)
+    }
+}
+
+fn capped_fee_overflow(maximum: Option<u128>) -> Result<i128, LedgerError> {
+    maximum.map_or(Err(LedgerError::ArithmeticOverflow), |value| {
+        i128::try_from(value).map_err(|_| LedgerError::ArithmeticOverflow)
+    })
+}
+
+impl CallAuctionFeeSchedule {
+    /// Constructs one immutable instrument-version-bound fee schedule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError::FeeScheduleRevisionZero`] for revision zero and
+    /// [`LedgerError::FeeScheduleEmpty`] when neither side has a rule.
+    pub fn new(
+        revision: u64,
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        fee_account_id: AccountId,
+        buy_rule: Option<CallAuctionFeeRule>,
+        sell_rule: Option<CallAuctionFeeRule>,
+    ) -> Result<Self, LedgerError> {
+        if revision == 0 {
+            return Err(LedgerError::FeeScheduleRevisionZero);
+        }
+        if buy_rule.is_none() && sell_rule.is_none() {
+            return Err(LedgerError::FeeScheduleEmpty);
+        }
+        Ok(Self {
+            revision,
+            instrument_id,
+            instrument_version,
+            fee_account_id,
+            buy_rule,
+            sell_rule,
+        })
+    }
+
+    /// Returns the non-zero schedule revision.
+    #[must_use]
+    pub const fn revision(self) -> u64 {
+        self.revision
+    }
+
+    /// Returns the bound instrument identity.
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the bound immutable instrument-definition version.
+    #[must_use]
+    pub const fn instrument_version(self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the account that receives fees and supplies rebates.
+    #[must_use]
+    pub const fn fee_account_id(self) -> AccountId {
+        self.fee_account_id
+    }
+
+    /// Returns the optional buyer rule.
+    #[must_use]
+    pub const fn buy_rule(self) -> Option<CallAuctionFeeRule> {
+        self.buy_rule
+    }
+
+    /// Returns the optional seller rule.
+    #[must_use]
+    pub const fn sell_rule(self) -> Option<CallAuctionFeeRule> {
+        self.sell_rule
+    }
+
+    /// Calculates all fees and rebates in report order, Buy before Sell.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] for schedule-definition mismatch, an invalid
+    /// report, participant/fee account identity, arithmetic overflow, or exact
+    /// output reservation failure.
+    pub fn assess_report(
+        self,
+        report: &CallAuctionExecutionReport,
+        definition: InstrumentDefinition,
+    ) -> Result<Vec<CallAuctionFeeAssessment>, LedgerError> {
+        self.validate_definition(definition)?;
+        let trade_count = validate_call_auction_settlement_report(report, definition)?;
+        let assessment_count = self.assessment_count(trade_count)?;
+        let mut assessments = reserve_ledger_preparation_vec(
+            assessment_count,
+            LedgerPreparationResource::CallAuctionFeeAssessments,
+        )?;
+        self.for_each_assessment(report, definition, trade_count, |assessment| {
+            assessments.push(assessment);
+            Ok(())
+        })?;
+        Ok(assessments)
+    }
+
+    fn validate_definition(self, definition: InstrumentDefinition) -> Result<(), LedgerError> {
+        if self.instrument_id != definition.instrument_id() {
+            return Err(LedgerError::FeeScheduleInstrumentMismatch);
+        }
+        if self.instrument_version != definition.version() {
+            return Err(LedgerError::FeeScheduleVersionMismatch);
+        }
+        Ok(())
+    }
+
+    fn assessment_count(self, trade_count: usize) -> Result<usize, LedgerError> {
+        let rules_per_trade = usize::from(self.buy_rule.is_some())
+            .checked_add(usize::from(self.sell_rule.is_some()))
+            .ok_or(LedgerError::ArithmeticOverflow)?;
+        trade_count
+            .checked_mul(rules_per_trade)
+            .ok_or(LedgerError::ArithmeticOverflow)
+    }
+
+    fn for_each_assessment(
+        self,
+        report: &CallAuctionExecutionReport,
+        definition: InstrumentDefinition,
+        trade_count: usize,
+        mut accept: impl FnMut(CallAuctionFeeAssessment) -> Result<(), LedgerError>,
+    ) -> Result<(), LedgerError> {
+        let convention = definition.settlement_convention();
+        for event in report.events.iter().take(trade_count) {
+            let CallAuctionEventKind::Trade(trade) = event.kind else {
+                unreachable!("validated call-auction trade prefix changed")
+            };
+            if let Some(rule) = self.buy_rule {
+                accept(self.assess_trade(trade, Side::Buy, rule, convention)?)?;
+            }
+            if let Some(rule) = self.sell_rule {
+                accept(self.assess_trade(trade, Side::Sell, rule, convention)?)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn assess_trade(
+        self,
+        trade: CallAuctionTrade,
+        side: Side,
+        rule: CallAuctionFeeRule,
+        convention: SettlementConvention,
+    ) -> Result<CallAuctionFeeAssessment, LedgerError> {
+        let participant_account_id = match side {
+            Side::Buy => trade.buy_account_id(),
+            Side::Sell => trade.sell_account_id(),
+        };
+        if participant_account_id == self.fee_account_id {
+            return Err(LedgerError::FeeAccountsIdentical(participant_account_id));
+        }
+        let basis_amount =
+            rule.calculate_basis_amount(trade.price(), trade.quantity(), convention)?;
+        let amount = rule.calculate_amount_from_basis(basis_amount)?;
+        Ok(CallAuctionFeeAssessment {
+            schedule_revision: self.revision,
+            trade_id: trade.trade_id(),
+            side,
+            participant_account_id,
+            fee_account_id: self.fee_account_id,
+            asset_id: rule.asset_id,
+            basis: rule.basis,
+            basis_amount,
+            direction: rule.direction(),
+            amount,
+        })
+    }
+}
+
+impl CallAuctionFeeAssessment {
+    /// Returns the schedule revision that produced this assessment.
+    #[must_use]
+    pub const fn schedule_revision(self) -> u64 {
+        self.schedule_revision
+    }
+
+    /// Returns the book-local trade identity.
+    #[must_use]
+    pub const fn trade_id(self) -> TradeId {
+        self.trade_id
+    }
+
+    /// Returns the assessed participant side.
+    #[must_use]
+    pub const fn side(self) -> Side {
+        self.side
+    }
+
+    /// Returns the assessed participant account.
+    #[must_use]
+    pub const fn participant_account_id(self) -> AccountId {
+        self.participant_account_id
+    }
+
+    /// Returns the account that receives the fee or supplies the rebate.
+    #[must_use]
+    pub const fn fee_account_id(self) -> AccountId {
+        self.fee_account_id
+    }
+
+    /// Returns the transfer asset denomination.
+    #[must_use]
+    pub const fn asset_id(self) -> AssetId {
+        self.asset_id
+    }
+
+    /// Returns the economic basis kind.
+    #[must_use]
+    pub const fn basis(self) -> CallAuctionFeeBasis {
+        self.basis
+    }
+
+    /// Returns the non-negative basis magnitude in basis-defined units.
+    #[must_use]
+    pub const fn basis_amount(self) -> u128 {
+        self.basis_amount
+    }
+
+    /// Returns whether the participant pays a fee or receives a rebate.
+    #[must_use]
+    pub const fn direction(self) -> CallAuctionFeeDirection {
+        self.direction
+    }
+
+    /// Returns the positive transfer magnitude in the asset's smallest unit.
+    #[must_use]
+    pub const fn amount(self) -> i128 {
+        self.amount
+    }
+
+    /// Binds this assessment to one global transaction identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] if the assessed accounts or amount cannot form
+    /// an explicit fee transfer.
+    pub fn into_fee(self, transaction_id: TransactionId) -> Result<CallAuctionFee, LedgerError> {
+        let (debit_account_id, credit_account_id) = match self.direction {
+            CallAuctionFeeDirection::ParticipantPays => {
+                (self.participant_account_id, self.fee_account_id)
+            }
+            CallAuctionFeeDirection::ParticipantReceives => {
+                (self.fee_account_id, self.participant_account_id)
+            }
+        };
+        CallAuctionFee::new(
+            transaction_id,
+            self.trade_id,
+            debit_account_id,
+            credit_account_id,
+            self.asset_id,
+            self.amount,
+        )
     }
 }
 
@@ -2126,12 +2756,91 @@ impl CallAuctionSettlement {
         definition: InstrumentDefinition,
     ) -> Result<Self, LedgerError> {
         let trade_count = validate_call_auction_settlement_report(report, definition)?;
-        if transaction_ids.len() != trade_count {
-            return Err(LedgerError::CallAuctionSettlementTransactionCountMismatch {
-                transaction_count: transaction_ids.len(),
-                trade_count,
+        Self::from_validated_report_with_fees(
+            transaction_ids,
+            fees,
+            effective_date,
+            recorded_at,
+            report,
+            definition,
+            trade_count,
+        )
+    }
+
+    /// Calculates side-specific fees and constructs one atomic DVP-and-fee event.
+    ///
+    /// The schedule must match the immutable settlement definition. One DVP
+    /// transaction identity binds to each report trade. One fee transaction
+    /// identity binds to each configured side assessment in canonical report
+    /// order, Buy before Sell. Calculated transfers use [`CallAuctionFee`] and
+    /// the same indivisible settlement batch as explicitly supplied fees.
+    ///
+    /// The schedule revision is not stored as separate ledger policy metadata;
+    /// the resulting entries durably retain the exact postings and trade
+    /// references. Schedule distribution, authorization, and registry durability
+    /// remain external.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LedgerError`] for schedule-definition mismatch, report or DVP
+    /// failure, fee-transaction count mismatch, arithmetic overflow, or exact
+    /// preparation reservation failure. No ledger state is mutated during
+    /// construction.
+    pub fn from_report_with_fee_schedule(
+        transaction_ids: Vec<TransactionId>,
+        fee_transaction_ids: Vec<TransactionId>,
+        effective_date: AccountingDate,
+        recorded_at: TimestampNs,
+        report: &CallAuctionExecutionReport,
+        definition: InstrumentDefinition,
+        schedule: &CallAuctionFeeSchedule,
+    ) -> Result<Self, LedgerError> {
+        let schedule = *schedule;
+        schedule.validate_definition(definition)?;
+        let trade_count = validate_call_auction_settlement_report(report, definition)?;
+        validate_call_auction_settlement_transaction_count(transaction_ids.len(), trade_count)?;
+        let assessment_count = schedule.assessment_count(trade_count)?;
+        if fee_transaction_ids.len() != assessment_count {
+            return Err(LedgerError::CallAuctionFeeTransactionCountMismatch {
+                transaction_count: fee_transaction_ids.len(),
+                assessment_count,
             });
         }
+
+        let mut fees = reserve_ledger_preparation_vec(
+            assessment_count,
+            LedgerPreparationResource::CallAuctionCalculatedFees,
+        )?;
+        let mut fee_transaction_ids = fee_transaction_ids.into_iter();
+        schedule.for_each_assessment(report, definition, trade_count, |assessment| {
+            let Some(transaction_id) = fee_transaction_ids.next() else {
+                unreachable!("validated fee transaction count changed")
+            };
+            fees.push(assessment.into_fee(transaction_id)?);
+            Ok(())
+        })?;
+        debug_assert!(fee_transaction_ids.next().is_none());
+        Self::from_validated_report_with_fees(
+            transaction_ids,
+            fees,
+            effective_date,
+            recorded_at,
+            report,
+            definition,
+            trade_count,
+        )
+    }
+
+    fn from_validated_report_with_fees(
+        transaction_ids: Vec<TransactionId>,
+        fees: Vec<CallAuctionFee>,
+        effective_date: AccountingDate,
+        recorded_at: TimestampNs,
+        report: &CallAuctionExecutionReport,
+        definition: InstrumentDefinition,
+        trade_count: usize,
+    ) -> Result<Self, LedgerError> {
+        validate_call_auction_settlement_transaction_count(transaction_ids.len(), trade_count)?;
 
         let entry_count = trade_count
             .checked_add(fees.len())
@@ -2331,6 +3040,19 @@ impl CallAuctionSettlementCorrection {
             self.replacement_transaction_count,
         )
     }
+}
+
+fn validate_call_auction_settlement_transaction_count(
+    transaction_count: usize,
+    trade_count: usize,
+) -> Result<(), LedgerError> {
+    if transaction_count != trade_count {
+        return Err(LedgerError::CallAuctionSettlementTransactionCountMismatch {
+            transaction_count,
+            trade_count,
+        });
+    }
+    Ok(())
 }
 
 fn validate_call_auction_settlement_report(
@@ -5687,6 +6409,19 @@ mod resource_limit_tests {
                     resource,
                 )
                 .unwrap_err(),
+                LedgerError::PreparationAllocationFailed(resource)
+            );
+        }
+    }
+
+    #[test]
+    fn unrepresentable_fee_scratch_is_typed_by_exact_resource() {
+        for resource in [
+            LedgerPreparationResource::CallAuctionFeeAssessments,
+            LedgerPreparationResource::CallAuctionCalculatedFees,
+        ] {
+            assert_eq!(
+                reserve_ledger_preparation_vec::<u8>(usize::MAX, resource).unwrap_err(),
                 LedgerError::PreparationAllocationFailed(resource)
             );
         }

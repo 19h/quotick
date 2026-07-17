@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A163 are stable and are referenced from code comments and other
+identifiers A1-A164 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -4018,9 +4018,11 @@ ID order. For each trade, `from_report_with_fees` constructs the A116 DVP entry
 and then every contiguous fee entry bound to that trade. Trades may have zero,
 one, or multiple fees. An unknown or reordered binding and any global
 transaction-ID duplication across DVP or fee entries fail before ledger
-mutation. Fee calculation, account-role mapping, asset selection, and tax or
-disclosure parameters are authoritative external inputs. Authorization remains
-an external lifecycle responsibility; the ledger does not infer or attest it.
+mutation. For `from_report_with_fees`, fee calculation, account-role mapping,
+asset selection, and tax or disclosure parameters are authoritative external
+inputs. A164 defines a separate optional exact calculated schedule path.
+Authorization remains an external lifecycle responsibility; the ledger does
+not infer or attest it.
 
 **Dependent results.** [A1, A7, A11, A12, A17, A29, A33, A34, A42, A43,
 A64, A65, A66, A69, A79, A89, A90, A116, A118] For `T` trades, `C`
@@ -4058,8 +4060,8 @@ repair a torn tail, recover from uncut WAL and both A/B checkpoint slots, apply
 a suffix, and retry before and after reopen. Compare every balance, transaction
 reference, posting, record, sequence, checkpoint image, and WAL length. Any fee
 bound to another trade, sign/direction ambiguity, partial DVP or fee effect,
-second retry effect, frame split, recovery divergence, or inferred external fee
-policy falsifies A118.
+second retry effect, frame split, recovery divergence, or an inferred
+unconfigured external fee policy falsifies A118.
 
 ## A119 — atomic full-settlement call-auction correction
 
@@ -6983,10 +6985,99 @@ active commit, accepted sequence/coordinate regression or equal-boundary fork,
 rejected valid poisoned repair, transition-grammar duplication, allocation,
 invalid retained standby image, or encoded-byte change falsifies A163.
 
+## A164 — instrument-version-bound call-auction fee calculation
+
+**Assumption.** One immutable `CallAuctionFeeSchedule` has a non-zero revision,
+one instrument ID and definition version, one fee account, and optional Buy and
+Sell rules with at least one rule present. Each `CallAuctionFeeRule` selects one
+explicit transfer asset and exactly one basis: traded lots, delivered base
+asset units, or absolute quote notional. It has a non-zero signed-`i64`
+numerator, positive `u64` denominator, `Down`, `Up`, or `NearestTiesToEven`
+rounding, a positive signed-`i128` minimum amount, and an optional maximum no
+smaller than the minimum. A positive numerator charges the participant to the
+fee account; a negative numerator pays a rebate in the opposite direction.
+
+For price `p`, quantity `q`, base multiplier `b`, and quote multiplier `c`, the
+basis is respectively `q`, `q * b`, or `abs(p * q * c)`. The latter two reuse
+the shared settlement amounts. Every basis first proves the checked signed-
+`i128` base, quote, and opposite quote DVP legs are representable. Rate
+magnitude is exact rational integer arithmetic over the non-negative basis and
+absolute numerator. Rounding occurs once before the minimum and optional
+maximum clamp. An intermediate that exceeds fixed-width arithmetic returns the
+configured maximum when one exists because the exact positive result
+necessarily exceeds that maximum; without a maximum it is
+`ArithmeticOverflow`.
+
+Schedule identity/version validation precedes report validation. Assessment
+then consumes one complete accepted A116 report in canonical trade order and,
+within each trade, Buy before Sell. A participant equal to the fee account is
+rejected. `assess_report` returns the exact ordered assessment vector, including
+schedule revision, basis magnitude, direction, and positive amount.
+`from_report_with_fee_schedule` requires exactly one global fee transaction ID
+per assessment, converts each assessment through the A118 `CallAuctionFee`
+constructor, and reuses the existing DVP-plus-fee atomic settlement path.
+
+The resulting ordinary ledger entries durably retain exact postings and trade
+references under WAL/snapshot version 20. The schedule revision is process-
+local assessment provenance and is not separately encoded as ledger policy
+metadata. Schedule distribution, authentication, authorization, durable
+registry storage, tax/disclosure policy, and non-call-auction fee models remain
+external lifecycle responsibilities.
+
+**Dependent results.** [A1, A2, A7, A11, A12, A17, A29, A33, A34, A42,
+A43, A64, A65, A66, A69, A79, A89, A90, A116, A118, A164] Let `T` be report
+trades, `C` remainder cancellations, `S` configured side rules where
+`1 <= S <= 2`, and `F = T * S` assessments. Schedule checks are `O(1)`;
+report validation and assessment are `O(T + C + F)` time. Each basis/rate
+calculation uses a fixed number of checked integer operations and `O(1)`
+space. Public assessment fallibly reserves exactly `F` rows and owns `O(F)`
+result storage. Direct settlement instead fallibly reserves exactly `F`
+`CallAuctionFee` values, then retains A118's `N = T + F`,
+`L <= 4T + 2F`, and batch preparation/commit bounds. No successful or failed
+calculation mutates the ledger, report, definition, or schedule.
+
+**Falsification probe.** Reject revision zero, an empty schedule, a zero rate
+numerator or denominator, a zero/negative minimum, maximum below minimum,
+foreign instrument/version definitions, identical participant/fee accounts,
+invalid reports, and too few or too many fee transaction IDs. Exercise each
+basis at negative, zero, and positive prices; positive and negative rates;
+`i64::MIN` numerator magnitude; exact and inexact divisions; Down and Up; and
+nearest values below, above, and exactly halfway with even and odd quotients.
+
+Exercise minimum-only, maximum-only-effect, and minimum/maximum clamp paths;
+representable boundaries; uncapped overflow; and capped arithmetic overflow.
+Use zero, one, and multiple report trades with Buy-only, Sell-only, and two-
+side schedules. Require trade/Buy/Sell assessment order, fee/rebate account
+direction, exact basis/amount, DVP-followed-by-fees batch order, balances,
+typed assessment/calculated-fee reservation failure, atomic failure, exact
+retry, WAL/checkpoint recovery, and unchanged encoded bytes. Any floating-
+point dependence, double rounding, sign ambiguity, partial returned output,
+partial ledger effect, policy-metadata claim, allocation growth, or divergent
+explicit-versus-calculated settlement semantics falsifies A164.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** A164 adds deterministic instrument-version-bound Buy/Sell
+  call-auction fee and rebate assessment over lots, base units, or absolute
+  quote notional. Exact rational rounding, clamps, canonical ordering, and
+  conversion through A118 preserve the existing atomic DVP-plus-fee path.
+
+- **Medium impact opportunity:** callers can retain A164 assessment rows with
+  their schedule revision as external audit evidence before assigning global
+  fee transaction identities or constructing settlement.
+
+- **High impact risk:** ledger/WAL/checkpoint state retains exact postings and
+  trade references but not the schedule revision or schedule definition.
+  Durable policy provenance therefore depends on an authenticated external
+  schedule registry and evidence workflow.
+
+- **High impact boundary:** A164 covers at most one rule per side for one
+  call-auction instrument version. Continuous maker/taker classification,
+  participant tiers, tax, currency conversion, allocation/novation fees,
+  schedule authorization, and cross-instrument fee netting remain external.
 
 - **High impact:** A163 makes snapshot anchoring plus one retained continuous
   page or complete-auction-batch page one active-state transaction. Older

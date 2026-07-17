@@ -1529,17 +1529,29 @@ slot. Initial entry/batch construction creates one shared-owner control block
 after validation; that stable-Rust allocator boundary remains A12.
 
 For one accepted call-auction uncross with `T` trades, `C` remainder
-cancellations, `F` explicit fee transfers, `N = T + F` entries, and
-`L <= 4T + 2F` non-zero posting legs, report and canonical fee-binding
+cancellations, `F` explicit or calculated fee transfers, `N = T + F` entries,
+and `L <= 4T + 2F` non-zero posting legs, report and canonical fee-binding
 validation is `O(T + C + F)` time and `O(1)` auxiliary space. Settlement
 construction fallibly reserves exactly `N` entry handles and two postings per
 fee, uses checked `i128` DVP arithmetic, and owns `O(N + L)` result storage
-before ledger mutation. The `T = 1, F = 0` case uses ordinary entry
-preparation. Otherwise batch construction adds expected `O(N)` time and
-`O(N)` identity storage, after which the existing batch bounds above apply:
-`O(L log L)` preparation, `O(N + L + U)` auxiliary memory, and expected
-`O(N + U)` commit. Durable settlement adds one entry or batch frame; exact
-replay is resolved without frame growth.
+before ledger mutation.
+
+For an immutable fee schedule with `S` configured side rules,
+`1 <= S <= 2` and `F = T * S`. Schedule validation is `O(1)`. Assessment is
+`O(T + C + F)` time; each basis/rate calculation uses a fixed number of
+checked `i128`/`u128` multiply, divide, remainder, comparison, and clamp
+operations. `assess_report` fallibly reserves exactly `F` output rows and owns
+`O(F)` result storage. Direct calculated settlement instead reserves exactly
+`F` `CallAuctionFee` values before constructing the existing settlement; it
+does not materialize the public assessment vector.
+
+The `T = 1, F = 0` case uses ordinary entry preparation. Otherwise batch
+construction adds expected `O(N)` time and `O(N)` identity storage, after which
+the existing batch bounds above apply: `O(L log L)` preparation,
+`O(N + L + U)` auxiliary memory, and expected `O(N + U)` commit. Durable
+settlement adds one entry or batch frame; exact replay is resolved without
+frame growth. The fee schedule and revision add no ledger, WAL, or checkpoint
+storage.
 
 For a correction over `N` original settlement entries with `L_o` posting legs
 and a replacement of `M` entries with `L_r` posting legs, let

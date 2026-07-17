@@ -630,6 +630,11 @@ Run any program with `cargo run --example <name>`.
   in canonical order. Every fee has its own global transaction ID and balanced
   debit/credit pair; DVP and fee entries commit in the same atomic batch.
   Rebates reverse account direction rather than using negative fee amounts.
+- Immutable instrument-version-bound schedules can calculate one Buy and/or
+  Sell transfer per report trade from lots, base units, or absolute quote
+  notional. Signed rational rates use exact selectable rounding followed by a
+  positive minimum and optional maximum; calculated transfers reuse the same
+  atomic fee path.
 - Full-settlement busts reverse every original DVP and fee entry in canonical
   order. Replacement corrections append one separately validated complete
   settlement after all inverses; exact original entry/batch grouping is proved
@@ -765,12 +770,13 @@ external. The auction path provides instrument-bound atomic DVP settlement for
 a complete accepted uncross report and explicit trade-bound fee transfers in
 the same ledger event. It can atomically bust that exact complete settlement or
 reverse it before one complete replacement settlement. Fee calculation and
-authorization, correction reason and authorization, coordinated matching/risk/
-external-position correction, partial trade/allocation amendments, allocation
-workflows, settlement-date derivation, reference or dynamic-band derivation,
-alternative-counterparty STP rearrangement, cancel/decrement STP policies,
-calendar-driven phase scheduling, and venue-specific uncross rules remain
-external.
+authorization outside the immutable side schedule, schedule distribution/
+authentication and durable registry storage, correction reason and
+authorization, coordinated matching/risk/external-position correction,
+partial trade/allocation amendments, allocation workflows, settlement-date
+derivation, reference or dynamic-band derivation, alternative-counterparty STP
+rearrangement, cancel/decrement STP policies, calendar-driven phase scheduling,
+and venue-specific uncross rules remain external.
 
 The complete boundary, the failure model, and the register of environmental
 assumptions are documented in
@@ -782,7 +788,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 163 tagged assumptions (A1–A163), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 164 tagged assumptions (A1–A164), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -939,14 +945,15 @@ includes:
   iteration, retry stability, unchanged resource telemetry, and durable
   recovery. Account-order queries cover canonical all/side selection, unknown
   owners, typed allocation failure, private-index corruption, and nonmutation.
-  Settlement coverage proves one-entry and multi-entry mappings,
-  canonical explicit fee binding, instrument/version
-  mismatch, invalid fee and same-account rejection, overflow/capacity
-  atomicity, partial-prior-commit detection, one-frame recovery, checkpoint
-  cutover, and WAL-free exact retry. Full-settlement correction coverage adds
-  fee-enriched busts, reversal-before-replacement order, exact original-group
-  proof, identity/timestamp/capacity rejection, one-frame recovery, checkpoint
-  cutover, and retry without a committed prefix.
+  Settlement coverage proves one-entry and multi-entry mappings, canonical
+  explicit fee binding, version-bound calculated Buy/Sell fees, exact rational
+  rounding/clamps and fee/rebate direction, instrument/version mismatch,
+  invalid fee and same-account rejection, overflow/capacity atomicity, partial-
+  prior-commit detection, one-frame recovery, checkpoint cutover, and WAL-free
+  exact retry. Full-settlement correction coverage adds fee-enriched busts,
+  reversal-before-replacement order, exact original-group proof, identity/
+  timestamp/capacity rejection, one-frame recovery, checkpoint cutover, and
+  retry without a committed prefix.
 - **Market data and accounting:** continuous and complete-batch auction depth
   reconstruction, replay-first gap repair, snapshot fallback,
   allocation-stable ring wrap, continuous and auction settlement, reversals,
