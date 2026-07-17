@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A151 are stable and are referenced from code comments and other
+identifiers A1-A152 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -6069,10 +6069,123 @@ change on noncommit; WAL growth before acceptance; lost lease; risk trace
 duplication or omission; interposed engine mutation; durable grammar/recovery
 drift; allocation; or new wire value falsifies A151.
 
+## A152 — provenance-bound call-auction order observation and conditional cancellation
+
+**Assumption.** `CallAuctionBook::try_order_observation` returns one owned,
+fixed-size `CallAuctionOrderObservation` bound to the immutable instrument ID,
+instrument-definition version, current collection-book revision, and requested
+`OrderId`. Indexed absence produces `state = None`. Present state is exposed
+only after the selected active row is consistent with accepted identity,
+instrument quantity/price rules, assigned priority prefix, its exact
+market/limit queue aggregates and endpoints, reciprocal immediate queue links,
+and its owner's exact side-lane aggregates, endpoints, and reciprocal immediate
+links. This is a selected-order local proof, not a complete book/topology audit;
+unrelated corruption remains the responsibility of the A74 offline audit.
+
+One `try_submit_cancel_order_if` call on `CallAuctionEngine`,
+`CallAuctionRiskManagedEngine`, `DurableCallAuctionEngine`, or
+`DurableCallAuctionRiskEngine` holds the corresponding exclusive shard borrow
+across ordinary owner-cancel preparation, fail-closed selected-order
+observation, one synchronous predicate, and commit of that same move-only
+preparation. `CallAuctionCancelObservation` owns the exact target snapshot and
+binds command identity/time, instrument ID/version, prospective command and
+first-event sequences, phase/cycle snapshot, source/resulting book revisions,
+and the previous still-current A112 indication. Its compact internal indication
+form is lossless: current auction/phase/book coordinates are independently
+validated and the clearing result is reconstructed exactly from price and
+eligible buy/sell `u128` quantities. The public value is `Copy`, has no
+destructor, and is independent of the preparation after return.
+
+Exact replay and every core business rejection bypass observation and the
+predicate and return `observation = None` with the ordinary report. Decline
+returns the owned observation without consuming sequence, invalidating the
+indication, mutating book/history/risk, or appending WAL; unwind has the same
+state semantics. Acceptance revalidates the stored source revision and exact
+selected state at commit, removes that same order, invalidates the current
+indication, and returns `observation = Some` with the ordinary report. Coupled
+authorization is account-independent for cancellation; accepted application
+releases exactly the target reservation once. The coupled wrapper validates
+that account-independent authorization before the predicate and repeats it at
+ordinary commit. Durable acceptance and business rejection retain the existing
+command/report two-frame grammar; decline,
+unwind, and replay append zero frames. Neither observation nor decision is
+encoded, authenticated, authorized, remotely transported, or coordinated
+across shards. A152 adds no wire value or version.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A9, A10, A12, A15, A22, A37,
+A39, A52, A60, A62, A64, A65, A67, A72, A74, A80, A81, A82, A85, A112,
+A151, A152] For `O` active orders, `P` occupied limit prices, and `A` active
+accounts, one present direct observation performs a constant number of stable-
+AVL identity/neighbor lookups and at most one price lookup plus one expected
+constant-time account lookup. Expected time is `O(log(O + 1) + log(P + 1))`,
+auxiliary space is `O(1)`, and successful allocation is zero. A fully
+colliding account hash can add `O(A)` lookup time without storage growth.
+Absent lookup is `O(log(O + 1))`.
+
+Ordinary conditional preparation and pre-predicate observation each retain the
+same AVL bound. Decline or unwind costs
+`O(log(O + 1) + log(P + 1) + F)` for predicate cost `F`; acceptance adds one
+commit-time selected observation plus ordinary cancellation and therefore
+retains `O(log(O + 1) + log(P + 1) + F)` asymptotic time with larger constant
+factors. The observation and generic conditional evaluator add `O(1)` storage.
+Coupled application is expected `O(1)` beyond book work. Durable acceptance
+and business rejection append two existing frames; decline, unwind, and replay
+append zero. Count, quantity, price, revision, and sequence arithmetic is exact
+integer arithmetic; approximation error is zero.
+
+**Falsification probe.** Exercise missing, singleton, head, middle, and tail
+market/limit targets on both sides, multiple accounts, classes, signed prices,
+and present/absent previous indications with and without clearing. Corrupt the
+selected identity, accepted-ID membership, quantity, price, priority sequence,
+queue aggregate/endpoints, immediate queue links, owner membership, owner-lane
+aggregate/endpoints, and immediate owner links; require a typed query failure
+before state output or predicate execution. Mutate an unrelated order through
+an internal white-box path after cancel preparation and require stale-
+generation rejection before the predicate.
+
+Across all four conditional surfaces, run accepting, declining, and unwinding
+predicates; exercise wrong route/version, wrong owner, missing target, exact
+retry, command-ID collision, counter/history exhaustion, selected-state
+corruption, journal failure, and reopen. Require exact observation/report event
+equality, one predicate call only for a core-admissible target, unchanged
+sequence/book/indication/history/risk/WAL on noncommit, exact target-only
+removal and reservation release on acceptance, zero replay frames, two accepted
+frames, and identical plain/coupled recovered state. Any partial or stale
+observation, predicate on rejection/replay, hidden whole-book-validity claim,
+interposed mutation, noncommit effect, different removed target, reservation
+drift, WAL-before-acceptance, recovery divergence, successful-path allocation,
+or new wire value falsifies A152.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** A152 closes the local gap between observing one active
+  call-auction target and committing its owner cancellation. The exact target,
+  provenance, phase, revision, sequence, and prior indication are owned by the
+  outcome, while the exclusive engine borrow prevents an interposed safe
+  transition and accepted commit revalidates the same target.
+
+- **Medium impact opportunity:** deterministic OMS, reconciliation,
+  surveillance, and exposure controls can condition cancellation on exact
+  private target state without copying a full book or inferring state from a
+  later event. The reusable owned conditional evaluator can support future
+  amendment/replacement controls after their operation-specific observations
+  and gates are defined.
+
+- **Medium impact risk:** A152 validates the selected order, immediate price-
+  queue neighbors, immediate owner-lane neighbors, and redundant local
+  aggregates. It deliberately does not traverse unrelated topology, and the
+  synchronous predicate extends the exclusive shard borrow. Whole-book
+  integrity still requires A74; maximum-capacity predicate and cache-latency
+  effects remain unknown pending pinned-hardware measurement.
+
+- **High impact boundary:** A152 supplies no principal authentication,
+  cancel-on-behalf authorization, durable decision evidence before command
+  append, remote protocol, callback deadline, or multi-shard atomicity. A
+  process failure after local acceptance but before WAL command append retains
+  no recoverable policy decision.
 
 - **High impact:** A151 closes the process-local gap between call-auction
   allocation/pairing observation and uncross commit. Policy code can inspect

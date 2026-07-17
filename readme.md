@@ -392,7 +392,9 @@ Run any program with `cargo run --example <name>`.
   compared after market/price and before time/ID, owner-checked cancellation,
   account/side-scoped mass cancellation through a bounded intrusive owner
   index, typed fallible canonical account-order-ID extraction over the same
-  owner lanes,
+  owner lanes, and fixed-size instrument/version/revision-bound active-order
+  observation that fail-closes on selected price-queue or owner-lane
+  contradiction,
   revision-bound indicative results, atomic new-identity cancel/replace with
   complete priority loss and saturated active/price-level capacity reuse when
   accepted-ID headroom remains, strict retained-priority active-quantity
@@ -422,6 +424,12 @@ Run any program with `cargo run --example <name>`.
   returns the leased buffers without sequencing, state mutation, risk change,
   or WAL growth. Durable acceptance and rejection retain the existing two-
   frame command/report grammar.
+- Atomic conditional owner cancellation on the plain, coupled-risk, and both
+  durable engine surfaces. A fixed-size owned observation binds the exact
+  command, prospective sequences, phase, book revisions, prior indication, and
+  locally validated target state to the same prepared cancel. Replay and
+  business rejection bypass the predicate; decline or unwind is state-, risk-,
+  and WAL-neutral; accepted durable execution uses the existing two frames.
 - Zero-copy exact lookup and chronological iteration over the engine's bounded
   command/report history, including accepted commands and business rejections;
   exact retries add no row and do not change the canonical cached report.
@@ -462,6 +470,10 @@ Run any program with `cargo run --example <name>`.
   Conditional call-auction uncross is also account-independent before
   observation. Acceptance applies the ordinary complete uncross trace once;
   decline or unwind leaves reservations, exposures, and positions unchanged.
+  Conditional call-auction cancellation is likewise account-independent and
+  validates that coupled authorization after ordinary core preparation but
+  before observation. Acceptance releases only the exact observed
+  target reservation; decline or unwind leaves every reservation unchanged.
 - Reservation lifecycle derived from the sequenced trace across fills,
   cancellation, GTD expiry, stop arming/activation, replacement, mass
   cancellation, account controls, and self-trade prevention; dormant stops
@@ -678,7 +690,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 151 tagged assumptions (A1–A151), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 152 tagged assumptions (A1–A152), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -790,7 +802,11 @@ includes:
   proves exact zero-copy allocation/trade/cancellation observation, decline and
   unwind neutrality, predicate bypass on rejection/replay, lease exhaustion
   and return, coupled-risk application, WAL-free noncommit, and plain/coupled
-  durable recovery. Retained auction-history queries
+  durable recovery. Atomic conditional owner-cancel coverage proves fixed-size
+  exact target/provenance observation, selected-link fail-closed behavior,
+  rejection/replay predicate bypass, unwind/decline neutrality, exact coupled
+  reservation release, zero-frame durable noncommit, two-frame acceptance,
+  and plain/coupled durable recovery. Retained auction-history queries
   cover accepted and rejected rows, exact lookup, zero-copy chronological
   iteration, retry stability, unchanged resource telemetry, and durable
   recovery. Account-order queries cover canonical all/side selection, unknown

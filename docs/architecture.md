@@ -1129,6 +1129,14 @@ interest for discovery, allocation, and uncross preparation.
      previous/tail links, count, quantity, and duplicate identity. Allocation
      or topology failure is typed and returns no partial output; an unknown
      account returns an empty vector and no query mutates collection state.
+   - `try_order_observation` returns one fixed-size
+     instrument/version/book-revision-bound result for an exact `OrderId`.
+     Indexed absence is explicit. Present state is returned only after local
+     validation of accepted identity, instrument rules, priority prefix,
+     market/limit queue aggregates and endpoints, reciprocal immediate queue
+     links, owner-side aggregates and endpoints, and reciprocal immediate owner
+     links. It allocates no successful-path output and does not claim to replace
+     the complete offline topology audit.
    - Read-only aggregate inspection exposes direct and best occupied limit
      levels without allocation. `limit_depth_iter` is a double-ended exact-size
      view that traverses bids descending or asks ascending without caller-owned
@@ -1157,7 +1165,11 @@ interest for discovery, allocation, and uncross preparation.
    `O(K(log K + log O + log P))` and independent of unrelated active orders.
    Read-only account-ID extraction is expected `O(1) + O(K log K)` time and
    `O(K)` caller-owned output for `K` selected orders, also independent of
-   unrelated active orders. Direct/best aggregate lookup is
+   unrelated active orders. A present exact-order observation costs expected
+   `O(log(O + 1) + log(P + 1))` time, plus `O(A)` only under a fully colliding
+   active-account hash of cardinality `A`; absence costs `O(log(O + 1))`.
+   Both use `O(1)` fixed output and auxiliary space. Direct/best aggregate
+   lookup is
    `O(log(P + 1))`; allocation-free depth iteration has
    `O(log(P + 1))` setup, `O(P)` complete traversal, and `O(1)` auxiliary
    space. Fallible output of limit `L` costs
@@ -1364,6 +1376,26 @@ process-local call-auction engine.
       engine mutation and consumes the identical preparation. The observation
       and decision are process-local and valid only during the call; they are
       not retained or encoded.
+13. `try_submit_cancel_order_if` holds one exclusive mutable engine borrow
+    across ordinary owner-cancel preparation, selected-order validation, one
+    synchronous predicate, and commit of that same preparation.
+    - `CallAuctionCancelObservation` is a fixed-size owned value carrying the
+      exact target snapshot, command/time, instrument/version, prospective
+      command and first-event sequences, phase/cycle snapshot, source/resulting
+      book revisions, and previous still-current indication. The indication's
+      compact representation reconstructs exact clearing state from price and
+      eligible buy/sell quantities after independently validating shared
+      auction/phase/book coordinates.
+    - Exact replay and business rejection bypass observation and predicate and
+      report `observation = None`. Decline returns the owned observation and
+      unwind drops it; neither path changes sequence, event, indication, book,
+      history, risk, or durable state. Acceptance revalidates source revision
+      and exact target state, removes that target, and returns the observation
+      with the ordinary report.
+    - The selected-state query and conditional path prove local target,
+      immediate-neighbor, and redundant-aggregate consistency, not unrelated
+      whole-book topology. The observation/decision are process-local and add
+      no command, report, checkpoint, snapshot, market-data, or WAL value.
 
 ## Coupled call-auction risk invariants
 
@@ -1450,6 +1482,12 @@ admission and tracks reservations and positions.
    changes no reservation, exposure, position, or netting scratch. Acceptance
    commits the observed trace once, releasing paired/remainder reservations and
    applying the existing per-account net position update exactly once.
+10. Conditional owner cancellation performs ordinary core preparation and its
+    account-independent coupled authorization before selected-state
+    observation. Commit repeats the same nonmutating authorization. Decline or
+    unwind changes no reservation, exposure, or position; acceptance commits
+    the exact observed target and
+    releases only its reservation once through the ordinary cancellation trace.
 
 ## Durable call-auction invariants
 
@@ -1491,6 +1529,12 @@ call-auction engine.
      command-before-state-before-report two-frame grammar. Decline, unwind, and
      exact retry append zero frames; no command, report, checkpoint, or WAL
      value changes.
+   - Conditional owner cancellation likewise performs fail-closed selected-
+     order validation and invokes its process-local predicate before command
+     append. Acceptance and business rejection use the same two-frame grammar;
+     decline, unwind, and exact retry append zero frames. Coupled acceptance
+     releases the exact target reservation through the ordinary recovered
+     trace; no durable observation or decision value is added.
 4. Full-WAL recovery starts a fresh engine, submits every persisted command,
    and requires exact equality with its following report. Checkpoint recovery
    independently validates direct state against complete semantic history,
@@ -2667,6 +2711,13 @@ and exact-replay predicate bypass; internally stale preparation rejection before
 the predicate; A86 lease exhaustion and return; coupled reservation/position
 application; zero-frame durable noncommit; two-frame acceptance and business
 rejection; and exact plain/coupled-risk reopen state.
+Conditional call-auction owner-cancel tests cover fixed-size owned command,
+sequence, phase, book, prior-indication, and exact target provenance; clearing-
+present indication reconstruction; direct present/absent revision binding;
+selected-link corruption and stale-generation rejection before predicate;
+acceptance, decline, and unwind; business-rejection/replay predicate bypass;
+target-only mutation and coupled reservation release; zero-frame durable
+noncommit, two-frame acceptance, and exact plain/coupled-risk reopen state.
 
 FOK tests cover reserve-hidden and fully hidden total-leaves eligibility,
 displayed- and hidden-class same-price self barriers, atomic decrement-and-
@@ -3143,6 +3194,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Conditional expiry control | Atomic expiry control with exact prior/resulting watermarks and one canonical qualifying GTD set is implemented across plain, coupled-risk, durable, and durable-risk books; remaining work is authenticated controller authorization, sequenced clock/calendar scheduling, cross-shard coordination, and completion aggregation |
 | High | Conditional stop-reference control | Atomic bounded stop-reference control with exact prior/requested sourced references and one canonical qualifying dormant-stop prefix is implemented across plain, coupled-risk, durable, and durable-risk books; remaining work is authenticated source/controller authorization, raw-feed normalization and gap recovery, cross-shard coordination, and completion aggregation |
 | High | Conditional call-auction uncross | Atomic local binding of exact prepared allocation, counterparty trades, remainder cancellations, and phase/book provenance to the same uncross commit is implemented across plain, coupled-risk, durable, and durable-risk engines; remaining work is authenticated policy authority, durable decision evidence before command append, callback latency limits, remote protocol mapping, and multi-shard coordination |
+| High | Conditional call-auction cancellation | Atomic local binding of one fail-closed selected target plus command/sequence/phase/book/indication provenance to the same owner-cancel commit is implemented across plain, coupled-risk, durable, and durable-risk engines; remaining work is authenticated cancel-on-behalf policy, durable decision evidence before command append, callback latency limits, remote protocol mapping, and multi-shard coordination |
 | High | Instrument lifecycle expansion | authoritative calendar ingestion/distribution/activation, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |

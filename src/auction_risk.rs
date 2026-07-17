@@ -16,12 +16,14 @@ use crate::auction_book::{
     CallAuctionBookLimits, CallAuctionBookLimitsSpec, CallAuctionOrder, CallAuctionOrderSnapshot,
 };
 use crate::auction_engine::{
-    CallAuctionCheckpoint, CallAuctionCheckpointError, CallAuctionCommand,
-    CallAuctionCommandOutcome, CallAuctionCommandPreparation, CallAuctionEngine,
-    CallAuctionEngineConstructionError, CallAuctionEngineError, CallAuctionEngineLimits,
-    CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionExecutionReport,
-    CallAuctionRejectReason, CallAuctionUncrossCommand, CallAuctionUncrossObservation,
-    ConditionalCallAuctionOutcome, ConditionalCallAuctionPreparation, PreparedCallAuctionCommand,
+    CallAuctionCancelObservation, CallAuctionCancelOrder, CallAuctionCheckpoint,
+    CallAuctionCheckpointError, CallAuctionCommand, CallAuctionCommandOutcome,
+    CallAuctionCommandPreparation, CallAuctionEngine, CallAuctionEngineConstructionError,
+    CallAuctionEngineError, CallAuctionEngineLimits, CallAuctionEngineLimitsSpec,
+    CallAuctionEventKind, CallAuctionExecutionReport, CallAuctionRejectReason,
+    CallAuctionUncrossCommand, CallAuctionUncrossObservation, ConditionalCallAuctionCommandOutcome,
+    ConditionalCallAuctionCommandPreparation, ConditionalCallAuctionOutcome,
+    ConditionalCallAuctionPreparation, PreparedCallAuctionCommand, evaluate_conditional_cancel,
     evaluate_conditional_uncross,
 };
 use crate::bounded_hash::BoundedHashMap;
@@ -1554,6 +1556,22 @@ impl CallAuctionRiskManagedEngine {
         Ok(report)
     }
 
+    pub(crate) fn validate_conditional_cancel_authorization(
+        &self,
+        preparation: &CallAuctionCommandPreparation,
+    ) -> Result<(), CallAuctionEngineError> {
+        let CallAuctionCommandPreparation::Ready(prepared) = preparation else {
+            return Ok(());
+        };
+        if !matches!(prepared.command(), CallAuctionCommand::Cancel(_)) {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        }
+        if prepared.core_rejection().is_none() && self.risk.authorize(prepared.command()).is_err() {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        }
+        Ok(())
+    }
+
     /// Applies one command with exact retry suppression and sequenced risk rejection.
     ///
     /// # Errors
@@ -1566,6 +1584,41 @@ impl CallAuctionRiskManagedEngine {
         match self.prepare(command)? {
             CallAuctionCommandPreparation::Replay(report) => Ok(report),
             CallAuctionCommandPreparation::Ready(prepared) => self.commit(prepared),
+        }
+    }
+
+    /// Atomically risk-gates, observes, and conditionally commits one owner cancel.
+    ///
+    /// Replay plus core rejection bypass `accept`. Decline or unwind changes
+    /// neither auction nor risk state. Acceptance commits the exact observed
+    /// preparation and releases its coupled reservation once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionEngineError`] for preparation, fail-closed query,
+    /// generation validation, or coupled commit failure.
+    pub fn try_submit_cancel_order_if(
+        &mut self,
+        command: CallAuctionCancelOrder,
+        accept: impl FnOnce(&CallAuctionCancelObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionCancelObservation>,
+        CallAuctionEngineError,
+    > {
+        let preparation = self.prepare(CallAuctionCommand::Cancel(command))?;
+        self.validate_conditional_cancel_authorization(&preparation)?;
+        match evaluate_conditional_cancel(&self.engine, preparation, accept)? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => Ok(outcome),
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => {
+                self.commit(prepared)
+                    .map(|report| ConditionalCallAuctionCommandOutcome::Reported {
+                        observation: if report.replayed { None } else { observation },
+                        report,
+                    })
+            }
         }
     }
 

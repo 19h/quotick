@@ -377,6 +377,12 @@ orders, and `P` occupied limit prices:
   aggregates, and sorts them in `O(K log K)`. Its `O(K)` caller-owned output and
   runtime are independent of unrelated active orders; failures return no
   partial vector and mutate no collection state.
+- `try_order_observation` performs one active-order AVL lookup. A present row
+  adds accepted-identity, immediate-neighbor, and at most one price-level AVL
+  lookup plus one expected `O(1)` active-account lookup. Its expected time is
+  `O(log(O + 1) + log(P + 1))`; indexed absence is `O(log(O + 1))`. A fully
+  colliding active-account hash can add `O(A)` time for `A` active accounts.
+  The result and auxiliary state are `O(1)`, and success allocates nothing.
 - Direct and best aggregate limit-level lookup are `O(log(P + 1))` and allocate
   no output. `limit_depth_iter` has `O(log(P + 1))` setup and streams all `P`
   levels in market priority using `O(1)` auxiliary space. For requested limit
@@ -446,6 +452,17 @@ A86 plan/trade/cancellation buffers, adds `O(1)` auxiliary state, and performs
 no allocation. Coupled-risk acceptance retains expected `O(T + C)` trace
 application. Durable acceptance and business rejection append two existing
 frames; decline, unwind, and replay append zero.
+
+Conditional owner cancellation first performs ordinary owner-cancel preflight,
+then one fail-closed selected-order observation before the predicate. Decline
+or unwind is `O(log(O + 1) + log(P + 1) + F)` for predicate cost `F` and adds
+one fixed-size owned result. Acceptance repeats selected-state validation at
+commit and performs the ordinary AVL cancellation; constant factors increase
+without changing the `O(log(O + 1) + log(P + 1) + F)` asymptotic bound. The
+generic evaluator and observation use `O(1)` auxiliary space and allocate
+nothing on success. Coupled acceptance adds expected `O(1)` reservation
+release. Durable acceptance and business rejection append two existing frames;
+decline, unwind, and replay append zero.
 
 One sequenced indicative publication reconstructs the canonical bid and ask
 aggregates and applies the shared discovery kernel in `O(B + A)` time with

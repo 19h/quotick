@@ -384,6 +384,53 @@ pub struct CallAuctionOrderSnapshot {
     pub priority_sequence: u64,
 }
 
+/// Immutable result of one fail-closed active-order lookup.
+///
+/// The optional state is bound to the exact instrument definition and
+/// collection-book revision observed by the query. A present order is returned
+/// only after its identity, instrument rules, price queue, and account lane are
+/// locally consistent. The value owns no allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionOrderObservation {
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    book_revision: u64,
+    order_id: OrderId,
+    state: Option<CallAuctionOrderSnapshot>,
+}
+
+impl CallAuctionOrderObservation {
+    /// Returns the routed instrument identity.
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version.
+    #[must_use]
+    pub const fn instrument_version(self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the exact collection-book revision observed by the query.
+    #[must_use]
+    pub const fn book_revision(self) -> u64 {
+        self.book_revision
+    }
+
+    /// Returns the requested order identifier.
+    #[must_use]
+    pub const fn order_id(self) -> OrderId {
+        self.order_id
+    }
+
+    /// Returns validated active state, or `None` when the order is not active.
+    #[must_use]
+    pub const fn state(self) -> Option<CallAuctionOrderSnapshot> {
+        self.state
+    }
+}
+
 /// One anonymized aggregate limit-price level in a call-auction collection book.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CallAuctionLevelSnapshot {
@@ -2129,6 +2176,38 @@ impl CallAuctionBook {
         self.orders.get(&order_id).copied().map(Into::into)
     }
 
+    /// Fallibly observes one active order at the current book revision.
+    ///
+    /// A present result validates only the selected order and its immediate
+    /// price-queue and account-lane topology. The query performs indexed
+    /// lookups, uses `O(1)` auxiliary space, and does not allocate on success.
+    /// It does not constitute a full-book invariant audit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionBookQueryError::InvariantViolation`] if selected
+    /// private state contradicts identity, instrument, aggregate, or intrusive
+    /// link invariants.
+    pub fn try_order_observation(
+        &self,
+        order_id: OrderId,
+    ) -> Result<CallAuctionOrderObservation, CallAuctionBookQueryError> {
+        let state = match self.orders.get(&order_id).copied() {
+            Some(order) => {
+                self.validate_selected_order(order_id, order)?;
+                Some(order.into())
+            }
+            None => None,
+        };
+        Ok(CallAuctionOrderObservation {
+            instrument_id: self.definition.instrument_id(),
+            instrument_version: self.definition.version(),
+            book_revision: self.state_revision,
+            order_id,
+            state,
+        })
+    }
+
     /// Returns one account's active-order count for all orders or one side.
     ///
     /// This performs one expected `O(1)` account lookup and no book scan.
@@ -3206,6 +3285,301 @@ impl CallAuctionBook {
                     "active order priority sequence is outside the assigned prefix",
                 ));
             }
+        }
+        Ok(())
+    }
+
+    fn validate_selected_order(
+        &self,
+        order_id: OrderId,
+        order: RestingAuctionOrder,
+    ) -> Result<(), CallAuctionInvariantViolation> {
+        if order.order_id != order_id || self.seen_order_ids.get(&order_id).is_none() {
+            return Err(CallAuctionInvariantViolation::new(
+                "selected active order identity is inconsistent or absent from accepted identities",
+            ));
+        }
+        self.definition
+            .quantity_rules()
+            .validate_leaves(order.quantity)
+            .map_err(|_| {
+                CallAuctionInvariantViolation::new(
+                    "selected active order quantity violates instrument rules",
+                )
+            })?;
+        if let AuctionOrderConstraint::Limit(price) = order.constraint {
+            self.definition.price_rules().validate(price).map_err(|_| {
+                CallAuctionInvariantViolation::new(
+                    "selected active limit price violates instrument rules",
+                )
+            })?;
+        }
+        if order.priority_sequence == 0 || order.priority_sequence >= self.next_priority_sequence {
+            return Err(CallAuctionInvariantViolation::new(
+                "selected active order priority sequence is outside the assigned prefix",
+            ));
+        }
+
+        let queue = self.queue_snapshot(order.side, order.constraint);
+        self.validate_selected_price_links(order, queue)?;
+        let account = self
+            .account_orders
+            .get(&order.account_id)
+            .copied()
+            .ok_or_else(|| {
+                CallAuctionInvariantViolation::new(
+                    "selected active order owner is absent from the account index",
+                )
+            })?;
+        self.validate_selected_account_links(order, account.side(order.side))
+    }
+
+    fn validate_selected_price_links(
+        &self,
+        order: RestingAuctionOrder,
+        queue: AuctionQueue,
+    ) -> Result<(), CallAuctionInvariantViolation> {
+        let quantity = u128::from(order.quantity.lots());
+        if queue.order_count == 0
+            || queue.head.is_none()
+            || queue.tail.is_none()
+            || queue.total_quantity < quantity
+            || usize::try_from(queue.order_count).map_or(true, |count| count > self.orders.len())
+        {
+            return Err(CallAuctionInvariantViolation::new(
+                "selected active order price queue lacks consistent non-empty aggregates",
+            ));
+        }
+        if queue.order_count == 1 {
+            if queue.head != Some(order.order_id)
+                || queue.tail != Some(order.order_id)
+                || queue.total_quantity != quantity
+                || order.previous.is_some()
+                || order.next.is_some()
+            {
+                return Err(CallAuctionInvariantViolation::new(
+                    "singleton selected active order price queue is inconsistent",
+                ));
+            }
+            return Ok(());
+        }
+        self.validate_selected_price_endpoints(order, queue)?;
+        if queue.total_quantity <= quantity
+            || (order.previous.is_none()) != (queue.head == Some(order.order_id))
+            || (order.next.is_none()) != (queue.tail == Some(order.order_id))
+            || order.previous == order.next
+            || u64::from(order.previous.is_some()) + u64::from(order.next.is_some()) + 1
+                > queue.order_count
+        {
+            return Err(CallAuctionInvariantViolation::new(
+                "selected active order contradicts its price-queue endpoints or aggregate",
+            ));
+        }
+        if let Some(previous_id) = order.previous {
+            if previous_id == order.order_id {
+                return Err(CallAuctionInvariantViolation::new(
+                    "selected active order price predecessor is self-referential",
+                ));
+            }
+            let previous = self.orders.get(&previous_id).copied().ok_or_else(|| {
+                CallAuctionInvariantViolation::new(
+                    "selected active order price predecessor is absent",
+                )
+            })?;
+            if previous.order_id != previous_id
+                || self.seen_order_ids.get(&previous_id).is_none()
+                || previous.side != order.side
+                || previous.constraint != order.constraint
+                || previous.next != Some(order.order_id)
+                || previous.priority_sequence >= order.priority_sequence
+            {
+                return Err(CallAuctionInvariantViolation::new(
+                    "selected active order price predecessor is inconsistent",
+                ));
+            }
+        }
+        if let Some(next_id) = order.next {
+            if next_id == order.order_id {
+                return Err(CallAuctionInvariantViolation::new(
+                    "selected active order price successor is self-referential",
+                ));
+            }
+            let next = self.orders.get(&next_id).copied().ok_or_else(|| {
+                CallAuctionInvariantViolation::new(
+                    "selected active order price successor is absent",
+                )
+            })?;
+            if next.order_id != next_id
+                || self.seen_order_ids.get(&next_id).is_none()
+                || next.side != order.side
+                || next.constraint != order.constraint
+                || next.previous != Some(order.order_id)
+                || next.priority_sequence <= order.priority_sequence
+            {
+                return Err(CallAuctionInvariantViolation::new(
+                    "selected active order price successor is inconsistent",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_selected_price_endpoints(
+        &self,
+        order: RestingAuctionOrder,
+        queue: AuctionQueue,
+    ) -> Result<(), CallAuctionInvariantViolation> {
+        let head_id = queue.head.expect("validated non-empty queue has a head");
+        let tail_id = queue.tail.expect("validated non-empty queue has a tail");
+        let head = self.orders.get(&head_id).copied().ok_or_else(|| {
+            CallAuctionInvariantViolation::new("selected active order price-queue head is absent")
+        })?;
+        let tail = self.orders.get(&tail_id).copied().ok_or_else(|| {
+            CallAuctionInvariantViolation::new("selected active order price-queue tail is absent")
+        })?;
+        if head_id == tail_id
+            || head.order_id != head_id
+            || tail.order_id != tail_id
+            || self.seen_order_ids.get(&head_id).is_none()
+            || self.seen_order_ids.get(&tail_id).is_none()
+            || head.side != order.side
+            || tail.side != order.side
+            || head.constraint != order.constraint
+            || tail.constraint != order.constraint
+            || head.previous.is_some()
+            || tail.next.is_some()
+            || head.priority_sequence > order.priority_sequence
+            || tail.priority_sequence < order.priority_sequence
+        {
+            return Err(CallAuctionInvariantViolation::new(
+                "selected active order price-queue endpoints are inconsistent",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_selected_account_links(
+        &self,
+        order: RestingAuctionOrder,
+        side_index: AuctionAccountSideIndex,
+    ) -> Result<(), CallAuctionInvariantViolation> {
+        let quantity = u128::from(order.quantity.lots());
+        if side_index.order_count == 0
+            || side_index.head.is_none()
+            || side_index.tail.is_none()
+            || side_index.total_quantity < quantity
+            || side_index.order_count > self.orders.len()
+        {
+            return Err(CallAuctionInvariantViolation::new(
+                "selected active order account lane lacks consistent non-empty aggregates",
+            ));
+        }
+        if side_index.order_count == 1 {
+            if side_index.head != Some(order.order_id)
+                || side_index.tail != Some(order.order_id)
+                || side_index.total_quantity != quantity
+                || order.account_previous.is_some()
+                || order.account_next.is_some()
+            {
+                return Err(CallAuctionInvariantViolation::new(
+                    "singleton selected active order account lane is inconsistent",
+                ));
+            }
+            return Ok(());
+        }
+        self.validate_selected_account_endpoints(order, side_index)?;
+        if side_index.total_quantity <= quantity
+            || (order.account_previous.is_none()) != (side_index.head == Some(order.order_id))
+            || (order.account_next.is_none()) != (side_index.tail == Some(order.order_id))
+            || order.account_previous == order.account_next
+            || usize::from(order.account_previous.is_some())
+                + usize::from(order.account_next.is_some())
+                + 1
+                > side_index.order_count
+        {
+            return Err(CallAuctionInvariantViolation::new(
+                "selected active order contradicts its account-lane endpoints or aggregate",
+            ));
+        }
+        if let Some(previous_id) = order.account_previous {
+            if previous_id == order.order_id {
+                return Err(CallAuctionInvariantViolation::new(
+                    "selected active order account predecessor is self-referential",
+                ));
+            }
+            let previous = self.orders.get(&previous_id).copied().ok_or_else(|| {
+                CallAuctionInvariantViolation::new(
+                    "selected active order account predecessor is absent",
+                )
+            })?;
+            if previous.order_id != previous_id
+                || self.seen_order_ids.get(&previous_id).is_none()
+                || previous.account_id != order.account_id
+                || previous.side != order.side
+                || previous.account_next != Some(order.order_id)
+            {
+                return Err(CallAuctionInvariantViolation::new(
+                    "selected active order account predecessor is inconsistent",
+                ));
+            }
+        }
+        if let Some(next_id) = order.account_next {
+            if next_id == order.order_id {
+                return Err(CallAuctionInvariantViolation::new(
+                    "selected active order account successor is self-referential",
+                ));
+            }
+            let next = self.orders.get(&next_id).copied().ok_or_else(|| {
+                CallAuctionInvariantViolation::new(
+                    "selected active order account successor is absent",
+                )
+            })?;
+            if next.order_id != next_id
+                || self.seen_order_ids.get(&next_id).is_none()
+                || next.account_id != order.account_id
+                || next.side != order.side
+                || next.account_previous != Some(order.order_id)
+            {
+                return Err(CallAuctionInvariantViolation::new(
+                    "selected active order account successor is inconsistent",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_selected_account_endpoints(
+        &self,
+        order: RestingAuctionOrder,
+        side_index: AuctionAccountSideIndex,
+    ) -> Result<(), CallAuctionInvariantViolation> {
+        let head_id = side_index
+            .head
+            .expect("validated non-empty account lane has a head");
+        let tail_id = side_index
+            .tail
+            .expect("validated non-empty account lane has a tail");
+        let head = self.orders.get(&head_id).copied().ok_or_else(|| {
+            CallAuctionInvariantViolation::new("selected active order account-lane head is absent")
+        })?;
+        let tail = self.orders.get(&tail_id).copied().ok_or_else(|| {
+            CallAuctionInvariantViolation::new("selected active order account-lane tail is absent")
+        })?;
+        if head_id == tail_id
+            || head.order_id != head_id
+            || tail.order_id != tail_id
+            || self.seen_order_ids.get(&head_id).is_none()
+            || self.seen_order_ids.get(&tail_id).is_none()
+            || head.account_id != order.account_id
+            || tail.account_id != order.account_id
+            || head.side != order.side
+            || tail.side != order.side
+            || head.account_previous.is_some()
+            || tail.account_next.is_some()
+        {
+            return Err(CallAuctionInvariantViolation::new(
+                "selected active order account-lane endpoints are inconsistent",
+            ));
         }
         Ok(())
     }
@@ -4431,5 +4805,35 @@ mod tests {
             CallAuctionBookQueryError::InvariantViolation(_)
         ));
         assert_eq!(book.resource_status(), before);
+    }
+
+    #[test]
+    fn order_observation_rejects_selected_local_corruption_without_mutation() {
+        let head = OrderId::new(10).unwrap();
+        let assert_rejected = |book: &CallAuctionBook| {
+            let before = book.resource_status();
+            let error = book.try_order_observation(head).unwrap_err();
+            assert!(matches!(
+                error,
+                CallAuctionBookQueryError::InvariantViolation(_)
+            ));
+            assert_eq!(book.resource_status(), before);
+        };
+
+        let mut price_link = two_order_book(AuctionOrderConstraint::Market);
+        price_link.orders.get_mut(&head).unwrap().next = Some(head);
+        assert_rejected(&price_link);
+
+        let mut queue_count = two_order_book(AuctionOrderConstraint::Market);
+        queue_count.market_buys.order_count = 3;
+        assert_rejected(&queue_count);
+
+        let mut queue_endpoint = two_order_book(AuctionOrderConstraint::Market);
+        queue_endpoint.market_buys.tail = Some(OrderId::new(99).unwrap());
+        assert_rejected(&queue_endpoint);
+
+        let mut account_link = two_order_book(AuctionOrderConstraint::Market);
+        account_link.orders.get_mut(&head).unwrap().account_next = Some(head);
+        assert_rejected(&account_link);
     }
 }
