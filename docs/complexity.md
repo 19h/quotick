@@ -383,18 +383,25 @@ orders, and `P` occupied limit prices:
   `O(log(O + 1) + log(P + 1))`; indexed absence is `O(log(O + 1))`. A fully
   colliding active-account hash can add `O(A)` time for `A` active accounts.
   The result and auxiliary state are `O(1)`, and success allocates nothing.
-- Direct and best aggregate limit-level lookup are `O(log(P + 1))` and allocate
-  no output. `limit_depth_iter` has `O(log(P + 1))` setup and streams all `P`
-  levels in market priority using `O(1)` auxiliary space. For requested limit
-  `L`, `try_limit_depth` reserves before traversal and costs
-  `O(log(P + 1) + min(P, L))` time with `O(min(P, L))` caller-owned output.
-  Market-constrained interest is excluded and queried separately.
+- `try_observation` validates scalar revision/cardinality, both market
+  aggregates, and both best AVL extrema in `O(log(P + 1))` time and `O(1)`
+  space. The fixed-size value and successful path allocate nothing. Direct and
+  best aggregate limit-level lookup compose that gate and remain
+  `O(log(P + 1))`. `try_limit_depth_iter` has `O(log(P + 1))` gated setup and
+  streams all `P` levels in market priority using `O(1)` auxiliary space; each
+  selected row adds `O(1)` price/aggregate/endpoint-shape validation. For
+  requested limit `L` and `S = min(P, L)`, `try_limit_depth` validates and
+  copies through two `O(log(P + 1) + S)` prefix passes, exactly reserves `S`
+  rows, and owns `O(S)` output. Market-constrained interest is excluded from
+  depth and retained in the fixed observation.
 - For an inclusive band and requested output limit, let `K` be the returned
-  occupied limit prices. `limit_depth_range_iter` costs
-  `O(log(P + 1) + K)` total time and `O(1)`
-  auxiliary space. `try_limit_depth_range` counts and copies in two such
-  passes, exactly reserves `K` output rows, and owns `O(K)` caller output. An
-  inverted band is empty, and market-constrained interest remains separate.
+  occupied limit prices. `try_limit_depth_range_iter` costs
+  `O(log(P + 1) + K)` total time and `O(1)` auxiliary space after the shared
+  gate. `try_limit_depth_range` validates and copies in two such passes,
+  exactly reserves `K` output rows, and owns `O(K)` caller output. A streamed
+  valid prefix may precede a deeper typed failure; materializers expose no
+  partial vector. An inverted band is empty, and market-constrained interest
+  remains separate.
 - Aggregate scratch construction and discovery are `O(B + A)`.
 - Canonical order scratch construction is `O(O log O + P)`: intrusive arrival-
   FIFO identities are resolved through a stable AVL, then both caller-owned

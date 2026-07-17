@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A159 are stable and are referenced from code comments and other
+identifiers A1-A160 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -6728,10 +6728,101 @@ omission, continuous spread rule, untyped failure, partial vector, diagnostic
 fencing, mutation, allocation on successful observation/streaming, recovery
 divergence, or wire-byte change falsifies A159.
 
+## A160 — fail-closed authoritative call-auction public aggregates
+
+**Assumption.** One authoritative public aggregate query holds one immutable
+`CallAuctionBook` borrow. `try_observation` is the shared gate for book revision,
+both market aggregates, and both best limit rows. Active-order cardinality may
+not exceed permanently accepted-identity cardinality; accepted cardinality may
+not exceed the mutation revision; and the next priority sequence and trade ID
+must be non-zero. These are local chronology/cardinality constraints, not an
+engine command/event-sequence proof.
+
+For aggregate quantity `Q`, order count `C`, active-leaves increment `q_inc`,
+and per-order maximum `q_max`, A159's shared kernel accepts empty state exactly
+when `Q = C = 0`; occupied state requires `C >= 1`,
+`C q_inc <= Q <= C q_max`, and `Q mod q_inc = 0`. Source queue count must also
+fit the active-order cardinality. Empty market queues have no head or tail;
+occupied market and limit queues have both, and singleton status agrees with
+head/tail identity. Every selected limit price satisfies the immutable
+instrument grid/collar. Locked and crossed opposing extrema remain valid.
+
+The fixed-size `CallAuctionBookObservation` binds instrument ID/version and
+book revision to both validated market aggregates and nullable best bid/ask.
+`try_best_limit_price`, `try_best_limit_level`, `try_limit_level`,
+`try_market_quantity`, and `try_market_order_count` compose the same gate.
+`try_limit_depth_iter` and `try_limit_depth_range_iter` reject an invalid gate
+before iterator exposure, then validate every selected row independently. A
+valid prefix may precede a deeper typed failure. `try_limit_depth` and
+`try_limit_depth_range` validate/count the exact selected prefix or range,
+reserve exactly that cardinality, and copy through a second immutable pass; an
+error returns no partial vector.
+
+State-revision, best/point, market, depth, range, and iterator convenience
+methods compose the typed boundary and panic on an unhealthy result under A12.
+Active/accepted/price cardinalities, next trade ID, limits, and resource
+telemetry remain diagnostic reads. The gate validates public aggregate and
+immediate queue-endpoint shape; it does not replace the allocation-free full
+private FIFO/account/index audit or the exact selected-order observation.
+Publisher bootstrap and source cross-audit consume the fallible observation and
+streams and map source corruption to typed source divergence. A160 changes no
+command, event, update, snapshot, replay, WAL, checkpoint, codec, or wire value.
+
+**Dependent results.** [A1, A10, A12, A55, A62, A67, A123, A159, A160] Gate
+work is `O(log(P + 1))` for `P` occupied limit prices and uses `O(1)` space;
+the fixed observation allocates nothing. Full/range iterator setup retains
+`O(log(P + 1))`, complete traversal is `O(P)` or `O(K)`, iterator state is
+`O(1)`, and each row adds `O(1)` validation.
+
+For `S = min(P, L)` selected full-depth rows under limit `L`, materialization
+makes two `O(log(P + 1) + S)` prefix passes, exactly reserves `S` rows, and
+owns `O(S)` result space. For `S = min(K, L)` rows selected from a band
+containing `K` occupied prices, the same two-pass bound applies. The exact
+quantity bounds use `u128` products of `u64` inputs and cannot overflow `u128`.
+Healthy publisher bootstrap/cross-audit and caught-up A159 replica observation
+retain exact source public-state parity.
+
+**Falsification probe.** Exercise genesis, market-only, one-sided, locked,
+crossed, and uncrossed states; both sides; exact-point presence/absence; limits
+`0`, `1`, occupied cardinality, and `usize::MAX`; inclusive, outside, and
+inverted bands; and forward, reverse, and mixed traversal. Require fixed-size
+observation ownership, exact instrument/version/revision/market/best values,
+source/replica parity, nonmutation, and no successful observation/streaming
+allocation.
+
+In white-box state, corrupt active/accepted/revision relations, next priority/
+trade counters, market and extremum quantity/count, queue endpoints, and best
+price. Corrupt a deeper row independently and place it inside/outside the
+selected prefix and range. Require typed failure before exposure for shared
+state, exact per-item failure from either end for reached deeper state,
+successful locality when unselected, no partial owned vector, convenience
+panic, diagnostic availability, and publisher typed source divergence. Any
+invalid aggregate output, continuous spread rule, skipped selected corruption,
+partial vector, mutation, successful-path allocation, publisher panic,
+source/replica divergence, or wire-byte change falsifies A160.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** A160 closes the authoritative call-auction public-aggregate
+  read gap. Source observation, point/best reads, typed streams, materializers,
+  publisher bootstrap, and source cross-audit now share one fail-closed gate.
+
+- **Medium impact opportunity:** auction ladders, liquidity heatmaps, clearing
+  previews, and feed-reconciliation controllers can compare one revision-bound
+  authoritative observation directly with the A159 replica observation.
+
+- **Medium impact risk:** a fallible authoritative depth stream can return a
+  valid prefix before a corrupt deeper row. Consumers requiring all-or-nothing
+  ownership must use the vector materializers.
+
+- **High impact boundary:** A160 proves local public aggregate and immediate
+  queue-endpoint shape, not complete private FIFO/account topology, engine
+  phase/event chronology, source authentication, or transport freshness. Full
+  `CallAuctionBook::validate` and higher-layer lineage checks retain those
+  distinct local responsibilities.
 
 - **High impact:** A159 closes the call-auction public-replica read-after-poison
   gap. One fixed-size observation coherently binds phase, indication, market

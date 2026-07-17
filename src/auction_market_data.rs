@@ -16,8 +16,9 @@ use std::ops::RangeInclusive;
 
 use crate::auction::{AuctionClearing, AuctionOrderConstraint, AuctionPriorityClass};
 use crate::auction_book::{
-    CallAuctionBookLimits, CallAuctionCancellation, CallAuctionLevelSnapshot,
-    CallAuctionOrderSnapshot, CallAuctionTrade,
+    CallAuctionBookLimits, CallAuctionBookQueryError, CallAuctionCancellation,
+    CallAuctionLevelSnapshot, CallAuctionOrderSnapshot, CallAuctionTrade,
+    call_auction_aggregate_is_plausible,
 };
 use crate::auction_engine::{
     CallAuctionCommand, CallAuctionCommandOutcome, CallAuctionEngine, CallAuctionEngineLimits,
@@ -1182,16 +1183,26 @@ impl CallAuctionMarketDataPublisher {
     ) -> Result<Self, CallAuctionMarketDataConstructionError> {
         ensure_source_limits(limits, engine.limits())?;
         let definition = engine.book().definition();
+        let source_observation = engine
+            .book()
+            .try_observation()
+            .map_err(source_book_construction_error)?;
         let maximum_levels = limits.max_price_levels_per_side();
         let mut publisher = Self {
             limits,
             instrument_id: definition.instrument_id(),
             instrument_version: definition.version(),
             phase: engine.phase_snapshot(),
-            book_revision: engine.book().state_revision(),
+            book_revision: source_observation.book_revision(),
             indicative: engine.last_indicative(),
-            market_buy: aggregate_market(engine, Side::Buy),
-            market_sell: aggregate_market(engine, Side::Sell),
+            market_buy: Aggregate {
+                quantity: source_observation.market_quantity(Side::Buy),
+                order_count: source_observation.market_order_count(Side::Buy),
+            },
+            market_sell: Aggregate {
+                quantity: source_observation.market_quantity(Side::Sell),
+                order_count: source_observation.market_order_count(Side::Sell),
+            },
             bids: try_depth_map(
                 maximum_levels,
                 CallAuctionMarketDataResource::BidPriceLevels,
@@ -1223,7 +1234,12 @@ impl CallAuctionMarketDataPublisher {
             poisoned: false,
         };
 
-        for level in engine.book().limit_depth_levels(Side::Buy) {
+        for level in engine
+            .book()
+            .try_limit_depth_iter(Side::Buy)
+            .map_err(source_book_construction_error)?
+        {
+            let level = level.map_err(source_book_construction_error)?;
             publisher.bids.insert(
                 level.price(),
                 Aggregate {
@@ -1232,7 +1248,12 @@ impl CallAuctionMarketDataPublisher {
                 },
             );
         }
-        for level in engine.book().limit_depth_levels(Side::Sell) {
+        for level in engine
+            .book()
+            .try_limit_depth_iter(Side::Sell)
+            .map_err(source_book_construction_error)?
+        {
+            let level = level.map_err(source_book_construction_error)?;
             publisher.asks.insert(
                 level.price(),
                 Aggregate {
@@ -1512,6 +1533,7 @@ impl CallAuctionMarketDataPublisher {
         if definition.version() != self.instrument_version {
             return Err(CallAuctionMarketDataError::WrongInstrumentVersion);
         }
+        let source_observation = engine.book().try_observation().map_err(source_book_error)?;
         let engine_command_sequence = previous_sequence(
             engine.next_command_sequence(),
             "auction next command sequence is zero",
@@ -1521,7 +1543,7 @@ impl CallAuctionMarketDataPublisher {
             "auction next event sequence is zero",
         )?;
         if self.phase != engine.phase_snapshot()
-            || self.book_revision != engine.book().state_revision()
+            || self.book_revision != source_observation.book_revision()
             || self.indicative != engine.last_indicative()
             || self.last_command_sequence != engine_command_sequence
             || self.last_event_sequence != engine_event_sequence
@@ -1541,10 +1563,34 @@ impl CallAuctionMarketDataPublisher {
                 "publisher active-order mirror differs from the auction book",
             ));
         }
-        if self.market_buy != aggregate_market(engine, Side::Buy)
-            || self.market_sell != aggregate_market(engine, Side::Sell)
-            || !auction_depth_matches(&self.bids, engine.book().limit_depth_levels(Side::Buy))
-            || !auction_depth_matches(&self.asks, engine.book().limit_depth_levels(Side::Sell))
+        let source_market_buy = Aggregate {
+            quantity: source_observation.market_quantity(Side::Buy),
+            order_count: source_observation.market_order_count(Side::Buy),
+        };
+        let source_market_sell = Aggregate {
+            quantity: source_observation.market_quantity(Side::Sell),
+            order_count: source_observation.market_order_count(Side::Sell),
+        };
+        let bid_depth_matches = auction_depth_matches_fallible(
+            &self.bids,
+            Side::Buy,
+            engine
+                .book()
+                .try_limit_depth_iter(Side::Buy)
+                .map_err(source_book_error)?,
+        )?;
+        let ask_depth_matches = auction_depth_matches_fallible(
+            &self.asks,
+            Side::Sell,
+            engine
+                .book()
+                .try_limit_depth_iter(Side::Sell)
+                .map_err(source_book_error)?,
+        )?;
+        if self.market_buy != source_market_buy
+            || self.market_sell != source_market_sell
+            || !bid_depth_matches
+            || !ask_depth_matches
         {
             return Err(CallAuctionMarketDataError::SourceDivergence(
                 "publisher aggregate state differs from the auction book",
@@ -3128,23 +3174,12 @@ impl CallAuctionMarketDataReplica {
     }
 
     fn aggregate_is_plausible(&self, aggregate: Aggregate) -> bool {
-        if aggregate == Aggregate::default() {
-            return true;
-        }
-        if aggregate.quantity == 0 || aggregate.order_count == 0 {
-            return false;
-        }
-        let rules = self.definition.quantity_rules();
-        let order_count = u128::from(aggregate.order_count);
         // The live-batch envelope does not cap snapshot-held aggregate count.
-        // Positive active leaves can be below the new-order minimum after a
-        // partial fill, but each remainder stays increment-aligned and no
-        // order can retain more than the entry maximum.
-        let minimum = order_count * u128::from(rules.increment_lots());
-        let maximum = order_count * u128::from(rules.maximum_lots());
-        aggregate.quantity >= minimum
-            && aggregate.quantity <= maximum
-            && aggregate.quantity % u128::from(rules.increment_lots()) == 0
+        call_auction_aggregate_is_plausible(
+            self.definition,
+            aggregate.quantity,
+            aggregate.order_count,
+        )
     }
 
     fn try_market_level(
@@ -4102,11 +4137,16 @@ const fn aggregate_from_level(level: CallAuctionMarketDataLevel) -> Aggregate {
     }
 }
 
-fn aggregate_market(engine: &CallAuctionEngine, side: Side) -> Aggregate {
-    Aggregate {
-        quantity: engine.book().market_quantity(side),
-        order_count: engine.book().market_order_count(side),
-    }
+fn source_book_error(_: CallAuctionBookQueryError) -> CallAuctionMarketDataError {
+    CallAuctionMarketDataError::SourceDivergence(
+        "authoritative call-auction public state is internally inconsistent",
+    )
+}
+
+fn source_book_construction_error(
+    error: CallAuctionBookQueryError,
+) -> CallAuctionMarketDataConstructionError {
+    CallAuctionMarketDataConstructionError::Source(source_book_error(error))
 }
 
 fn previous_trade_id(next_trade_id: u64) -> Result<Option<TradeId>, CallAuctionMarketDataError> {
@@ -4296,19 +4336,25 @@ fn preflight_replica_level_capacity(
     Ok(())
 }
 
-fn auction_depth_matches(
+fn auction_depth_matches_fallible(
     mirror: &AuctionDepthMap,
-    source: impl ExactSizeIterator<Item = CallAuctionLevelSnapshot>,
-) -> bool {
-    mirror.len() == source.len()
-        && mirror
-            .iter()
-            .zip(source)
-            .all(|((&price, aggregate), level)| {
-                price == level.price()
-                    && aggregate.quantity == level.quantity()
-                    && aggregate.order_count == level.order_count()
-            })
+    side: Side,
+    source: impl ExactSizeIterator<Item = Result<CallAuctionLevelSnapshot, CallAuctionBookQueryError>>,
+) -> Result<bool, CallAuctionMarketDataError> {
+    if mirror.len() != source.len() {
+        return Ok(false);
+    }
+    let mirror = DirectionalIter::new(mirror.iter(), side == Side::Buy);
+    for ((&price, aggregate), level) in mirror.zip(source) {
+        let level = level.map_err(source_book_error)?;
+        if price != level.price()
+            || aggregate.quantity != level.quantity()
+            || aggregate.order_count != level.order_count()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn arena_status(levels: &AuctionDepthMap) -> CallAuctionMarketDataArenaStatus {

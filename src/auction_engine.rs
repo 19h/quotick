@@ -4057,7 +4057,7 @@ fn try_mass_cancel_observation_context(
     else {
         return Err(CallAuctionEngineError::InternalInvariantViolation);
     };
-    if engine.book.state_revision() != book_revision {
+    if engine.book.state_revision_raw() != book_revision {
         return Err(CallAuctionEngineError::StalePreparation);
     }
     let current = engine
@@ -4590,7 +4590,7 @@ impl CallAuctionEngine {
             wal_sequence,
             self.book.definition(),
             self.phase_snapshot(),
-            self.book.state_revision(),
+            self.book.state_revision_raw(),
             self.book.next_priority_sequence(),
             self.book.next_trade_id(),
             accepted_order_ids,
@@ -5091,7 +5091,7 @@ impl CallAuctionEngine {
         else {
             return Err(CallAuctionEngineError::InternalInvariantViolation);
         };
-        if self.book.state_revision() != book_revision {
+        if self.book.state_revision_raw() != book_revision {
             return Err(CallAuctionEngineError::StalePreparation);
         }
         let predicted = self
@@ -5176,15 +5176,15 @@ impl CallAuctionEngine {
         prepared: &PreparedCallAuctionPhaseControl,
     ) -> Result<(), CallAuctionEngineError> {
         if self.phase_snapshot() != prepared.phase
-            || self.book.state_revision() != prepared.book_revision
+            || self.book.state_revision_raw() != prepared.book_revision
             || self.book.active_order_count() != prepared.active_order_count
             || self.book.accepted_order_id_count() != prepared.accepted_order_count
             || self.book.price_level_count(Side::Buy) != prepared.bid_price_level_count
             || self.book.price_level_count(Side::Sell) != prepared.ask_price_level_count
-            || self.book.market_order_count(Side::Buy) != prepared.buy_market_order_count
-            || self.book.market_order_count(Side::Sell) != prepared.sell_market_order_count
-            || self.book.market_quantity(Side::Buy) != prepared.buy_market_quantity_lots
-            || self.book.market_quantity(Side::Sell) != prepared.sell_market_quantity_lots
+            || self.book.market_order_count_raw(Side::Buy) != prepared.buy_market_order_count
+            || self.book.market_order_count_raw(Side::Sell) != prepared.sell_market_order_count
+            || self.book.market_quantity_raw(Side::Buy) != prepared.buy_market_quantity_lots
+            || self.book.market_quantity_raw(Side::Sell) != prepared.sell_market_quantity_lots
             || self.last_indicative
                 != prepared
                     .previous_indicative
@@ -5259,7 +5259,8 @@ impl CallAuctionEngine {
         state: CallAuctionIndicativeState,
         phase: CallAuctionPhaseSnapshot,
     ) -> Result<(), CallAuctionEngineError> {
-        if self.book.state_revision() != state.book_revision() || self.phase_snapshot() != phase {
+        if self.book.state_revision_raw() != state.book_revision() || self.phase_snapshot() != phase
+        {
             return Err(CallAuctionEngineError::StalePreparation);
         }
         if self.book.definition().instrument_id() != command.instrument_id
@@ -5270,7 +5271,7 @@ impl CallAuctionEngine {
             || phase.last_auction_id() != phase.active_auction_id()
             || state.auction_id() != command.auction_id
             || state.phase_revision() != phase.revision()
-            || state.book_revision() != self.book.state_revision()
+            || state.book_revision() != self.book.state_revision_raw()
             || state.price_band() != command.price_band
             || state.reference_price() != command.reference_price
             || state.price_policy() != command.price_policy
@@ -5309,7 +5310,7 @@ impl CallAuctionEngine {
         else {
             return Err(CallAuctionEngineError::InternalInvariantViolation);
         };
-        if self.book.state_revision() != book_revision {
+        if self.book.state_revision_raw() != book_revision {
             return Err(CallAuctionEngineError::StalePreparation);
         }
         let observed = self
@@ -5379,7 +5380,7 @@ impl CallAuctionEngine {
         else {
             return Err(CallAuctionEngineError::InternalInvariantViolation);
         };
-        if self.book.state_revision() != book_revision {
+        if self.book.state_revision_raw() != book_revision {
             return Err(CallAuctionEngineError::StalePreparation);
         }
         let observed = self
@@ -5455,7 +5456,7 @@ impl CallAuctionEngine {
         else {
             return Err(CallAuctionEngineError::InternalInvariantViolation);
         };
-        if self.book.state_revision() != book_revision {
+        if self.book.state_revision_raw() != book_revision {
             return Err(CallAuctionEngineError::StalePreparation);
         }
         let cancelled = self
@@ -5789,7 +5790,7 @@ impl CallAuctionEngine {
         let CallAuctionCommand::Submit(submit) = command else {
             return Err(CallAuctionEngineError::InternalInvariantViolation);
         };
-        if self.book.state_revision() != book_revision {
+        if self.book.state_revision_raw() != book_revision {
             return Err(CallAuctionEngineError::StalePreparation);
         }
         let predicted = self
@@ -5804,7 +5805,7 @@ impl CallAuctionEngine {
             .admit(submit.order)
             .map_err(|_| CallAuctionEngineError::InternalInvariantViolation)?;
         if admitted != accepted
-            || self.book.state_revision()
+            || self.book.state_revision_raw()
                 != book_revision
                     .checked_add(1)
                     .ok_or(CallAuctionEngineError::InternalInvariantViolation)?
@@ -5826,7 +5827,7 @@ impl CallAuctionEngine {
         book_revision: u64,
         events: &mut CallAuctionEventTraceBuilder,
     ) -> Result<CallAuctionCommandOutcome, CallAuctionEngineError> {
-        if self.book.state_revision() != book_revision {
+        if self.book.state_revision_raw() != book_revision {
             return Err(CallAuctionEngineError::StalePreparation);
         }
         let observed = self
@@ -5879,7 +5880,7 @@ impl CallAuctionEngine {
         book_revision: u64,
         events: &mut CallAuctionEventTraceBuilder,
     ) -> Result<CallAuctionCommandOutcome, CallAuctionEngineError> {
-        if self.book.state_revision() != book_revision {
+        if self.book.state_revision_raw() != book_revision {
             return Err(CallAuctionEngineError::StalePreparation);
         }
         let resulting_book_revision = book_revision
@@ -5924,7 +5925,7 @@ impl CallAuctionEngine {
         let CallAuctionCommand::Replace(replace) = command else {
             return Err(CallAuctionEngineError::InternalInvariantViolation);
         };
-        if self.book.state_revision() != book_revision {
+        if self.book.state_revision_raw() != book_revision {
             return Err(CallAuctionEngineError::StalePreparation);
         }
         let resulting_book_revision = book_revision
@@ -5958,7 +5959,7 @@ impl CallAuctionEngine {
                 replace.replacement,
             )
             .map_err(|_| CallAuctionEngineError::InternalInvariantViolation)?;
-        if replaced != replacement || self.book.state_revision() != resulting_book_revision {
+        if replaced != replacement || self.book.state_revision_raw() != resulting_book_revision {
             return Err(CallAuctionEngineError::InternalInvariantViolation);
         }
         self.push_event(
@@ -5986,7 +5987,7 @@ impl CallAuctionEngine {
         preflight: CallAuctionMassCancelResult,
         events: &mut CallAuctionEventTraceBuilder,
     ) -> Result<CallAuctionCommandOutcome, CallAuctionEngineError> {
-        if self.book.state_revision() != book_revision
+        if self.book.state_revision_raw() != book_revision
             || self
                 .book
                 .preflight_mass_cancel(account_id, scope)
@@ -6096,7 +6097,7 @@ impl CallAuctionEngine {
                 match self.book.preflight_admission(submit.order) {
                     Ok(accepted) => Ok(PreparedCallAuctionAction::Submit {
                         accepted,
-                        book_revision: self.book.state_revision(),
+                        book_revision: self.book.state_revision_raw(),
                     }),
                     Err(CallAuctionAdmissionError::Instrument(error)) => {
                         Ok(PreparedCallAuctionAction::Rejected(
@@ -6124,7 +6125,7 @@ impl CallAuctionEngine {
                 {
                     Ok(order) => Ok(PreparedCallAuctionAction::Cancel {
                         order,
-                        book_revision: self.book.state_revision(),
+                        book_revision: self.book.state_revision_raw(),
                     }),
                     Err(CallAuctionCancelError::UnknownOrder) => Ok(
                         PreparedCallAuctionAction::Rejected(CallAuctionRejectReason::UnknownOrder),
@@ -6148,7 +6149,7 @@ impl CallAuctionEngine {
                 Ok(PreparedCallAuctionAction::MassCancel {
                     account_id: mass_cancel.account_id,
                     scope: mass_cancel.scope,
-                    book_revision: self.book.state_revision(),
+                    book_revision: self.book.state_revision_raw(),
                     preflight,
                 })
             }
@@ -6218,7 +6219,7 @@ impl CallAuctionEngine {
             state: CallAuctionIndicativeState::from_parts(
                 command.auction_id,
                 self.phase_revision,
-                self.book.state_revision(),
+                self.book.state_revision_raw(),
                 command.price_band,
                 command.reference_price,
                 command.price_policy,
@@ -6252,7 +6253,7 @@ impl CallAuctionEngine {
                 Ok(PreparedCallAuctionAction::Amend {
                     previous,
                     current,
-                    book_revision: self.book.state_revision(),
+                    book_revision: self.book.state_revision_raw(),
                 })
             }
             Err(CallAuctionAmendError::UnknownOrder) => Ok(PreparedCallAuctionAction::Rejected(
@@ -6297,7 +6298,7 @@ impl CallAuctionEngine {
         ) {
             Ok(replacement) => Ok(PreparedCallAuctionAction::Replace {
                 replacement,
-                book_revision: self.book.state_revision(),
+                book_revision: self.book.state_revision_raw(),
             }),
             Err(CallAuctionReplaceError::Target(CallAuctionCancelError::UnknownOrder)) => Ok(
                 PreparedCallAuctionAction::Rejected(CallAuctionRejectReason::UnknownOrder),
@@ -6425,15 +6426,15 @@ impl CallAuctionEngine {
                     active_after,
                     last_after,
                 ),
-                book_revision: self.book.state_revision(),
+                book_revision: self.book.state_revision_raw(),
                 active_order_count: self.book.active_order_count(),
                 accepted_order_count: self.book.accepted_order_id_count(),
                 bid_price_level_count: self.book.price_level_count(Side::Buy),
                 ask_price_level_count: self.book.price_level_count(Side::Sell),
-                buy_market_order_count: self.book.market_order_count(Side::Buy),
-                sell_market_order_count: self.book.market_order_count(Side::Sell),
-                buy_market_quantity_lots: self.book.market_quantity(Side::Buy),
-                sell_market_quantity_lots: self.book.market_quantity(Side::Sell),
+                buy_market_order_count: self.book.market_order_count_raw(Side::Buy),
+                sell_market_order_count: self.book.market_order_count_raw(Side::Sell),
+                buy_market_quantity_lots: self.book.market_quantity_raw(Side::Buy),
+                sell_market_quantity_lots: self.book.market_quantity_raw(Side::Sell),
                 previous_indicative: CompactOptionalCallAuctionIndicativeState::from_option(
                     self.last_indicative,
                     self.book.instrument_price_band(),

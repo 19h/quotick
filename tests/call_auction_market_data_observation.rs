@@ -198,6 +198,7 @@ fn healthy_observation_is_fixed_size_coherent_and_depth_streams_are_fallible() {
 
     let (engine, _, replica) = populated();
     let observation = replica.try_observation().unwrap();
+    let source = engine.book().try_observation().unwrap();
     assert_eq!(observation, replica.observation());
     assert_eq!(observation.instrument_id(), instrument());
     assert_eq!(observation.instrument_version(), version());
@@ -220,6 +221,25 @@ fn healthy_observation_is_fixed_size_coherent_and_depth_streams_are_fallible() {
         Price::from_raw(110)
     );
     assert_eq!(observation.best_ask().unwrap().quantity(), 4);
+    assert_eq!(source.instrument_id(), observation.instrument_id());
+    assert_eq!(
+        source.instrument_version(),
+        observation.instrument_version()
+    );
+    assert_eq!(source.book_revision(), observation.book_revision());
+    for side in [Side::Buy, Side::Sell] {
+        let replica_market = match side {
+            Side::Buy => observation.market_buy(),
+            Side::Sell => observation.market_sell(),
+        };
+        assert_eq!(source.market_quantity(side), replica_market.quantity());
+        assert_eq!(
+            source.market_order_count(side),
+            replica_market.order_count()
+        );
+    }
+    assert_eq!(source.best_bid(), observation.best_bid());
+    assert_eq!(source.best_ask(), observation.best_ask());
 
     let mut bids = replica.try_limit_depth_iter(Side::Buy).unwrap();
     assert_eq!(bids.len(), 2);

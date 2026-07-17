@@ -1137,17 +1137,27 @@ interest for discovery, allocation, and uncross preparation.
      links, owner-side aggregates and endpoints, and reciprocal immediate owner
      links. It allocates no successful-path output and does not claim to replace
      the complete offline topology audit.
-   - Read-only aggregate inspection exposes direct and best occupied limit
-     levels without allocation. `limit_depth_iter` is a double-ended exact-size
-     view that traverses bids descending or asks ascending without caller-owned
-     output. `limit_depth_range_iter` applies the same order to exact inclusive
-     endpoints, treats an inverted range as empty, and visits only in-band
-     occupied prices. `try_limit_depth_range` counts the selected rows without
-     allocation and reserves exactly that cardinality before copying.
-     `try_limit_depth` reserves at most `min(P, L)` levels before copying.
-     Either fallible query returns typed allocation failure without partial
-     output; convenience wrappers retain A12's panic boundary.
-     Market-constrained interest remains separate.
+   - Every authoritative public aggregate read composes one fixed-size
+     `CallAuctionBookObservation` gate. It validates scalar revision/
+     cardinality, both market aggregates, and both best limit rows before
+     output. Quantity/count validation uses the instrument active-leaves
+     increment and maximum; partial uncross remainders can be smaller than the
+     new-order minimum. Queue empty/occupied state must agree with head/tail
+     endpoints and active-order cardinality. Locked and crossed extrema remain
+     valid.
+   - `try_best_limit_price`, `try_best_limit_level`, `try_limit_level`,
+     `try_market_quantity`, and `try_market_order_count` expose typed scalar or
+     point output. `try_limit_depth_iter` is a double-ended exact-size view that
+     traverses bids descending or asks ascending without caller-owned output;
+     `try_limit_depth_range_iter` applies the same order to exact inclusive
+     endpoints. Every selected row validates its price, aggregate, and queue
+     endpoint shape. A valid stream prefix can precede a deeper typed failure.
+     `try_limit_depth` and `try_limit_depth_range` validate and count the exact
+     selected prefix/range without allocation, reserve exactly that
+     cardinality, and copy in a second immutable pass; no error returns partial
+     output. Convenience wrappers compose the fallible paths and retain A12's
+     panic boundary. Full private FIFO/account topology remains the offline
+     audit's contract. Market-constrained interest remains separate.
 6. Indicative discovery rebuilds canonical aggregate scratch and invokes the
    A60 kernel with current market totals. Allocation-plan construction rebuilds
    canonical market/price/class/time/ID order scratch under A111 and invokes
@@ -1168,15 +1178,18 @@ interest for discovery, allocation, and uncross preparation.
    unrelated active orders. A present exact-order observation costs expected
    `O(log(O + 1) + log(P + 1))` time, plus `O(A)` only under a fully colliding
    active-account hash of cardinality `A`; absence costs `O(log(O + 1))`.
-   Both use `O(1)` fixed output and auxiliary space. Direct/best aggregate
-   lookup is
-   `O(log(P + 1))`; allocation-free depth iteration has
-   `O(log(P + 1))` setup, `O(P)` complete traversal, and `O(1)` auxiliary
-   space. Fallible output of limit `L` costs
-   `O(log(P + 1) + min(P, L))` time and `O(min(P, L))` result space.
+   Both use `O(1)` fixed output and auxiliary space. The shared public gate,
+   direct/best aggregate lookup, and fixed-size observation are
+   `O(log(P + 1))` time and `O(1)` space; successful observation allocates
+   nothing. Allocation-free fallible depth iteration has `O(log(P + 1))`
+   gated setup, `O(P)` complete traversal, and `O(1)` auxiliary space. For
+   `S = min(P, L)`, fallible output validates and copies through two
+   `O(log(P + 1) + S)` prefix passes and owns `O(S)` exactly reserved result
+   space.
    An inclusive band containing `K` selected occupied prices costs
    `O(log(P + 1) + K)` traversal time and `O(1)` iterator space; its fallible
-   materialization makes two such passes and owns `O(K)` selected output.
+   materialization makes two validated passes and owns `O(K)` exactly reserved
+   selected output.
    Aggregate scratch plus discovery is `O(B + A)`.
    Order scratch is `O(O log O + P)` because intrusive links contain stable
    order identities resolved through the AVL and the preallocated slices are
@@ -2345,18 +2358,20 @@ market-data stream and its replicas.
 This section defines the public call-auction market-data stream and its
 replica contract.
 
-1. `CallAuctionBook::limit_depth_iter`,
-   `CallAuctionBook::limit_depth_range_iter`,
+1. `CallAuctionBook::try_limit_depth_iter`,
+   `CallAuctionBook::try_limit_depth_range_iter`,
    `CallAuctionBook::try_limit_depth`,
    `CallAuctionBook::limit_depth`,
    `CallAuctionBook::try_limit_depth_range`, and
    `CallAuctionBook::limit_depth_range`
-   expose anonymized occupied limit aggregates in best-to-worst order;
-   range endpoints are inclusive and an inverted range is empty.
-   `CallAuctionBook::limit_level` and `CallAuctionBook::best_limit_level`
-   expose one aggregate without output allocation. Market-constrained quantity
-   and order count are separate side-specific values. Locked and crossed
-   opposing limits are valid collection state.
+   expose fail-closed anonymized occupied limit aggregates in best-to-worst
+   order; range endpoints are inclusive and an inverted range is empty.
+   `CallAuctionBook::try_observation`, `try_limit_level`,
+   `try_best_limit_level`, and `try_best_limit_price` expose fixed or point
+   state without successful-path allocation. Every entry composes the shared
+   scalar/market/best gate and every streamed row is validated independently.
+   Market-constrained quantity and order count are separate side-specific
+   values. Locked and crossed opposing limits are valid collection state.
 2. Every non-replayed auction event maps to one public update at the identical
    source sequence and timestamp. Rejections preserve continuity through
    `NoPublicChange`; exact command retries publish no second update.
@@ -2391,7 +2406,9 @@ replica contract.
 7. Publisher bootstrap captures active private orders, aggregate depth,
    phase/cycle state, book revision, the optional current indication, and
    command/event/trade boundaries from a live or recovered engine, then
-   cross-audits them against the authoritative book.
+   cross-audits them against the authoritative book. Bootstrap and cross-audit
+   consume the A160 fallible source observation/streams; source corruption maps
+   to typed source divergence rather than a convenience panic.
 8. Snapshots carry complete public collection state at one event/command
    boundary, including the optional indication. A present indication must bind
    the active auction, phase revision, and book revision and can exist only in
@@ -3051,7 +3068,14 @@ reservations and require structural rejection.
 Replica limit-depth query tests additionally cover allocation-free
 best-to-worst full and inclusive-band traversal, reverse traversal, limits,
 inverted bands, separate market interest, and authoritative-book parity on
-both sides. Coherent-observation tests bind phase, indication, event/command
+both sides. Authoritative-book observation tests cover genesis, crossed
+extrema, fixed-size revision/market/best state, typed point/best reads, and
+double-ended fallible full/range streams. White-box tests corrupt scalar
+chronology, market/extremum aggregate and endpoint shape, best price, and a
+deeper row; they require outer failure, selected-prefix/range locality,
+forward/reverse per-item failure, bulk no-partial failure, convenience panic,
+diagnostic availability, and unchanged resource telemetry.
+Replica coherent-observation tests bind phase, indication, event/command
 sequences, book revision, market interest, and both best limits in one fixed-
 size value. An actual invalid incremental transition must fence every economic
 read until snapshot repair; unit corruption tests require outer failure for

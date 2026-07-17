@@ -498,6 +498,105 @@ impl CallAuctionLevelSnapshot {
     }
 }
 
+/// Returns whether one anonymized call-auction aggregate can be composed from
+/// active leaves admitted under `definition`.
+///
+/// Active leaves remain increment-aligned but can be smaller than the
+/// new-order minimum after a partial uncross. Products are exact in `u128`
+/// because both factors are `u64`.
+pub(crate) fn call_auction_aggregate_is_plausible(
+    definition: InstrumentDefinition,
+    quantity: u128,
+    order_count: u64,
+) -> bool {
+    if quantity == 0 || order_count == 0 {
+        return quantity == 0 && order_count == 0;
+    }
+    let rules = definition.quantity_rules();
+    let count = u128::from(order_count);
+    let increment = u128::from(rules.increment_lots());
+    let minimum = count * increment;
+    let maximum = count * u128::from(rules.maximum_lots());
+    quantity >= minimum && quantity <= maximum && quantity % increment == 0
+}
+
+/// One coherent fixed-size observation of authoritative call-auction public
+/// collection state.
+///
+/// The value binds both market aggregates and both best limit levels to one
+/// instrument definition and collection-book revision. It owns no allocation.
+/// Locked and crossed best limits remain valid while auction interest is being
+/// collected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionBookObservation {
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    book_revision: u64,
+    market_buy_quantity: u128,
+    market_buy_order_count: u64,
+    market_sell_quantity: u128,
+    market_sell_order_count: u64,
+    best_bid: Option<CallAuctionLevelSnapshot>,
+    best_ask: Option<CallAuctionLevelSnapshot>,
+}
+
+impl CallAuctionBookObservation {
+    /// Returns the routed instrument identity.
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version.
+    #[must_use]
+    pub const fn instrument_version(self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the exact collection-book revision observed by the query.
+    #[must_use]
+    pub const fn book_revision(self) -> u64 {
+        self.book_revision
+    }
+
+    /// Returns active market-constrained quantity on `side` in lots.
+    #[must_use]
+    pub const fn market_quantity(self, side: Side) -> u128 {
+        match side {
+            Side::Buy => self.market_buy_quantity,
+            Side::Sell => self.market_sell_quantity,
+        }
+    }
+
+    /// Returns the active market-constrained order count on `side`.
+    #[must_use]
+    pub const fn market_order_count(self, side: Side) -> u64 {
+        match side {
+            Side::Buy => self.market_buy_order_count,
+            Side::Sell => self.market_sell_order_count,
+        }
+    }
+
+    /// Returns the validated best bid limit level, if present.
+    #[must_use]
+    pub const fn best_bid(self) -> Option<CallAuctionLevelSnapshot> {
+        self.best_bid
+    }
+
+    /// Returns the validated best ask limit level, if present.
+    #[must_use]
+    pub const fn best_ask(self) -> Option<CallAuctionLevelSnapshot> {
+        self.best_ask
+    }
+
+    const fn best_limit_level(self, side: Side) -> Option<CallAuctionLevelSnapshot> {
+        match side {
+            Side::Buy => self.best_bid,
+            Side::Sell => self.best_ask,
+        }
+    }
+}
+
 /// Admission failure for one call-auction order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CallAuctionAdmissionError {
@@ -1695,10 +1794,6 @@ impl AuctionPriceLevels {
                 .map(|(price, queue)| (*price, *queue)),
         }
     }
-
-    fn best_price(&self) -> Option<Price> {
-        self.best().map(|(price, _)| price)
-    }
 }
 
 /// Bounded active order state for one call-auction instrument version.
@@ -1879,9 +1974,18 @@ impl CallAuctionBook {
         self.seen_order_ids.len()
     }
 
-    /// Returns the mutation revision of active collection state.
+    /// Returns the mutation revision of coherent active collection state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the public collection boundary is internally inconsistent.
+    /// Use [`Self::try_observation`] when failure must remain typed.
     #[must_use]
-    pub const fn state_revision(&self) -> u64 {
+    pub fn state_revision(&self) -> u64 {
+        self.observation().book_revision()
+    }
+
+    pub(crate) const fn state_revision_raw(&self) -> u64 {
         self.state_revision
     }
 
@@ -1980,69 +2084,222 @@ impl CallAuctionBook {
         Ok(book)
     }
 
+    /// Fallibly returns one coherent fixed-size public collection observation.
+    ///
+    /// The shared economic gate validates revision/cardinality relations, both
+    /// market aggregates, and both best limit aggregates before returning any
+    /// value. It uses `O(log(P + 1))` time for `P` occupied limit prices,
+    /// `O(1)` auxiliary space, and allocates nothing on success. Crossed or
+    /// locked limit extrema are valid call-auction state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionBookQueryError::InvariantViolation`] if scalar,
+    /// market, or best-limit state is internally inconsistent.
+    pub fn try_observation(&self) -> Result<CallAuctionBookObservation, CallAuctionBookQueryError> {
+        self.validate_public_scalars()?;
+        let market_buy = self.try_public_market_queue(Side::Buy)?;
+        let market_sell = self.try_public_market_queue(Side::Sell)?;
+        let best_bid = self.try_best_limit_level_raw(Side::Buy)?;
+        let best_ask = self.try_best_limit_level_raw(Side::Sell)?;
+        Ok(CallAuctionBookObservation {
+            instrument_id: self.definition.instrument_id(),
+            instrument_version: self.definition.version(),
+            book_revision: self.state_revision,
+            market_buy_quantity: market_buy.total_quantity,
+            market_buy_order_count: market_buy.order_count,
+            market_sell_quantity: market_sell.total_quantity,
+            market_sell_order_count: market_sell.order_count,
+            best_bid,
+            best_ask,
+        })
+    }
+
+    /// Returns one coherent observation using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if public collection state is internally inconsistent. Use
+    /// [`Self::try_observation`] when failure must remain typed.
+    #[must_use]
+    pub fn observation(&self) -> CallAuctionBookObservation {
+        self.try_observation()
+            .expect("call-auction book economic state is not queryable")
+    }
+
     /// Returns the number of occupied limit prices on one side.
     #[must_use]
     pub fn price_level_count(&self, side: Side) -> usize {
         self.levels(side).len()
     }
 
+    /// Fallibly returns the most aggressive occupied limit price on one side.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionBookQueryError::InvariantViolation`] if the shared
+    /// public collection gate fails.
+    pub fn try_best_limit_price(
+        &self,
+        side: Side,
+    ) -> Result<Option<Price>, CallAuctionBookQueryError> {
+        Ok(self
+            .try_observation()?
+            .best_limit_level(side)
+            .map(CallAuctionLevelSnapshot::price))
+    }
+
     /// Returns the most aggressive occupied limit price on one side.
+    ///
+    /// # Panics
+    ///
+    /// Panics if public collection state is internally inconsistent. Use
+    /// [`Self::try_best_limit_price`] when failure must remain typed.
     #[must_use]
     pub fn best_limit_price(&self, side: Side) -> Option<Price> {
-        self.levels(side).best_price()
+        self.try_best_limit_price(side)
+            .expect("call-auction book best limit price is not queryable")
+    }
+
+    /// Fallibly returns the most aggressive occupied aggregate limit level.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionBookQueryError::InvariantViolation`] if the shared
+    /// public collection gate fails.
+    pub fn try_best_limit_level(
+        &self,
+        side: Side,
+    ) -> Result<Option<CallAuctionLevelSnapshot>, CallAuctionBookQueryError> {
+        Ok(self.try_observation()?.best_limit_level(side))
     }
 
     /// Returns the most aggressive occupied aggregate limit level on one side.
+    ///
+    /// # Panics
+    ///
+    /// Panics if public collection state is internally inconsistent. Use
+    /// [`Self::try_best_limit_level`] when failure must remain typed.
     #[must_use]
     pub fn best_limit_level(&self, side: Side) -> Option<CallAuctionLevelSnapshot> {
-        self.levels(side)
-            .best()
-            .map(|(price, queue)| Self::limit_level_snapshot(side, price, queue))
+        self.try_best_limit_level(side)
+            .expect("call-auction book best limit level is not queryable")
     }
 
-    /// Returns one occupied aggregate limit level by side and price.
+    /// Fallibly returns one occupied aggregate limit level by side and price.
     ///
-    /// The lookup is `O(log(P + 1))` for `P` occupied prices and does not
-    /// allocate.
-    #[must_use]
-    pub fn limit_level(&self, side: Side, price: Price) -> Option<CallAuctionLevelSnapshot> {
+    /// The shared gate plus exact lookup is `O(log(P + 1))` for `P` occupied
+    /// prices and does not allocate on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionBookQueryError::InvariantViolation`] if shared
+    /// public state or the selected level is internally inconsistent.
+    pub fn try_limit_level(
+        &self,
+        side: Side,
+        price: Price,
+    ) -> Result<Option<CallAuctionLevelSnapshot>, CallAuctionBookQueryError> {
+        self.try_observation()?;
         self.levels(side)
             .get(price)
             .copied()
-            .map(|queue| Self::limit_level_snapshot(side, price, queue))
+            .map(|queue| self.try_limit_level_snapshot(side, price, queue))
+            .transpose()
+    }
+
+    /// Returns one occupied aggregate limit level using the fallible path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if public collection state or the selected level is internally
+    /// inconsistent. Use [`Self::try_limit_level`] for typed failure.
+    #[must_use]
+    pub fn limit_level(&self, side: Side, price: Price) -> Option<CallAuctionLevelSnapshot> {
+        self.try_limit_level(side, price)
+            .expect("call-auction book exact limit level is not queryable")
+    }
+
+    /// Fallibly returns active market quantity on one side in lots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionBookQueryError::InvariantViolation`] if the shared
+    /// public collection gate fails.
+    pub fn try_market_quantity(&self, side: Side) -> Result<u128, CallAuctionBookQueryError> {
+        Ok(self.try_observation()?.market_quantity(side))
     }
 
     /// Returns active market quantity on one side in instrument-defined lots.
+    ///
+    /// # Panics
+    ///
+    /// Panics if public collection state is internally inconsistent. Use
+    /// [`Self::try_market_quantity`] when failure must remain typed.
     #[must_use]
     pub fn market_quantity(&self, side: Side) -> u128 {
-        self.market_queue(side).total_quantity
+        self.try_market_quantity(side)
+            .expect("call-auction book market quantity is not queryable")
+    }
+
+    /// Fallibly returns the active market-constrained order count on one side.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionBookQueryError::InvariantViolation`] if the shared
+    /// public collection gate fails.
+    pub fn try_market_order_count(&self, side: Side) -> Result<u64, CallAuctionBookQueryError> {
+        Ok(self.try_observation()?.market_order_count(side))
     }
 
     /// Returns the number of active market-constrained orders on one side.
+    ///
+    /// # Panics
+    ///
+    /// Panics if public collection state is internally inconsistent. Use
+    /// [`Self::try_market_order_count`] when failure must remain typed.
     #[must_use]
     pub fn market_order_count(&self, side: Side) -> u64 {
-        self.market_queue(side).order_count
+        self.try_market_order_count(side)
+            .expect("call-auction book market order count is not queryable")
     }
 
     /// Fallibly returns anonymized limit depth in best-to-worst price order.
     ///
     /// Market-constrained interest is reported separately by
     /// [`Self::market_quantity`] and [`Self::market_order_count`]. The complete
-    /// bounded result is reserved before the first level is copied.
+    /// selected prefix is validated without allocation, then its exact
+    /// cardinality is reserved before a second immutable copy pass.
     ///
     /// # Errors
     ///
-    /// Returns [`CallAuctionBookQueryError::ReservationFailed`] without partial
-    /// output if the caller-owned result vector cannot be reserved.
+    /// Returns [`CallAuctionBookQueryError::InvariantViolation`] for an invalid
+    /// shared boundary or selected row, or
+    /// [`CallAuctionBookQueryError::ReservationFailed`] without partial output
+    /// if the caller-owned result vector cannot be reserved.
     pub fn try_limit_depth(
         &self,
         side: Side,
         limit: usize,
     ) -> Result<Vec<CallAuctionLevelSnapshot>, CallAuctionBookQueryError> {
-        let maximum = self.levels(side).len().min(limit);
+        let maximum =
+            self.try_limit_depth_iter(side)?
+                .take(limit)
+                .try_fold(0_usize, |count, level| {
+                    level?;
+                    count.checked_add(1).ok_or_else(|| {
+                        CallAuctionBookQueryError::InvariantViolation(
+                            CallAuctionInvariantViolation::new(
+                                "call-auction selected depth cardinality is exhausted",
+                            ),
+                        )
+                    })
+                })?;
         let mut output =
             reserve_call_auction_book_query_vec(maximum, CallAuctionBookQueryResource::LimitDepth)?;
-        output.extend(self.limit_depth_iter(side).take(limit));
+        for level in self.try_limit_depth_iter(side)?.take(limit) {
+            output.push(level?);
+        }
         Ok(output)
     }
 
@@ -2055,8 +2312,10 @@ impl CallAuctionBook {
     ///
     /// # Errors
     ///
-    /// Returns [`CallAuctionBookQueryError::ReservationFailed`] without partial
-    /// output if the caller-owned result vector cannot be reserved.
+    /// Returns [`CallAuctionBookQueryError::InvariantViolation`] for an invalid
+    /// shared boundary or selected row, or
+    /// [`CallAuctionBookQueryError::ReservationFailed`] without partial output
+    /// if the caller-owned result vector cannot be reserved.
     pub fn try_limit_depth_range(
         &self,
         side: Side,
@@ -2064,12 +2323,23 @@ impl CallAuctionBook {
         limit: usize,
     ) -> Result<Vec<CallAuctionLevelSnapshot>, CallAuctionBookQueryError> {
         let maximum = self
-            .limit_depth_range_iter(side, range.clone())
+            .try_limit_depth_range_iter(side, range.clone())?
             .take(limit)
-            .count();
+            .try_fold(0_usize, |count, level| {
+                level?;
+                count.checked_add(1).ok_or_else(|| {
+                    CallAuctionBookQueryError::InvariantViolation(
+                        CallAuctionInvariantViolation::new(
+                            "call-auction selected range-depth cardinality is exhausted",
+                        ),
+                    )
+                })
+            })?;
         let mut output =
             reserve_call_auction_book_query_vec(maximum, CallAuctionBookQueryResource::LimitDepth)?;
-        output.extend(self.limit_depth_range_iter(side, range).take(limit));
+        for level in self.try_limit_depth_range_iter(side, range)?.take(limit) {
+            output.push(level?);
+        }
         Ok(output)
     }
 
@@ -2077,12 +2347,12 @@ impl CallAuctionBook {
     ///
     /// # Panics
     ///
-    /// Panics only if result-vector allocation fails. Use
-    /// [`Self::try_limit_depth`] when allocation failure must remain typed.
+    /// Panics if public state is inconsistent or result-vector allocation
+    /// fails. Use [`Self::try_limit_depth`] when failure must remain typed.
     #[must_use]
     pub fn limit_depth(&self, side: Side, limit: usize) -> Vec<CallAuctionLevelSnapshot> {
         self.try_limit_depth(side, limit)
-            .expect("call-auction book limit-depth output allocation failed")
+            .expect("call-auction book limit depth is not queryable")
     }
 
     /// Returns anonymized limit depth inside an inclusive price range using
@@ -2090,8 +2360,8 @@ impl CallAuctionBook {
     ///
     /// # Panics
     ///
-    /// Panics only if result-vector allocation fails. Use
-    /// [`Self::try_limit_depth_range`] when allocation failure must remain typed.
+    /// Panics if public state is inconsistent or result-vector allocation
+    /// fails. Use [`Self::try_limit_depth_range`] for typed failure.
     #[must_use]
     pub fn limit_depth_range(
         &self,
@@ -2100,61 +2370,192 @@ impl CallAuctionBook {
         limit: usize,
     ) -> Vec<CallAuctionLevelSnapshot> {
         self.try_limit_depth_range(side, range, limit)
-            .expect("call-auction price-range depth output allocation failed")
+            .expect("call-auction book range depth is not queryable")
     }
 
-    /// Iterates anonymized limit depth in market-priority order without
-    /// allocating.
+    /// Fallibly exposes anonymized limit depth in market-priority order.
     ///
     /// Bids are descending and asks are ascending. Market-constrained interest
     /// is excluded. The iterator is double-ended and exact-sized. Creating it
     /// is `O(log(P + 1))`; consuming it is `O(P)` time for `P` occupied prices
     /// and `O(1)` auxiliary space.
+    ///
+    /// Each item validates its selected price and aggregate. A valid prefix can
+    /// precede a typed deeper-row failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionBookQueryError::InvariantViolation`] before iterator
+    /// exposure if the shared public collection gate fails.
+    pub fn try_limit_depth_iter(
+        &self,
+        side: Side,
+    ) -> Result<
+        impl DoubleEndedIterator<Item = Result<CallAuctionLevelSnapshot, CallAuctionBookQueryError>>
+        + ExactSizeIterator
+        + '_,
+        CallAuctionBookQueryError,
+    > {
+        self.try_observation()?;
+        Ok(DirectionalIter::new(
+            self.levels(side)
+                .iter()
+                .map(move |(&price, &queue)| self.try_limit_level_snapshot(side, price, queue)),
+            side == Side::Buy,
+        ))
+    }
+
+    /// Iterates anonymized limit depth using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if shared or selected public state is inconsistent. Use
+    /// [`Self::try_limit_depth_iter`] when failure must remain typed.
     #[must_use]
     pub fn limit_depth_iter(
         &self,
         side: Side,
     ) -> impl DoubleEndedIterator<Item = CallAuctionLevelSnapshot> + ExactSizeIterator + '_ {
-        DirectionalIter::new(self.limit_depth_levels(side), side == Side::Buy)
+        self.try_limit_depth_iter(side)
+            .expect("call-auction book depth iterator is not queryable")
+            .map(|level| level.expect("call-auction book depth row is not queryable"))
     }
 
-    /// Iterates anonymized limit depth inside an inclusive price range without
-    /// allocating.
+    /// Fallibly exposes anonymized limit depth inside an inclusive price range.
     ///
     /// Bids are descending and asks are ascending. Market-constrained interest
     /// is excluded, and an inverted range is empty. Creating the iterator is
     /// `O(log(P + 1))`; consuming `K` in-range levels is
     /// `O(K + log(P + 1))` total time with `O(1)` auxiliary space.
+    ///
+    /// Each item validates its selected price and aggregate. A valid prefix can
+    /// precede a typed deeper-row failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionBookQueryError::InvariantViolation`] before iterator
+    /// exposure if the shared public collection gate fails.
+    pub fn try_limit_depth_range_iter(
+        &self,
+        side: Side,
+        range: RangeInclusive<Price>,
+    ) -> Result<
+        impl DoubleEndedIterator<Item = Result<CallAuctionLevelSnapshot, CallAuctionBookQueryError>>
+        + '_,
+        CallAuctionBookQueryError,
+    > {
+        self.try_observation()?;
+        Ok(DirectionalIter::new(
+            self.levels(side)
+                .range(range)
+                .map(move |(&price, &queue)| self.try_limit_level_snapshot(side, price, queue)),
+            side == Side::Buy,
+        ))
+    }
+
+    /// Iterates range depth using the fallible production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if shared or selected public state is inconsistent. Use
+    /// [`Self::try_limit_depth_range_iter`] when failure must remain typed.
     #[must_use]
     pub fn limit_depth_range_iter(
         &self,
         side: Side,
         range: RangeInclusive<Price>,
     ) -> impl DoubleEndedIterator<Item = CallAuctionLevelSnapshot> + '_ {
-        DirectionalIter::new(
-            self.limit_depth_levels_range(side, range),
-            side == Side::Buy,
-        )
+        self.try_limit_depth_range_iter(side, range)
+            .expect("call-auction book range-depth iterator is not queryable")
+            .map(|level| level.expect("call-auction book range-depth row is not queryable"))
     }
 
-    /// Iterates aggregate limit depth in ascending price order without allocating.
-    pub(crate) fn limit_depth_levels(
+    fn try_public_market_queue(
         &self,
         side: Side,
-    ) -> impl DoubleEndedIterator<Item = CallAuctionLevelSnapshot> + ExactSizeIterator + '_ {
-        self.levels(side)
-            .iter()
-            .map(move |(&price, queue)| Self::limit_level_snapshot(side, price, *queue))
+    ) -> Result<AuctionQueue, CallAuctionBookQueryError> {
+        let queue = *self.market_queue(side);
+        self.validate_public_queue(side, AuctionOrderConstraint::Market, queue, true)?;
+        Ok(queue)
     }
 
-    fn limit_depth_levels_range(
+    fn try_best_limit_level_raw(
         &self,
         side: Side,
-        range: RangeInclusive<Price>,
-    ) -> impl DoubleEndedIterator<Item = CallAuctionLevelSnapshot> + '_ {
+    ) -> Result<Option<CallAuctionLevelSnapshot>, CallAuctionBookQueryError> {
         self.levels(side)
-            .range(range)
-            .map(move |(&price, queue)| Self::limit_level_snapshot(side, price, *queue))
+            .best()
+            .map(|(price, queue)| self.try_limit_level_snapshot(side, price, queue))
+            .transpose()
+    }
+
+    fn try_limit_level_snapshot(
+        &self,
+        side: Side,
+        price: Price,
+        queue: AuctionQueue,
+    ) -> Result<CallAuctionLevelSnapshot, CallAuctionBookQueryError> {
+        self.definition.price_rules().validate(price).map_err(|_| {
+            CallAuctionInvariantViolation::new(match side {
+                Side::Buy => "call-auction bid output contains an invalid price",
+                Side::Sell => "call-auction ask output contains an invalid price",
+            })
+        })?;
+        self.validate_public_queue(side, AuctionOrderConstraint::Limit(price), queue, false)?;
+        Ok(Self::limit_level_snapshot(side, price, queue))
+    }
+
+    fn validate_public_queue(
+        &self,
+        side: Side,
+        constraint: AuctionOrderConstraint,
+        queue: AuctionQueue,
+        permit_empty: bool,
+    ) -> Result<(), CallAuctionBookQueryError> {
+        if !call_auction_aggregate_is_plausible(
+            self.definition,
+            queue.total_quantity,
+            queue.order_count,
+        ) {
+            return Err(CallAuctionInvariantViolation::new(match constraint {
+                AuctionOrderConstraint::Market => match side {
+                    Side::Buy => "call-auction buy-market output contains an impossible aggregate",
+                    Side::Sell => {
+                        "call-auction sell-market output contains an impossible aggregate"
+                    }
+                },
+                AuctionOrderConstraint::Limit(_) => match side {
+                    Side::Buy => "call-auction bid output contains an impossible aggregate",
+                    Side::Sell => "call-auction ask output contains an impossible aggregate",
+                },
+            })
+            .into());
+        }
+        if queue.order_count == 0 {
+            if !permit_empty || queue.head.is_some() || queue.tail.is_some() {
+                return Err(CallAuctionInvariantViolation::new(
+                    "empty call-auction public queue has non-empty redundant state",
+                )
+                .into());
+            }
+            return Ok(());
+        }
+        let count = usize::try_from(queue.order_count).map_err(|_| {
+            CallAuctionInvariantViolation::new(
+                "call-auction public queue count is not representable on this target",
+            )
+        })?;
+        if count > self.orders.len()
+            || queue.head.is_none()
+            || queue.tail.is_none()
+            || (queue.order_count == 1) != (queue.head == queue.tail)
+        {
+            return Err(CallAuctionInvariantViolation::new(
+                "occupied call-auction public queue has inconsistent cardinality or endpoints",
+            )
+            .into());
+        }
+        Ok(())
     }
 
     const fn limit_level_snapshot(
@@ -3225,6 +3626,7 @@ impl CallAuctionBook {
     /// Returns [`CallAuctionInvariantViolation`] at the first contradiction.
     pub fn validate(&self) -> Result<(), CallAuctionInvariantViolation> {
         self.validate_storage()?;
+        self.validate_public_scalars()?;
         let mut indexed_orders = 0_usize;
         self.validate_queue(
             self.market_buys,
@@ -3261,6 +3663,20 @@ impl CallAuctionBook {
         }
         self.validate_account_order_index()?;
         self.validate_active_orders()
+    }
+
+    fn validate_public_scalars(&self) -> Result<(), CallAuctionInvariantViolation> {
+        if self.orders.len() > self.seen_order_ids.len()
+            || u64::try_from(self.seen_order_ids.len())
+                .map_or(true, |accepted| accepted > self.state_revision)
+            || self.next_priority_sequence == 0
+            || self.next_trade_id == 0
+        {
+            return Err(CallAuctionInvariantViolation::new(
+                "call-auction public scalar state is internally inconsistent",
+            ));
+        }
+        Ok(())
     }
 
     fn validate_storage(&self) -> Result<(), CallAuctionInvariantViolation> {
@@ -4389,6 +4805,14 @@ impl CallAuctionBook {
         }
     }
 
+    pub(crate) fn market_quantity_raw(&self, side: Side) -> u128 {
+        self.market_queue(side).total_quantity
+    }
+
+    pub(crate) fn market_order_count_raw(&self, side: Side) -> u64 {
+        self.market_queue(side).order_count
+    }
+
     fn queue_snapshot(&self, side: Side, constraint: AuctionOrderConstraint) -> AuctionQueue {
         match constraint {
             AuctionOrderConstraint::Market => *self.market_queue(side),
@@ -4667,6 +5091,8 @@ fn append_queue_orders(
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use super::{
         AuctionOrderConstraint, AuctionQueue, CallAuctionBook, CallAuctionBookLimits,
         CallAuctionBookLimitsSpec, CallAuctionBookQueryError, CallAuctionBookQueryResource,
@@ -4723,6 +5149,58 @@ mod tests {
                 Side::Buy,
                 constraint,
                 Quantity::new(1).unwrap(),
+                crate::auction::AuctionPriorityClass::HIGHEST,
+            ))
+            .unwrap();
+        }
+        book.validate().unwrap();
+        book
+    }
+
+    fn public_depth_book() -> CallAuctionBook {
+        let limits = CallAuctionBookLimits::new(CallAuctionBookLimitsSpec {
+            max_active_orders: 8,
+            max_price_levels_per_side: 4,
+            max_accepted_order_ids: 16,
+            max_prepared_uncrosses: 1,
+        })
+        .unwrap();
+        let mut book = CallAuctionBook::try_with_limits(definition(), limits).unwrap();
+        for (order_id, side, constraint, quantity) in [
+            (1, Side::Buy, AuctionOrderConstraint::Market, 3),
+            (
+                2,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                5,
+            ),
+            (
+                3,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(90)),
+                7,
+            ),
+            (
+                4,
+                Side::Buy,
+                AuctionOrderConstraint::Limit(Price::from_raw(80)),
+                9,
+            ),
+            (
+                5,
+                Side::Sell,
+                AuctionOrderConstraint::Limit(Price::from_raw(110)),
+                4,
+            ),
+        ] {
+            book.admit(CallAuctionOrder::new(
+                OrderId::new(order_id).unwrap(),
+                AccountId::new(order_id).unwrap(),
+                InstrumentId::new(7).unwrap(),
+                InstrumentVersion::new(3).unwrap(),
+                side,
+                constraint,
+                Quantity::new(quantity).unwrap(),
                 crate::auction::AuctionPriorityClass::HIGHEST,
             ))
             .unwrap();
@@ -4790,6 +5268,224 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn public_observation_gate_rejects_scalar_market_and_extremum_corruption() {
+        let assert_rejected = |book: &CallAuctionBook| {
+            let before = book.resource_status();
+            assert!(matches!(
+                book.try_observation(),
+                Err(CallAuctionBookQueryError::InvariantViolation(_))
+            ));
+            assert!(matches!(
+                book.try_limit_depth_iter(Side::Sell),
+                Err(CallAuctionBookQueryError::InvariantViolation(_))
+            ));
+            assert!(book.validate().is_err());
+            assert_eq!(book.resource_status(), before);
+        };
+
+        let mut revision = public_depth_book();
+        revision.state_revision = 0;
+        assert_rejected(&revision);
+
+        let mut priority_sequence = public_depth_book();
+        priority_sequence.next_priority_sequence = 0;
+        assert_rejected(&priority_sequence);
+
+        let mut trade_id = public_depth_book();
+        trade_id.next_trade_id = 0;
+        assert_rejected(&trade_id);
+
+        let mut market_aggregate = public_depth_book();
+        market_aggregate.market_buys.total_quantity = 0;
+        assert_rejected(&market_aggregate);
+
+        let mut market_endpoint = public_depth_book();
+        market_endpoint.market_buys.head = None;
+        assert_rejected(&market_endpoint);
+
+        let mut best_aggregate = public_depth_book();
+        best_aggregate
+            .bids
+            .by_price
+            .get_mut(&Price::from_raw(100))
+            .unwrap()
+            .order_count = 0;
+        assert_rejected(&best_aggregate);
+
+        let mut best_endpoint = public_depth_book();
+        best_endpoint
+            .bids
+            .by_price
+            .get_mut(&Price::from_raw(100))
+            .unwrap()
+            .tail = None;
+        assert_rejected(&best_endpoint);
+
+        let mut invalid_price = public_depth_book();
+        let queue = invalid_price
+            .bids
+            .by_price
+            .remove(&Price::from_raw(100))
+            .unwrap();
+        invalid_price
+            .bids
+            .by_price
+            .insert(Price::from_raw(205), queue);
+        assert_rejected(&invalid_price);
+    }
+
+    #[test]
+    fn public_convenience_queries_panic_on_unhealthy_state_but_diagnostics_remain() {
+        fn assert_panics(query: impl FnOnce()) {
+            assert!(catch_unwind(AssertUnwindSafe(query)).is_err());
+        }
+
+        let mut book = public_depth_book();
+        book.market_buys.order_count = 0;
+        let before = book.resource_status();
+
+        assert!(matches!(
+            book.try_best_limit_price(Side::Buy),
+            Err(CallAuctionBookQueryError::InvariantViolation(_))
+        ));
+        assert!(matches!(
+            book.try_best_limit_level(Side::Buy),
+            Err(CallAuctionBookQueryError::InvariantViolation(_))
+        ));
+        assert!(matches!(
+            book.try_limit_level(Side::Buy, Price::from_raw(100)),
+            Err(CallAuctionBookQueryError::InvariantViolation(_))
+        ));
+        assert!(matches!(
+            book.try_market_quantity(Side::Buy),
+            Err(CallAuctionBookQueryError::InvariantViolation(_))
+        ));
+        assert!(matches!(
+            book.try_market_order_count(Side::Buy),
+            Err(CallAuctionBookQueryError::InvariantViolation(_))
+        ));
+        assert!(matches!(
+            book.try_limit_depth(Side::Buy, 0),
+            Err(CallAuctionBookQueryError::InvariantViolation(_))
+        ));
+        assert!(matches!(
+            book.try_limit_depth_range(Side::Buy, Price::from_raw(100)..=Price::from_raw(90), 0,),
+            Err(CallAuctionBookQueryError::InvariantViolation(_))
+        ));
+        assert!(matches!(
+            book.try_limit_depth_range_iter(Side::Buy, Price::from_raw(100)..=Price::from_raw(90),),
+            Err(CallAuctionBookQueryError::InvariantViolation(_))
+        ));
+
+        assert_panics(|| {
+            let _ = book.state_revision();
+        });
+        assert_panics(|| {
+            let _ = book.best_limit_price(Side::Buy);
+        });
+        assert_panics(|| {
+            let _ = book.best_limit_level(Side::Buy);
+        });
+        assert_panics(|| {
+            let _ = book.limit_level(Side::Buy, Price::from_raw(100));
+        });
+        assert_panics(|| {
+            let _ = book.market_quantity(Side::Buy);
+        });
+        assert_panics(|| {
+            let _ = book.market_order_count(Side::Buy);
+        });
+        assert_panics(|| {
+            let _ = book.limit_depth(Side::Buy, 0);
+        });
+        assert_panics(|| {
+            let _ =
+                book.limit_depth_range(Side::Buy, Price::from_raw(100)..=Price::from_raw(90), 0);
+        });
+        assert_panics(|| {
+            let _ = book.limit_depth_iter(Side::Buy);
+        });
+        assert_panics(|| {
+            let _ =
+                book.limit_depth_range_iter(Side::Buy, Price::from_raw(100)..=Price::from_raw(90));
+        });
+
+        assert_eq!(book.active_order_count(), 5);
+        assert_eq!(book.accepted_order_id_count(), 5);
+        assert_eq!(book.price_level_count(Side::Buy), 3);
+        assert_eq!(book.next_trade_id(), 1);
+        assert_eq!(book.resource_status(), before);
+    }
+
+    #[test]
+    fn public_depth_reports_selected_deeper_corruption_without_partial_output() {
+        let mut book = public_depth_book();
+        book.bids
+            .by_price
+            .get_mut(&Price::from_raw(80))
+            .unwrap()
+            .total_quantity = 0;
+
+        assert!(book.try_observation().is_ok());
+        let mut forward = book.try_limit_depth_iter(Side::Buy).unwrap();
+        assert_eq!(
+            forward.next().unwrap().unwrap().price(),
+            Price::from_raw(100)
+        );
+        assert_eq!(
+            forward.next().unwrap().unwrap().price(),
+            Price::from_raw(90)
+        );
+        assert!(matches!(
+            forward.next().unwrap(),
+            Err(CallAuctionBookQueryError::InvariantViolation(_))
+        ));
+
+        let mut reverse = book.try_limit_depth_iter(Side::Buy).unwrap();
+        assert!(matches!(
+            reverse.next_back().unwrap(),
+            Err(CallAuctionBookQueryError::InvariantViolation(_))
+        ));
+        assert_eq!(
+            reverse.next_back().unwrap().unwrap().price(),
+            Price::from_raw(90)
+        );
+
+        assert_eq!(book.try_limit_depth(Side::Buy, 2).unwrap().len(), 2);
+        assert!(matches!(
+            book.try_limit_depth(Side::Buy, 3),
+            Err(CallAuctionBookQueryError::InvariantViolation(_))
+        ));
+        assert_eq!(
+            book.try_limit_depth_range(
+                Side::Buy,
+                Price::from_raw(90)..=Price::from_raw(100),
+                usize::MAX,
+            )
+            .unwrap()
+            .len(),
+            2
+        );
+        assert!(matches!(
+            book.try_limit_depth_range(
+                Side::Buy,
+                Price::from_raw(80)..=Price::from_raw(90),
+                usize::MAX,
+            ),
+            Err(CallAuctionBookQueryError::InvariantViolation(_))
+        ));
+        assert!(
+            book.try_limit_level(Side::Buy, Price::from_raw(90))
+                .unwrap()
+                .is_some()
+        );
+        assert!(matches!(
+            book.try_limit_level(Side::Buy, Price::from_raw(80)),
+            Err(CallAuctionBookQueryError::InvariantViolation(_))
+        ));
     }
 
     #[test]
