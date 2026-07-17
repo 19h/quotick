@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A153 are stable and are referenced from code comments and other
+identifiers A1-A154 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -6234,10 +6234,125 @@ mutation, noncommit effect, incorrect reservation delta, WAL growth before
 acceptance, interposed transition, recovery divergence, successful-path
 allocation, or new wire value falsifies A153.
 
+## A154 — atomic conditional call-auction new-identity replacement
+
+**Assumption.** One `try_submit_replace_order_if` call on a
+`CallAuctionEngine`, `CallAuctionRiskManagedEngine`,
+`DurableCallAuctionEngine`, or `DurableCallAuctionRiskEngine` holds the
+corresponding exclusive shard borrow across ordinary A62 replacement
+preparation, coupled net-risk authorization where applicable, fail-closed
+target and replacement-identity observation, one synchronous predicate, and
+commit of that same move-only preparation. Ordinary preparation owns the
+exact `CallAuctionReplacement` predicted by preflight and its source book
+revision. It does not defer target selection, new-identity selection, or
+priority assignment to the predicate or commit path.
+
+`CallAuctionReplaceObservation` is one owned, fixed-size, allocation-free
+value. It binds command identity/time, instrument ID/version, prospective
+command and both event sequences, phase/cycle snapshot, source/resulting book
+revisions, the previous still-current A112 indication, the exact target
+snapshot removed by acceptance, and the exact new-identity snapshot admitted
+at the book's next strict priority sequence. The accepted snapshot preserves
+the replacement request's owner, side, constraint, quantity, and priority
+class while assigning its unused order ID and fresh priority sequence. Before
+predicate execution, the engine proves same-instance/same-generation state,
+the exact collecting cycle and phase revision, the exact source book revision,
+A152 selected-target consistency, absence of an active replacement identity,
+and consistency between the prepared result, command, and current priority
+sequence.
+
+Exact replay and every core or coupled-risk business rejection bypass
+observation and the predicate and return `observation = None` with the ordinary
+report. Decline returns the owned observation without consuming sequence,
+invalidating the indication, mutating book/history/risk, or appending WAL;
+unwind has the same state semantics. Acceptance revalidates the source
+revision, exact target, absent replacement identity, and priority coordinate;
+applies the ordinary A62 replacement; verifies the returned target/replacement
+snapshots and successor revision; invalidates the indication; and returns the
+same observation with the report.
+
+Coupled authorization removes the target reservation from the exposure
+baseline before authorizing the proposed replacement and is evaluated before
+the predicate and repeated at ordinary commit. Accepted risk application
+removes the target reservation and admits exactly the replacement reservation;
+rejection or noncommit preserves both book and risk state. Durable acceptance
+and core or risk business rejection retain the existing command/report two-
+frame grammar; decline, unwind, and replay append zero frames. Neither
+observation nor decision is encoded, authenticated, authorized, remotely
+transported, or coordinated across shards. A154 adds no wire value or version.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A9, A10, A12, A15, A22, A37,
+A39, A41, A52, A60, A62, A64, A65, A68, A74, A76, A80, A81, A82, A85,
+A97, A109, A111, A112, A152, A153, A154] Let `A` be ordinary replacement
+preparation cost, `V` the complete fail-closed target/new-identity validation
+cost, `F` predicate cost, and `M` ordinary replacement commit cost. For `O`
+active orders, `P` occupied limit prices, and `R` registered risk accounts,
+`A`, `V`, and `M` each retain expected
+`O(log(O + 1) + log(P + 1))` time; fully colliding order or account hashes can
+add `O(O + R)` lookup time without storage growth. Decline or unwind costs
+`O(A + V + F)`. Acceptance costs `O(A + V + F + M)` and deliberately repeats
+dual-identity validation at commit. Observation and evaluator auxiliary space
+are `O(1)` and allocate no successful-path storage. Coupled net authorization
+and reservation application add expected `O(1)` work. Durable acceptance and
+core or risk business rejection append two existing frames; decline, unwind,
+and replay append zero. Count, quantity, price, notional, revision, priority,
+and sequence arithmetic is exact integer arithmetic; approximation error is
+zero.
+
+**Falsification probe.** Across all four surfaces, replace market and limit
+targets at head, middle, and tail priority with market and limit orders on the
+same or opposite side, same or different price, and lower, equal, or higher
+priority class. Include signed prices and present/absent prior indications.
+Run accepting, declining, and unwinding predicates. Require exact command/
+instrument/sequence/time/phase/book/auction provenance, exact removed/admitted
+snapshots, unused replacement identity, fresh priority, one successor book
+revision, canonical cancellation-then-admission events, and exact observation/
+report equality on acceptance.
+
+Exercise wrong route/version, cycle, phase revision, phase, owner, missing
+target, replacement-owner mismatch, duplicate replacement identity,
+instrument/capacity/aggregate/counter exhaustion, exact retry, command-ID
+collision, core and risk rejection, selected-state corruption, journal
+failure, and reopen. Mutate an unrelated order through an internal white-box
+path after replacement preparation and require stale-generation rejection
+before the predicate. Count predicate calls and compare target/replacement/
+unrelated state, queue and owner aggregates, indication, priority/command/event
+sequences, accepted IDs, risk reservations/notional/exposure, history, WAL
+frames, and plain/coupled recovered state. Any predicate on core or risk
+rejection or replay, target/replacement drift, reused identity or priority,
+second target selection with different state, partial mutation, noncommit
+effect, incorrect net reservation, WAL growth before acceptance, interposed
+transition, recovery divergence, successful-path allocation, or new wire value
+falsifies A154.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** A154 closes the local gap between observing an exact
+  call-auction cancel/replace transition and committing it. The predicate owns
+  complete removed/admitted order state, phase, revision, sequence, and prior
+  indication provenance; acceptance revalidates and commits that same prepared
+  replacement across plain, coupled-risk, and both durable engines.
+
+- **Medium impact opportunity:** deterministic OMS, exposure, auction-quality,
+  and liquidity controls can condition a new-identity replacement on the exact
+  target, requested state, fresh priority coordinate, and prior indicative
+  economics without correlating separate target, phase, and sequence queries.
+
+- **Medium impact risk:** the A154 predicate is synchronous under the exclusive
+  shard borrow and performs two fail-closed identity validations before the
+  callback and again at accepted commit. Maximum-capacity callback latency,
+  cache behavior, and collision-cluster effects remain unknown pending pinned-
+  hardware measurement.
+
+- **High impact boundary:** A154 does not calculate the hypothetical
+  post-replacement indication, authenticate the beneficial owner or order
+  authority, persist policy-decision evidence before command append, impose a
+  callback deadline, provide asynchronous validity or remote protocol, or
+  coordinate across shards. Venue-specific in-place repricing remains outside
+  A62/A154 new-identity replacement semantics.
 
 - **High impact:** A153 closes the local gap between observing an exact
   retained-priority quantity reduction and committing it. The predicate owns

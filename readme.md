@@ -438,6 +438,12 @@ Run any program with `cargo run --example <name>`.
   unwind is state-, risk-, and WAL-neutral; acceptance preserves identity and
   priority and reduces the coupled reservation by the exact quantity/notional
   delta.
+- Atomic conditional new-identity call-auction replacement on the plain,
+  coupled-risk, and both durable engine surfaces. A fixed-size owned observation
+  binds the exact removed target and fresh-priority admitted state to one
+  revision-bound preparation. Replay plus core or risk rejection bypass the
+  predicate; decline or unwind is state-, risk-, and WAL-neutral; acceptance
+  commits the same cancellation/admission pair and net reservation transition.
 - Zero-copy exact lookup and chronological iteration over the engine's bounded
   command/report history, including accepted commands and business rejections;
   exact retries add no row and do not change the canonical cached report.
@@ -485,6 +491,10 @@ Run any program with `cargo run --example <name>`.
   Conditional call-auction amendment uses the same account-independent gate.
   Acceptance reduces only the exact observed target reservation quantity,
   notional, and exposure; decline or unwind leaves every reservation unchanged.
+  Conditional call-auction replacement performs the ordinary net replacement
+  risk gate before observation. Core or risk rejection bypasses the predicate;
+  acceptance replaces exactly the observed target reservation with the
+  observed new-identity reservation.
 - Reservation lifecycle derived from the sequenced trace across fills,
   cancellation, GTD expiry, stop arming/activation, replacement, mass
   cancellation, account controls, and self-trade prevention; dormant stops
@@ -654,9 +664,9 @@ Conditional expiry-sweep predicates have the same process-local boundary and
 are not persisted, authenticated, clock-scheduled, or transported.
 Conditional stop-trigger-sweep predicates have the same process-local boundary
 and are not persisted, authenticated, source-authorized, or transported.
-Conditional call-auction uncross, cancellation, and amendment predicates are
-likewise process-local and are not persisted, authenticated, authorized,
-transported, or retained as durable decision evidence.
+Conditional call-auction uncross, cancellation, amendment, and replacement
+predicates are likewise process-local and are not persisted, authenticated,
+authorized, transported, or retained as durable decision evidence.
 Their synchronous execution extends the exclusive local shard borrow. A
 dormant-stop observation contains no activation-time forecast, and active
 minimum-quantity IOC observations must be interpreted with the submitted
@@ -701,7 +711,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 153 tagged assumptions (A1–A153), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 154 tagged assumptions (A1–A154), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -822,7 +832,13 @@ includes:
   provenance, rejection/replay predicate bypass, stale-preparation rejection,
   priority retention, unwind/decline neutrality, exact coupled reservation
   reduction, zero-frame durable noncommit, two-frame acceptance, and plain/
-  coupled durable recovery. Retained auction-history queries
+  coupled durable recovery. Atomic conditional new-identity replacement
+  coverage adds exact removed/admitted state and fresh priority, dual-identity
+  fail-closed validation, core/risk rejection and replay predicate bypass,
+  stale-preparation rejection, unwind/decline neutrality, exact net coupled
+  reservation replacement, zero-frame durable noncommit, two-frame business
+  rejection/acceptance, and plain/coupled durable recovery. Retained auction-
+  history queries
   cover accepted and rejected rows, exact lookup, zero-copy chronological
   iteration, retry stability, unchanged resource telemetry, and durable
   recovery. Account-order queries cover canonical all/side selection, unknown

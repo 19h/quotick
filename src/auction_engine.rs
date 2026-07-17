@@ -24,7 +24,7 @@ use crate::auction_book::{
     CallAuctionCommitError, CallAuctionConstructionError, CallAuctionIndicative,
     CallAuctionInvariantViolation, CallAuctionMassCancelError, CallAuctionMassCancelResult,
     CallAuctionOrder, CallAuctionOrderSnapshot, CallAuctionPrepareError, CallAuctionReplaceError,
-    CallAuctionSelfTradePolicy, CallAuctionTrade, CallAuctionUncrossPolicy,
+    CallAuctionReplacement, CallAuctionSelfTradePolicy, CallAuctionTrade, CallAuctionUncrossPolicy,
     PreparedCallAuctionUncross,
 };
 use crate::bounded_hash::{BoundedHashMap, BoundedHashSet};
@@ -907,6 +907,125 @@ impl CallAuctionAmendObservation {
     #[must_use]
     pub const fn current(self) -> CallAuctionOrderSnapshot {
         self.current
+    }
+}
+
+/// Exact owned state offered to one conditional new-identity replacement.
+///
+/// The observation is bound to one same-generation preparation and contains
+/// both the exact active target removed by acceptance and the exact fresh-
+/// priority state admitted in its place. It is fixed-size, allocation-free,
+/// and remains usable after either decline or accepted commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionReplaceObservation {
+    command_id: CommandId,
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    command_sequence: u64,
+    first_event_sequence: u64,
+    phase: CallAuctionPhaseSnapshot,
+    book_revision: u64,
+    received_at: TimestampNs,
+    previous_indicative: CompactOptionalCallAuctionIndicativeState,
+    replacement: CallAuctionReplacement,
+}
+
+impl CallAuctionReplaceObservation {
+    /// Returns the exact command identity.
+    #[must_use]
+    pub const fn command_id(self) -> CommandId {
+        self.command_id
+    }
+
+    /// Returns the immutable instrument identity.
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version.
+    #[must_use]
+    pub const fn instrument_version(self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the command sequence assigned by acceptance.
+    #[must_use]
+    pub const fn command_sequence(self) -> u64 {
+        self.command_sequence
+    }
+
+    /// Returns the cancellation event sequence assigned by acceptance.
+    #[must_use]
+    pub const fn first_event_sequence(self) -> u64 {
+        self.first_event_sequence
+    }
+
+    /// Returns the replacement-admission event sequence assigned by acceptance.
+    #[must_use]
+    pub const fn second_event_sequence(self) -> u64 {
+        self.first_event_sequence.wrapping_add(1)
+    }
+
+    /// Returns the current phase and cycle identity.
+    #[must_use]
+    pub const fn phase(self) -> CallAuctionPhaseSnapshot {
+        self.phase
+    }
+
+    /// Returns the exact collection-book revision observed by the predicate.
+    #[must_use]
+    pub const fn book_revision(self) -> u64 {
+        self.book_revision
+    }
+
+    /// Returns the collection-book revision produced by acceptance.
+    #[must_use]
+    pub const fn resulting_book_revision(self) -> u64 {
+        self.book_revision.wrapping_add(1)
+    }
+
+    /// Returns the authorizing owner account.
+    #[must_use]
+    pub const fn account_id(self) -> AccountId {
+        self.replacement.cancelled().account_id
+    }
+
+    /// Returns the active target identifier removed by acceptance.
+    #[must_use]
+    pub const fn target_order_id(self) -> OrderId {
+        self.replacement.cancelled().order_id
+    }
+
+    /// Returns the fresh replacement identifier admitted by acceptance.
+    #[must_use]
+    pub const fn replacement_order_id(self) -> OrderId {
+        self.replacement.accepted().order_id
+    }
+
+    /// Returns the gateway/controller receive time.
+    #[must_use]
+    pub const fn received_at(self) -> TimestampNs {
+        self.received_at
+    }
+
+    /// Returns the latest still-current published indication, if present.
+    #[must_use]
+    pub const fn previous_indicative(self) -> Option<CallAuctionIndicativeState> {
+        self.previous_indicative
+            .expand(self.phase, self.book_revision)
+    }
+
+    /// Returns the exact active target removed by acceptance.
+    #[must_use]
+    pub const fn cancelled(self) -> CallAuctionOrderSnapshot {
+        self.replacement.cancelled()
+    }
+
+    /// Returns the exact new-identity state admitted at fresh priority.
+    #[must_use]
+    pub const fn accepted(self) -> CallAuctionOrderSnapshot {
+        self.replacement.accepted()
     }
 }
 
@@ -3242,9 +3361,8 @@ enum PreparedCallAuctionAction {
         book_revision: u64,
     },
     Replace {
-        account_id: AccountId,
-        target_order_id: OrderId,
-        replacement: CallAuctionOrder,
+        replacement: CallAuctionReplacement,
+        book_revision: u64,
     },
     Indicative(CallAuctionIndicativeState),
     Uncross {
@@ -3363,6 +3481,7 @@ pub(crate) enum ConditionalCallAuctionCommandPreparation<T> {
 fn evaluate_conditional_call_auction_command<T>(
     engine: &CallAuctionEngine,
     preparation: CallAuctionCommandPreparation,
+    observe_authorized: bool,
     observe: impl FnOnce(
         &CallAuctionEngine,
         &PreparedCallAuctionCommand,
@@ -3379,7 +3498,7 @@ fn evaluate_conditional_call_auction_command<T>(
             ))
         }
         CallAuctionCommandPreparation::Ready(prepared) => {
-            if prepared.core_rejection().is_some() {
+            if prepared.core_rejection().is_some() || !observe_authorized {
                 return Ok(ConditionalCallAuctionCommandPreparation::Commit {
                     prepared,
                     observation: None,
@@ -3411,6 +3530,7 @@ pub(crate) fn evaluate_conditional_cancel(
     evaluate_conditional_call_auction_command(
         engine,
         preparation,
+        true,
         CallAuctionEngine::try_cancel_observation,
         accept,
     )
@@ -3427,9 +3547,46 @@ pub(crate) fn evaluate_conditional_amend(
     evaluate_conditional_call_auction_command(
         engine,
         preparation,
+        true,
         CallAuctionEngine::try_amend_observation,
         accept,
     )
+}
+
+pub(crate) fn evaluate_conditional_replace(
+    engine: &CallAuctionEngine,
+    preparation: CallAuctionCommandPreparation,
+    observe_authorized: bool,
+    accept: impl FnOnce(&CallAuctionReplaceObservation) -> bool,
+) -> Result<
+    ConditionalCallAuctionCommandPreparation<CallAuctionReplaceObservation>,
+    CallAuctionEngineError,
+> {
+    evaluate_conditional_call_auction_command(
+        engine,
+        preparation,
+        observe_authorized,
+        CallAuctionEngine::try_replace_observation,
+        accept,
+    )
+}
+
+fn replacement_matches_command(
+    replacement: CallAuctionReplacement,
+    command: CallAuctionReplaceOrder,
+    priority_sequence: u64,
+) -> bool {
+    let cancelled = replacement.cancelled();
+    let accepted = replacement.accepted();
+    cancelled.order_id == command.target_order_id
+        && cancelled.account_id == command.account_id
+        && accepted.order_id == command.replacement.order_id()
+        && accepted.account_id == command.replacement.account_id()
+        && accepted.side == command.replacement.side()
+        && accepted.constraint == command.replacement.constraint()
+        && accepted.quantity == command.replacement.quantity()
+        && accepted.priority_class == command.replacement.priority_class()
+        && accepted.priority_sequence == priority_sequence
 }
 
 pub(crate) fn evaluate_conditional_uncross(
@@ -3976,6 +4133,42 @@ impl CallAuctionEngine {
         }
     }
 
+    /// Atomically observes and conditionally commits one new-identity replacement.
+    ///
+    /// Replay and deterministic business rejection bypass `accept`. A
+    /// core-admissible command invokes the predicate with owned, revision-bound
+    /// target and fresh-priority replacement state after both identities are
+    /// validated. Decline or unwind drops the preparation without sequencing
+    /// or mutation; acceptance commits that exact replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionEngineError`] for preparation, fail-closed query,
+    /// generation validation, or commit failure.
+    pub fn try_submit_replace_order_if(
+        &mut self,
+        command: CallAuctionReplaceOrder,
+        accept: impl FnOnce(&CallAuctionReplaceObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionReplaceObservation>,
+        CallAuctionEngineError,
+    > {
+        let preparation = self.prepare(CallAuctionCommand::Replace(command))?;
+        match evaluate_conditional_replace(self, preparation, true, accept)? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => Ok(outcome),
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => {
+                self.commit(prepared)
+                    .map(|report| ConditionalCallAuctionCommandOutcome::Reported {
+                        observation: if report.replayed { None } else { observation },
+                        report,
+                    })
+            }
+        }
+    }
+
     /// Atomically observes and conditionally commits one frozen-cycle uncross.
     ///
     /// Replay and business rejection bypass `accept`. A core-admissible
@@ -4207,6 +4400,98 @@ impl CallAuctionEngine {
         })
     }
 
+    fn try_replace_observation(
+        &self,
+        prepared: &PreparedCallAuctionCommand,
+    ) -> Result<CallAuctionReplaceObservation, CallAuctionEngineError> {
+        if prepared.engine_instance_id != self.instance_id {
+            return Err(CallAuctionEngineError::ForeignPreparation);
+        }
+        if prepared.expected_retained_commands != self.reports.len()
+            || prepared.expected_retained_events != self.retained_event_count
+        {
+            return Err(CallAuctionEngineError::StalePreparation);
+        }
+        let CallAuctionCommand::Replace(command) = prepared.command else {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        };
+        let PreparedCallAuctionAction::Replace {
+            replacement,
+            book_revision,
+        } = prepared.action
+        else {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        };
+        if self.book.state_revision() != book_revision {
+            return Err(CallAuctionEngineError::StalePreparation);
+        }
+        let cancelled = self
+            .book
+            .try_order_observation(command.target_order_id)
+            .map_err(CallAuctionEngineError::BookQuery)?;
+        let replacement_identity = self
+            .book
+            .try_order_observation(command.replacement.order_id())
+            .map_err(CallAuctionEngineError::BookQuery)?;
+        book_revision
+            .checked_add(1)
+            .ok_or(CallAuctionEngineError::InternalInvariantViolation)?;
+        self.next_event_sequence
+            .checked_add(1)
+            .ok_or(CallAuctionEngineError::InternalInvariantViolation)?;
+        self.book
+            .next_priority_sequence()
+            .checked_add(1)
+            .ok_or(CallAuctionEngineError::InternalInvariantViolation)?;
+        if cancelled.instrument_id() != command.replacement.instrument_id()
+            || cancelled.instrument_version() != command.replacement.instrument_version()
+            || cancelled.book_revision() != book_revision
+            || cancelled.order_id() != command.target_order_id
+            || cancelled.state() != Some(replacement.cancelled())
+            || replacement_identity.instrument_id() != command.replacement.instrument_id()
+            || replacement_identity.instrument_version() != command.replacement.instrument_version()
+            || replacement_identity.book_revision() != book_revision
+            || replacement_identity.order_id() != command.replacement.order_id()
+            || replacement_identity.state().is_some()
+            || !replacement_matches_command(
+                replacement,
+                command,
+                self.book.next_priority_sequence(),
+            )
+            || self.phase != CallAuctionPhase::Collecting
+            || self.phase_revision != command.expected_phase_revision
+            || self.active_auction_id != Some(command.auction_id)
+        {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        }
+        if (self.phase == CallAuctionPhase::Closed) != self.active_auction_id.is_none()
+            || (self.active_auction_id.is_some() && self.active_auction_id != self.last_auction_id)
+            || self.last_indicative.is_some_and(|indicative| {
+                self.active_auction_id != Some(indicative.auction_id())
+                    || indicative.phase_revision() != self.phase_revision
+                    || indicative.book_revision() != book_revision
+                    || !indicative.is_valid_for(self.book.definition())
+            })
+        {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        }
+        Ok(CallAuctionReplaceObservation {
+            command_id: command.command_id,
+            instrument_id: command.replacement.instrument_id(),
+            instrument_version: command.replacement.instrument_version(),
+            command_sequence: self.next_command_sequence,
+            first_event_sequence: self.next_event_sequence,
+            phase: self.phase_snapshot(),
+            book_revision,
+            received_at: command.received_at,
+            previous_indicative: CompactOptionalCallAuctionIndicativeState::from_option(
+                self.last_indicative,
+                self.book.instrument_price_band(),
+            ),
+            replacement,
+        })
+    }
+
     fn try_uncross_observation<'a>(
         &'a self,
         prepared: &'a PreparedCallAuctionCommand,
@@ -4435,10 +4720,9 @@ impl CallAuctionEngine {
                 book_revision,
             } => self.apply_amend(command, previous, current, book_revision, events)?,
             PreparedCallAuctionAction::Replace {
-                account_id,
-                target_order_id,
                 replacement,
-            } => self.apply_replace(command, account_id, target_order_id, replacement, events)?,
+                book_revision,
+            } => self.apply_replace(command, replacement, book_revision, events)?,
             PreparedCallAuctionAction::Indicative(indicative) => {
                 self.apply_indicative(command, indicative, events)
             }
@@ -4549,15 +4833,50 @@ impl CallAuctionEngine {
     fn apply_replace(
         &mut self,
         command: CallAuctionCommand,
-        account_id: AccountId,
-        target_order_id: OrderId,
-        replacement: CallAuctionOrder,
+        replacement: CallAuctionReplacement,
+        book_revision: u64,
         events: &mut CallAuctionEventTraceBuilder,
     ) -> Result<CallAuctionCommandOutcome, CallAuctionEngineError> {
+        let CallAuctionCommand::Replace(replace) = command else {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        };
+        if self.book.state_revision() != book_revision {
+            return Err(CallAuctionEngineError::StalePreparation);
+        }
+        let resulting_book_revision = book_revision
+            .checked_add(1)
+            .ok_or(CallAuctionEngineError::InternalInvariantViolation)?;
+        let cancelled = self
+            .book
+            .try_order_observation(replace.target_order_id)
+            .map_err(CallAuctionEngineError::BookQuery)?;
+        let replacement_identity = self
+            .book
+            .try_order_observation(replace.replacement.order_id())
+            .map_err(CallAuctionEngineError::BookQuery)?;
+        if cancelled.book_revision() != book_revision
+            || cancelled.state() != Some(replacement.cancelled())
+            || replacement_identity.book_revision() != book_revision
+            || replacement_identity.state().is_some()
+            || !replacement_matches_command(
+                replacement,
+                replace,
+                self.book.next_priority_sequence(),
+            )
+        {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        }
         let replaced = self
             .book
-            .replace(account_id, target_order_id, replacement)
+            .replace(
+                replacement.cancelled().account_id,
+                replacement.cancelled().order_id,
+                replace.replacement,
+            )
             .map_err(|_| CallAuctionEngineError::InternalInvariantViolation)?;
+        if replaced != replacement || self.book.state_revision() != resulting_book_revision {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        }
         self.push_event(
             command,
             CallAuctionEventKind::OrderCancelled {
@@ -4885,10 +5204,9 @@ impl CallAuctionEngine {
             replace.target_order_id,
             replace.replacement,
         ) {
-            Ok(_) => Ok(PreparedCallAuctionAction::Replace {
-                account_id: replace.account_id,
-                target_order_id: replace.target_order_id,
-                replacement: replace.replacement,
+            Ok(replacement) => Ok(PreparedCallAuctionAction::Replace {
+                replacement,
+                book_revision: self.book.state_revision(),
             }),
             Err(CallAuctionReplaceError::Target(CallAuctionCancelError::UnknownOrder)) => Ok(
                 PreparedCallAuctionAction::Rejected(CallAuctionRejectReason::UnknownOrder),
@@ -6063,10 +6381,10 @@ mod tests {
         CallAuctionCheckpointResource, CallAuctionCommand, CallAuctionCommandOutcome,
         CallAuctionCommandPreparation, CallAuctionEngine, CallAuctionEngineError,
         CallAuctionEventKind, CallAuctionPhase, CallAuctionPhaseControl, CallAuctionRejectReason,
-        CallAuctionSubmitOrder, CallAuctionUncrossCommand, evaluate_conditional_amend,
-        evaluate_conditional_cancel, evaluate_conditional_uncross,
-        reserve_call_auction_checkpoint_map, reserve_call_auction_checkpoint_set,
-        reserve_call_auction_checkpoint_vec,
+        CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+        evaluate_conditional_amend, evaluate_conditional_cancel, evaluate_conditional_replace,
+        evaluate_conditional_uncross, reserve_call_auction_checkpoint_map,
+        reserve_call_auction_checkpoint_set, reserve_call_auction_checkpoint_vec,
     };
     use crate::auction::{AuctionOrderConstraint, AuctionPricePolicy};
     use crate::auction_book::{
@@ -6479,6 +6797,79 @@ mod tests {
                 .quantity,
             Quantity::new(2).unwrap()
         );
+    }
+
+    #[test]
+    fn conditional_replace_rejects_a_stale_book_preparation_before_predicate() {
+        let mut engine = CallAuctionEngine::try_new(definition()).unwrap();
+        let instrument_id = engine.book.definition().instrument_id();
+        let instrument_version = engine.book.definition().version();
+        let auction_id = AuctionId::new(1).unwrap();
+        engine
+            .submit(CallAuctionCommand::PhaseControl(CallAuctionPhaseControl {
+                command_id: CommandId::new(1).unwrap(),
+                instrument_id,
+                instrument_version,
+                auction_id,
+                expected_phase_revision: 0,
+                target_phase: CallAuctionPhase::Collecting,
+                received_at: TimestampNs::from_unix_nanos(1),
+            }))
+            .unwrap();
+        for (command_id, order_id, account_id) in [(2_u64, 1_u64, 1_u64), (3_u64, 2_u64, 2_u64)] {
+            engine
+                .submit(CallAuctionCommand::Submit(CallAuctionSubmitOrder {
+                    command_id: CommandId::new(command_id).unwrap(),
+                    auction_id,
+                    expected_phase_revision: 1,
+                    order: CallAuctionOrder::new(
+                        OrderId::new(order_id).unwrap(),
+                        AccountId::new(account_id).unwrap(),
+                        instrument_id,
+                        instrument_version,
+                        Side::Buy,
+                        AuctionOrderConstraint::Limit(Price::from_raw(50)),
+                        Quantity::new(2).unwrap(),
+                        crate::auction::AuctionPriorityClass::HIGHEST,
+                    ),
+                    received_at: TimestampNs::from_unix_nanos(command_id),
+                }))
+                .unwrap();
+        }
+        let preparation = engine
+            .prepare(CallAuctionCommand::Replace(CallAuctionReplaceOrder {
+                command_id: CommandId::new(4).unwrap(),
+                auction_id,
+                expected_phase_revision: 1,
+                account_id: AccountId::new(1).unwrap(),
+                target_order_id: OrderId::new(1).unwrap(),
+                replacement: CallAuctionOrder::new(
+                    OrderId::new(3).unwrap(),
+                    AccountId::new(1).unwrap(),
+                    instrument_id,
+                    instrument_version,
+                    Side::Sell,
+                    AuctionOrderConstraint::Limit(Price::from_raw(51)),
+                    Quantity::new(1).unwrap(),
+                    crate::auction::AuctionPriorityClass::HIGHEST,
+                ),
+                received_at: TimestampNs::from_unix_nanos(4),
+            }))
+            .unwrap();
+        engine
+            .book
+            .cancel(AccountId::new(2).unwrap(), OrderId::new(2).unwrap())
+            .unwrap();
+        let called = Cell::new(false);
+        let error = evaluate_conditional_replace(&engine, preparation, true, |_| {
+            called.set(true);
+            true
+        })
+        .unwrap_err();
+        assert!(!called.get());
+        assert!(matches!(error, CallAuctionEngineError::StalePreparation));
+        assert!(engine.book.order(OrderId::new(1).unwrap()).is_some());
+        assert!(engine.book.order(OrderId::new(3).unwrap()).is_none());
     }
 
     #[test]

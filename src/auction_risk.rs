@@ -21,10 +21,11 @@ use crate::auction_engine::{
     CallAuctionCommandOutcome, CallAuctionCommandPreparation, CallAuctionEngine,
     CallAuctionEngineConstructionError, CallAuctionEngineError, CallAuctionEngineLimits,
     CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionExecutionReport,
-    CallAuctionRejectReason, CallAuctionUncrossCommand, CallAuctionUncrossObservation,
-    ConditionalCallAuctionCommandOutcome, ConditionalCallAuctionCommandPreparation,
-    ConditionalCallAuctionOutcome, ConditionalCallAuctionPreparation, PreparedCallAuctionCommand,
-    evaluate_conditional_amend, evaluate_conditional_cancel, evaluate_conditional_uncross,
+    CallAuctionRejectReason, CallAuctionReplaceObservation, CallAuctionReplaceOrder,
+    CallAuctionUncrossCommand, CallAuctionUncrossObservation, ConditionalCallAuctionCommandOutcome,
+    ConditionalCallAuctionCommandPreparation, ConditionalCallAuctionOutcome,
+    ConditionalCallAuctionPreparation, PreparedCallAuctionCommand, evaluate_conditional_amend,
+    evaluate_conditional_cancel, evaluate_conditional_replace, evaluate_conditional_uncross,
 };
 use crate::bounded_hash::BoundedHashMap;
 use crate::domain::{AccountId, OrderId, Side};
@@ -1574,6 +1575,19 @@ impl CallAuctionRiskManagedEngine {
         })
     }
 
+    pub(crate) fn conditional_replace_observation_is_authorized(
+        &self,
+        preparation: &CallAuctionCommandPreparation,
+    ) -> Result<bool, CallAuctionEngineError> {
+        let CallAuctionCommandPreparation::Ready(prepared) = preparation else {
+            return Ok(false);
+        };
+        if !matches!(prepared.command(), CallAuctionCommand::Replace(_)) {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        }
+        Ok(prepared.core_rejection().is_none() && self.risk.authorize(prepared.command()).is_ok())
+    }
+
     fn validate_conditional_authorization(
         &self,
         preparation: &CallAuctionCommandPreparation,
@@ -1663,6 +1677,43 @@ impl CallAuctionRiskManagedEngine {
         let preparation = self.prepare(CallAuctionCommand::Amend(command))?;
         self.validate_conditional_amend_authorization(&preparation)?;
         match evaluate_conditional_amend(&self.engine, preparation, accept)? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => Ok(outcome),
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => {
+                self.commit(prepared)
+                    .map(|report| ConditionalCallAuctionCommandOutcome::Reported {
+                        observation: if report.replayed { None } else { observation },
+                        report,
+                    })
+            }
+        }
+    }
+
+    /// Atomically risk-gates, observes, and conditionally commits one replacement.
+    ///
+    /// Replay plus core or risk rejection bypass `accept`. Decline or unwind
+    /// changes neither auction nor risk state. Acceptance commits the exact
+    /// observed target/new-identity transition and applies its net coupled
+    /// reservation effect once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionEngineError`] for preparation, fail-closed query,
+    /// generation validation, or coupled commit failure.
+    pub fn try_submit_replace_order_if(
+        &mut self,
+        command: CallAuctionReplaceOrder,
+        accept: impl FnOnce(&CallAuctionReplaceObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionReplaceObservation>,
+        CallAuctionEngineError,
+    > {
+        let preparation = self.prepare(CallAuctionCommand::Replace(command))?;
+        let observe_authorized =
+            self.conditional_replace_observation_is_authorized(&preparation)?;
+        match evaluate_conditional_replace(&self.engine, preparation, observe_authorized, accept)? {
             ConditionalCallAuctionCommandPreparation::Complete(outcome) => Ok(outcome),
             ConditionalCallAuctionCommandPreparation::Commit {
                 prepared,

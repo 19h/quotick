@@ -16,10 +16,11 @@ use crate::auction_engine::{
     CallAuctionCheckpointError, CallAuctionCommand, CallAuctionCommandPreparation,
     CallAuctionEngine, CallAuctionEngineConstructionError, CallAuctionEngineError,
     CallAuctionEngineInvariantViolation, CallAuctionEngineLimits, CallAuctionExecutionReport,
-    CallAuctionUncrossCommand, CallAuctionUncrossObservation, ConditionalCallAuctionCommandOutcome,
+    CallAuctionReplaceObservation, CallAuctionReplaceOrder, CallAuctionUncrossCommand,
+    CallAuctionUncrossObservation, ConditionalCallAuctionCommandOutcome,
     ConditionalCallAuctionCommandPreparation, ConditionalCallAuctionOutcome,
     ConditionalCallAuctionPreparation, PreparedCallAuctionCommand, evaluate_conditional_amend,
-    evaluate_conditional_cancel, evaluate_conditional_uncross,
+    evaluate_conditional_cancel, evaluate_conditional_replace, evaluate_conditional_uncross,
 };
 use crate::auction_risk::{
     CallAuctionRiskCheckpoint, CallAuctionRiskCheckpointCapture, CallAuctionRiskCheckpointError,
@@ -1089,6 +1090,48 @@ impl DurableCallAuctionEngine {
         }
     }
 
+    /// Durably observes and conditionally commits one new-identity replacement.
+    ///
+    /// Replay and deterministic business rejection bypass `accept`. Decline or
+    /// unwind changes neither WAL nor auction state. Acceptance appends and
+    /// commits the same revision-bound target/replacement preparation under
+    /// the ordinary poison and recovery protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, preparation,
+    /// fail-closed query, journal, or commit failure.
+    pub fn try_submit_replace_order_if(
+        &mut self,
+        command: CallAuctionReplaceOrder,
+        accept: impl FnOnce(&CallAuctionReplaceObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionReplaceObservation>,
+        DurableCallAuctionError,
+    > {
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        let preparation = self.engine.prepare(CallAuctionCommand::Replace(command))?;
+        match evaluate_conditional_replace(&self.engine, preparation, true, accept)? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => {
+                if self.is_poisoned() {
+                    return Err(DurableCallAuctionError::Poisoned);
+                }
+                Ok(outcome)
+            }
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => self.commit_prepared(prepared).map(|report| {
+                ConditionalCallAuctionCommandOutcome::Reported {
+                    observation: if report.replayed { None } else { observation },
+                    report,
+                }
+            }),
+        }
+    }
+
     /// Durably observes and conditionally commits one frozen-cycle uncross.
     ///
     /// Replay and business rejection bypass `accept`. The predicate borrows
@@ -1793,6 +1836,56 @@ impl DurableCallAuctionRiskEngine {
         self.managed
             .validate_conditional_amend_authorization(&preparation)?;
         match evaluate_conditional_amend(self.managed.engine(), preparation, accept)? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => {
+                if self.is_poisoned() {
+                    return Err(DurableCallAuctionError::Poisoned);
+                }
+                Ok(outcome)
+            }
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => self.commit_prepared(prepared).map(|report| {
+                ConditionalCallAuctionCommandOutcome::Reported {
+                    observation: if report.replayed { None } else { observation },
+                    report,
+                }
+            }),
+        }
+    }
+
+    /// Durably risk-gates, observes, and conditionally commits one replacement.
+    ///
+    /// Replay plus core or risk rejection bypass `accept`. Decline or unwind
+    /// changes neither WAL, auction, nor risk state. Acceptance persists and
+    /// commits the exact observed target/new-identity transition and applies
+    /// its net coupled reservation effect once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, preparation,
+    /// fail-closed query, journal, or coupled commit failure.
+    pub fn try_submit_replace_order_if(
+        &mut self,
+        command: CallAuctionReplaceOrder,
+        accept: impl FnOnce(&CallAuctionReplaceObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionReplaceObservation>,
+        DurableCallAuctionError,
+    > {
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        let preparation = self.managed.prepare(CallAuctionCommand::Replace(command))?;
+        let observe_authorized = self
+            .managed
+            .conditional_replace_observation_is_authorized(&preparation)?;
+        match evaluate_conditional_replace(
+            self.managed.engine(),
+            preparation,
+            observe_authorized,
+            accept,
+        )? {
             ConditionalCallAuctionCommandPreparation::Complete(outcome) => {
                 if self.is_poisoned() {
                     return Err(DurableCallAuctionError::Poisoned);

@@ -2740,7 +2740,7 @@ impl CallAuctionBook {
         target_order_id: OrderId,
         replacement: CallAuctionOrder,
     ) -> Result<CallAuctionReplacement, CallAuctionReplaceError> {
-        let cancelled = self.preflight_replace(account_id, target_order_id, replacement)?;
+        let preflight = self.preflight_replace(account_id, target_order_id, replacement)?;
         let target =
             self.orders
                 .get(&target_order_id)
@@ -2762,10 +2762,12 @@ impl CallAuctionBook {
         self.remove_active_order(target);
         let accepted =
             self.insert_preflighted(replacement, next_priority_sequence, next_state_revision);
-        Ok(CallAuctionReplacement {
-            cancelled,
+        let result = CallAuctionReplacement {
+            cancelled: preflight.cancelled(),
             accepted,
-        })
+        };
+        debug_assert_eq!(result, preflight);
+        Ok(result)
     }
 
     pub(crate) fn preflight_replace(
@@ -2773,7 +2775,7 @@ impl CallAuctionBook {
         account_id: AccountId,
         target_order_id: OrderId,
         replacement: CallAuctionOrder,
-    ) -> Result<CallAuctionOrderSnapshot, CallAuctionReplaceError> {
+    ) -> Result<CallAuctionReplacement, CallAuctionReplaceError> {
         let target =
             self.orders
                 .get(&target_order_id)
@@ -2873,7 +2875,26 @@ impl CallAuctionBook {
             .ok_or(CallAuctionReplaceError::Replacement(
                 CallAuctionAdmissionError::AggregateQuantityOverflow(replacement.side),
             ))?;
-        Ok(target.into())
+        Ok(self.predicted_replacement(target, replacement))
+    }
+
+    fn predicted_replacement(
+        &self,
+        target: RestingAuctionOrder,
+        replacement: CallAuctionOrder,
+    ) -> CallAuctionReplacement {
+        CallAuctionReplacement {
+            cancelled: target.into(),
+            accepted: CallAuctionOrderSnapshot {
+                order_id: replacement.order_id(),
+                account_id: replacement.account_id(),
+                side: replacement.side(),
+                constraint: replacement.constraint(),
+                quantity: replacement.quantity(),
+                priority_class: replacement.priority_class(),
+                priority_sequence: self.next_priority_sequence,
+            },
+        }
     }
 
     fn preflight_replacement_level(
