@@ -567,6 +567,11 @@ Run any program with `cargo run --example <name>`.
   per-instrument replay ring repairs retained short gaps without allocation;
   older gaps recover by atomically swapping double-buffered, pre-reserved
   snapshot arenas.
+- Continuous and call-auction publishers reject recovery snapshots immediately
+  after poison, before output allocation, and validate each complete healthy
+  image before returning ownership. Poisoned publishers must be reconstructed
+  from their authoritative matching book or auction engine rather than used to
+  repair replicas.
 - Authoritative call-auction books expose one fixed-size revision-bound public
   observation plus typed best/point, market, full-depth, and inclusive-range
   reads. Scalar, market, and best state fails before output; streamed rows are
@@ -768,7 +773,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 160 tagged assumptions (A1–A160), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 161 tagged assumptions (A1–A161), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |

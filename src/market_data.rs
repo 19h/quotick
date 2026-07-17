@@ -1066,9 +1066,15 @@ impl MarketDataPublisher {
     ///
     /// # Errors
     ///
-    /// Returns [`MarketDataError::PreparationAllocationFailed`] before emitting
-    /// a partial image if either output vector cannot be reserved.
+    /// Returns [`MarketDataError::Poisoned`] before allocation when trace
+    /// failure invalidated publication state,
+    /// [`MarketDataError::PreparationAllocationFailed`] before emitting a
+    /// partial image if either output vector cannot be reserved, or a typed
+    /// snapshot error if the constructed recovery image is inconsistent.
     pub fn try_snapshot(&self) -> Result<MarketDataSnapshot, MarketDataError> {
+        if self.poisoned {
+            return Err(MarketDataError::Poisoned);
+        }
         let mut bids = Vec::new();
         bids.try_reserve_exact(self.bids.len()).map_err(|_| {
             MarketDataError::PreparationAllocationFailed(MarketDataResource::BidPriceLevels)
@@ -1094,7 +1100,7 @@ impl MarketDataPublisher {
             quantity: level.quantity,
             order_count: level.order_count,
         }));
-        Ok(MarketDataSnapshot {
+        let snapshot = MarketDataSnapshot {
             instrument_id: self.instrument_id,
             instrument_version: self.instrument_version,
             as_of_sequence: self.last_sequence,
@@ -1102,19 +1108,22 @@ impl MarketDataPublisher {
             trading_state: self.trading_state,
             bids,
             asks,
-        })
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
     }
 
     /// Materializes a complete full-depth image using the fallible production path.
     ///
     /// # Panics
     ///
-    /// Panics only if output-vector allocation fails. Use [`Self::try_snapshot`]
-    /// when allocation failure must remain typed.
+    /// Panics if publication state is poisoned, the constructed image is
+    /// invalid, or output-vector allocation fails. Use [`Self::try_snapshot`]
+    /// when failure must remain typed.
     #[must_use]
     pub fn snapshot(&self) -> MarketDataSnapshot {
         self.try_snapshot()
-            .expect("market-data snapshot output allocation failed")
+            .expect("market-data publisher snapshot is not queryable")
     }
 
     /// Publishes one complete matching trace.
@@ -4637,6 +4646,31 @@ fn validate_report_outcome(report: &ExecutionReport) -> Result<(), MarketDataErr
 #[cfg(test)]
 mod resource_limit_tests {
     use super::*;
+    use crate::domain::AssetId;
+    use crate::instrument::{
+        InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
+        QuantityRules, ReserveOrderRules,
+    };
+
+    fn definition() -> InstrumentDefinition {
+        InstrumentDefinition::new(InstrumentSpec {
+            instrument_id: InstrumentId::new(1).unwrap(),
+            version: InstrumentVersion::new(1).unwrap(),
+            effective_from: TimestampNs::from_unix_nanos(0),
+            symbol: InstrumentSymbol::new("MD-UNIT").unwrap(),
+            kind: InstrumentKind::Spot,
+            base_asset_id: AssetId::new(1).unwrap(),
+            quote_asset_id: AssetId::new(2).unwrap(),
+            price: PriceRules::new(0, 1, Price::from_raw(0), Price::from_raw(1_000)).unwrap(),
+            quantity: QuantityRules::new(1, 1, 1_000).unwrap(),
+            reserve: ReserveOrderRules::disabled(),
+            hidden_orders_supported: true,
+            base_units_per_lot: 1,
+            quote_units_per_price_unit: 1,
+            trading_state: TradingState::Open,
+        })
+        .unwrap()
+    }
 
     fn replica() -> MarketDataReplica {
         MarketDataReplica::try_with_limits(
@@ -4651,6 +4685,47 @@ mod resource_limit_tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn publisher_snapshot_rejects_poison_before_invalid_recovery_state() {
+        let book = OrderBook::new(definition());
+        let mut publisher = MarketDataPublisher::from_book(&book).unwrap();
+        let bid_status = publisher.price_level_arena_status(Side::Buy);
+        let ask_status = publisher.price_level_arena_status(Side::Sell);
+        publisher.last_trade_id = Some(TradeId::new(1).unwrap());
+        publisher.poisoned = true;
+
+        assert_eq!(publisher.try_snapshot(), Err(MarketDataError::Poisoned));
+        publisher.poisoned = false;
+        assert_eq!(
+            publisher.try_snapshot(),
+            Err(MarketDataError::InvalidSnapshot(
+                "snapshot trade identifier exceeds its event sequence"
+            ))
+        );
+        assert_eq!(publisher.price_level_arena_status(Side::Buy), bid_status);
+        assert_eq!(publisher.price_level_arena_status(Side::Sell), ask_status);
+
+        publisher.last_trade_id = None;
+        publisher.bids.insert(
+            Price::from_raw(100),
+            Aggregate {
+                quantity: 0,
+                order_count: 1,
+            },
+        );
+        let invalid_status = publisher.price_level_arena_status(Side::Buy);
+        assert_eq!(
+            publisher.try_snapshot(),
+            Err(MarketDataError::InvalidSnapshot(
+                "snapshot level has an invalid side or empty aggregate"
+            ))
+        );
+        assert_eq!(
+            publisher.price_level_arena_status(Side::Buy),
+            invalid_status
+        );
     }
 
     #[test]

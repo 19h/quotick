@@ -1320,11 +1320,18 @@ impl CallAuctionMarketDataPublisher {
     ///
     /// # Errors
     ///
-    /// Returns [`CallAuctionMarketDataError::PreparationAllocationFailed`]
-    /// before returning a partial image if either output vector cannot be reserved.
+    /// Returns [`CallAuctionMarketDataError::Poisoned`] before allocation when
+    /// trace failure invalidated publication state,
+    /// [`CallAuctionMarketDataError::PreparationAllocationFailed`] before
+    /// returning a partial image if either output vector cannot be reserved,
+    /// or a typed snapshot error if the constructed recovery image is
+    /// inconsistent.
     pub fn try_snapshot(
         &self,
     ) -> Result<CallAuctionMarketDataSnapshot, CallAuctionMarketDataError> {
+        if self.poisoned {
+            return Err(CallAuctionMarketDataError::Poisoned);
+        }
         let mut bids = Vec::new();
         bids.try_reserve_exact(self.bids.len()).map_err(|_| {
             CallAuctionMarketDataError::PreparationAllocationFailed(
@@ -1332,7 +1339,7 @@ impl CallAuctionMarketDataPublisher {
             )
         })?;
         for (&price, &aggregate) in self.bids.iter().rev() {
-            bids.push(level_from_aggregate(
+            bids.push(snapshot_level_from_aggregate(
                 Side::Buy,
                 AuctionOrderConstraint::Limit(price),
                 aggregate,
@@ -1345,13 +1352,13 @@ impl CallAuctionMarketDataPublisher {
             )
         })?;
         for (&price, &aggregate) in self.asks.iter() {
-            asks.push(level_from_aggregate(
+            asks.push(snapshot_level_from_aggregate(
                 Side::Sell,
                 AuctionOrderConstraint::Limit(price),
                 aggregate,
             )?);
         }
-        Ok(CallAuctionMarketDataSnapshot {
+        let snapshot = CallAuctionMarketDataSnapshot {
             instrument_id: self.instrument_id,
             instrument_version: self.instrument_version,
             as_of_sequence: self.last_event_sequence,
@@ -1364,19 +1371,22 @@ impl CallAuctionMarketDataPublisher {
             market_sell: self.market_level(Side::Sell),
             bids,
             asks,
-        })
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
     }
 
     /// Materializes a complete full-depth image using the fallible production path.
     ///
     /// # Panics
     ///
-    /// Panics only if output-vector allocation fails. Use [`Self::try_snapshot`]
-    /// when allocation failure must remain typed.
+    /// Panics if publication state is poisoned, the constructed image is
+    /// invalid, or output-vector allocation fails. Use [`Self::try_snapshot`]
+    /// when failure must remain typed.
     #[must_use]
     pub fn snapshot(&self) -> CallAuctionMarketDataSnapshot {
         self.try_snapshot()
-            .expect("call-auction market-data snapshot output allocation failed")
+            .expect("call-auction publisher snapshot is not queryable")
     }
 
     /// Publishes one complete auction command/report trace.
@@ -4130,6 +4140,18 @@ fn level_from_aggregate(
     )
 }
 
+fn snapshot_level_from_aggregate(
+    side: Side,
+    constraint: AuctionOrderConstraint,
+    aggregate: Aggregate,
+) -> Result<CallAuctionMarketDataLevel, CallAuctionMarketDataError> {
+    level_from_aggregate(side, constraint, aggregate).map_err(|_| {
+        CallAuctionMarketDataError::InvalidSnapshot(
+            "auction publisher limit aggregate is structurally invalid",
+        )
+    })
+}
+
 const fn aggregate_from_level(level: CallAuctionMarketDataLevel) -> Aggregate {
     Aggregate {
         quantity: level.quantity,
@@ -4414,6 +4436,50 @@ mod tests {
             trading_state: TradingState::Halted,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn publisher_snapshot_rejects_poison_before_invalid_recovery_state() {
+        let engine = CallAuctionEngine::try_new(definition()).unwrap();
+        let mut publisher = CallAuctionMarketDataPublisher::from_engine(&engine).unwrap();
+        let bid_status = publisher.price_level_arena_status(Side::Buy);
+        let ask_status = publisher.price_level_arena_status(Side::Sell);
+        publisher.last_trade_id = Some(TradeId::new(1).unwrap());
+        publisher.poisoned = true;
+
+        assert_eq!(
+            publisher.try_snapshot(),
+            Err(CallAuctionMarketDataError::Poisoned)
+        );
+        publisher.poisoned = false;
+        assert_eq!(
+            publisher.try_snapshot(),
+            Err(CallAuctionMarketDataError::InvalidSnapshot(
+                "auction trade identifier exceeds the event sequence"
+            ))
+        );
+        assert_eq!(publisher.price_level_arena_status(Side::Buy), bid_status);
+        assert_eq!(publisher.price_level_arena_status(Side::Sell), ask_status);
+
+        publisher.last_trade_id = None;
+        publisher.bids.insert(
+            Price::from_raw(100),
+            Aggregate {
+                quantity: 0,
+                order_count: 1,
+            },
+        );
+        let invalid_status = publisher.price_level_arena_status(Side::Buy);
+        assert_eq!(
+            publisher.try_snapshot(),
+            Err(CallAuctionMarketDataError::InvalidSnapshot(
+                "auction publisher limit aggregate is structurally invalid"
+            ))
+        );
+        assert_eq!(
+            publisher.price_level_arena_status(Side::Buy),
+            invalid_status
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A160 are stable and are referenced from code comments and other
+identifiers A1-A161 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -6801,10 +6801,75 @@ invalid aggregate output, continuous spread rule, skipped selected corruption,
 partial vector, mutation, successful-path allocation, publisher panic,
 source/replica divergence, or wire-byte change falsifies A160.
 
+## A161 — poison-aware publisher recovery snapshots
+
+**Assumption.** One continuous or call-auction publisher snapshot query holds
+one immutable publisher borrow. `MarketDataPublisher::try_snapshot` and
+`CallAuctionMarketDataPublisher::try_snapshot` reject their respective
+`Poisoned` error before reserving or traversing output. A trace failure can
+poison before or after incremental mutation; the local publisher therefore
+makes no claim that its retained image is authoritative once poisoned.
+
+For a healthy publisher, each output vector requests its exact current public
+side cardinality and copies complete depth in canonical market priority. The
+fully constructed snapshot then passes the existing snapshot validator before
+ownership is returned. Continuous validation covers trade/state revision
+chronology, side and non-empty aggregate shape, strict within-side ordering,
+and an uncrossed top of book. Call-auction validation covers event/command/book
+revision chronology, phase/cycle shape, nullable indication provenance, trade
+chronology, market-level shape, and canonical non-empty limit-side ordering.
+Any error destroys local output and returns no partial recovery image.
+
+The convenience `snapshot` methods compose the typed path and panic on poison,
+invalid constructed state, or output reservation failure under A12. Sequence,
+poison, limits, and allocation telemetry remain diagnostic reads. A161 changes
+no update, snapshot, replay, WAL, checkpoint, codec, or wire value.
+
+**Dependent results.** [A1, A3, A10, A12, A21, A23, A44, A55, A67, A70,
+A83, A103, A161] Poison rejection is `O(1)` time and space before allocation.
+For `B` public bids, `A` public asks, and `P = B + A`, a healthy query requests
+and owns `O(P)` output, performs `O(P)` construction plus `O(P)` validation,
+and uses `O(1)` auxiliary state beyond the returned vectors. Exact reservation
+requests do not assert allocator capacity or resident-byte equality.
+
+**Falsification probe.** Poison each publisher through an invalid report before
+mutation and after at least one valid event has mutated its mirror; require the
+typed poison error before allocation, traversal, or snapshot ownership. In
+white-box state, combine poison with invalid trade/revision chronology and
+require poison precedence, then clear poison and require the exact typed
+snapshot error without changed telemetry.
+
+Exercise healthy genesis and populated one-/two-sided images, continuous
+locked/crossed rejection, call-auction crossed collection acceptance, market
+interest, indication presence/absence, signed prices, and empty/full depth.
+Require canonical rows, exact scalar provenance, source/replica recovery
+parity, unchanged encoded bytes, nonmutation, and convenience panic on every
+typed failure. Any poisoned snapshot success, partial returned image, skipped
+constructed-image validation, allocation before poison rejection, mutation,
+telemetry change, recovery divergence, or wire-byte change falsifies A161.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** A161 prevents poisoned continuous and call-auction
+  publishers from becoming recovery authorities. Both snapshot paths reject
+  poison before allocation and validate the complete constructed image before
+  returning ownership.
+
+- **Medium impact opportunity:** recovery controllers can treat successful
+  publisher snapshot construction as an explicit local health boundary before
+  applying the image to a replica or beginning suffix replay.
+
+- **High impact risk:** publisher poison is process-local and not a durable
+  incident record. Reconstruction must use the authoritative matching or
+  auction engine; restarting or clearing external supervision cannot establish
+  that a retained publisher image is valid.
+
+- **High impact boundary:** A161 proves local snapshot structure and publisher
+  health, not source authentication, transport freshness, entitlement,
+  snapshot-plus-suffix lineage, or cross-process publication atomicity.
 
 - **High impact:** A160 closes the authoritative call-auction public-aggregate
   read gap. Source observation, point/best reads, typed streams, materializers,

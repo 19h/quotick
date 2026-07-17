@@ -1112,7 +1112,10 @@ space, and emits `NoBookChange`. Its later events retain their ordinary bounds.
 
 - Publisher bootstrap is expected `O(O + P log P + S log(O + 1) + T)` for `S`
   dormant stops.
-- A full-depth snapshot output is `O(P)`.
+- A healthy full-depth publisher snapshot requests and owns `O(P)` output,
+  makes one `O(P)` construction pass and one `O(P)` validation pass, and uses
+  `O(1)` auxiliary state beyond the output. Poison rejects in `O(1)` before
+  allocation or tree traversal.
 - Allocation-free double-buffered snapshot application is `O(P log P)`.
 - A complete publisher cross-audit is expected
   `O(O + P + S log(O + 1) + T)` outside adversarial hash collision clusters.
@@ -1228,8 +1231,11 @@ updates and `U` unique affected limit identities:
   invalidation of its fixed-size optional state are `O(1)`.
 - An aborted self-trade rejection fixes `E = 1` and projects one
   `NoPublicChange` in `O(1)`; its exact retry fixes `E = 0`.
-- Snapshot output is `O(P)`; double-buffered snapshot application is
-  allocation-free after construction and `O(P log P)`.
+- A healthy snapshot requests and owns `O(P)` output, performs `O(P)`
+  construction plus `O(P)` validation, and uses `O(1)` auxiliary state beyond
+  the output. Poison rejects in `O(1)` before allocation or tree traversal.
+  Double-buffered snapshot application is allocation-free after construction
+  and `O(P log P)`.
 
 Publisher fixed state is `O(O_max + P_max)` and replica fixed state is
 `O(P_max + E_max)`, including four active/standby side arenas in total.

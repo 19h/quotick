@@ -924,6 +924,84 @@ fn snapshot_repairs_gaps_and_corrupt_absolute_transition_poisoning_is_fail_close
 }
 
 #[test]
+fn poisoned_publisher_cannot_emit_a_recovery_snapshot() {
+    let mut engine = engine();
+    let mut publisher = CallAuctionMarketDataPublisher::from_engine(&engine).unwrap();
+    let command = phase(1, 1, 0, CallAuctionPhase::Collecting);
+    let mut report = engine.submit(command).unwrap();
+    report.command_id = CommandId::new(2).unwrap();
+
+    assert_eq!(
+        publisher.publish(command, &report, &engine),
+        Err(CallAuctionMarketDataError::TraceMismatch(
+            "auction report identity is wrong or its event trace is empty"
+        ))
+    );
+    assert!(publisher.is_poisoned());
+    assert_eq!(
+        publisher.try_snapshot(),
+        Err(CallAuctionMarketDataError::Poisoned)
+    );
+    assert!(std::panic::catch_unwind(|| publisher.snapshot()).is_err());
+    assert_eq!(publisher.last_sequence(), 0);
+    assert_eq!(publisher.last_command_sequence(), 0);
+}
+
+#[test]
+fn partially_mutated_publisher_cannot_emit_a_recovery_snapshot() {
+    let mut engine = engine();
+    let mut publisher = CallAuctionMarketDataPublisher::from_engine(&engine).unwrap();
+    for command in [
+        phase(1, 1, 0, CallAuctionPhase::Collecting),
+        submit(
+            2,
+            1,
+            1,
+            1,
+            7,
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(100)),
+            5,
+        ),
+    ] {
+        let report = engine.submit(command).unwrap();
+        publisher.publish(command, &report, &engine).unwrap();
+    }
+
+    let command = replace(
+        3,
+        1,
+        1,
+        1,
+        7,
+        2,
+        Side::Sell,
+        AuctionOrderConstraint::Limit(Price::from_raw(105)),
+        3,
+    );
+    let mut report = engine.submit(command).unwrap();
+    let events = report.events.make_mut();
+    let quotick::auction_engine::CallAuctionEventKind::OrderAccepted(order) = &mut events[1].kind
+    else {
+        panic!("replacement report must end in acceptance");
+    };
+    order.quantity = Quantity::new(4).unwrap();
+
+    assert_eq!(
+        publisher.publish(command, &report, &engine),
+        Err(CallAuctionMarketDataError::TraceMismatch(
+            "accepted order contradicts its command or collection state"
+        ))
+    );
+    assert!(publisher.is_poisoned());
+    assert!(publisher.last_sequence() + 1 < engine.next_event_sequence());
+    assert_eq!(
+        publisher.try_snapshot(),
+        Err(CallAuctionMarketDataError::Poisoned)
+    );
+}
+
+#[test]
 fn rejection_user_cancel_and_live_bootstrap_preserve_public_boundaries() {
     let mut engine = engine();
     let mut publisher = CallAuctionMarketDataPublisher::from_engine(&engine).unwrap();

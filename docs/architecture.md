@@ -2249,7 +2249,10 @@ market-data stream and its replicas.
     audits private and public state.
 12. A full-depth snapshot contains public occupied bids in descending price
     order and asks in ascending price order at one source sequence. Hidden-only
-    prices are absent. Locked or crossed snapshots are invalid.
+    prices are absent. Locked or crossed snapshots are invalid. Publisher
+    `try_snapshot` rejects poison before output reservation and validates the
+    complete constructed image before returning ownership; no error returns a
+    partial recovery image.
 13. A replica rejects a missing, duplicated, or reordered sequence before
     mutating depth. A non-stale full-depth snapshot resets the recovery boundary.
     A separate `MarketDataReplayBuffer` may retain one exact bounded suffix for
@@ -2264,7 +2267,9 @@ market-data stream and its replicas.
       They return a zero-copy source-ordered iterator across physical wrap, or
       report that the cursor is ahead or its required first sequence is gone.
 14. Trace or structural failures after incremental mutation poison publisher or
-    replica state; a fresh authoritative bootstrap/snapshot is required.
+    replica state; a fresh authoritative bootstrap/snapshot is required. A
+    poisoned publisher cannot supply that snapshot and must be reconstructed
+    from the authoritative book.
     Batch-size, level-cardinality, and snapshot-cardinality failures are
     preflighted before authoritative mutation and do not poison the replica.
     Every public replica economic observation uses one coherent query gate that
@@ -2343,9 +2348,10 @@ market-data stream and its replicas.
     Their convenience wrappers also panic on an unhealthy replica instead of
     returning partially advanced state. Applying a valid non-stale source
     snapshot repairs poison and re-enables all observations at one new boundary.
-    `try_snapshot`, `try_depth`, and `try_depth_range` keep caller-owned output
-    allocation failure typed; the wire payload contains no process-local limit
-    or allocation metadata.
+    Publisher `try_snapshot` rejects poison before allocation and validates its
+    complete constructed recovery image. It, `try_depth`, and
+    `try_depth_range` keep caller-owned output allocation failure typed; the
+    wire payload contains no process-local limit or allocation metadata.
 21. For retained capacity `N`, replay construction initializes exactly `N`
     optional typed slots. Admission and exact-overlap proof are `O(E)` for an
     `E`-update batch, each new write and retained lookup is `O(1)`, range-query
@@ -2414,10 +2420,12 @@ replica contract.
    the active auction, phase revision, and book revision and can exist only in
    `Collecting` or `Frozen`. A replica rejects stale images, invalid phase/cycle
    topology, wrong-side/noncanonical/empty levels, and definition-off-grid
-   prices.
+   prices. Publisher `try_snapshot` rejects poison before output reservation
+   and validates the complete constructed image before returning ownership.
 9. Missing or reordered sequences fail before mutation. A later structural
    error poisons publisher or replica state until authoritative reconstruction
-   or a non-stale valid snapshot.
+   or a non-stale valid snapshot. A poisoned publisher cannot provide that
+   repair image and must be reconstructed from its authoritative engine.
 10. The stable schema is
     [call-auction market-data payload version 5](auction-market-data-v5.md).
     Indicative kind tag `6` publishes the exact revision-bound state with
@@ -2446,9 +2454,10 @@ replica contract.
     Every streamed row validates its price and quantity/count aggregate.
     `try_limit_depth_range` and `try_limit_depth` validate selected rows before
     exactly reserving and copying them through a second immutable pass.
-    `try_snapshot`, `try_limit_depth`, and `try_limit_depth_range` make caller-
-    owned output allocation failure typed; convenience wrappers compose these
-    paths and may panic under A12.
+    Publisher `try_snapshot` rejects poison before allocation and validates its
+    complete constructed recovery image. It, `try_limit_depth`, and
+    `try_limit_depth_range` make caller-owned output allocation failure typed;
+    convenience wrappers compose these paths and may panic under A12.
 14. A replica owns active and standby AVL arenas for both sides plus a fixed
     batch-level scratch hash. It simulates all price-level occupancy transitions
     before mutation and validates aggregate deltas during application.
@@ -3034,6 +3043,10 @@ snapshot atomically; recover through the preallocated standby image; and run
 bucket, and scratch allocations remain fixed. Unit corruption tests deliberately
 discard active-arena and batch-scratch reservations and require the invariant
 auditor to reject both layouts.
+Publisher snapshot tests poison state through a report contradiction and
+require typed refusal plus convenience panic. White-box tests combine poison
+with invalid trade chronology, require poison precedence, then clear poison and
+require constructed-image validation without arena-telemetry change.
 Replica depth-query tests additionally cover allocation-free best-first full
 and inclusive-band traversal, reverse traversal, limits, inverted bands, and
 authoritative-book parity on both sides. Shared BBO, best-side, trading-state,
@@ -3065,6 +3078,9 @@ They run 1,000 different order/price identities with periodic source audit and
 snapshot repair while publisher/replica AVL, dense, bucket, and scratch
 allocations remain fixed; unit corruption tests discard arena and scratch
 reservations and require structural rejection.
+Publisher snapshot tests likewise require poison refusal and convenience panic;
+white-box trade-chronology corruption proves poison precedence, constructed-
+image validation after poison clears, and unchanged arena telemetry.
 Replica limit-depth query tests additionally cover allocation-free
 best-to-worst full and inclusive-band traversal, reverse traversal, limits,
 inverted bands, separate market interest, and authoritative-book parity on

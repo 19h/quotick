@@ -937,6 +937,9 @@ fn account_control_prior_state_corruption_poison_publisher() {
         ))
     );
     assert!(publisher.is_poisoned());
+    assert!(publisher.last_sequence() < book.last_event_sequence());
+    assert_eq!(publisher.try_snapshot(), Err(MarketDataError::Poisoned));
+    assert!(std::panic::catch_unwind(|| publisher.snapshot()).is_err());
 }
 
 #[test]
@@ -1223,6 +1226,8 @@ fn publisher_bootstraps_from_an_existing_book_and_fails_closed_on_a_trace_gap() 
         })
     );
     assert!(publisher.is_poisoned());
+    assert_eq!(publisher.last_sequence(), 2);
+    assert_eq!(publisher.try_snapshot(), Err(MarketDataError::Poisoned));
     assert_eq!(
         publisher.publish(second, &report, &book),
         Err(MarketDataError::Poisoned)
