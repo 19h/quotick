@@ -3,7 +3,7 @@ use quotick::instrument::{
     QuantityRules, ReserveOrderRules, TradingState,
 };
 use quotick::market_data::{
-    MarketDataBatch, MarketDataPublisher, MarketDataReplayBuffer,
+    MarketDataBatch, MarketDataError, MarketDataPublisher, MarketDataReplayBuffer,
     MarketDataReplayConstructionError, MarketDataReplayError, MarketDataReplica, MarketDataUpdate,
 };
 use quotick::matching::{
@@ -16,6 +16,52 @@ use quotick::{
 
 fn instrument(value: u64) -> InstrumentId {
     InstrumentId::new(value).unwrap()
+}
+
+#[test]
+fn healthy_replica_rejects_a_divergent_same_sequence_publisher_snapshot() {
+    let definition = instrument_definition(1);
+    let mut first_book = OrderBook::new(definition);
+    let mut first_publisher = MarketDataPublisher::from_book(&first_book).unwrap();
+    publish(
+        &mut first_book,
+        &mut first_publisher,
+        order(definition, 1, 1, 100),
+    );
+    let first = first_publisher.snapshot();
+
+    let mut second_book = OrderBook::new(definition);
+    let mut second_publisher = MarketDataPublisher::from_book(&second_book).unwrap();
+    publish(
+        &mut second_book,
+        &mut second_publisher,
+        order(definition, 1, 1, 99),
+    );
+    let second = second_publisher.snapshot();
+    assert_eq!(first.as_of_sequence(), second.as_of_sequence());
+    assert_ne!(first, second);
+
+    let mut replica = MarketDataReplica::new(instrument(1), version(), TradingState::Open);
+    replica.apply_snapshot(&first).unwrap();
+    let bid_status = replica.price_level_arena_status(Side::Buy);
+    let standby_status = replica.standby_price_level_arena_status(Side::Buy);
+    replica.apply_snapshot(&first).unwrap();
+    assert_eq!(replica.price_level_arena_status(Side::Buy), bid_status);
+    assert_eq!(
+        replica.standby_price_level_arena_status(Side::Buy),
+        standby_status
+    );
+    assert_eq!(
+        replica.apply_snapshot(&second),
+        Err(MarketDataError::SnapshotSequenceFork {
+            sequence: first.as_of_sequence(),
+        })
+    );
+    assert_eq!(
+        replica.depth(Side::Buy, usize::MAX),
+        first_book.depth(Side::Buy, usize::MAX)
+    );
+    assert!(!replica.is_poisoned());
 }
 
 fn version() -> InstrumentVersion {

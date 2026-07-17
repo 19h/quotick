@@ -635,6 +635,24 @@ fn validate_snapshot_side(
     Ok(())
 }
 
+/// One monotone coordinate below a continuous snapshot's event sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarketDataSnapshotCoordinate {
+    /// Final contiguous trade identifier, with genesis represented by zero.
+    LastTradeId,
+    /// Revision of the effective trading-state control.
+    TradingStateRevision,
+}
+
+impl fmt::Display for MarketDataSnapshotCoordinate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::LastTradeId => "last trade identifier",
+            Self::TradingStateRevision => "trading-state revision",
+        })
+    }
+}
+
 /// Publication, validation, or replica-recovery failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarketDataError {
@@ -654,6 +672,20 @@ pub enum MarketDataError {
         /// Current replica sequence.
         current: u64,
         /// Snapshot boundary.
+        snapshot: u64,
+    },
+    /// A healthy replica received different content at its current sequence.
+    SnapshotSequenceFork {
+        /// Conflicting source sequence.
+        sequence: u64,
+    },
+    /// A newer snapshot regressed one healthy subordinate lineage coordinate.
+    SnapshotCoordinateRegression {
+        /// Coordinate whose monotonicity failed.
+        coordinate: MarketDataSnapshotCoordinate,
+        /// Current healthy coordinate.
+        current: u64,
+        /// Coordinate proposed by the snapshot.
         snapshot: u64,
     },
     /// A full-depth image violated a structural invariant.
@@ -699,6 +731,18 @@ impl fmt::Display for MarketDataError {
             Self::StaleSnapshot { current, snapshot } => write!(
                 formatter,
                 "snapshot sequence {snapshot} predates replica sequence {current}"
+            ),
+            Self::SnapshotSequenceFork { sequence } => write!(
+                formatter,
+                "market-data snapshot conflicts with healthy replica sequence {sequence}"
+            ),
+            Self::SnapshotCoordinateRegression {
+                coordinate,
+                current,
+                snapshot,
+            } => write!(
+                formatter,
+                "market-data snapshot {coordinate} regresses from {current} to {snapshot}"
             ),
             Self::InvalidSnapshot(detail)
             | Self::InvalidUpdate(detail)
@@ -3354,12 +3398,17 @@ impl MarketDataReplica {
         hash_status(&self.batch_levels)
     }
 
-    /// Atomically replaces local depth with a non-stale verified snapshot.
+    /// Atomically admits one non-stale, lineage-consistent recovery image.
+    ///
+    /// An exact healthy retry at the current sequence returns without mutation.
+    /// A poisoned replica accepts different valid state at that sequence because
+    /// its partially applied economic coordinates are not recovery authority.
     ///
     /// # Errors
     ///
-    /// Returns [`MarketDataError`] for identity, staleness, or snapshot
-    /// structural failure. A valid snapshot also clears a poisoned state.
+    /// Returns [`MarketDataError`] for identity, staleness, snapshot structure,
+    /// a healthy same-sequence fork, subordinate-coordinate regression, or
+    /// capacity failure. A successfully applied snapshot clears poison.
     pub fn apply_snapshot(&mut self, snapshot: &MarketDataSnapshot) -> Result<(), MarketDataError> {
         if snapshot.instrument_id != self.instrument_id {
             return Err(MarketDataError::WrongInstrument);
@@ -3396,6 +3445,27 @@ impl MarketDataReplica {
                 attempted: snapshot.asks.len(),
             });
         }
+        if !self.poisoned {
+            if snapshot.as_of_sequence == self.last_sequence {
+                return if self.snapshot_matches_active(snapshot) {
+                    Ok(())
+                } else {
+                    Err(MarketDataError::SnapshotSequenceFork {
+                        sequence: self.last_sequence,
+                    })
+                };
+            }
+            Self::validate_snapshot_coordinate(
+                MarketDataSnapshotCoordinate::LastTradeId,
+                trade_coordinate(self.last_trade_id),
+                trade_coordinate(snapshot.last_trade_id),
+            )?;
+            Self::validate_snapshot_coordinate(
+                MarketDataSnapshotCoordinate::TradingStateRevision,
+                self.trading_state.revision(),
+                snapshot.trading_state.revision(),
+            )?;
+        }
         self.standby_bids.clear();
         self.standby_asks.clear();
         for level in &snapshot.bids {
@@ -3423,6 +3493,46 @@ impl MarketDataReplica {
         self.trading_state = snapshot.trading_state;
         self.poisoned = false;
         Ok(())
+    }
+
+    fn validate_snapshot_coordinate(
+        coordinate: MarketDataSnapshotCoordinate,
+        current: u64,
+        snapshot: u64,
+    ) -> Result<(), MarketDataError> {
+        if snapshot < current {
+            return Err(MarketDataError::SnapshotCoordinateRegression {
+                coordinate,
+                current,
+                snapshot,
+            });
+        }
+        Ok(())
+    }
+
+    fn snapshot_matches_active(&self, snapshot: &MarketDataSnapshot) -> bool {
+        snapshot.last_trade_id == self.last_trade_id
+            && snapshot.trading_state == self.trading_state
+            && snapshot.bids.len() == self.bids.len()
+            && snapshot.asks.len() == self.asks.len()
+            && snapshot.bids.iter().zip(self.bids.iter().rev()).all(
+                |(snapshot, (&price, aggregate))| {
+                    snapshot.side == Side::Buy
+                        && snapshot.price == price
+                        && snapshot.quantity == aggregate.quantity
+                        && snapshot.order_count == aggregate.order_count
+                },
+            )
+            && snapshot
+                .asks
+                .iter()
+                .zip(self.asks.iter())
+                .all(|(snapshot, (&price, aggregate))| {
+                    snapshot.side == Side::Sell
+                        && snapshot.price == price
+                        && snapshot.quantity == aggregate.quantity
+                        && snapshot.order_count == aggregate.order_count
+                })
     }
 
     /// Applies one contiguous command batch.
@@ -4418,6 +4528,13 @@ const fn update_level(update: MarketDataUpdate) -> Option<MarketDataLevel> {
     }
 }
 
+pub(crate) const fn trade_coordinate(trade_id: Option<TradeId>) -> u64 {
+    match trade_id {
+        Some(trade_id) => trade_id.get(),
+        None => 0,
+    }
+}
+
 fn preflight_replica_level_capacity(
     scratch: &mut BoundedHashMap<(Side, Price), bool>,
     bids: &DepthMap,
@@ -4687,6 +4804,28 @@ mod resource_limit_tests {
         .unwrap()
     }
 
+    fn recovery_snapshot() -> MarketDataSnapshot {
+        MarketDataSnapshot {
+            instrument_id: InstrumentId::new(1).unwrap(),
+            instrument_version: InstrumentVersion::new(1).unwrap(),
+            as_of_sequence: 4,
+            last_trade_id: Some(TradeId::new(2).unwrap()),
+            trading_state: TradingStateSnapshot::from_parts(TradingState::Halted, 2),
+            bids: vec![MarketDataLevel {
+                side: Side::Buy,
+                price: Price::from_raw(100),
+                quantity: 10,
+                order_count: 1,
+            }],
+            asks: vec![MarketDataLevel {
+                side: Side::Sell,
+                price: Price::from_raw(110),
+                quantity: 5,
+                order_count: 1,
+            }],
+        }
+    }
+
     #[test]
     fn publisher_snapshot_rejects_poison_before_invalid_recovery_state() {
         let book = OrderBook::new(definition());
@@ -4726,6 +4865,158 @@ mod resource_limit_tests {
             publisher.price_level_arena_status(Side::Buy),
             invalid_status
         );
+    }
+
+    #[test]
+    fn healthy_replica_rejects_same_sequence_snapshot_forks_without_mutation() {
+        let snapshot = recovery_snapshot();
+        let mut replica = replica();
+        replica.apply_snapshot(&snapshot).unwrap();
+        let bid_status = replica.price_level_arena_status(Side::Buy);
+        let ask_status = replica.price_level_arena_status(Side::Sell);
+        let standby_bid_status = replica.standby_price_level_arena_status(Side::Buy);
+        let standby_ask_status = replica.standby_price_level_arena_status(Side::Sell);
+        let scratch_status = replica.batch_level_hash_status();
+
+        replica.apply_snapshot(&snapshot).unwrap();
+        assert_eq!(replica.price_level_arena_status(Side::Buy), bid_status);
+        assert_eq!(replica.price_level_arena_status(Side::Sell), ask_status);
+        assert_eq!(
+            replica.standby_price_level_arena_status(Side::Buy),
+            standby_bid_status
+        );
+        assert_eq!(
+            replica.standby_price_level_arena_status(Side::Sell),
+            standby_ask_status
+        );
+        assert_eq!(replica.batch_level_hash_status(), scratch_status);
+
+        let mut forks = Vec::new();
+        let mut trade = snapshot.clone();
+        trade.last_trade_id = Some(TradeId::new(1).unwrap());
+        forks.push(trade);
+        let mut state = snapshot.clone();
+        state.trading_state = TradingStateSnapshot::from_parts(TradingState::Open, 1);
+        forks.push(state);
+        let mut bid = snapshot.clone();
+        bid.bids[0].quantity = 11;
+        forks.push(bid);
+        let mut ask = snapshot.clone();
+        ask.asks[0].quantity = 6;
+        forks.push(ask);
+
+        for fork in forks {
+            fork.validate().unwrap();
+            assert_eq!(
+                replica.apply_snapshot(&fork),
+                Err(MarketDataError::SnapshotSequenceFork { sequence: 4 })
+            );
+            assert_eq!(replica.last_sequence, snapshot.as_of_sequence);
+            assert_eq!(replica.last_trade_id, snapshot.last_trade_id);
+            assert_eq!(replica.trading_state, snapshot.trading_state);
+            assert_eq!(
+                replica.bids.get(&Price::from_raw(100)).unwrap().quantity,
+                10
+            );
+            assert_eq!(replica.asks.get(&Price::from_raw(110)).unwrap().quantity, 5);
+            assert_eq!(replica.price_level_arena_status(Side::Buy), bid_status);
+            assert_eq!(replica.price_level_arena_status(Side::Sell), ask_status);
+            assert_eq!(
+                replica.standby_price_level_arena_status(Side::Buy),
+                standby_bid_status
+            );
+            assert_eq!(
+                replica.standby_price_level_arena_status(Side::Sell),
+                standby_ask_status
+            );
+            assert_eq!(replica.batch_level_hash_status(), scratch_status);
+            assert!(!replica.poisoned);
+            replica.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn healthy_replica_rejects_newer_snapshot_coordinate_regressions() {
+        let snapshot = recovery_snapshot();
+
+        let mut trade_regression = replica();
+        trade_regression.apply_snapshot(&snapshot).unwrap();
+        let mut newer = snapshot.clone();
+        newer.as_of_sequence = 5;
+        newer.last_trade_id = Some(TradeId::new(1).unwrap());
+        newer.validate().unwrap();
+        assert_eq!(
+            trade_regression.apply_snapshot(&newer),
+            Err(MarketDataError::SnapshotCoordinateRegression {
+                coordinate: MarketDataSnapshotCoordinate::LastTradeId,
+                current: 2,
+                snapshot: 1,
+            })
+        );
+        assert_eq!(trade_regression.last_sequence, 4);
+        assert_eq!(trade_regression.last_trade_id, snapshot.last_trade_id);
+        trade_regression.validate().unwrap();
+
+        let mut state_regression = replica();
+        state_regression.apply_snapshot(&snapshot).unwrap();
+        newer.last_trade_id = snapshot.last_trade_id;
+        newer.trading_state = TradingStateSnapshot::from_parts(TradingState::Open, 1);
+        newer.validate().unwrap();
+        assert_eq!(
+            state_regression.apply_snapshot(&newer),
+            Err(MarketDataError::SnapshotCoordinateRegression {
+                coordinate: MarketDataSnapshotCoordinate::TradingStateRevision,
+                current: 2,
+                snapshot: 1,
+            })
+        );
+        assert_eq!(state_regression.last_sequence, 4);
+        assert_eq!(state_regression.trading_state, snapshot.trading_state);
+        state_regression.validate().unwrap();
+
+        let mut forward = replica();
+        forward.apply_snapshot(&snapshot).unwrap();
+        let mut equal_coordinates = snapshot.clone();
+        equal_coordinates.as_of_sequence = 5;
+        equal_coordinates.bids[0].quantity = 12;
+        forward.apply_snapshot(&equal_coordinates).unwrap();
+        let mut greater_coordinates = equal_coordinates.clone();
+        greater_coordinates.as_of_sequence = 6;
+        greater_coordinates.last_trade_id = Some(TradeId::new(3).unwrap());
+        greater_coordinates.trading_state =
+            TradingStateSnapshot::from_parts(TradingState::CancelOnly, 3);
+        forward.apply_snapshot(&greater_coordinates).unwrap();
+        assert_eq!(forward.last_sequence, 6);
+        assert_eq!(forward.last_trade_id, greater_coordinates.last_trade_id);
+        assert_eq!(forward.trading_state, greater_coordinates.trading_state);
+        assert_eq!(
+            forward.bids.get(&Price::from_raw(100)).unwrap().quantity,
+            12
+        );
+        forward.validate().unwrap();
+    }
+
+    #[test]
+    fn poisoned_replica_accepts_valid_same_sequence_authoritative_repair() {
+        let snapshot = recovery_snapshot();
+        let mut replica = replica();
+        replica.apply_snapshot(&snapshot).unwrap();
+        replica.poisoned = true;
+
+        let mut repair = snapshot.clone();
+        repair.last_trade_id = Some(TradeId::new(1).unwrap());
+        repair.trading_state = TradingStateSnapshot::from_parts(TradingState::Open, 1);
+        repair.bids[0].quantity = 11;
+        replica.apply_snapshot(&repair).unwrap();
+
+        assert!(!replica.poisoned);
+        assert_eq!(replica.last_trade_id, repair.last_trade_id);
+        assert_eq!(replica.trading_state, repair.trading_state);
+        assert_eq!(
+            replica.bids.get(&Price::from_raw(100)).unwrap().quantity,
+            11
+        );
+        replica.validate().unwrap();
     }
 
     #[test]

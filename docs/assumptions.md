@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A161 are stable and are referenced from code comments and other
+identifiers A1-A162 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -6848,10 +6848,87 @@ typed failure. Any poisoned snapshot success, partial returned image, skipped
 constructed-image validation, allocation before poison rejection, mutation,
 telemetry change, recovery divergence, or wire-byte change falsifies A161.
 
+## A162 — monotone idempotent replica snapshot lineage
+
+**Assumption.** One continuous or call-auction snapshot application holds one
+exclusive replica borrow. Identity, immutable version, event-sequence
+staleness, complete snapshot grammar/economics, and side capacities are
+validated before lineage comparison or standby-arena mutation. Event-sequence
+staleness remains unconditional because the final applied event boundary is a
+diagnostic coordinate even after poison.
+
+While a replica is healthy, a snapshot at its current event sequence is an
+exact retry only when the complete economic image equals active state. The
+continuous comparison covers last trade, trading state, and every bid/ask row.
+The call-auction comparison additionally covers command sequence, phase/cycle,
+book revision, nullable indication, both market aggregates, and every limit
+row. Exact equality returns before clearing, filling, or swapping standby
+arenas. Different content returns `SnapshotSequenceFork` without mutation.
+
+A snapshot at a later event sequence cannot regress healthy subordinate
+coordinates. Continuous admission treats no trade as coordinate zero and
+checks last trade ID and trading-state revision. Call-auction admission checks
+command sequence, phase revision, book revision, and the zero-based last-trade
+coordinate. `SnapshotCoordinateRegression` owns the exact coordinate and both
+values. Other forward state changes remain governed by complete snapshot
+validation.
+
+Poison means incremental mutation may have partially advanced those economic
+coordinates, so a poisoned replica does not use them as lineage authority. A
+valid same-sequence or newer authoritative snapshot may replace different or
+lower subordinate state and clears poison after the atomic active/standby
+swap. Stale event boundaries, wrong identity/version, invalid structure or
+economics, and capacity excess remain typed nonmutating failures. A162 changes
+no update, snapshot, replay, WAL, checkpoint, codec, or wire value.
+
+**Dependent results.** [A1, A3, A10, A12, A21, A23, A44, A55, A67, A70,
+A107, A108, A130, A132, A159, A161, A162] For `P` total snapshot rows,
+validation and an equal-sequence complete-image comparison each use `O(P)`
+time and `O(1)` auxiliary state. An exact healthy retry performs no arena or
+scalar mutation. A fork or coordinate regression fails before standby mutation.
+Forward or poisoned recovery retains the existing allocation-free
+`O(P log(P + 1))` standby fill and `O(1)` active/standby swap.
+
+**Falsification probe.** Apply exact genesis, one-sided, two-sided, market-only,
+indicative, crossed call-auction, and uncrossed continuous snapshots twice at
+one healthy boundary. Require identical active/standby arena and scratch
+telemetry, scalar state, depth, and poison status. At that same sequence,
+independently change every compared scalar, nullable value, market aggregate,
+and first/middle/final row while retaining valid snapshot structure; require
+the exact fork error and complete nonmutation.
+
+Advance only the event sequence while independently regressing each subordinate
+coordinate through zero, one, and its immediate predecessor; require the exact
+coordinate error. Accept equal and greater coordinate values at a later event
+boundary. Poison replicas before and after partial incremental mutation, then
+require valid equal/newer authoritative repair even when local subordinate
+coordinates or depth differ. Continue rejecting stale events, foreign identity/
+version, invalid structure/economics, and capacity excess. Any accepted healthy
+fork/regression, rejected valid poisoned repair, retry mutation, poison on
+lineage rejection, allocation growth, partial active mutation, replay divergence,
+or encoded-byte change falsifies A162.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** A162 makes healthy continuous and call-auction snapshot
+  application idempotent and component-monotone. Equal-sequence forks and
+  newer subordinate-coordinate regressions fail before standby mutation.
+
+- **Medium impact opportunity:** recovery controllers can distinguish an exact
+  snapshot retry from a local same-sequence fork without hashing or copying the
+  active image and can retain the typed conflicting coordinate in telemetry.
+
+- **High impact risk:** poisoned replicas intentionally waive active-image and
+  subordinate-coordinate lineage because partial application invalidates that
+  evidence. The supplied replacement snapshot must therefore come from an
+  independently authoritative source.
+
+- **High impact boundary:** A162 proves local event/subordinate monotonicity and
+  equal-boundary identity, not source authentication, freshness, durable fork
+  evidence, atomic snapshot-plus-suffix application, or cross-process lineage.
 
 - **High impact:** A161 prevents poisoned continuous and call-auction
   publishers from becoming recovery authorities. Both snapshot paths reject

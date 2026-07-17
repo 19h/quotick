@@ -572,6 +572,11 @@ Run any program with `cargo run --example <name>`.
   image before returning ownership. Poisoned publishers must be reconstructed
   from their authoritative matching book or auction engine rather than used to
   repair replicas.
+- Healthy replicas accept an equal-sequence snapshot only as a complete exact
+  retry and otherwise return a typed fork without touching active or standby
+  state. Newer snapshots cannot regress continuous trade/state revisions or
+  call-auction command/phase/book/trade coordinates; poisoned replicas retain
+  valid authoritative same-sequence repair.
 - Authoritative call-auction books expose one fixed-size revision-bound public
   observation plus typed best/point, market, full-depth, and inclusive-range
   reads. Scalar, market, and best state fails before output; streamed rows are
@@ -773,7 +778,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 161 tagged assumptions (A1–A161), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 162 tagged assumptions (A1–A162), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |

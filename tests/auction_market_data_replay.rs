@@ -109,6 +109,54 @@ fn publish(
     publisher.publish(command, &report, engine).unwrap()
 }
 
+#[test]
+fn healthy_replica_rejects_a_divergent_same_sequence_publisher_snapshot() {
+    let definition = definition();
+    let mut first_engine = engine(definition);
+    let mut first_publisher = CallAuctionMarketDataPublisher::from_engine(&first_engine).unwrap();
+    publish(&mut first_engine, &mut first_publisher, phase(definition));
+    publish(
+        &mut first_engine,
+        &mut first_publisher,
+        order(definition, 2, 1, Side::Buy, 100),
+    );
+    let first = first_publisher.snapshot();
+
+    let mut second_engine = engine(definition);
+    let mut second_publisher = CallAuctionMarketDataPublisher::from_engine(&second_engine).unwrap();
+    publish(&mut second_engine, &mut second_publisher, phase(definition));
+    publish(
+        &mut second_engine,
+        &mut second_publisher,
+        order(definition, 2, 1, Side::Buy, 99),
+    );
+    let second = second_publisher.snapshot();
+    assert_eq!(first.as_of_sequence(), second.as_of_sequence());
+    assert_ne!(first, second);
+
+    let mut replica = CallAuctionMarketDataReplica::new(definition);
+    replica.apply_snapshot(&first).unwrap();
+    let bid_status = replica.price_level_arena_status(Side::Buy);
+    let standby_status = replica.standby_price_level_arena_status(Side::Buy);
+    replica.apply_snapshot(&first).unwrap();
+    assert_eq!(replica.price_level_arena_status(Side::Buy), bid_status);
+    assert_eq!(
+        replica.standby_price_level_arena_status(Side::Buy),
+        standby_status
+    );
+    assert_eq!(
+        replica.apply_snapshot(&second),
+        Err(CallAuctionMarketDataError::SnapshotSequenceFork {
+            sequence: first.as_of_sequence(),
+        })
+    );
+    assert_eq!(
+        replica.limit_depth(Side::Buy, usize::MAX),
+        first_engine.book().limit_depth(Side::Buy, usize::MAX)
+    );
+    assert!(!replica.is_poisoned());
+}
+
 fn order(
     definition: InstrumentDefinition,
     command_id: u64,

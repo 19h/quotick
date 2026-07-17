@@ -2255,6 +2255,10 @@ market-data stream and its replicas.
     partial recovery image.
 13. A replica rejects a missing, duplicated, or reordered sequence before
     mutating depth. A non-stale full-depth snapshot resets the recovery boundary.
+    While healthy, an equal-sequence snapshot is either an exact complete-image
+    retry that performs no mutation or a typed fork; a later image cannot
+    regress trade or trading-state revision. Poisoned state does not treat its
+    potentially partial economic coordinates as repair authority.
     A separate `MarketDataReplayBuffer` may retain one exact bounded suffix for
     short-gap recovery before that snapshot path is used.
     - The ring binds one instrument/version and one already-published initial
@@ -2304,7 +2308,11 @@ market-data stream and its replicas.
     later insertion in the same batch. Genuine overflow fails without depth,
     sequence, poison, or scratch residue.
 20. Snapshot application validates identity, staleness, grammar, and both side
-    cardinalities before clearing standby arenas. It fills already-owned
+    cardinalities before lineage checks or clearing standby arenas. A healthy
+    equal-sequence image is compared against last trade, trading state, and
+    every active bid/ask row. Exact equality returns without changing active or
+    standby telemetry; divergence is typed. Later healthy images cannot regress
+    last trade or trading-state revision. It fills already-owned
     standby slots, swaps both sides atomically, and retains the prior active
     image as the next reusable standby allocation. `try_depth_iter` exposes a
     double-ended, exact-size market-priority replica traversal without output
@@ -2420,7 +2428,11 @@ replica contract.
    the active auction, phase revision, and book revision and can exist only in
    `Collecting` or `Frozen`. A replica rejects stale images, invalid phase/cycle
    topology, wrong-side/noncanonical/empty levels, and definition-off-grid
-   prices. Publisher `try_snapshot` rejects poison before output reservation
+   prices. While healthy, an equal-event snapshot must exactly equal command,
+   phase/cycle, book, indication, trade, market, and limit state; a later image
+   cannot regress command, phase, book, or trade coordinates. Poisoned replicas
+   waive those untrusted local comparisons but retain event staleness and all
+   image validation. Publisher `try_snapshot` rejects poison before output reservation
    and validates the complete constructed image before returning ownership.
 9. Missing or reordered sequences fail before mutation. A later structural
    error poisons publisher or replica state until authoritative reconstruction
@@ -2464,8 +2476,10 @@ replica contract.
     Batch-size, replacement/mass-cancel shape, or level-cardinality failure
     leaves depth, sequences, poison state, and scratch unchanged.
 15. Snapshot application validates identity, staleness, phase/level grammar,
-    definition prices, and both side cardinalities before clearing standby
-    arenas. It fills already-owned standby slots and atomically swaps both
+    definition prices, and both side cardinalities before lineage checks or
+    clearing standby arenas. Exact healthy retries return without mutation;
+    same-event forks and newer subordinate-coordinate regressions are typed.
+    It fills already-owned standby slots and atomically swaps both
     sides; the prior active image becomes the next reusable standby allocation.
     Process-local limits and allocation telemetry are absent from version-5
     payload bytes.
@@ -3047,6 +3061,11 @@ Publisher snapshot tests poison state through a report contradiction and
 require typed refusal plus convenience panic. White-box tests combine poison
 with invalid trade chronology, require poison precedence, then clear poison and
 require constructed-image validation without arena-telemetry change.
+Replica snapshot-lineage tests compare divergent real publisher images at one
+sequence, require exact retries to preserve both active and standby telemetry,
+and reject typed same-sequence forks. White-box tests independently regress
+trade and trading-state coordinates, prove complete nonmutation, and require
+poisoned same-sequence authoritative repair to remain available.
 Replica depth-query tests additionally cover allocation-free best-first full
 and inclusive-band traversal, reverse traversal, limits, inverted bands, and
 authoritative-book parity on both sides. Shared BBO, best-side, trading-state,
@@ -3081,6 +3100,11 @@ reservations and require structural rejection.
 Publisher snapshot tests likewise require poison refusal and convenience panic;
 white-box trade-chronology corruption proves poison precedence, constructed-
 image validation after poison clears, and unchanged arena telemetry.
+Replica snapshot-lineage tests compare divergent real publisher images at one
+event sequence and require typed fork rejection without active or standby
+change. White-box tests independently regress command, phase, book, and trade
+coordinates and require poisoned same-sequence repair to bypass only those
+untrusted local lineage values.
 Replica limit-depth query tests additionally cover allocation-free
 best-to-worst full and inclusive-band traversal, reverse traversal, limits,
 inverted bands, separate market interest, and authoritative-book parity on

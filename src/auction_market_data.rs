@@ -32,6 +32,7 @@ use crate::domain::{
 };
 use crate::indexed_avl::{DirectionalIter, IndexedAvlMap};
 use crate::instrument::InstrumentDefinition;
+use crate::market_data::trade_coordinate;
 pub use crate::market_data::{CallAuctionMarketDataReplay, CallAuctionMarketDataReplayBatch};
 use crate::matching::MassCancelScope;
 
@@ -980,6 +981,30 @@ impl CallAuctionMarketDataSnapshot {
     }
 }
 
+/// One monotone coordinate below a call-auction snapshot's event sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallAuctionMarketDataSnapshotCoordinate {
+    /// Final committed engine-command sequence.
+    CommandSequence,
+    /// Effective phase-control revision.
+    PhaseRevision,
+    /// Authoritative collection-book mutation revision.
+    BookRevision,
+    /// Final contiguous trade identifier, with genesis represented by zero.
+    LastTradeId,
+}
+
+impl fmt::Display for CallAuctionMarketDataSnapshotCoordinate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::CommandSequence => "command sequence",
+            Self::PhaseRevision => "phase revision",
+            Self::BookRevision => "book revision",
+            Self::LastTradeId => "last trade identifier",
+        })
+    }
+}
+
 /// Publication, validation, or replica-recovery failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CallAuctionMarketDataError {
@@ -1006,6 +1031,20 @@ pub enum CallAuctionMarketDataError {
         /// Current event sequence.
         current: u64,
         /// Snapshot event boundary.
+        snapshot: u64,
+    },
+    /// A healthy replica received different content at its current event sequence.
+    SnapshotSequenceFork {
+        /// Conflicting event sequence.
+        sequence: u64,
+    },
+    /// A newer snapshot regressed one healthy subordinate lineage coordinate.
+    SnapshotCoordinateRegression {
+        /// Coordinate whose monotonicity failed.
+        coordinate: CallAuctionMarketDataSnapshotCoordinate,
+        /// Current healthy coordinate.
+        current: u64,
+        /// Coordinate proposed by the snapshot.
         snapshot: u64,
     },
     /// A full-depth image violated a structural invariant.
@@ -1053,6 +1092,18 @@ impl fmt::Display for CallAuctionMarketDataError {
             Self::StaleSnapshot { current, snapshot } => write!(
                 formatter,
                 "auction snapshot sequence {snapshot} predates replica sequence {current}"
+            ),
+            Self::SnapshotSequenceFork { sequence } => write!(
+                formatter,
+                "auction snapshot conflicts with healthy replica event sequence {sequence}"
+            ),
+            Self::SnapshotCoordinateRegression {
+                coordinate,
+                current,
+                snapshot,
+            } => write!(
+                formatter,
+                "auction snapshot {coordinate} regresses from {current} to {snapshot}"
             ),
             Self::InvalidSnapshot(detail)
             | Self::InvalidUpdate(detail)
@@ -2587,12 +2638,18 @@ impl CallAuctionMarketDataReplica {
         hash_status(&self.batch_levels)
     }
 
-    /// Atomically replaces local state with a non-stale verified snapshot.
+    /// Atomically admits one non-stale, lineage-consistent recovery image.
+    ///
+    /// An exact healthy retry at the current event sequence is nonmutating. A
+    /// poisoned replica accepts different valid state at that event boundary
+    /// because partially applied economic coordinates are not repair authority.
     ///
     /// # Errors
     ///
     /// Returns [`CallAuctionMarketDataError`] for identity, staleness,
-    /// definition, or snapshot structural failure.
+    /// definition/economic structure, a healthy same-sequence fork,
+    /// subordinate-coordinate regression, or capacity failure. Success clears
+    /// poison.
     pub fn apply_snapshot(
         &mut self,
         snapshot: &CallAuctionMarketDataSnapshot,
@@ -2626,6 +2683,37 @@ impl CallAuctionMarketDataReplica {
                 attempted: snapshot.asks.len(),
             });
         }
+        if !self.poisoned {
+            if snapshot.as_of_sequence == self.last_event_sequence {
+                return if self.snapshot_matches_active(snapshot) {
+                    Ok(())
+                } else {
+                    Err(CallAuctionMarketDataError::SnapshotSequenceFork {
+                        sequence: self.last_event_sequence,
+                    })
+                };
+            }
+            Self::validate_snapshot_coordinate(
+                CallAuctionMarketDataSnapshotCoordinate::CommandSequence,
+                self.last_command_sequence,
+                snapshot.command_sequence,
+            )?;
+            Self::validate_snapshot_coordinate(
+                CallAuctionMarketDataSnapshotCoordinate::PhaseRevision,
+                self.phase.revision(),
+                snapshot.phase.revision(),
+            )?;
+            Self::validate_snapshot_coordinate(
+                CallAuctionMarketDataSnapshotCoordinate::BookRevision,
+                self.book_revision,
+                snapshot.book_revision,
+            )?;
+            Self::validate_snapshot_coordinate(
+                CallAuctionMarketDataSnapshotCoordinate::LastTradeId,
+                trade_coordinate(self.last_trade_id),
+                trade_coordinate(snapshot.last_trade_id),
+            )?;
+        }
         self.standby_bids.clear();
         self.standby_asks.clear();
         for level in &snapshot.bids {
@@ -2649,6 +2737,49 @@ impl CallAuctionMarketDataReplica {
         self.reset_cycle_trace();
         self.poisoned = false;
         Ok(())
+    }
+
+    fn validate_snapshot_coordinate(
+        coordinate: CallAuctionMarketDataSnapshotCoordinate,
+        current: u64,
+        snapshot: u64,
+    ) -> Result<(), CallAuctionMarketDataError> {
+        if snapshot < current {
+            return Err(CallAuctionMarketDataError::SnapshotCoordinateRegression {
+                coordinate,
+                current,
+                snapshot,
+            });
+        }
+        Ok(())
+    }
+
+    fn snapshot_matches_active(&self, snapshot: &CallAuctionMarketDataSnapshot) -> bool {
+        snapshot.command_sequence == self.last_command_sequence
+            && snapshot.phase == self.phase
+            && snapshot.book_revision == self.book_revision
+            && snapshot.indicative == self.indicative
+            && snapshot.last_trade_id == self.last_trade_id
+            && aggregate_from_level(snapshot.market_buy) == self.market_buy
+            && aggregate_from_level(snapshot.market_sell) == self.market_sell
+            && snapshot.bids.len() == self.bids.len()
+            && snapshot.asks.len() == self.asks.len()
+            && snapshot.bids.iter().zip(self.bids.iter().rev()).all(
+                |(snapshot, (&price, aggregate))| {
+                    snapshot.side == Side::Buy
+                        && snapshot.constraint == AuctionOrderConstraint::Limit(price)
+                        && aggregate_from_level(*snapshot) == *aggregate
+                },
+            )
+            && snapshot
+                .asks
+                .iter()
+                .zip(self.asks.iter())
+                .all(|(snapshot, (&price, aggregate))| {
+                    snapshot.side == Side::Sell
+                        && snapshot.constraint == AuctionOrderConstraint::Limit(price)
+                        && aggregate_from_level(*snapshot) == *aggregate
+                })
     }
 
     /// Applies one contiguous command batch.
@@ -4438,6 +4569,49 @@ mod tests {
         .unwrap()
     }
 
+    fn recovery_snapshot() -> CallAuctionMarketDataSnapshot {
+        let auction_id = AuctionId::new(1).unwrap();
+        CallAuctionMarketDataSnapshot {
+            instrument_id: InstrumentId::new(1).unwrap(),
+            instrument_version: InstrumentVersion::new(1).unwrap(),
+            as_of_sequence: 6,
+            command_sequence: 4,
+            phase: CallAuctionPhaseSnapshot::from_parts(
+                CallAuctionPhase::Collecting,
+                2,
+                Some(auction_id),
+                Some(auction_id),
+            ),
+            book_revision: 3,
+            indicative: None,
+            last_trade_id: Some(TradeId::new(2).unwrap()),
+            market_buy: CallAuctionMarketDataLevel {
+                side: Side::Buy,
+                constraint: AuctionOrderConstraint::Market,
+                quantity: 0,
+                order_count: 0,
+            },
+            market_sell: CallAuctionMarketDataLevel {
+                side: Side::Sell,
+                constraint: AuctionOrderConstraint::Market,
+                quantity: 0,
+                order_count: 0,
+            },
+            bids: vec![CallAuctionMarketDataLevel {
+                side: Side::Buy,
+                constraint: AuctionOrderConstraint::Limit(Price::from_raw(100)),
+                quantity: 10,
+                order_count: 1,
+            }],
+            asks: vec![CallAuctionMarketDataLevel {
+                side: Side::Sell,
+                constraint: AuctionOrderConstraint::Limit(Price::from_raw(110)),
+                quantity: 5,
+                order_count: 1,
+            }],
+        }
+    }
+
     #[test]
     fn publisher_snapshot_rejects_poison_before_invalid_recovery_state() {
         let engine = CallAuctionEngine::try_new(definition()).unwrap();
@@ -4480,6 +4654,245 @@ mod tests {
             publisher.price_level_arena_status(Side::Buy),
             invalid_status
         );
+    }
+
+    #[test]
+    fn healthy_replica_rejects_same_sequence_snapshot_forks_without_mutation() {
+        let snapshot = recovery_snapshot();
+        let mut replica = CallAuctionMarketDataReplica::new(definition());
+        replica.apply_snapshot(&snapshot).unwrap();
+        let bid_status = replica.price_level_arena_status(Side::Buy);
+        let ask_status = replica.price_level_arena_status(Side::Sell);
+        let standby_bid_status = replica.standby_price_level_arena_status(Side::Buy);
+        let standby_ask_status = replica.standby_price_level_arena_status(Side::Sell);
+        let scratch_status = replica.batch_level_hash_status();
+
+        replica.apply_snapshot(&snapshot).unwrap();
+        assert_eq!(replica.price_level_arena_status(Side::Buy), bid_status);
+        assert_eq!(replica.price_level_arena_status(Side::Sell), ask_status);
+        assert_eq!(
+            replica.standby_price_level_arena_status(Side::Buy),
+            standby_bid_status
+        );
+        assert_eq!(
+            replica.standby_price_level_arena_status(Side::Sell),
+            standby_ask_status
+        );
+        assert_eq!(replica.batch_level_hash_status(), scratch_status);
+
+        let mut forks = Vec::new();
+        let mut command = snapshot.clone();
+        command.command_sequence = 5;
+        forks.push(command);
+        let mut phase = snapshot.clone();
+        phase.phase = CallAuctionPhaseSnapshot::from_parts(
+            CallAuctionPhase::Collecting,
+            3,
+            Some(AuctionId::new(1).unwrap()),
+            Some(AuctionId::new(1).unwrap()),
+        );
+        forks.push(phase);
+        let mut book = snapshot.clone();
+        book.book_revision = 4;
+        forks.push(book);
+        let mut trade = snapshot.clone();
+        trade.last_trade_id = Some(TradeId::new(3).unwrap());
+        forks.push(trade);
+        let mut indicative = snapshot.clone();
+        let engine = CallAuctionEngine::try_new(definition()).unwrap();
+        indicative.indicative = Some(CallAuctionIndicativeState::from_parts(
+            AuctionId::new(1).unwrap(),
+            2,
+            3,
+            engine.book().instrument_price_band(),
+            Price::from_raw(100),
+            crate::auction::AuctionPricePolicy::REFERENCE_THEN_LOWER,
+            None,
+        ));
+        forks.push(indicative);
+        let mut market_buy = snapshot.clone();
+        market_buy.market_buy.quantity = 1;
+        market_buy.market_buy.order_count = 1;
+        forks.push(market_buy);
+        let mut market_sell = snapshot.clone();
+        market_sell.market_sell.quantity = 1;
+        market_sell.market_sell.order_count = 1;
+        forks.push(market_sell);
+        let mut bid = snapshot.clone();
+        bid.bids[0].quantity = 11;
+        forks.push(bid);
+        let mut ask = snapshot.clone();
+        ask.asks[0].quantity = 6;
+        forks.push(ask);
+
+        for fork in forks {
+            fork.validate().unwrap();
+            replica.validate_snapshot_economics(&fork).unwrap();
+            assert_eq!(
+                replica.apply_snapshot(&fork),
+                Err(CallAuctionMarketDataError::SnapshotSequenceFork { sequence: 6 })
+            );
+            assert_eq!(replica.last_event_sequence, snapshot.as_of_sequence);
+            assert_eq!(replica.last_command_sequence, snapshot.command_sequence);
+            assert_eq!(replica.phase, snapshot.phase);
+            assert_eq!(replica.book_revision, snapshot.book_revision);
+            assert_eq!(replica.last_trade_id, snapshot.last_trade_id);
+            assert_eq!(
+                replica.bids.get(&Price::from_raw(100)).unwrap().quantity,
+                10
+            );
+            assert_eq!(replica.asks.get(&Price::from_raw(110)).unwrap().quantity, 5);
+            assert_eq!(replica.price_level_arena_status(Side::Buy), bid_status);
+            assert_eq!(replica.price_level_arena_status(Side::Sell), ask_status);
+            assert_eq!(
+                replica.standby_price_level_arena_status(Side::Buy),
+                standby_bid_status
+            );
+            assert_eq!(
+                replica.standby_price_level_arena_status(Side::Sell),
+                standby_ask_status
+            );
+            assert_eq!(replica.batch_level_hash_status(), scratch_status);
+            assert!(!replica.poisoned);
+            replica.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn healthy_replica_rejects_newer_snapshot_coordinate_regressions() {
+        let snapshot = recovery_snapshot();
+        let mut regressions = Vec::new();
+
+        let mut command = snapshot.clone();
+        command.as_of_sequence = 7;
+        command.command_sequence = 3;
+        regressions.push((
+            command,
+            CallAuctionMarketDataSnapshotCoordinate::CommandSequence,
+            4,
+            3,
+        ));
+
+        let mut phase = snapshot.clone();
+        phase.as_of_sequence = 7;
+        phase.command_sequence = 5;
+        phase.phase = CallAuctionPhaseSnapshot::from_parts(
+            CallAuctionPhase::Collecting,
+            1,
+            Some(AuctionId::new(1).unwrap()),
+            Some(AuctionId::new(1).unwrap()),
+        );
+        regressions.push((
+            phase,
+            CallAuctionMarketDataSnapshotCoordinate::PhaseRevision,
+            2,
+            1,
+        ));
+
+        let mut book = snapshot.clone();
+        book.as_of_sequence = 7;
+        book.command_sequence = 5;
+        book.book_revision = 2;
+        regressions.push((
+            book,
+            CallAuctionMarketDataSnapshotCoordinate::BookRevision,
+            3,
+            2,
+        ));
+
+        let mut trade = snapshot.clone();
+        trade.as_of_sequence = 7;
+        trade.command_sequence = 5;
+        trade.last_trade_id = Some(TradeId::new(1).unwrap());
+        regressions.push((
+            trade,
+            CallAuctionMarketDataSnapshotCoordinate::LastTradeId,
+            2,
+            1,
+        ));
+
+        for (regression, coordinate, current, snapshot_coordinate) in regressions {
+            let mut replica = CallAuctionMarketDataReplica::new(definition());
+            replica.apply_snapshot(&snapshot).unwrap();
+            regression.validate().unwrap();
+            replica.validate_snapshot_economics(&regression).unwrap();
+            assert_eq!(
+                replica.apply_snapshot(&regression),
+                Err(CallAuctionMarketDataError::SnapshotCoordinateRegression {
+                    coordinate,
+                    current,
+                    snapshot: snapshot_coordinate,
+                })
+            );
+            assert_eq!(replica.last_event_sequence, snapshot.as_of_sequence);
+            assert_eq!(replica.last_command_sequence, snapshot.command_sequence);
+            assert_eq!(replica.phase, snapshot.phase);
+            assert_eq!(replica.book_revision, snapshot.book_revision);
+            assert_eq!(replica.last_trade_id, snapshot.last_trade_id);
+            assert!(!replica.poisoned);
+            replica.validate().unwrap();
+        }
+
+        let mut forward = CallAuctionMarketDataReplica::new(definition());
+        forward.apply_snapshot(&snapshot).unwrap();
+        let mut equal_coordinates = snapshot.clone();
+        equal_coordinates.as_of_sequence = 7;
+        equal_coordinates.bids[0].quantity = 12;
+        forward.apply_snapshot(&equal_coordinates).unwrap();
+        let mut greater_coordinates = equal_coordinates.clone();
+        greater_coordinates.as_of_sequence = 8;
+        greater_coordinates.command_sequence = 5;
+        greater_coordinates.phase = CallAuctionPhaseSnapshot::from_parts(
+            CallAuctionPhase::Collecting,
+            3,
+            Some(AuctionId::new(1).unwrap()),
+            Some(AuctionId::new(1).unwrap()),
+        );
+        greater_coordinates.book_revision = 4;
+        greater_coordinates.last_trade_id = Some(TradeId::new(3).unwrap());
+        forward.apply_snapshot(&greater_coordinates).unwrap();
+        assert_eq!(forward.last_event_sequence, 8);
+        assert_eq!(forward.last_command_sequence, 5);
+        assert_eq!(forward.phase, greater_coordinates.phase);
+        assert_eq!(forward.book_revision, 4);
+        assert_eq!(forward.last_trade_id, greater_coordinates.last_trade_id);
+        assert_eq!(
+            forward.bids.get(&Price::from_raw(100)).unwrap().quantity,
+            12
+        );
+        forward.validate().unwrap();
+    }
+
+    #[test]
+    fn poisoned_replica_accepts_valid_same_sequence_authoritative_repair() {
+        let snapshot = recovery_snapshot();
+        let mut replica = CallAuctionMarketDataReplica::new(definition());
+        replica.apply_snapshot(&snapshot).unwrap();
+        replica.poisoned = true;
+
+        let mut repair = snapshot.clone();
+        repair.command_sequence = 3;
+        repair.phase = CallAuctionPhaseSnapshot::from_parts(
+            CallAuctionPhase::Collecting,
+            1,
+            Some(AuctionId::new(1).unwrap()),
+            Some(AuctionId::new(1).unwrap()),
+        );
+        repair.book_revision = 2;
+        repair.last_trade_id = Some(TradeId::new(1).unwrap());
+        repair.bids[0].quantity = 11;
+        replica.apply_snapshot(&repair).unwrap();
+
+        assert!(!replica.poisoned);
+        assert_eq!(replica.last_command_sequence, repair.command_sequence);
+        assert_eq!(replica.phase, repair.phase);
+        assert_eq!(replica.book_revision, repair.book_revision);
+        assert_eq!(replica.last_trade_id, repair.last_trade_id);
+        assert_eq!(
+            replica.bids.get(&Price::from_raw(100)).unwrap().quantity,
+            11
+        );
+        replica.validate().unwrap();
     }
 
     #[test]

@@ -1116,7 +1116,10 @@ space, and emits `NoBookChange`. Its later events retain their ordinary bounds.
   makes one `O(P)` construction pass and one `O(P)` validation pass, and uses
   `O(1)` auxiliary state beyond the output. Poison rejects in `O(1)` before
   allocation or tree traversal.
-- Allocation-free double-buffered snapshot application is `O(P log P)`.
+- Snapshot validation is `O(P)`. A healthy equal-sequence retry adds one `O(P)`
+  complete-image comparison and returns without mutation; a later subordinate-
+  coordinate check is `O(1)`. Allocation-free double-buffered forward or poison
+  recovery is `O(P log(P + 1))`.
 - A complete publisher cross-audit is expected
   `O(O + P + S log(O + 1) + T)` outside adversarial hash collision clusters.
 
@@ -1234,8 +1237,10 @@ updates and `U` unique affected limit identities:
 - A healthy snapshot requests and owns `O(P)` output, performs `O(P)`
   construction plus `O(P)` validation, and uses `O(1)` auxiliary state beyond
   the output. Poison rejects in `O(1)` before allocation or tree traversal.
-  Double-buffered snapshot application is allocation-free after construction
-  and `O(P log P)`.
+  Snapshot validation is `O(P)`. Healthy equal-event retry comparison is
+  `O(P)` and nonmutating; later subordinate-coordinate checks are `O(1)`.
+  Double-buffered forward or poisoned snapshot application is allocation-free
+  after construction and `O(P log(P + 1))`.
 
 Publisher fixed state is `O(O_max + P_max)` and replica fixed state is
 `O(P_max + E_max)`, including four active/standby side arenas in total.
