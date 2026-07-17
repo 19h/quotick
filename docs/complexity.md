@@ -438,6 +438,17 @@ only through the first conflicting canonical pair, then emits one fixed-size
 business-rejection event. It performs no commit work or terminal-lane
 admission.
 
+Conditional call-auction submission first performs ordinary admission
+preparation. Before the predicate it repeats exact admission validation and an
+absent-identity observation. For `I` accepted identities, `O` active orders,
+`P` occupied limit prices, and predicate cost `F`, decline or unwind is
+`O(log(I + 1) + log(O + 1) + log(P + 1) + F)`. Acceptance repeats ordinary
+validation and commit without changing that asymptotic bound. The fixed-size
+owned observation and generic evaluator add `O(1)` auxiliary state and allocate
+no output. Coupled authorization and accepted reservation insertion add
+expected `O(1)` each. Durable acceptance and business rejection append two
+existing frames; decline, unwind, and replay append zero.
+
 For conditional uncross, let `A` be ordinary uncross preparation, `F_b + F_a`
 the positive fill count, `T` trade pairs, `C` remainder cancellations, `O`
 canonical source orders, `F` predicate cost, and `M` ordinary commit cost.

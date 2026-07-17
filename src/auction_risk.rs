@@ -22,12 +22,12 @@ use crate::auction_engine::{
     CallAuctionEngineConstructionError, CallAuctionEngineError, CallAuctionEngineLimits,
     CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionExecutionReport,
     CallAuctionMassCancel, CallAuctionMassCancelObservation, CallAuctionRejectReason,
-    CallAuctionReplaceObservation, CallAuctionReplaceOrder, CallAuctionUncrossCommand,
-    CallAuctionUncrossObservation, ConditionalCallAuctionCommandOutcome,
-    ConditionalCallAuctionCommandPreparation, ConditionalCallAuctionOutcome,
-    ConditionalCallAuctionPreparation, PreparedCallAuctionCommand, evaluate_conditional_amend,
-    evaluate_conditional_cancel, evaluate_conditional_mass_cancel, evaluate_conditional_replace,
-    evaluate_conditional_uncross,
+    CallAuctionReplaceObservation, CallAuctionReplaceOrder, CallAuctionSubmitObservation,
+    CallAuctionSubmitOrder, CallAuctionUncrossCommand, CallAuctionUncrossObservation,
+    ConditionalCallAuctionCommandOutcome, ConditionalCallAuctionCommandPreparation,
+    ConditionalCallAuctionOutcome, ConditionalCallAuctionPreparation, PreparedCallAuctionCommand,
+    evaluate_conditional_amend, evaluate_conditional_cancel, evaluate_conditional_mass_cancel,
+    evaluate_conditional_replace, evaluate_conditional_submit, evaluate_conditional_uncross,
 };
 use crate::bounded_hash::BoundedHashMap;
 use crate::domain::{AccountId, OrderId, Side};
@@ -1559,6 +1559,15 @@ impl CallAuctionRiskManagedEngine {
         Ok(report)
     }
 
+    pub(crate) fn conditional_submit_observation_is_authorized(
+        &self,
+        preparation: &CallAuctionCommandPreparation,
+    ) -> Result<bool, CallAuctionEngineError> {
+        self.conditional_observation_is_authorized(preparation, |command| {
+            matches!(command, CallAuctionCommand::Submit(_))
+        })
+    }
+
     pub(crate) fn validate_conditional_cancel_authorization(
         &self,
         preparation: &CallAuctionCommandPreparation,
@@ -1590,10 +1599,20 @@ impl CallAuctionRiskManagedEngine {
         &self,
         preparation: &CallAuctionCommandPreparation,
     ) -> Result<bool, CallAuctionEngineError> {
+        self.conditional_observation_is_authorized(preparation, |command| {
+            matches!(command, CallAuctionCommand::Replace(_))
+        })
+    }
+
+    fn conditional_observation_is_authorized(
+        &self,
+        preparation: &CallAuctionCommandPreparation,
+        is_expected_command: fn(CallAuctionCommand) -> bool,
+    ) -> Result<bool, CallAuctionEngineError> {
         let CallAuctionCommandPreparation::Ready(prepared) = preparation else {
             return Ok(false);
         };
-        if !matches!(prepared.command(), CallAuctionCommand::Replace(_)) {
+        if !is_expected_command(prepared.command()) {
             return Err(CallAuctionEngineError::InternalInvariantViolation);
         }
         Ok(prepared.core_rejection().is_none() && self.risk.authorize(prepared.command()).is_ok())
@@ -1628,6 +1647,42 @@ impl CallAuctionRiskManagedEngine {
         match self.prepare(command)? {
             CallAuctionCommandPreparation::Replay(report) => Ok(report),
             CallAuctionCommandPreparation::Ready(prepared) => self.commit(prepared),
+        }
+    }
+
+    /// Atomically risk-gates, observes, and conditionally commits one auction
+    /// order.
+    ///
+    /// Replay plus core or risk rejection bypass `accept`. Decline or unwind
+    /// changes neither auction nor risk state. Acceptance commits the exact
+    /// predicted active state and inserts its coupled reservation once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionEngineError`] for preparation, fail-closed query,
+    /// generation validation, or coupled commit failure.
+    pub fn try_submit_order_if(
+        &mut self,
+        command: CallAuctionSubmitOrder,
+        accept: impl FnOnce(&CallAuctionSubmitObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionSubmitObservation>,
+        CallAuctionEngineError,
+    > {
+        let preparation = self.prepare(CallAuctionCommand::Submit(command))?;
+        let observe_authorized = self.conditional_submit_observation_is_authorized(&preparation)?;
+        match evaluate_conditional_submit(&self.engine, preparation, observe_authorized, accept)? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => Ok(outcome),
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => {
+                self.commit(prepared)
+                    .map(|report| ConditionalCallAuctionCommandOutcome::Reported {
+                        observation: if report.replayed { None } else { observation },
+                        report,
+                    })
+            }
         }
     }
 

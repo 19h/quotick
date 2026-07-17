@@ -2541,7 +2541,7 @@ impl CallAuctionBook {
         &mut self,
         command: CallAuctionOrder,
     ) -> Result<CallAuctionOrderSnapshot, CallAuctionAdmissionError> {
-        self.preflight_admission(command)?;
+        let predicted = self.preflight_admission(command)?;
         let next_priority_sequence = self
             .next_priority_sequence
             .checked_add(1)
@@ -2550,13 +2550,16 @@ impl CallAuctionBook {
             .state_revision
             .checked_add(1)
             .ok_or(CallAuctionAdmissionError::StateRevisionExhausted)?;
-        Ok(self.insert_preflighted(command, next_priority_sequence, next_state_revision))
+        let accepted =
+            self.insert_preflighted(command, next_priority_sequence, next_state_revision);
+        debug_assert_eq!(accepted, predicted);
+        Ok(accepted)
     }
 
     pub(crate) fn preflight_admission(
         &self,
         command: CallAuctionOrder,
-    ) -> Result<(), CallAuctionAdmissionError> {
+    ) -> Result<CallAuctionOrderSnapshot, CallAuctionAdmissionError> {
         self.validate_command(command)?;
         if self.seen_order_ids.get(&command.order_id).is_some() {
             return Err(CallAuctionAdmissionError::DuplicateOrderId);
@@ -2615,7 +2618,19 @@ impl CallAuctionBook {
         account_side.order_count.checked_add(1).ok_or(
             CallAuctionAdmissionError::AggregateQuantityOverflow(command.side),
         )?;
-        Ok(())
+        Ok(self.predicted_admission(command))
+    }
+
+    fn predicted_admission(&self, command: CallAuctionOrder) -> CallAuctionOrderSnapshot {
+        CallAuctionOrderSnapshot {
+            order_id: command.order_id(),
+            account_id: command.account_id(),
+            side: command.side(),
+            constraint: command.constraint(),
+            quantity: command.quantity(),
+            priority_class: command.priority_class(),
+            priority_sequence: self.next_priority_sequence,
+        }
     }
 
     /// Cancels one active order after exact owner verification.
@@ -4714,6 +4729,37 @@ mod tests {
         }
         book.validate().unwrap();
         book
+    }
+
+    #[test]
+    fn admission_preflight_predicts_exact_committed_state_without_mutation() {
+        let mut book = CallAuctionBook::try_new(definition()).unwrap();
+        let order = CallAuctionOrder::new(
+            OrderId::new(10).unwrap(),
+            AccountId::new(1).unwrap(),
+            InstrumentId::new(7).unwrap(),
+            InstrumentVersion::new(3).unwrap(),
+            Side::Buy,
+            AuctionOrderConstraint::Limit(Price::from_raw(50)),
+            Quantity::new(2).unwrap(),
+            crate::auction::AuctionPriorityClass::HIGHEST,
+        );
+
+        let predicted = book.preflight_admission(order).unwrap();
+
+        assert_eq!(predicted.priority_sequence, 1);
+        assert_eq!(book.state_revision(), 0);
+        assert_eq!(book.active_order_count(), 0);
+        assert_eq!(book.accepted_order_id_count(), 0);
+        assert!(book.order(order.order_id()).is_none());
+
+        let accepted = book.admit(order).unwrap();
+
+        assert_eq!(accepted, predicted);
+        assert_eq!(book.order(order.order_id()), Some(predicted));
+        assert_eq!(book.state_revision(), 1);
+        assert_eq!(book.active_order_count(), 1);
+        assert_eq!(book.accepted_order_id_count(), 1);
     }
 
     #[test]

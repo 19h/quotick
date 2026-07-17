@@ -415,6 +415,13 @@ Run any program with `cargo run --example <name>`.
   guaranteeing that currently valid individual/non-empty mass cancellation,
   freeze/close, and uncross commands remain possible for a full book even at
   exhausted ordinary capacity.
+- Atomic conditional submission on the plain, coupled-risk, and both durable
+  call-auction engine surfaces. A fixed-size owned observation binds exact
+  predicted priority-bearing order state, prospective sequences, phase, book
+  revisions, and prior indication to one same-generation admission. Replay
+  plus core or risk rejection bypasses the predicate; decline or unwind is
+  state-, risk-, and WAL-neutral; acceptance emits and reserves exactly the
+  observed admitted state.
 - Atomic conditional uncross on the plain, coupled-risk, and both durable
   engine surfaces. One exclusive shard borrow spans ordinary uncross
   preparation, fail-closed validation, a zero-copy predicate view of exact
@@ -489,6 +496,10 @@ Run any program with `cargo run --example <name>`.
   gate before observation. Acceptance transitions exactly the observed
   dormant reservations through the ordinary trigger, trade, cancellation, and
   residual lifecycle; noncommit leaves every reservation unchanged.
+  Conditional call-auction submission performs the ordinary coupled-risk gate
+  before observation. Acceptance inserts exactly the observed admitted
+  reservation once; core or risk rejection bypasses the predicate, and decline
+  or unwind leaves every reservation unchanged.
   Conditional call-auction uncross is also account-independent before
   observation. Acceptance applies the ordinary complete uncross trace once;
   decline or unwind leaves reservations, exposures, and positions unchanged.
@@ -676,10 +687,10 @@ Conditional expiry-sweep predicates have the same process-local boundary and
 are not persisted, authenticated, clock-scheduled, or transported.
 Conditional stop-trigger-sweep predicates have the same process-local boundary
 and are not persisted, authenticated, source-authorized, or transported.
-Conditional call-auction uncross, cancellation, mass cancellation, amendment,
-and replacement predicates are likewise process-local and are not persisted,
-authenticated, authorized, transported, or retained as durable decision
-evidence.
+Conditional call-auction submission, uncross, cancellation, mass cancellation,
+amendment, and replacement predicates are likewise process-local and are not
+persisted, authenticated, authorized, transported, or retained as durable
+decision evidence.
 Their synchronous execution extends the exclusive local shard borrow. A
 dormant-stop observation contains no activation-time forecast, and active
 minimum-quantity IOC observations must be interpreted with the submitted
@@ -724,7 +735,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 155 tagged assumptions (A1–A155), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 156 tagged assumptions (A1–A156), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -840,7 +851,13 @@ includes:
   exact target/provenance observation, selected-link fail-closed behavior,
   rejection/replay predicate bypass, unwind/decline neutrality, exact coupled
   reservation release, zero-frame durable noncommit, two-frame acceptance,
-  and plain/coupled durable recovery. Atomic conditional mass-cancel coverage
+  and plain/coupled durable recovery. Atomic conditional submission coverage
+  adds fixed-size exact predicted admitted state and fresh priority, absent-
+  identity and stale-preparation rejection, core/risk rejection and replay
+  predicate bypass, unwind/decline neutrality, exact coupled reservation
+  insertion, zero-frame durable noncommit, two-frame business rejection/
+  acceptance, and plain/coupled durable recovery. Atomic conditional mass-
+  cancel coverage
   adds canonical populated all/side and empty selection,
   exact count/quantity and event-sequence provenance, stale-generation and
   rejection/replay predicate bypass, unwind/decline neutrality, scratch

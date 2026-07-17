@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A155 are stable and are referenced from code comments and other
+identifiers A1-A156 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -6410,10 +6410,110 @@ residue or growth, incorrect reservation release, WAL growth before acceptance,
 interposed transition, recovery divergence, successful-path allocation, or new
 wire value falsifies A155.
 
+## A156 — atomic conditional call-auction submission
+
+**Assumption.** One `try_submit_order_if` call on a `CallAuctionEngine`,
+`CallAuctionRiskManagedEngine`, `DurableCallAuctionEngine`, or
+`DurableCallAuctionRiskEngine` holds the corresponding exclusive shard borrow
+across ordinary submission preparation, exact predicted admission, one
+synchronous predicate, and commit of the same-generation preparation.
+Collection-book preflight validates routing and instrument rules, unused
+identity, active-order/accepted-identity/price-level capacity, priority and
+revision successors, and queue/account aggregate arithmetic without mutation.
+It returns the exact `CallAuctionOrderSnapshot` that acceptance will create,
+including the next authoritative priority sequence. Ordinary engine preparation
+binds that snapshot and the source book revision to command/event capacity and
+the engine/history generation.
+
+Before the predicate, the engine rejects foreign or stale preparation, repeats
+exact admission preflight, proves the candidate identity absent through the
+revision-bound active-order observation, and validates collecting-phase,
+cycle, phase-revision, and prior-indication coherence. The fixed-size owned
+`CallAuctionSubmitObservation` binds command identity/time, instrument
+ID/version, prospective command and first-event sequences, phase/cycle,
+source/resulting book revisions, previous still-current indication, and the
+complete exact admitted snapshot.
+
+Exact replay and every core or coupled-risk business rejection bypass
+observation and predicate and return the ordinary report. Decline returns the
+owned observation without consuming an identity, priority, revision, sequence,
+event, indication, history, risk reservation, or WAL frame. Unwind has the same
+semantic result. Acceptance revalidates the source revision and exact predicted
+snapshot, applies ordinary admission, proves exact admitted-state equality and
+one successor book revision, emits one canonical `OrderAccepted` event,
+invalidates the indication, and returns that same observation with the report.
+Coupled authorization occurs before observation; accepted ordinary risk
+application inserts exactly the admitted reservation once.
+
+Durable acceptance and core or risk business rejection retain the existing
+command/report two-frame grammar; decline, unwind, and replay append zero
+frames. The observation and decision are not encoded, authenticated,
+authorized, remotely transported, retained after the call, or coordinated
+across shards. A156 adds no wire value or version.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A9, A10, A12, A15, A22, A37,
+A39, A41, A52, A60, A64, A65, A68, A74, A76, A80, A81, A82, A85, A97,
+A109, A111, A112, A151, A152, A153, A154, A155, A156] Let `A` be ordinary
+admission preparation, `V` exact observation validation, `F` predicate cost,
+and `M` ordinary admission commit for `I` accepted identities, `O` active
+orders, and `P` occupied limit prices. `A`, `V`, and `M` are each
+`O(log(I + 1) + log(O + 1) + log(P + 1))`; coupled risk authorization and
+accepted reservation insertion add expected `O(1)` each. Decline or unwind
+costs `O(A + V + F)`, while acceptance costs `O(A + V + F + M)`. The
+observation and evaluator use `O(1)` auxiliary state and allocate no output.
+Durable acceptance and business rejection append two existing frames;
+decline, unwind, and replay append zero. Sequence, priority, revision,
+quantity, and notional arithmetic is exact integer arithmetic; approximation
+error is zero.
+
+**Falsification probe.** Across all four surfaces, submit market and limit
+interest on both sides, signed prices, every priority-class boundary, new and
+existing price levels, and present/absent prior indications. Run accepting,
+declining, and unwinding predicates. Require exact command/instrument/sequence/
+time/phase/book provenance, exact requested state with the next priority
+sequence, one successor revision, one equal accepted event, indication
+invalidation only on acceptance, and observation equality after decline and
+acceptance.
+
+Exercise wrong route/version, cycle, phase/revision, duplicate identity,
+instrument/capacity/aggregate/counter exhaustion, exact retry, command-ID
+collision, core and risk rejection, journal failure, and reopen. Mutate an
+unrelated order through an internal white-box path after preparation and
+require stale-generation rejection before the predicate. Compare candidate and
+unrelated state, queues and owner aggregates, accepted identities, priority/
+command/event sequences, indication, risk reservations/notional/exposure,
+history, WAL frames, and plain/coupled recovered state. Any predicate on core
+or risk rejection or replay, predicted/accepted state drift, reused identity or
+priority, partial mutation, noncommit effect, incorrect reservation, WAL growth
+before acceptance, interposed transition, recovery divergence, successful-
+path allocation, or new wire value falsifies A156.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** A156 closes the local gap between observing exact
+  call-auction admission state and committing it. The fixed-size predicate
+  value owns the predicted priority-bearing order state with phase, revision,
+  sequence, and prior-indication provenance; acceptance commits that unchanged
+  generation across plain, coupled-risk, and both durable engines.
+
+- **Medium impact opportunity:** deterministic admission, auction-quality,
+  exposure, and surveillance controls can condition a new order on its exact
+  authoritative priority coordinate and prior indicative economics without
+  correlating separate order, phase, sequence, and indication queries.
+
+- **Medium impact risk:** the A156 predicate is synchronous under the exclusive
+  shard borrow. Exact admission preflight is repeated before the predicate and
+  at commit. Maximum-capacity callback, cache, tree, and hash-collision latency
+  is unknown pending pinned-hardware measurement.
+
+- **High impact boundary:** A156 does not calculate the hypothetical
+  post-admission indication, authenticate the beneficial owner or order
+  authority, persist policy-decision evidence before command append, impose a
+  callback deadline, provide asynchronous validity or remote protocol, or
+  coordinate admission across shards.
 
 - **High impact:** A155 closes the local gap between observing an exact
   account/side call-auction cancellation set and committing it. The predicate

@@ -702,6 +702,106 @@ impl CompactOptionalCallAuctionIndicativeState {
     }
 }
 
+/// Exact owned state offered to one conditional call-auction submission.
+///
+/// The observation is bound to one same-generation preparation and contains
+/// the exact active state admitted by acceptance. It is fixed-size,
+/// allocation-free, and remains usable after either decline or accepted commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionSubmitObservation {
+    command_id: CommandId,
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    command_sequence: u64,
+    first_event_sequence: u64,
+    phase: CallAuctionPhaseSnapshot,
+    book_revision: u64,
+    received_at: TimestampNs,
+    previous_indicative: CompactOptionalCallAuctionIndicativeState,
+    accepted: CallAuctionOrderSnapshot,
+}
+
+impl CallAuctionSubmitObservation {
+    /// Returns the exact command identity.
+    #[must_use]
+    pub const fn command_id(self) -> CommandId {
+        self.command_id
+    }
+
+    /// Returns the immutable instrument identity.
+    #[must_use]
+    pub const fn instrument_id(self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version.
+    #[must_use]
+    pub const fn instrument_version(self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the command sequence assigned by acceptance.
+    #[must_use]
+    pub const fn command_sequence(self) -> u64 {
+        self.command_sequence
+    }
+
+    /// Returns the admission event sequence assigned by acceptance.
+    #[must_use]
+    pub const fn first_event_sequence(self) -> u64 {
+        self.first_event_sequence
+    }
+
+    /// Returns the current phase and cycle identity.
+    #[must_use]
+    pub const fn phase(self) -> CallAuctionPhaseSnapshot {
+        self.phase
+    }
+
+    /// Returns the exact collection-book revision used by preparation.
+    #[must_use]
+    pub const fn book_revision(self) -> u64 {
+        self.book_revision
+    }
+
+    /// Returns the collection-book revision produced by acceptance.
+    #[must_use]
+    pub const fn resulting_book_revision(self) -> u64 {
+        self.book_revision.wrapping_add(1)
+    }
+
+    /// Returns the owner of the admitted order.
+    #[must_use]
+    pub const fn account_id(self) -> AccountId {
+        self.accepted.account_id
+    }
+
+    /// Returns the admitted order identifier.
+    #[must_use]
+    pub const fn order_id(self) -> OrderId {
+        self.accepted.order_id
+    }
+
+    /// Returns the gateway/controller receive time.
+    #[must_use]
+    pub const fn received_at(self) -> TimestampNs {
+        self.received_at
+    }
+
+    /// Returns the latest still-current published indication, if present.
+    #[must_use]
+    pub const fn previous_indicative(self) -> Option<CallAuctionIndicativeState> {
+        self.previous_indicative
+            .expand(self.phase, self.book_revision)
+    }
+
+    /// Returns the exact active order state produced by acceptance.
+    #[must_use]
+    pub const fn accepted(self) -> CallAuctionOrderSnapshot {
+        self.accepted
+    }
+}
+
 /// Exact owned state offered to one conditional owner-cancel predicate.
 ///
 /// The observation is bound to one same-generation preparation and the exact
@@ -3468,7 +3568,10 @@ enum PreparedCallAuctionAction {
         active_after: Option<AuctionId>,
         last_after: Option<AuctionId>,
     },
-    Submit(CallAuctionOrder),
+    Submit {
+        accepted: CallAuctionOrderSnapshot,
+        book_revision: u64,
+    },
     Cancel {
         order: CallAuctionOrderSnapshot,
         book_revision: u64,
@@ -3513,7 +3616,7 @@ impl PreparedCallAuctionAction {
                 .ok_or(CallAuctionEngineError::SequenceExhausted),
             Self::Rejected(_)
             | Self::PhaseTransition { .. }
-            | Self::Submit(_)
+            | Self::Submit { .. }
             | Self::Cancel { .. }
             | Self::Amend { .. }
             | Self::Indicative(_) => Ok(1),
@@ -3798,6 +3901,24 @@ pub(crate) fn evaluate_conditional_mass_cancel(
             }
         }
     }
+}
+
+pub(crate) fn evaluate_conditional_submit(
+    engine: &CallAuctionEngine,
+    preparation: CallAuctionCommandPreparation,
+    observe_authorized: bool,
+    accept: impl FnOnce(&CallAuctionSubmitObservation) -> bool,
+) -> Result<
+    ConditionalCallAuctionCommandPreparation<CallAuctionSubmitObservation>,
+    CallAuctionEngineError,
+> {
+    evaluate_conditional_call_auction_command(
+        engine,
+        preparation,
+        observe_authorized,
+        CallAuctionEngine::try_submit_observation,
+        accept,
+    )
 }
 
 pub(crate) fn evaluate_conditional_cancel(
@@ -4341,6 +4462,43 @@ impl CallAuctionEngine {
         }
     }
 
+    /// Atomically observes and conditionally commits one auction order.
+    ///
+    /// Replay and deterministic business rejection bypass `accept`. A
+    /// core-admissible command invokes the predicate with owned, revision-bound
+    /// state containing the exact order identity and priority assigned by
+    /// acceptance. Decline or unwind drops the preparation without sequencing
+    /// or mutation; acceptance commits that same preparation and returns the
+    /// exact observation with its report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionEngineError`] for preparation, fail-closed query,
+    /// generation validation, or commit failure.
+    pub fn try_submit_order_if(
+        &mut self,
+        command: CallAuctionSubmitOrder,
+        accept: impl FnOnce(&CallAuctionSubmitObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionSubmitObservation>,
+        CallAuctionEngineError,
+    > {
+        let preparation = self.prepare(CallAuctionCommand::Submit(command))?;
+        match evaluate_conditional_submit(self, preparation, true, accept)? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => Ok(outcome),
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => {
+                self.commit(prepared)
+                    .map(|report| ConditionalCallAuctionCommandOutcome::Reported {
+                        observation: if report.replayed { None } else { observation },
+                        report,
+                    })
+            }
+        }
+    }
+
     /// Atomically observes and conditionally commits one owner cancellation.
     ///
     /// Replay and deterministic business rejection bypass `accept`. A
@@ -4559,6 +4717,80 @@ impl CallAuctionEngine {
                 events,
             },
         ))
+    }
+
+    fn try_submit_observation(
+        &self,
+        prepared: &PreparedCallAuctionCommand,
+    ) -> Result<CallAuctionSubmitObservation, CallAuctionEngineError> {
+        if prepared.engine_instance_id != self.instance_id {
+            return Err(CallAuctionEngineError::ForeignPreparation);
+        }
+        if prepared.expected_retained_commands != self.reports.len()
+            || prepared.expected_retained_events != self.retained_event_count
+        {
+            return Err(CallAuctionEngineError::StalePreparation);
+        }
+        let CallAuctionCommand::Submit(command) = prepared.command else {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        };
+        let PreparedCallAuctionAction::Submit {
+            accepted,
+            book_revision,
+        } = prepared.action
+        else {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        };
+        if self.book.state_revision() != book_revision {
+            return Err(CallAuctionEngineError::StalePreparation);
+        }
+        let predicted = self
+            .book
+            .preflight_admission(command.order)
+            .map_err(|_| CallAuctionEngineError::InternalInvariantViolation)?;
+        let identity = self
+            .book
+            .try_order_observation(command.order.order_id())
+            .map_err(CallAuctionEngineError::BookQuery)?;
+        book_revision
+            .checked_add(1)
+            .ok_or(CallAuctionEngineError::InternalInvariantViolation)?;
+        if predicted != accepted
+            || identity.instrument_id() != command.order.instrument_id()
+            || identity.instrument_version() != command.order.instrument_version()
+            || identity.book_revision() != book_revision
+            || identity.order_id() != command.order.order_id()
+            || identity.state().is_some()
+            || self.phase != CallAuctionPhase::Collecting
+            || self.phase_revision != command.expected_phase_revision
+            || self.active_auction_id != Some(command.auction_id)
+            || self.last_auction_id != self.active_auction_id
+        {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        }
+        if self.last_indicative.is_some_and(|indicative| {
+            self.active_auction_id != Some(indicative.auction_id())
+                || indicative.phase_revision() != self.phase_revision
+                || indicative.book_revision() != book_revision
+                || !indicative.is_valid_for(self.book.definition())
+        }) {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        }
+        Ok(CallAuctionSubmitObservation {
+            command_id: command.command_id,
+            instrument_id: command.order.instrument_id(),
+            instrument_version: command.order.instrument_version(),
+            command_sequence: self.next_command_sequence,
+            first_event_sequence: self.next_event_sequence,
+            phase: self.phase_snapshot(),
+            book_revision,
+            received_at: command.received_at,
+            previous_indicative: CompactOptionalCallAuctionIndicativeState::from_option(
+                self.last_indicative,
+                self.book.instrument_price_band(),
+            ),
+            accepted,
+        })
     }
 
     fn try_cancel_observation(
@@ -5000,18 +5232,10 @@ impl CallAuctionEngine {
                 );
                 CallAuctionCommandOutcome::Accepted
             }
-            PreparedCallAuctionAction::Submit(order) => {
-                let snapshot = self
-                    .book
-                    .admit(order)
-                    .map_err(|_| CallAuctionEngineError::InternalInvariantViolation)?;
-                self.push_event(
-                    command,
-                    CallAuctionEventKind::OrderAccepted(snapshot),
-                    events,
-                );
-                CallAuctionCommandOutcome::Accepted
-            }
+            PreparedCallAuctionAction::Submit {
+                accepted,
+                book_revision,
+            } => self.apply_submit(command, accepted, book_revision, events)?,
             PreparedCallAuctionAction::Cancel {
                 order,
                 book_revision,
@@ -5053,6 +5277,46 @@ impl CallAuctionEngine {
             self.last_indicative = None;
         }
         Ok(outcome)
+    }
+
+    fn apply_submit(
+        &mut self,
+        command: CallAuctionCommand,
+        accepted: CallAuctionOrderSnapshot,
+        book_revision: u64,
+        events: &mut CallAuctionEventTraceBuilder,
+    ) -> Result<CallAuctionCommandOutcome, CallAuctionEngineError> {
+        let CallAuctionCommand::Submit(submit) = command else {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        };
+        if self.book.state_revision() != book_revision {
+            return Err(CallAuctionEngineError::StalePreparation);
+        }
+        let predicted = self
+            .book
+            .preflight_admission(submit.order)
+            .map_err(|_| CallAuctionEngineError::InternalInvariantViolation)?;
+        if predicted != accepted {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        }
+        let admitted = self
+            .book
+            .admit(submit.order)
+            .map_err(|_| CallAuctionEngineError::InternalInvariantViolation)?;
+        if admitted != accepted
+            || self.book.state_revision()
+                != book_revision
+                    .checked_add(1)
+                    .ok_or(CallAuctionEngineError::InternalInvariantViolation)?
+        {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        }
+        self.push_event(
+            command,
+            CallAuctionEventKind::OrderAccepted(admitted),
+            events,
+        );
+        Ok(CallAuctionCommandOutcome::Accepted)
     }
 
     fn apply_cancel(
@@ -5325,7 +5589,10 @@ impl CallAuctionEngine {
                     return Ok(PreparedCallAuctionAction::Rejected(reason));
                 }
                 match self.book.preflight_admission(submit.order) {
-                    Ok(()) => Ok(PreparedCallAuctionAction::Submit(submit.order)),
+                    Ok(accepted) => Ok(PreparedCallAuctionAction::Submit {
+                        accepted,
+                        book_revision: self.book.state_revision(),
+                    }),
                     Err(CallAuctionAdmissionError::Instrument(error)) => {
                         Ok(PreparedCallAuctionAction::Rejected(
                             CallAuctionRejectReason::Instrument(error),
@@ -6702,8 +6969,9 @@ mod tests {
         CallAuctionRejectReason, CallAuctionReplaceOrder, CallAuctionSubmitOrder,
         CallAuctionUncrossCommand, evaluate_conditional_amend, evaluate_conditional_cancel,
         evaluate_conditional_mass_cancel, evaluate_conditional_replace,
-        evaluate_conditional_uncross, reserve_call_auction_checkpoint_map,
-        reserve_call_auction_checkpoint_set, reserve_call_auction_checkpoint_vec,
+        evaluate_conditional_submit, evaluate_conditional_uncross,
+        reserve_call_auction_checkpoint_map, reserve_call_auction_checkpoint_set,
+        reserve_call_auction_checkpoint_vec,
     };
     use crate::auction::{AuctionOrderConstraint, AuctionPricePolicy};
     use crate::auction_book::{
@@ -7045,6 +7313,75 @@ mod tests {
         assert!(!called.get());
         assert!(matches!(error, CallAuctionEngineError::StalePreparation));
         assert!(engine.book.order(OrderId::new(1).unwrap()).is_some());
+    }
+
+    #[test]
+    fn conditional_submit_rejects_a_stale_book_preparation_before_predicate() {
+        let mut engine = CallAuctionEngine::try_new(definition()).unwrap();
+        let instrument_id = engine.book.definition().instrument_id();
+        let instrument_version = engine.book.definition().version();
+        let auction_id = AuctionId::new(1).unwrap();
+        engine
+            .submit(CallAuctionCommand::PhaseControl(CallAuctionPhaseControl {
+                command_id: CommandId::new(1).unwrap(),
+                instrument_id,
+                instrument_version,
+                auction_id,
+                expected_phase_revision: 0,
+                target_phase: CallAuctionPhase::Collecting,
+                received_at: TimestampNs::from_unix_nanos(1),
+            }))
+            .unwrap();
+        engine
+            .submit(CallAuctionCommand::Submit(CallAuctionSubmitOrder {
+                command_id: CommandId::new(2).unwrap(),
+                auction_id,
+                expected_phase_revision: 1,
+                order: CallAuctionOrder::new(
+                    OrderId::new(1).unwrap(),
+                    AccountId::new(1).unwrap(),
+                    instrument_id,
+                    instrument_version,
+                    Side::Buy,
+                    AuctionOrderConstraint::Limit(Price::from_raw(50)),
+                    Quantity::new(2).unwrap(),
+                    crate::auction::AuctionPriorityClass::HIGHEST,
+                ),
+                received_at: TimestampNs::from_unix_nanos(2),
+            }))
+            .unwrap();
+        let preparation = engine
+            .prepare(CallAuctionCommand::Submit(CallAuctionSubmitOrder {
+                command_id: CommandId::new(3).unwrap(),
+                auction_id,
+                expected_phase_revision: 1,
+                order: CallAuctionOrder::new(
+                    OrderId::new(2).unwrap(),
+                    AccountId::new(2).unwrap(),
+                    instrument_id,
+                    instrument_version,
+                    Side::Sell,
+                    AuctionOrderConstraint::Limit(Price::from_raw(51)),
+                    Quantity::new(1).unwrap(),
+                    crate::auction::AuctionPriorityClass::HIGHEST,
+                ),
+                received_at: TimestampNs::from_unix_nanos(3),
+            }))
+            .unwrap();
+        engine
+            .book
+            .cancel(AccountId::new(1).unwrap(), OrderId::new(1).unwrap())
+            .unwrap();
+        let called = Cell::new(false);
+        let error = evaluate_conditional_submit(&engine, preparation, true, |_| {
+            called.set(true);
+            true
+        })
+        .unwrap_err();
+
+        assert!(!called.get());
+        assert!(matches!(error, CallAuctionEngineError::StalePreparation));
+        assert!(engine.book.order(OrderId::new(2).unwrap()).is_none());
     }
 
     #[test]
