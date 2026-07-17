@@ -438,6 +438,16 @@ only through the first conflicting canonical pair, then emits one fixed-size
 business-rejection event. It performs no commit work or terminal-lane
 admission.
 
+Conditional phase control performs ordinary `O(1)` transition preparation
+once. It binds fixed-size prior/resulting cycle snapshots, book revision,
+active/accepted/limit-level/market-interest aggregates, and prior indication.
+For predicate cost `F`, exact generation and transition validation adds `O(1)`
+before the predicate and at accepted commit, so decline, unwind, and acceptance
+are `O(1 + F)`. The prepared state, owned observation, and generic evaluator
+add `O(1)` auxiliary space and allocate no output. Coupled authorization and
+one-event risk-neutral application add `O(1)`. Durable acceptance and business
+rejection append two existing frames; decline, unwind, and replay append zero.
+
 Conditional call-auction submission first performs ordinary admission
 preparation. Before the predicate it repeats exact admission validation and an
 absent-identity observation. For `I` accepted identities, `O` active orders,

@@ -22,13 +22,15 @@ use crate::auction_engine::{
     CallAuctionEngineConstructionError, CallAuctionEngineError, CallAuctionEngineLimits,
     CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionExecutionReport,
     CallAuctionIndicativeCommand, CallAuctionIndicativeObservation, CallAuctionMassCancel,
-    CallAuctionMassCancelObservation, CallAuctionRejectReason, CallAuctionReplaceObservation,
-    CallAuctionReplaceOrder, CallAuctionSubmitObservation, CallAuctionSubmitOrder,
-    CallAuctionUncrossCommand, CallAuctionUncrossObservation, ConditionalCallAuctionCommandOutcome,
+    CallAuctionMassCancelObservation, CallAuctionPhaseControl, CallAuctionPhaseControlObservation,
+    CallAuctionRejectReason, CallAuctionReplaceObservation, CallAuctionReplaceOrder,
+    CallAuctionSubmitObservation, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+    CallAuctionUncrossObservation, ConditionalCallAuctionCommandOutcome,
     ConditionalCallAuctionCommandPreparation, ConditionalCallAuctionOutcome,
     ConditionalCallAuctionPreparation, PreparedCallAuctionCommand, evaluate_conditional_amend,
     evaluate_conditional_cancel, evaluate_conditional_indicative, evaluate_conditional_mass_cancel,
-    evaluate_conditional_replace, evaluate_conditional_submit, evaluate_conditional_uncross,
+    evaluate_conditional_phase_control, evaluate_conditional_replace, evaluate_conditional_submit,
+    evaluate_conditional_uncross,
 };
 use crate::bounded_hash::BoundedHashMap;
 use crate::domain::{AccountId, OrderId, Side};
@@ -1569,6 +1571,15 @@ impl CallAuctionRiskManagedEngine {
         })
     }
 
+    pub(crate) fn validate_conditional_phase_control_authorization(
+        &self,
+        preparation: &CallAuctionCommandPreparation,
+    ) -> Result<(), CallAuctionEngineError> {
+        self.validate_conditional_authorization(preparation, |command| {
+            matches!(command, CallAuctionCommand::PhaseControl(_))
+        })
+    }
+
     pub(crate) fn validate_conditional_cancel_authorization(
         &self,
         preparation: &CallAuctionCommandPreparation,
@@ -1657,6 +1668,43 @@ impl CallAuctionRiskManagedEngine {
         match self.prepare(command)? {
             CallAuctionCommandPreparation::Replay(report) => Ok(report),
             CallAuctionCommandPreparation::Ready(prepared) => self.commit(prepared),
+        }
+    }
+
+    /// Atomically risk-gates, observes, and conditionally applies one phase
+    /// control.
+    ///
+    /// Replay plus core rejection bypass `accept`. Decline or unwind changes
+    /// neither auction nor risk state. Acceptance commits the exact observed
+    /// phase transition, invalidates the prior indication, and leaves every
+    /// coupled reservation and exposure unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionEngineError`] for preparation, fail-closed
+    /// generation validation, or coupled commit failure.
+    pub fn try_submit_phase_control_if(
+        &mut self,
+        command: CallAuctionPhaseControl,
+        accept: impl FnOnce(&CallAuctionPhaseControlObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionPhaseControlObservation>,
+        CallAuctionEngineError,
+    > {
+        let preparation = self.prepare(CallAuctionCommand::PhaseControl(command))?;
+        self.validate_conditional_phase_control_authorization(&preparation)?;
+        match evaluate_conditional_phase_control(&self.engine, preparation, accept)? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => Ok(outcome),
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => {
+                self.commit(prepared)
+                    .map(|report| ConditionalCallAuctionCommandOutcome::Reported {
+                        observation: if report.replayed { None } else { observation },
+                        report,
+                    })
+            }
         }
     }
 

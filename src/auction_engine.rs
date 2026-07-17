@@ -34,7 +34,7 @@ use crate::matching::MassCancelScope;
 use crate::trace_arena::AppendOnlyTraceArena;
 use crate::{
     AccountId, AuctionId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, Quantity,
-    TimestampNs,
+    Side, TimestampNs,
 };
 
 static NEXT_CALL_AUCTION_ENGINE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -699,6 +699,150 @@ impl CompactOptionalCallAuctionIndicativeState {
             self.price_policy,
             self.clearing.expand(),
         ))
+    }
+}
+
+/// Exact owned state offered to one conditional call-auction phase control.
+///
+/// The observation binds the prior and resulting cycle lineages, unchanged
+/// collection-book aggregates, and the indicative state invalidated by an
+/// accepted transition to one engine, history, and sequence generation. It is
+/// fixed-size, allocation-free, and remains usable after decline or commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionPhaseControlObservation {
+    command: CallAuctionPhaseControl,
+    command_sequence: u64,
+    first_event_sequence: u64,
+    transition: PreparedCallAuctionPhaseControl,
+}
+
+impl CallAuctionPhaseControlObservation {
+    /// Returns the exact command identity.
+    #[must_use]
+    pub const fn command_id(&self) -> CommandId {
+        self.command.command_id
+    }
+
+    /// Returns the immutable instrument identity.
+    #[must_use]
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.command.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version.
+    #[must_use]
+    pub const fn instrument_version(&self) -> InstrumentVersion {
+        self.command.instrument_version
+    }
+
+    /// Returns the cycle started or controlled by acceptance.
+    #[must_use]
+    pub const fn auction_id(&self) -> AuctionId {
+        self.command.auction_id
+    }
+
+    /// Returns the command sequence assigned by acceptance.
+    #[must_use]
+    pub const fn command_sequence(&self) -> u64 {
+        self.command_sequence
+    }
+
+    /// Returns the phase-change event sequence assigned by acceptance.
+    #[must_use]
+    pub const fn first_event_sequence(&self) -> u64 {
+        self.first_event_sequence
+    }
+
+    /// Returns the exact prior phase and cycle lineage.
+    #[must_use]
+    pub const fn phase(&self) -> CallAuctionPhaseSnapshot {
+        self.transition.phase
+    }
+
+    /// Returns the exact phase and cycle lineage produced by acceptance.
+    #[must_use]
+    pub const fn resulting_phase(&self) -> CallAuctionPhaseSnapshot {
+        self.transition.resulting_phase
+    }
+
+    /// Returns the collection-book revision bound to preparation.
+    #[must_use]
+    pub const fn book_revision(&self) -> u64 {
+        self.transition.book_revision
+    }
+
+    /// Returns the unchanged collection-book revision after acceptance.
+    #[must_use]
+    pub const fn resulting_book_revision(&self) -> u64 {
+        self.transition.book_revision
+    }
+
+    /// Returns the gateway/controller receive time.
+    #[must_use]
+    pub const fn received_at(&self) -> TimestampNs {
+        self.command.received_at
+    }
+
+    /// Returns the unchanged active-order cardinality.
+    #[must_use]
+    pub const fn active_order_count(&self) -> usize {
+        self.transition.active_order_count
+    }
+
+    /// Returns the unchanged never-reusable accepted-identity cardinality.
+    #[must_use]
+    pub const fn accepted_order_count(&self) -> usize {
+        self.transition.accepted_order_count
+    }
+
+    /// Returns the unchanged occupied bid-limit price cardinality.
+    #[must_use]
+    pub const fn bid_price_level_count(&self) -> usize {
+        self.transition.bid_price_level_count
+    }
+
+    /// Returns the unchanged occupied ask-limit price cardinality.
+    #[must_use]
+    pub const fn ask_price_level_count(&self) -> usize {
+        self.transition.ask_price_level_count
+    }
+
+    /// Returns the unchanged buy-market order cardinality.
+    #[must_use]
+    pub const fn buy_market_order_count(&self) -> u64 {
+        self.transition.buy_market_order_count
+    }
+
+    /// Returns the unchanged sell-market order cardinality.
+    #[must_use]
+    pub const fn sell_market_order_count(&self) -> u64 {
+        self.transition.sell_market_order_count
+    }
+
+    /// Returns the unchanged aggregate buy-market leaves in lots.
+    #[must_use]
+    pub const fn buy_market_quantity_lots(&self) -> u128 {
+        self.transition.buy_market_quantity_lots
+    }
+
+    /// Returns the unchanged aggregate sell-market leaves in lots.
+    #[must_use]
+    pub const fn sell_market_quantity_lots(&self) -> u128 {
+        self.transition.sell_market_quantity_lots
+    }
+
+    /// Returns the previous still-current indication invalidated by acceptance.
+    #[must_use]
+    pub const fn previous_indicative(&self) -> Option<CallAuctionIndicativeState> {
+        self.transition
+            .previous_indicative
+            .expand(self.transition.phase, self.transition.book_revision)
+    }
+
+    /// Returns the indicative state after acceptance.
+    #[must_use]
+    pub const fn resulting_indicative(&self) -> Option<CallAuctionIndicativeState> {
+        None
     }
 }
 
@@ -3640,6 +3784,22 @@ impl fmt::Display for CallAuctionEngineError {
 
 impl std::error::Error for CallAuctionEngineError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedCallAuctionPhaseControl {
+    phase: CallAuctionPhaseSnapshot,
+    resulting_phase: CallAuctionPhaseSnapshot,
+    book_revision: u64,
+    active_order_count: usize,
+    accepted_order_count: usize,
+    bid_price_level_count: usize,
+    ask_price_level_count: usize,
+    buy_market_order_count: u64,
+    sell_market_order_count: u64,
+    buy_market_quantity_lots: u128,
+    sell_market_quantity_lots: u128,
+    previous_indicative: CompactOptionalCallAuctionIndicativeState,
+}
+
 #[derive(Debug)]
 #[allow(
     clippy::large_enum_variant,
@@ -3647,14 +3807,7 @@ impl std::error::Error for CallAuctionEngineError {}
 )]
 enum PreparedCallAuctionAction {
     Rejected(CallAuctionRejectReason),
-    PhaseTransition {
-        auction_id: AuctionId,
-        previous: CallAuctionPhase,
-        current: CallAuctionPhase,
-        revision: u64,
-        active_after: Option<AuctionId>,
-        last_after: Option<AuctionId>,
-    },
+    PhaseTransition(PreparedCallAuctionPhaseControl),
     Submit {
         accepted: CallAuctionOrderSnapshot,
         book_revision: u64,
@@ -3705,7 +3858,7 @@ impl PreparedCallAuctionAction {
                 .and_then(|value| value.checked_add(1))
                 .ok_or(CallAuctionEngineError::SequenceExhausted),
             Self::Rejected(_)
-            | Self::PhaseTransition { .. }
+            | Self::PhaseTransition(_)
             | Self::Submit { .. }
             | Self::Cancel { .. }
             | Self::Amend { .. }
@@ -3722,7 +3875,7 @@ impl PreparedCallAuctionAction {
             (Self::Cancel { .. }, CallAuctionCommand::Cancel(_))
             | (Self::Uncross { .. }, CallAuctionCommand::Uncross(_))
             | (
-                Self::PhaseTransition { .. },
+                Self::PhaseTransition(_),
                 CallAuctionCommand::PhaseControl(CallAuctionPhaseControl {
                     target_phase: CallAuctionPhase::Frozen | CallAuctionPhase::Closed,
                     ..
@@ -4007,6 +4160,23 @@ pub(crate) fn evaluate_conditional_submit(
         preparation,
         observe_authorized,
         CallAuctionEngine::try_submit_observation,
+        accept,
+    )
+}
+
+pub(crate) fn evaluate_conditional_phase_control(
+    engine: &CallAuctionEngine,
+    preparation: CallAuctionCommandPreparation,
+    accept: impl FnOnce(&CallAuctionPhaseControlObservation) -> bool,
+) -> Result<
+    ConditionalCallAuctionCommandPreparation<CallAuctionPhaseControlObservation>,
+    CallAuctionEngineError,
+> {
+    evaluate_conditional_call_auction_command(
+        engine,
+        preparation,
+        true,
+        CallAuctionEngine::try_phase_control_observation,
         accept,
     )
 }
@@ -4569,6 +4739,43 @@ impl CallAuctionEngine {
         }
     }
 
+    /// Atomically observes and conditionally applies one phase control.
+    ///
+    /// Replay and deterministic business rejection bypass `accept`. A
+    /// core-admissible command invokes the predicate with exact prior/resulting
+    /// cycle lineage, unchanged book aggregates, and the prior indication that
+    /// acceptance invalidates. Decline or unwind changes no phase, book,
+    /// indication, sequence, or history; acceptance commits that same state in
+    /// one canonical event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionEngineError`] for preparation, fail-closed
+    /// generation validation, or commit failure.
+    pub fn try_submit_phase_control_if(
+        &mut self,
+        command: CallAuctionPhaseControl,
+        accept: impl FnOnce(&CallAuctionPhaseControlObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionPhaseControlObservation>,
+        CallAuctionEngineError,
+    > {
+        let preparation = self.prepare(CallAuctionCommand::PhaseControl(command))?;
+        match evaluate_conditional_phase_control(self, preparation, accept)? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => Ok(outcome),
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => {
+                self.commit(prepared)
+                    .map(|report| ConditionalCallAuctionCommandOutcome::Reported {
+                        observation: if report.replayed { None } else { observation },
+                        report,
+                    })
+            }
+        }
+    }
+
     /// Atomically observes and conditionally commits one auction order.
     ///
     /// Replay and deterministic business rejection bypass `accept`. A
@@ -4934,6 +5141,81 @@ impl CallAuctionEngine {
             ),
             accepted,
         })
+    }
+
+    fn try_phase_control_observation(
+        &self,
+        prepared: &PreparedCallAuctionCommand,
+    ) -> Result<CallAuctionPhaseControlObservation, CallAuctionEngineError> {
+        if prepared.engine_instance_id != self.instance_id {
+            return Err(CallAuctionEngineError::ForeignPreparation);
+        }
+        if prepared.expected_retained_commands != self.reports.len()
+            || prepared.expected_retained_events != self.retained_event_count
+        {
+            return Err(CallAuctionEngineError::StalePreparation);
+        }
+        let CallAuctionCommand::PhaseControl(command) = prepared.command else {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        };
+        let PreparedCallAuctionAction::PhaseTransition(transition) = prepared.action else {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        };
+        self.validate_prepared_phase_control(command, &transition)?;
+        Ok(CallAuctionPhaseControlObservation {
+            command,
+            command_sequence: self.next_command_sequence,
+            first_event_sequence: self.next_event_sequence,
+            transition,
+        })
+    }
+
+    fn validate_prepared_phase_control(
+        &self,
+        command: CallAuctionPhaseControl,
+        prepared: &PreparedCallAuctionPhaseControl,
+    ) -> Result<(), CallAuctionEngineError> {
+        if self.phase_snapshot() != prepared.phase
+            || self.book.state_revision() != prepared.book_revision
+            || self.book.active_order_count() != prepared.active_order_count
+            || self.book.accepted_order_id_count() != prepared.accepted_order_count
+            || self.book.price_level_count(Side::Buy) != prepared.bid_price_level_count
+            || self.book.price_level_count(Side::Sell) != prepared.ask_price_level_count
+            || self.book.market_order_count(Side::Buy) != prepared.buy_market_order_count
+            || self.book.market_order_count(Side::Sell) != prepared.sell_market_order_count
+            || self.book.market_quantity(Side::Buy) != prepared.buy_market_quantity_lots
+            || self.book.market_quantity(Side::Sell) != prepared.sell_market_quantity_lots
+            || self.last_indicative
+                != prepared
+                    .previous_indicative
+                    .expand(prepared.phase, prepared.book_revision)
+        {
+            return Err(CallAuctionEngineError::StalePreparation);
+        }
+        if self.book.definition().instrument_id() != command.instrument_id
+            || self.book.definition().version() != command.instrument_version
+            || (prepared.phase.phase() == CallAuctionPhase::Closed)
+                != prepared.phase.active_auction_id().is_none()
+            || (prepared.phase.active_auction_id().is_some()
+                && prepared.phase.active_auction_id() != prepared.phase.last_auction_id())
+            || self.last_indicative.is_some_and(|indicative| {
+                prepared.phase.active_auction_id() != Some(indicative.auction_id())
+                    || indicative.phase_revision() != prepared.phase.revision()
+                    || indicative.book_revision() != prepared.book_revision
+                    || !indicative.is_valid_for(self.book.definition())
+            })
+        {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        }
+        let PreparedCallAuctionAction::PhaseTransition(recomputed) =
+            self.prepare_phase_control(command)?
+        else {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        };
+        if recomputed != *prepared {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        }
+        Ok(())
     }
 
     fn try_indicative_observation(
@@ -5420,29 +5702,8 @@ impl CallAuctionEngine {
                 );
                 CallAuctionCommandOutcome::Rejected(reason)
             }
-            PreparedCallAuctionAction::PhaseTransition {
-                auction_id,
-                previous,
-                current,
-                revision,
-                active_after,
-                last_after,
-            } => {
-                self.phase = current;
-                self.phase_revision = revision;
-                self.active_auction_id = active_after;
-                self.last_auction_id = last_after;
-                self.push_event(
-                    command,
-                    CallAuctionEventKind::PhaseChanged {
-                        auction_id,
-                        previous,
-                        current,
-                        revision,
-                    },
-                    events,
-                );
-                CallAuctionCommandOutcome::Accepted
+            PreparedCallAuctionAction::PhaseTransition(prepared) => {
+                self.apply_phase_control(command, &prepared, events)?
             }
             PreparedCallAuctionAction::Submit {
                 accepted,
@@ -5489,6 +5750,33 @@ impl CallAuctionEngine {
             self.last_indicative = None;
         }
         Ok(outcome)
+    }
+
+    fn apply_phase_control(
+        &mut self,
+        command: CallAuctionCommand,
+        prepared: &PreparedCallAuctionPhaseControl,
+        events: &mut CallAuctionEventTraceBuilder,
+    ) -> Result<CallAuctionCommandOutcome, CallAuctionEngineError> {
+        let CallAuctionCommand::PhaseControl(control) = command else {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        };
+        self.validate_prepared_phase_control(control, prepared)?;
+        self.phase = prepared.resulting_phase.phase();
+        self.phase_revision = prepared.resulting_phase.revision();
+        self.active_auction_id = prepared.resulting_phase.active_auction_id();
+        self.last_auction_id = prepared.resulting_phase.last_auction_id();
+        self.push_event(
+            command,
+            CallAuctionEventKind::PhaseChanged {
+                auction_id: control.auction_id,
+                previous: prepared.phase.phase(),
+                current: prepared.resulting_phase.phase(),
+                revision: prepared.resulting_phase.revision(),
+            },
+            events,
+        );
+        Ok(CallAuctionCommandOutcome::Accepted)
     }
 
     fn apply_submit(
@@ -6128,14 +6416,30 @@ impl CallAuctionEngine {
             .phase_revision
             .checked_add(1)
             .ok_or(CallAuctionEngineError::PhaseRevisionExhausted)?;
-        Ok(PreparedCallAuctionAction::PhaseTransition {
-            auction_id: control.auction_id,
-            previous: self.phase,
-            current: control.target_phase,
-            revision,
-            active_after,
-            last_after,
-        })
+        Ok(PreparedCallAuctionAction::PhaseTransition(
+            PreparedCallAuctionPhaseControl {
+                phase: self.phase_snapshot(),
+                resulting_phase: CallAuctionPhaseSnapshot::from_parts(
+                    control.target_phase,
+                    revision,
+                    active_after,
+                    last_after,
+                ),
+                book_revision: self.book.state_revision(),
+                active_order_count: self.book.active_order_count(),
+                accepted_order_count: self.book.accepted_order_id_count(),
+                bid_price_level_count: self.book.price_level_count(Side::Buy),
+                ask_price_level_count: self.book.price_level_count(Side::Sell),
+                buy_market_order_count: self.book.market_order_count(Side::Buy),
+                sell_market_order_count: self.book.market_order_count(Side::Sell),
+                buy_market_quantity_lots: self.book.market_quantity(Side::Buy),
+                sell_market_quantity_lots: self.book.market_quantity(Side::Sell),
+                previous_indicative: CompactOptionalCallAuctionIndicativeState::from_option(
+                    self.last_indicative,
+                    self.book.instrument_price_band(),
+                ),
+            },
+        ))
     }
 
     fn prepare_uncross_command(
@@ -7188,8 +7492,8 @@ mod tests {
         CallAuctionReplaceOrder, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
         ConditionalCallAuctionCommandPreparation, evaluate_conditional_amend,
         evaluate_conditional_cancel, evaluate_conditional_indicative,
-        evaluate_conditional_mass_cancel, evaluate_conditional_replace,
-        evaluate_conditional_submit, evaluate_conditional_uncross,
+        evaluate_conditional_mass_cancel, evaluate_conditional_phase_control,
+        evaluate_conditional_replace, evaluate_conditional_submit, evaluate_conditional_uncross,
         reserve_call_auction_checkpoint_map, reserve_call_auction_checkpoint_set,
         reserve_call_auction_checkpoint_vec,
     };
@@ -7726,6 +8030,106 @@ mod tests {
         assert_eq!(engine.next_command_sequence(), 4);
         assert_eq!(engine.next_event_sequence(), 4);
         assert_eq!(engine.last_indicative, None);
+    }
+
+    #[test]
+    fn conditional_phase_control_rejects_stale_state_before_predicate() {
+        let freeze = |engine: &CallAuctionEngine| {
+            CallAuctionCommand::PhaseControl(CallAuctionPhaseControl {
+                command_id: CommandId::new(5).unwrap(),
+                instrument_id: engine.book.definition().instrument_id(),
+                instrument_version: engine.book.definition().version(),
+                auction_id: AuctionId::new(1).unwrap(),
+                expected_phase_revision: 1,
+                target_phase: CallAuctionPhase::Frozen,
+                received_at: TimestampNs::from_unix_nanos(5),
+            })
+        };
+
+        let mut engine = crossed_collecting_engine();
+        engine
+            .submit(CallAuctionCommand::Indicative(indicative_command(&engine)))
+            .unwrap();
+        let preparation = engine.prepare(freeze(&engine)).unwrap();
+        engine
+            .book
+            .cancel(AccountId::new(2).unwrap(), OrderId::new(2).unwrap())
+            .unwrap();
+        let called = Cell::new(false);
+        let error = evaluate_conditional_phase_control(&engine, preparation, |_| {
+            called.set(true);
+            true
+        })
+        .unwrap_err();
+        assert!(!called.get());
+        assert!(matches!(error, CallAuctionEngineError::StalePreparation));
+
+        let mut engine = crossed_collecting_engine();
+        let preparation = engine.prepare(freeze(&engine)).unwrap();
+        engine.phase = CallAuctionPhase::Frozen;
+        let called = Cell::new(false);
+        let error = evaluate_conditional_phase_control(&engine, preparation, |_| {
+            called.set(true);
+            true
+        })
+        .unwrap_err();
+        assert!(!called.get());
+        assert!(matches!(error, CallAuctionEngineError::StalePreparation));
+
+        let mut engine = crossed_collecting_engine();
+        engine
+            .submit(CallAuctionCommand::Indicative(indicative_command(&engine)))
+            .unwrap();
+        let preparation = engine.prepare(freeze(&engine)).unwrap();
+        engine.last_indicative = None;
+        let called = Cell::new(false);
+        let error = evaluate_conditional_phase_control(&engine, preparation, |_| {
+            called.set(true);
+            true
+        })
+        .unwrap_err();
+        assert!(!called.get());
+        assert!(matches!(error, CallAuctionEngineError::StalePreparation));
+    }
+
+    #[test]
+    fn phase_control_commit_rejects_state_change_after_predicate_acceptance() {
+        let mut engine = crossed_collecting_engine();
+        engine
+            .submit(CallAuctionCommand::Indicative(indicative_command(&engine)))
+            .unwrap();
+        let command = CallAuctionCommand::PhaseControl(CallAuctionPhaseControl {
+            command_id: CommandId::new(5).unwrap(),
+            instrument_id: engine.book.definition().instrument_id(),
+            instrument_version: engine.book.definition().version(),
+            auction_id: AuctionId::new(1).unwrap(),
+            expected_phase_revision: 1,
+            target_phase: CallAuctionPhase::Frozen,
+            received_at: TimestampNs::from_unix_nanos(5),
+        });
+        let preparation = engine.prepare(command).unwrap();
+        let ConditionalCallAuctionCommandPreparation::Commit {
+            prepared,
+            observation: Some(observation),
+        } = evaluate_conditional_phase_control(&engine, preparation, |_| true).unwrap()
+        else {
+            panic!("core-admissible phase control must be commit-ready");
+        };
+        assert_eq!(observation.book_revision(), 2);
+        assert!(observation.previous_indicative().is_some());
+        engine
+            .book
+            .cancel(AccountId::new(2).unwrap(), OrderId::new(2).unwrap())
+            .unwrap();
+
+        let error = engine.commit(prepared).unwrap_err();
+
+        assert!(matches!(error, CallAuctionEngineError::StalePreparation));
+        assert_eq!(engine.phase, CallAuctionPhase::Collecting);
+        assert_eq!(engine.phase_revision, 1);
+        assert_eq!(engine.next_command_sequence(), 5);
+        assert_eq!(engine.next_event_sequence(), 5);
+        assert!(engine.last_indicative.is_some());
     }
 
     #[test]

@@ -1453,6 +1453,25 @@ process-local call-auction engine.
       Acceptance emits one event equal to the prepared indication, retains it
       as latest, leaves the collection revision unchanged, and is risk-neutral.
       The observation and decision are process-local and add no encoded value.
+17. `try_submit_phase_control_if` holds one exclusive mutable engine borrow
+    across ordinary phase-control preparation, one synchronous predicate, and
+    commit of that same-generation transition.
+    - `CallAuctionPhaseControlObservation` is a fixed-size owned value carrying
+      exact prior/resulting phase and cycle snapshots, command/time,
+      instrument/version, prospective command and phase-event sequences,
+      unchanged book revision and occupancy aggregates, and the prior
+      indication acceptance invalidates.
+    - Before invoking the predicate, the engine rejects foreign or stale
+      engine, history, phase, book, aggregate, or indication generations. One
+      shared validator reuses ordinary phase preparation to prove the complete
+      transition both before the predicate and at accepted ordinary or
+      conditional commit. Replay and core business rejection bypass
+      observation and predicate.
+    - Decline returns the owned observation and unwind drops it; neither path
+      changes phase/cycle, sequence, event, indication, collection state,
+      history, risk, or WAL. Acceptance installs the exact resulting snapshot,
+      emits one equal phase event, invalidates the prior indication, leaves the
+      book and coupled risk unchanged, and adds no encoded value.
 
 ## Coupled call-auction risk invariants
 
@@ -2796,6 +2815,14 @@ predicate and book staleness at commit; acceptance, decline, and unwind; core-
 rejection/replay predicate bypass; unchanged book and coupled risk; zero-frame
 durable noncommit, two-frame acceptance/business rejection, and exact plain/
 coupled-risk reopen state.
+Conditional call-auction phase-control tests cover fixed-size owned command,
+sequence, every valid prior/resulting phase and cycle lineage, book revision,
+active/accepted/limit-level/market-interest aggregates, and prior-indication
+provenance; book/phase/indication staleness before the predicate and book
+staleness at commit; acceptance, decline, and unwind; core-rejection/replay
+predicate bypass; indication invalidation only on acceptance; unchanged book
+and coupled risk; zero-frame durable noncommit; two-frame acceptance/business
+rejection; and exact plain/coupled-risk reopen state.
 
 FOK tests cover reserve-hidden and fully hidden total-leaves eligibility,
 displayed- and hidden-class same-price self barriers, atomic decrement-and-
@@ -3276,6 +3303,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Conditional call-auction mass cancellation | Atomic local binding of one exact canonical account/side selection plus command/sequence/phase/book/indication provenance to the same-generation mass-cancel commit is implemented across plain, coupled-risk, durable, and durable-risk engines; remaining work is authenticated cancel-on-behalf policy, durable decision evidence before command append, callback latency limits, remote protocol mapping, and cross-shard completion aggregation |
 | High | Conditional call-auction submission | Atomic local binding of exact predicted priority-bearing admission state plus command/sequence/phase/book/indication provenance to the same-generation submit commit is implemented across plain, coupled-risk, durable, and durable-risk engines; remaining work is authenticated order authority, hypothetical post-admission indication, durable decision evidence before command append, callback latency limits, remote protocol mapping, and multi-shard coordination |
 | High | Conditional call-auction indicative publication | Atomic local binding of exact previous and prepared nullable indicative states plus command/sequence/phase/book provenance to the same-generation publication is implemented across plain, coupled-risk, durable, and durable-risk engines; remaining work is authenticated controller and reference/band authority, entitlement/disclosure policy, durable decision evidence before command append, callback latency limits, remote protocol mapping, and cross-shard publication cadence |
+| High | Conditional call-auction phase control | Atomic local binding of exact prior/resulting phase and cycle lineage, unchanged book aggregates, and invalidated prior indication to the same-generation phase transition is implemented across plain, coupled-risk, durable, and durable-risk engines; remaining work is authenticated controller and calendar/volatility authority, durable decision evidence before command append, callback latency limits, remote protocol mapping, cross-shard barriers, completion aggregation, and venue-specific phase graphs |
 | High | Instrument lifecycle expansion | authoritative calendar ingestion/distribution/activation, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |

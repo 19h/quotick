@@ -17,12 +17,13 @@ use crate::auction_engine::{
     CallAuctionEngine, CallAuctionEngineConstructionError, CallAuctionEngineError,
     CallAuctionEngineInvariantViolation, CallAuctionEngineLimits, CallAuctionExecutionReport,
     CallAuctionIndicativeCommand, CallAuctionIndicativeObservation, CallAuctionMassCancel,
-    CallAuctionMassCancelObservation, CallAuctionReplaceObservation, CallAuctionReplaceOrder,
-    CallAuctionSubmitObservation, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
-    CallAuctionUncrossObservation, ConditionalCallAuctionCommandOutcome,
-    ConditionalCallAuctionCommandPreparation, ConditionalCallAuctionOutcome,
-    ConditionalCallAuctionPreparation, PreparedCallAuctionCommand, evaluate_conditional_amend,
-    evaluate_conditional_cancel, evaluate_conditional_indicative, evaluate_conditional_mass_cancel,
+    CallAuctionMassCancelObservation, CallAuctionPhaseControl, CallAuctionPhaseControlObservation,
+    CallAuctionReplaceObservation, CallAuctionReplaceOrder, CallAuctionSubmitObservation,
+    CallAuctionSubmitOrder, CallAuctionUncrossCommand, CallAuctionUncrossObservation,
+    ConditionalCallAuctionCommandOutcome, ConditionalCallAuctionCommandPreparation,
+    ConditionalCallAuctionOutcome, ConditionalCallAuctionPreparation, PreparedCallAuctionCommand,
+    evaluate_conditional_amend, evaluate_conditional_cancel, evaluate_conditional_indicative,
+    evaluate_conditional_mass_cancel, evaluate_conditional_phase_control,
     evaluate_conditional_replace, evaluate_conditional_submit, evaluate_conditional_uncross,
 };
 use crate::auction_risk::{
@@ -1009,6 +1010,50 @@ impl DurableCallAuctionEngine {
         self.commit_prepared(prepared)
     }
 
+    /// Durably observes and conditionally applies one phase control.
+    ///
+    /// Replay and deterministic business rejection bypass `accept`. Decline or
+    /// unwind changes neither WAL nor auction state. Acceptance persists and
+    /// commits the exact phase/book-bound transition under the ordinary poison
+    /// and recovery protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, preparation,
+    /// fail-closed generation validation, journal, or commit failure.
+    pub fn try_submit_phase_control_if(
+        &mut self,
+        command: CallAuctionPhaseControl,
+        accept: impl FnOnce(&CallAuctionPhaseControlObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionPhaseControlObservation>,
+        DurableCallAuctionError,
+    > {
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        let preparation = self
+            .engine
+            .prepare(CallAuctionCommand::PhaseControl(command))?;
+        match evaluate_conditional_phase_control(&self.engine, preparation, accept)? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => {
+                if self.is_poisoned() {
+                    return Err(DurableCallAuctionError::Poisoned);
+                }
+                Ok(outcome)
+            }
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => self.commit_prepared(prepared).map(|report| {
+                ConditionalCallAuctionCommandOutcome::Reported {
+                    observation: if report.replayed { None } else { observation },
+                    report,
+                }
+            }),
+        }
+    }
+
     /// Durably observes and conditionally commits one auction order.
     ///
     /// Replay and deterministic business rejection bypass `accept`. Decline or
@@ -1890,6 +1935,52 @@ impl DurableCallAuctionRiskEngine {
             CallAuctionCommandPreparation::Ready(prepared) => prepared,
         };
         self.commit_prepared(prepared)
+    }
+
+    /// Durably risk-gates, observes, and conditionally applies one phase
+    /// control.
+    ///
+    /// Replay plus core rejection bypass `accept`. Decline or unwind changes
+    /// neither WAL, auction, nor risk state. Acceptance persists and commits
+    /// the exact phase transition while leaving coupled risk unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, preparation,
+    /// fail-closed generation validation, journal, or coupled commit failure.
+    pub fn try_submit_phase_control_if(
+        &mut self,
+        command: CallAuctionPhaseControl,
+        accept: impl FnOnce(&CallAuctionPhaseControlObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionPhaseControlObservation>,
+        DurableCallAuctionError,
+    > {
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        let preparation = self
+            .managed
+            .prepare(CallAuctionCommand::PhaseControl(command))?;
+        self.managed
+            .validate_conditional_phase_control_authorization(&preparation)?;
+        match evaluate_conditional_phase_control(self.managed.engine(), preparation, accept)? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => {
+                if self.is_poisoned() {
+                    return Err(DurableCallAuctionError::Poisoned);
+                }
+                Ok(outcome)
+            }
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => self.commit_prepared(prepared).map(|report| {
+                ConditionalCallAuctionCommandOutcome::Reported {
+                    observation: if report.replayed { None } else { observation },
+                    report,
+                }
+            }),
+        }
     }
 
     /// Durably risk-gates, observes, and conditionally commits one auction

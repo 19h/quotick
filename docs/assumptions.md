@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A157 are stable and are referenced from code comments and other
+identifiers A1-A158 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -6561,10 +6561,103 @@ publication, recomputed or drifting observation, noncommit effect, risk change,
 WAL growth before acceptance, recovery divergence, successful-path allocation,
 or new wire value falsifies A157.
 
+## A158 — atomic conditional call-auction phase control
+
+**Assumption.** One `try_submit_phase_control_if` call on a
+`CallAuctionEngine`, `CallAuctionRiskManagedEngine`,
+`DurableCallAuctionEngine`, or `DurableCallAuctionRiskEngine` holds the
+corresponding exclusive shard borrow across ordinary phase-control preparation,
+one synchronous predicate, and commit of that same-generation prepared
+transition. Ordinary preparation validates route/version, the observed phase
+revision, contiguous new-cycle identity, existing active-cycle identity, and
+the permitted `Closed`/`Collecting`/`Frozen` transition graph. It derives one
+checked successor revision and exact prior/resulting phase snapshots.
+
+The prepared action also binds the unchanged collection-book revision; active
+and accepted-order cardinalities; bid/ask limit-level cardinalities; buy/sell
+market-order cardinalities and aggregate quantities; previous still-current
+indication; and engine/history/event generation. Before the predicate, the
+engine rejects foreign or stale preparation and proves exact equality with all
+bound mutable state. One shared validator checks phase/cycle and indication
+coherence, then reuses ordinary phase-control preparation to prove the complete
+resulting snapshot and aggregates. Accepted ordinary and conditional commits
+reuse that validator.
+
+The fixed-size owned `CallAuctionPhaseControlObservation` binds command
+identity/time, instrument ID/version, controlled cycle, prospective command and
+phase-change event sequences, exact prior/resulting phase snapshots, unchanged
+book revision and aggregate counts/quantities, and the prior indication that
+acceptance invalidates. Exact replay and every core business rejection bypass
+observation and predicate and return the ordinary report. Decline returns the
+owned observation without changing phase, cycle, indication, book, history,
+risk, sequence, or WAL; unwind has the same semantic result.
+
+Acceptance revalidates the preparation, installs the exact resulting phase and
+cycle lineage, emits one equal `PhaseChanged` event, invalidates the previous
+indication, and leaves collection-book state unchanged. Coupled authorization
+is account-independent and occurs before observation; all outcomes are
+risk-neutral. Durable acceptance and core business rejection retain the
+existing command/report two-frame grammar; decline, unwind, and replay append
+zero frames. The observation and decision are not encoded, authenticated,
+authorized, remotely transported, retained after the call, or coordinated
+across shards. A158 adds no wire value or version.
+
+**Dependent results.** [A1, A3, A4, A5, A9, A10, A12, A15, A22, A37, A39,
+A41, A52, A60, A64, A65, A66, A68, A74, A76, A80, A81, A82, A85, A97,
+A109, A111, A112, A151, A152, A153, A154, A155, A156, A157, A158] For
+predicate cost `F`, ordinary preparation, pre-predicate validation, and
+accepted commit validation are each `O(1)`. Decline, unwind, and acceptance are
+therefore `O(1 + F)`. The prepared state, observation, and evaluator use
+`O(1)` auxiliary space and allocate no output. Coupled authorization and
+risk-neutral one-event trace application are `O(1)`. Durable acceptance and
+business rejection append two existing frames; decline, unwind, and replay
+append zero. Sequence, phase revision, cycle identity, cardinality, and
+quantity arithmetic is exact integer arithmetic; approximation error is zero.
+
+**Falsification probe.** Across all four surfaces, condition every valid
+transition: first-cycle and later-cycle `Closed` to `Collecting`, `Collecting`
+to `Frozen`, `Frozen` to `Collecting`, and both active phases to `Closed`.
+Exercise empty and populated books with market and limit interest and
+present/absent prior indications. Run accepting, declining, and unwinding
+predicates. Require exact command/instrument/sequence/time/cycle provenance,
+prior/resulting phase equality, unchanged book revision and aggregates, one
+equal phase event only on acceptance, and indication invalidation only on
+acceptance.
+
+Exercise wrong route/version, stale revision, non-next or mismatched cycle,
+invalid transition, revision/cycle/history/event exhaustion, exact retry,
+command-ID collision, journal failure, and reopen. Through internal white-box
+paths, change the book, phase, or indication after preparation and require
+rejection before the predicate; change state after predicate acceptance and
+require commit rejection. Compare phase/cycle lineage, collection state,
+sequences, event storage, indication, risk profiles/reservations/exposure,
+history, WAL frames, and plain/coupled recovered state. Any predicate on
+rejection or replay, stale or drifting transition, partial mutation, noncommit
+effect, risk change, WAL growth before acceptance, recovery divergence,
+successful-path allocation, or new wire value falsifies A158.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** A158 closes the final command-class gap in local atomic
+  conditional call-auction control. One fixed-size predicate value owns the
+  exact prior/resulting cycle lineage, unchanged book aggregates, and
+  invalidated indication across plain, coupled-risk, and both durable engines.
+
+- **Medium impact opportunity:** auction schedulers, volatility controllers,
+  and operational gates can condition cycle start, freeze, reopen, or close on
+  one revision-bound phase/book snapshot without correlating separate queries.
+
+- **Medium impact risk:** the A158 predicate is synchronous under the exclusive
+  shard borrow. Callback latency and maximum control-plane hold time are
+  unknown pending pinned-hardware and production-controller measurements.
+
+- **High impact boundary:** A158 adds no authenticated controller, calendar or
+  volatility-trigger authority, cross-shard transition barrier, completion
+  aggregation, durable policy-decision evidence, callback deadline, remote
+  control protocol, or venue-specific phase graph.
 
 - **High impact:** A157 closes the local gap between observing one exact
   revision-bound indicative result and publishing it. The predicate owns both
