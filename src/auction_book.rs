@@ -2364,23 +2364,20 @@ impl CallAuctionBook {
         })
     }
 
-    /// Atomically removes one account's selected active orders.
+    /// Materializes the exact canonical selection for one mass cancellation.
     ///
     /// `output` must be empty and retain capacity for the complete selection.
-    /// Selected snapshots are returned in ascending [`OrderId`] order. The
-    /// account index bounds selection work to `K` selected orders; sorting is
-    /// `O(K log K)` and each removal is `O(log O)` for `O` active orders. No
-    /// storage allocation occurs after construction when caller capacity is
-    /// sufficient. A non-empty selection advances the book revision exactly
-    /// once; an empty selection leaves it unchanged.
+    /// Selected snapshots are appended in ascending [`OrderId`] order. The
+    /// account index bounds traversal to `K` selected orders and sorting is
+    /// `O(K log K)`; no allocation or semantic book mutation occurs.
     ///
     /// # Errors
     ///
-    /// Returns [`CallAuctionMassCancelError`] before book mutation for invalid
-    /// output state, insufficient output capacity, revision exhaustion, or an
-    /// account-index contradiction.
-    pub fn mass_cancel_into(
-        &mut self,
+    /// Returns [`CallAuctionMassCancelError`] for invalid output state,
+    /// insufficient output capacity, revision exhaustion, or an account-index
+    /// contradiction. Any partially materialized output is cleared on failure.
+    pub fn preflight_mass_cancel_into(
+        &self,
         account_id: AccountId,
         scope: MassCancelScope,
         output: &mut Vec<CallAuctionOrderSnapshot>,
@@ -2434,19 +2431,59 @@ impl CallAuctionBook {
             return Err(CallAuctionMassCancelError::InternalInvariantViolation);
         }
         output.sort_unstable_by_key(|order| order.order_id);
+        let mut selected_quantity_lots = 0_u128;
         let invalid_selection = output
             .windows(2)
             .any(|pair| pair[0].order_id == pair[1].order_id)
             || output.iter().copied().any(|snapshot| {
-                self.orders
-                    .get(&snapshot.order_id)
-                    .copied()
-                    .map(CallAuctionOrderSnapshot::from)
-                    != Some(snapshot)
-            });
+                selected_quantity_lots = match selected_quantity_lots
+                    .checked_add(u128::from(snapshot.quantity.lots()))
+                {
+                    Some(quantity) => quantity,
+                    None => return true,
+                };
+                snapshot.account_id != account_id
+                    || matches!(scope, MassCancelScope::Side(side) if snapshot.side != side)
+                    || self
+                        .orders
+                        .get(&snapshot.order_id)
+                        .copied()
+                        .map(CallAuctionOrderSnapshot::from)
+                        != Some(snapshot)
+            })
+            || selected_quantity_lots != result.cancelled_quantity_lots;
         if invalid_selection {
             output.clear();
             return Err(CallAuctionMassCancelError::InternalInvariantViolation);
+        }
+        Ok(result)
+    }
+
+    /// Atomically removes one account's selected active orders.
+    ///
+    /// `output` must be empty and retain capacity for the complete selection.
+    /// Selected snapshots are returned in ascending [`OrderId`] order. The
+    /// account index bounds selection work to `K` selected orders; sorting is
+    /// `O(K log K)` and each removal is `O(log O)` for `O` active orders. No
+    /// storage allocation occurs after construction when caller capacity is
+    /// sufficient. A non-empty selection advances the book revision exactly
+    /// once; an empty selection leaves it unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionMassCancelError`] before book mutation for invalid
+    /// output state, insufficient output capacity, revision exhaustion, or an
+    /// account-index contradiction.
+    pub fn mass_cancel_into(
+        &mut self,
+        account_id: AccountId,
+        scope: MassCancelScope,
+        output: &mut Vec<CallAuctionOrderSnapshot>,
+    ) -> Result<CallAuctionMassCancelResult, CallAuctionMassCancelError> {
+        let result = self.preflight_mass_cancel_into(account_id, scope, output)?;
+        let selected_count = output.len();
+        if selected_count == 0 {
+            return Ok(result);
         }
         for snapshot in output.iter().copied() {
             let Some(order) = self.orders.get(&snapshot.order_id).copied() else {

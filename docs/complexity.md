@@ -464,6 +464,20 @@ nothing on success. Coupled acceptance adds expected `O(1)` reservation
 release. Durable acceptance and business rejection append two existing frames;
 decline, unwind, and replay append zero.
 
+Conditional call-auction mass cancellation first performs expected `O(1)`
+aggregate preparation. For `K` selected orders and predicate cost `F`, exact
+pre-predicate owner-lane traversal, in-place canonical sorting, and selected-row
+validation add `O(K log K + F)` time. Decline or unwind has that bound and
+returns the constructor-owned snapshot scratch to length zero. Acceptance
+repeats ordinary selection/sorting and removes the unchanged generation in
+`O(K(log K + log(O + 1) + log(P + 1)))` time for `O` active orders and `P`
+occupied limit prices. The fixed-size observation borrows the existing
+`O(O_max)` scratch and adds `O(1)` state; no successful path allocates. A valid
+empty selection invokes the predicate and keeps source/resulting revision
+equal. Coupled acceptance adds expected `O(K)` reservation release. Durable
+acceptance and business rejection append two existing frames; decline, unwind,
+and replay append zero.
+
 One sequenced indicative publication reconstructs the canonical bid and ask
 aggregates and applies the shared discovery kernel in `O(B + A)` time with
 `O(1)` auxiliary space. It emits exactly one fixed-size event whether clearing

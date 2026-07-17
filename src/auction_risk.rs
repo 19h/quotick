@@ -21,11 +21,13 @@ use crate::auction_engine::{
     CallAuctionCommandOutcome, CallAuctionCommandPreparation, CallAuctionEngine,
     CallAuctionEngineConstructionError, CallAuctionEngineError, CallAuctionEngineLimits,
     CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionExecutionReport,
-    CallAuctionRejectReason, CallAuctionReplaceObservation, CallAuctionReplaceOrder,
-    CallAuctionUncrossCommand, CallAuctionUncrossObservation, ConditionalCallAuctionCommandOutcome,
+    CallAuctionMassCancel, CallAuctionMassCancelObservation, CallAuctionRejectReason,
+    CallAuctionReplaceObservation, CallAuctionReplaceOrder, CallAuctionUncrossCommand,
+    CallAuctionUncrossObservation, ConditionalCallAuctionCommandOutcome,
     ConditionalCallAuctionCommandPreparation, ConditionalCallAuctionOutcome,
     ConditionalCallAuctionPreparation, PreparedCallAuctionCommand, evaluate_conditional_amend,
-    evaluate_conditional_cancel, evaluate_conditional_replace, evaluate_conditional_uncross,
+    evaluate_conditional_cancel, evaluate_conditional_mass_cancel, evaluate_conditional_replace,
+    evaluate_conditional_uncross,
 };
 use crate::bounded_hash::BoundedHashMap;
 use crate::domain::{AccountId, OrderId, Side};
@@ -1566,6 +1568,15 @@ impl CallAuctionRiskManagedEngine {
         })
     }
 
+    pub(crate) fn validate_conditional_mass_cancel_authorization(
+        &self,
+        preparation: &CallAuctionCommandPreparation,
+    ) -> Result<(), CallAuctionEngineError> {
+        self.validate_conditional_authorization(preparation, |command| {
+            matches!(command, CallAuctionCommand::MassCancel(_))
+        })
+    }
+
     pub(crate) fn validate_conditional_amend_authorization(
         &self,
         preparation: &CallAuctionCommandPreparation,
@@ -1652,6 +1663,34 @@ impl CallAuctionRiskManagedEngine {
                         report,
                     })
             }
+        }
+    }
+
+    /// Atomically risk-gates, observes, and conditionally commits one account
+    /// mass cancellation.
+    ///
+    /// Replay plus core rejection bypass `accept`. The predicate borrows the
+    /// exact canonical selection from constructor-owned auction scratch.
+    /// Decline or unwind changes neither auction nor risk state; acceptance
+    /// commits the same-generation preparation and releases every selected
+    /// coupled reservation once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionEngineError`] for preparation, fail-closed
+    /// selection, generation validation, or coupled commit failure.
+    pub fn try_submit_mass_cancel_if(
+        &mut self,
+        command: CallAuctionMassCancel,
+        accept: impl FnOnce(&CallAuctionMassCancelObservation<'_>) -> bool,
+    ) -> Result<ConditionalCallAuctionOutcome, CallAuctionEngineError> {
+        let preparation = self.prepare(CallAuctionCommand::MassCancel(command))?;
+        self.validate_conditional_mass_cancel_authorization(&preparation)?;
+        match evaluate_conditional_mass_cancel(&mut self.engine, preparation, accept)? {
+            ConditionalCallAuctionPreparation::Complete(outcome) => Ok(outcome),
+            ConditionalCallAuctionPreparation::Commit(prepared) => self
+                .commit(prepared)
+                .map(ConditionalCallAuctionOutcome::Reported),
         }
     }
 
@@ -1848,6 +1887,10 @@ impl CallAuctionRiskManagedEngine {
     #[must_use]
     pub const fn engine(&self) -> &CallAuctionEngine {
         &self.engine
+    }
+
+    pub(crate) const fn engine_mut(&mut self) -> &mut CallAuctionEngine {
+        &mut self.engine
     }
 
     /// Returns read-only risk state.

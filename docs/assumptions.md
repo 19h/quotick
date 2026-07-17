@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A154 are stable and are referenced from code comments and other
+identifiers A1-A155 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -6325,10 +6325,117 @@ effect, incorrect net reservation, WAL growth before acceptance, interposed
 transition, recovery divergence, successful-path allocation, or new wire value
 falsifies A154.
 
+## A155 — atomic conditional call-auction mass cancellation
+
+**Assumption.** One `try_submit_mass_cancel_if` call on a
+`CallAuctionEngine`, `CallAuctionRiskManagedEngine`,
+`DurableCallAuctionEngine`, or `DurableCallAuctionRiskEngine` holds the
+corresponding exclusive shard borrow across ordinary account/scope preflight,
+fail-closed exact selection, one synchronous predicate, and commit of the same-
+generation preparation. Ordinary preparation binds the routed command, source
+book revision, exact selected count and `u128` quantity, resulting revision,
+prospective report capacity, and engine/history generation. It does not own a
+variable-size selection.
+
+Before the predicate, the engine rejects foreign or stale preparation, proves
+phase/cycle/indication coherence, rechecks the aggregate preflight, traverses
+only the selected owner's intrusive side lanes, and materializes complete
+`CallAuctionOrderSnapshot` values in ascending `OrderId` order into the
+constructor-reserved `O_max` mass-cancel scratch vector. The selected rows are
+validated against active identity, owner, optional side, count, and total
+quantity. `CallAuctionMassCancelObservation<'_>` is a fixed-size zero-copy view
+of that scratch. It binds command identity/time, instrument ID/version,
+prospective command, first-event, and completion-event sequences, phase/cycle
+snapshot, source/resulting book revisions, previous still-current indication,
+account, scope, exact count/quantity, and the complete canonical selection.
+The observation is valid only during the synchronous predicate.
+
+Exact replay and every core business rejection bypass selection and predicate
+and return the ordinary report. A valid empty selection invokes the predicate
+with zero rows, equal source/resulting revisions, and a shared first/completion
+event sequence. Decline clears scratch without consuming sequence, invalidating
+the indication, mutating book/history/risk, or appending WAL. Unwind has the
+same semantic state and scratch-reclamation result. Acceptance clears the
+observation scratch, commits the same-generation preparation under the
+exclusive borrow, re-materializes the provably unchanged selection into that
+same reserved vector, removes exactly those rows, emits canonical cancellation
+events followed by one aggregate completion, and invalidates the indication.
+An accepted empty selection emits only completion and preserves book revision.
+
+Coupled authorization is account-independent and is checked before selection;
+ordinary commit rechecks it. Accepted risk application releases exactly the
+selected reservations through the cancellation events, while completion has
+no risk effect. Durable acceptance and core business rejection retain the
+existing command/report two-frame grammar; decline, unwind, and replay append
+zero frames. The observation and decision are not encoded, authenticated,
+authorized, remotely transported, retained after the call, or coordinated
+across shards. A155 adds no wire value or version.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A9, A10, A12, A15, A22, A37,
+A39, A41, A52, A60, A64, A65, A68, A74, A76, A80, A81, A82, A85, A97,
+A109, A111, A112, A152, A153, A154, A155] Let `A` be ordinary aggregate
+preparation cost, `K` the selected order count, `V` exact observation-selection
+cost, `F` predicate cost, and `M` ordinary mass-cancel commit cost. `A` is one
+expected `O(1)` owner lookup. `V = O(K log K)` for selected-lane traversal,
+in-place sort, and row/aggregate validation. Decline or unwind costs
+`O(A + V + F)`. Acceptance costs `O(A + V + F + M)`, where
+`M = O(K(log K + log(O + 1) + log(P + 1)))` for `O` active orders and `P`
+occupied limit prices. Coupled accepted application adds expected `O(K)`
+reservation removals. The observation and evaluator add `O(1)` state; the
+existing constructor-owned scratch retains `O(O_max)` snapshots and never
+grows. Durable acceptance and core business rejection append two existing
+frames; decline, unwind, and replay append zero. Count, quantity, revision, and
+sequence arithmetic is exact integer arithmetic; approximation error is zero.
+
+**Falsification probe.** Across all four surfaces, select empty and populated
+all/buy/sell scopes, sparse owners in a full mixed market/limit book, both
+sides, signed prices, multiple priority classes, and present/absent prior
+indications. Run accepting, declining, and unwinding predicates. Require exact
+command/instrument/sequence/time/phase/book provenance, ascending selected IDs,
+complete row equality, exact `u64` count, exact `u128` quantity, correct
+completion sequence, one successor revision only for `K > 0`, canonical
+removal/completion events, indication invalidation only on acceptance, and zero
+scratch length after every outcome.
+
+Exercise wrong route/version, exact retry, command-ID collision, counter/
+history/event exhaustion, output-capacity and account-link corruption, aggregate
+count/quantity contradiction, and journal failure. Mutate an unrelated order
+through an internal white-box path after preparation and require stale-
+generation rejection before selection or predicate. Compare selected,
+unselected, and other-account state, owner/queue aggregates, sequences,
+indication, risk reservations/notional/exposure, history, WAL frames, and
+plain/coupled recovered state. Any predicate on rejection or replay,
+noncanonical or drifting selection, partial mutation, noncommit effect, scratch
+residue or growth, incorrect reservation release, WAL growth before acceptance,
+interposed transition, recovery divergence, successful-path allocation, or new
+wire value falsifies A155.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** A155 closes the local gap between observing an exact
+  account/side call-auction cancellation set and committing it. The predicate
+  borrows complete canonical private state with phase, revision, sequence, and
+  prior-indication provenance; acceptance commits the unchanged generation
+  across plain, coupled-risk, and both durable engines.
+
+- **Medium impact opportunity:** deterministic kill controls, OMS,
+  surveillance, and exposure policy can condition one account/side removal on
+  exact selected private interest and aggregate quantity without copying or
+  scanning unrelated collection-book orders.
+
+- **Medium impact risk:** the A155 predicate is synchronous under the exclusive
+  shard borrow and follows `O(K log K)` selection/validation. Acceptance repeats
+  that selection and sorting at commit to reuse the ordinary mutation path.
+  Maximum-capacity callback, cache, sorting, and collision-cluster latency is
+  unknown pending pinned-hardware measurement.
+
+- **High impact boundary:** A155 adds no authenticated principal or
+  cancel-on-behalf authority, durable policy-decision evidence before command
+  append, callback deadline, asynchronous validity, remote protocol, or
+  cross-shard kill coordination and completion aggregation.
 
 - **High impact:** A154 closes the local gap between observing an exact
   call-auction cancel/replace transition and committing it. The predicate owns

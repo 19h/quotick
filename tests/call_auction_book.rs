@@ -665,6 +665,20 @@ fn account_mass_cancel_is_indexed_canonical_and_revision_atomic() {
 
     let allocation = book.resource_status();
     let mut removed = Vec::with_capacity(8);
+    let materialized = book
+        .preflight_mass_cancel_into(account(7), MassCancelScope::Side(Side::Sell), &mut removed)
+        .unwrap();
+    assert_eq!(materialized, preflight);
+    assert_eq!(
+        removed
+            .iter()
+            .map(|order| order.order_id.get())
+            .collect::<Vec<_>>(),
+        vec![40, 50]
+    );
+    assert_eq!(book.state_revision(), 6);
+    assert_eq!(book.active_order_count(), 6);
+    removed.clear();
     let result = book
         .mass_cancel_into(account(7), MassCancelScope::Side(Side::Sell), &mut removed)
         .unwrap();

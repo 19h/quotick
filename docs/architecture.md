@@ -1396,6 +1396,26 @@ process-local call-auction engine.
       immediate-neighbor, and redundant-aggregate consistency, not unrelated
       whole-book topology. The observation/decision are process-local and add
       no command, report, checkpoint, snapshot, market-data, or WAL value.
+14. `try_submit_mass_cancel_if` holds one exclusive mutable engine borrow
+    across ordinary aggregate preparation, exact owner/scope selection, one
+    synchronous predicate, and commit of that same-generation preparation.
+    - `CallAuctionMassCancelObservation` is a fixed-size zero-copy view of the
+      constructor-owned mass-cancel snapshot vector. It binds the complete
+      ascending-`OrderId` selection and exact count/quantity to command/time,
+      instrument/version, prospective command/first/completion sequences,
+      phase/cycle, source/resulting book revisions, account/scope, and the
+      previous still-current indication.
+    - Before the predicate, the engine rejects foreign or stale generations,
+      revalidates phase/cycle/indication and aggregate preflight state, then
+      validates every selected owner/side row without scanning unrelated
+      orders. Exact replay and business rejection bypass selection and
+      predicate. A valid empty selection invokes the predicate with zero rows.
+    - Decline or unwind clears scratch and changes no sequence, indication,
+      book, history, risk, or durable state. Acceptance cannot admit an
+      intervening mutation; ordinary commit re-materializes the therefore
+      identical selection, emits `K` cancellations plus completion, and
+      releases exactly those coupled reservations. The borrowed observation
+      and decision are process-local and add no encoded value.
 
 ## Coupled call-auction risk invariants
 
@@ -2718,6 +2738,13 @@ selected-link corruption and stale-generation rejection before predicate;
 acceptance, decline, and unwind; business-rejection/replay predicate bypass;
 target-only mutation and coupled reservation release; zero-frame durable
 noncommit, two-frame acceptance, and exact plain/coupled-risk reopen state.
+Conditional call-auction mass-cancel tests cover fixed-size zero-copy command,
+sequence, phase, book, prior-indication, account/scope, canonical selected-row,
+count, and quantity provenance; populated all/side and valid empty selections;
+stale-generation rejection before predicate; acceptance, decline, and unwind;
+business-rejection/replay predicate bypass; exact selected coupled-reservation
+release; scratch reclamation; zero-frame durable noncommit; two-frame
+acceptance; and exact plain/coupled-risk reopen state.
 
 FOK tests cover reserve-hidden and fully hidden total-leaves eligibility,
 displayed- and hidden-class same-price self barriers, atomic decrement-and-
@@ -3195,6 +3222,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Conditional stop-reference control | Atomic bounded stop-reference control with exact prior/requested sourced references and one canonical qualifying dormant-stop prefix is implemented across plain, coupled-risk, durable, and durable-risk books; remaining work is authenticated source/controller authorization, raw-feed normalization and gap recovery, cross-shard coordination, and completion aggregation |
 | High | Conditional call-auction uncross | Atomic local binding of exact prepared allocation, counterparty trades, remainder cancellations, and phase/book provenance to the same uncross commit is implemented across plain, coupled-risk, durable, and durable-risk engines; remaining work is authenticated policy authority, durable decision evidence before command append, callback latency limits, remote protocol mapping, and multi-shard coordination |
 | High | Conditional call-auction cancellation | Atomic local binding of one fail-closed selected target plus command/sequence/phase/book/indication provenance to the same owner-cancel commit is implemented across plain, coupled-risk, durable, and durable-risk engines; remaining work is authenticated cancel-on-behalf policy, durable decision evidence before command append, callback latency limits, remote protocol mapping, and multi-shard coordination |
+| High | Conditional call-auction mass cancellation | Atomic local binding of one exact canonical account/side selection plus command/sequence/phase/book/indication provenance to the same-generation mass-cancel commit is implemented across plain, coupled-risk, durable, and durable-risk engines; remaining work is authenticated cancel-on-behalf policy, durable decision evidence before command append, callback latency limits, remote protocol mapping, and cross-shard completion aggregation |
 | High | Instrument lifecycle expansion | authoritative calendar ingestion/distribution/activation, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |

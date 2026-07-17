@@ -16,11 +16,12 @@ use crate::auction_engine::{
     CallAuctionCheckpointError, CallAuctionCommand, CallAuctionCommandPreparation,
     CallAuctionEngine, CallAuctionEngineConstructionError, CallAuctionEngineError,
     CallAuctionEngineInvariantViolation, CallAuctionEngineLimits, CallAuctionExecutionReport,
-    CallAuctionReplaceObservation, CallAuctionReplaceOrder, CallAuctionUncrossCommand,
-    CallAuctionUncrossObservation, ConditionalCallAuctionCommandOutcome,
-    ConditionalCallAuctionCommandPreparation, ConditionalCallAuctionOutcome,
-    ConditionalCallAuctionPreparation, PreparedCallAuctionCommand, evaluate_conditional_amend,
-    evaluate_conditional_cancel, evaluate_conditional_replace, evaluate_conditional_uncross,
+    CallAuctionMassCancel, CallAuctionMassCancelObservation, CallAuctionReplaceObservation,
+    CallAuctionReplaceOrder, CallAuctionUncrossCommand, CallAuctionUncrossObservation,
+    ConditionalCallAuctionCommandOutcome, ConditionalCallAuctionCommandPreparation,
+    ConditionalCallAuctionOutcome, ConditionalCallAuctionPreparation, PreparedCallAuctionCommand,
+    evaluate_conditional_amend, evaluate_conditional_cancel, evaluate_conditional_mass_cancel,
+    evaluate_conditional_replace, evaluate_conditional_uncross,
 };
 use crate::auction_risk::{
     CallAuctionRiskCheckpoint, CallAuctionRiskCheckpointCapture, CallAuctionRiskCheckpointError,
@@ -1048,6 +1049,42 @@ impl DurableCallAuctionEngine {
         }
     }
 
+    /// Durably observes and conditionally commits one account mass cancel.
+    ///
+    /// Replay and deterministic business rejection bypass `accept`. The
+    /// predicate borrows the exact canonical selection from constructor-owned
+    /// scratch. Decline or unwind changes neither WAL nor auction state;
+    /// acceptance persists and commits the same-generation preparation under
+    /// the ordinary poison/recovery protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, preparation,
+    /// fail-closed selection, journal, or commit failure.
+    pub fn try_submit_mass_cancel_if(
+        &mut self,
+        command: CallAuctionMassCancel,
+        accept: impl FnOnce(&CallAuctionMassCancelObservation<'_>) -> bool,
+    ) -> Result<ConditionalCallAuctionOutcome, DurableCallAuctionError> {
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        let preparation = self
+            .engine
+            .prepare(CallAuctionCommand::MassCancel(command))?;
+        match evaluate_conditional_mass_cancel(&mut self.engine, preparation, accept)? {
+            ConditionalCallAuctionPreparation::Complete(outcome) => {
+                if self.is_poisoned() {
+                    return Err(DurableCallAuctionError::Poisoned);
+                }
+                Ok(outcome)
+            }
+            ConditionalCallAuctionPreparation::Commit(prepared) => self
+                .commit_prepared(prepared)
+                .map(ConditionalCallAuctionOutcome::Reported),
+        }
+    }
+
     /// Durably observes and conditionally commits one quantity amendment.
     ///
     /// Replay and deterministic business rejection bypass `accept`. Decline or
@@ -1807,6 +1844,45 @@ impl DurableCallAuctionRiskEngine {
                     report,
                 }
             }),
+        }
+    }
+
+    /// Durably risk-gates, observes, and conditionally commits one account
+    /// mass cancellation.
+    ///
+    /// Replay plus core rejection bypass `accept`. The predicate borrows the
+    /// exact canonical selection from constructor-owned auction scratch.
+    /// Decline or unwind changes neither WAL, auction, nor risk state;
+    /// acceptance persists and commits the same-generation preparation and
+    /// releases every selected reservation once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, preparation,
+    /// fail-closed selection, journal, or coupled commit failure.
+    pub fn try_submit_mass_cancel_if(
+        &mut self,
+        command: CallAuctionMassCancel,
+        accept: impl FnOnce(&CallAuctionMassCancelObservation<'_>) -> bool,
+    ) -> Result<ConditionalCallAuctionOutcome, DurableCallAuctionError> {
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        let preparation = self
+            .managed
+            .prepare(CallAuctionCommand::MassCancel(command))?;
+        self.managed
+            .validate_conditional_mass_cancel_authorization(&preparation)?;
+        match evaluate_conditional_mass_cancel(self.managed.engine_mut(), preparation, accept)? {
+            ConditionalCallAuctionPreparation::Complete(outcome) => {
+                if self.is_poisoned() {
+                    return Err(DurableCallAuctionError::Poisoned);
+                }
+                Ok(outcome)
+            }
+            ConditionalCallAuctionPreparation::Commit(prepared) => self
+                .commit_prepared(prepared)
+                .map(ConditionalCallAuctionOutcome::Reported),
         }
     }
 
