@@ -11,13 +11,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::auction_engine::{
-    CallAuctionCancelObservation, CallAuctionCancelOrder, CallAuctionCheckpoint,
-    CallAuctionCheckpointCapture, CallAuctionCheckpointError, CallAuctionCommand,
-    CallAuctionCommandPreparation, CallAuctionEngine, CallAuctionEngineConstructionError,
-    CallAuctionEngineError, CallAuctionEngineInvariantViolation, CallAuctionEngineLimits,
-    CallAuctionExecutionReport, CallAuctionUncrossCommand, CallAuctionUncrossObservation,
-    ConditionalCallAuctionCommandOutcome, ConditionalCallAuctionCommandPreparation,
-    ConditionalCallAuctionOutcome, ConditionalCallAuctionPreparation, PreparedCallAuctionCommand,
+    CallAuctionAmendObservation, CallAuctionAmendOrder, CallAuctionCancelObservation,
+    CallAuctionCancelOrder, CallAuctionCheckpoint, CallAuctionCheckpointCapture,
+    CallAuctionCheckpointError, CallAuctionCommand, CallAuctionCommandPreparation,
+    CallAuctionEngine, CallAuctionEngineConstructionError, CallAuctionEngineError,
+    CallAuctionEngineInvariantViolation, CallAuctionEngineLimits, CallAuctionExecutionReport,
+    CallAuctionUncrossCommand, CallAuctionUncrossObservation, ConditionalCallAuctionCommandOutcome,
+    ConditionalCallAuctionCommandPreparation, ConditionalCallAuctionOutcome,
+    ConditionalCallAuctionPreparation, PreparedCallAuctionCommand, evaluate_conditional_amend,
     evaluate_conditional_cancel, evaluate_conditional_uncross,
 };
 use crate::auction_risk::{
@@ -1046,6 +1047,48 @@ impl DurableCallAuctionEngine {
         }
     }
 
+    /// Durably observes and conditionally commits one quantity amendment.
+    ///
+    /// Replay and deterministic business rejection bypass `accept`. Decline or
+    /// unwind changes neither WAL nor auction state. Acceptance appends and
+    /// commits the same revision-bound, priority-retaining preparation under
+    /// the ordinary poison and recovery protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, preparation,
+    /// fail-closed query, journal, or commit failure.
+    pub fn try_submit_amend_order_if(
+        &mut self,
+        command: CallAuctionAmendOrder,
+        accept: impl FnOnce(&CallAuctionAmendObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionAmendObservation>,
+        DurableCallAuctionError,
+    > {
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        let preparation = self.engine.prepare(CallAuctionCommand::Amend(command))?;
+        match evaluate_conditional_amend(&self.engine, preparation, accept)? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => {
+                if self.is_poisoned() {
+                    return Err(DurableCallAuctionError::Poisoned);
+                }
+                Ok(outcome)
+            }
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => self.commit_prepared(prepared).map(|report| {
+                ConditionalCallAuctionCommandOutcome::Reported {
+                    observation: if report.replayed { None } else { observation },
+                    report,
+                }
+            }),
+        }
+    }
+
     /// Durably observes and conditionally commits one frozen-cycle uncross.
     ///
     /// Replay and business rejection bypass `accept`. The predicate borrows
@@ -1706,6 +1749,50 @@ impl DurableCallAuctionRiskEngine {
         self.managed
             .validate_conditional_cancel_authorization(&preparation)?;
         match evaluate_conditional_cancel(self.managed.engine(), preparation, accept)? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => {
+                if self.is_poisoned() {
+                    return Err(DurableCallAuctionError::Poisoned);
+                }
+                Ok(outcome)
+            }
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => self.commit_prepared(prepared).map(|report| {
+                ConditionalCallAuctionCommandOutcome::Reported {
+                    observation: if report.replayed { None } else { observation },
+                    report,
+                }
+            }),
+        }
+    }
+
+    /// Durably risk-gates, observes, and conditionally commits one amendment.
+    ///
+    /// Replay plus core rejection bypass `accept`. Decline or unwind changes
+    /// neither WAL, auction, nor risk state. Acceptance persists and commits the
+    /// exact observed quantity reduction and decreases its coupled reservation
+    /// once while retaining order identity and priority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, preparation,
+    /// fail-closed query, journal, or coupled commit failure.
+    pub fn try_submit_amend_order_if(
+        &mut self,
+        command: CallAuctionAmendOrder,
+        accept: impl FnOnce(&CallAuctionAmendObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionAmendObservation>,
+        DurableCallAuctionError,
+    > {
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        let preparation = self.managed.prepare(CallAuctionCommand::Amend(command))?;
+        self.managed
+            .validate_conditional_amend_authorization(&preparation)?;
+        match evaluate_conditional_amend(self.managed.engine(), preparation, accept)? {
             ConditionalCallAuctionCommandPreparation::Complete(outcome) => {
                 if self.is_poisoned() {
                     return Err(DurableCallAuctionError::Poisoned);

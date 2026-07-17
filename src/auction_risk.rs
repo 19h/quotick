@@ -16,15 +16,15 @@ use crate::auction_book::{
     CallAuctionBookLimits, CallAuctionBookLimitsSpec, CallAuctionOrder, CallAuctionOrderSnapshot,
 };
 use crate::auction_engine::{
-    CallAuctionCancelObservation, CallAuctionCancelOrder, CallAuctionCheckpoint,
-    CallAuctionCheckpointError, CallAuctionCommand, CallAuctionCommandOutcome,
-    CallAuctionCommandPreparation, CallAuctionEngine, CallAuctionEngineConstructionError,
-    CallAuctionEngineError, CallAuctionEngineLimits, CallAuctionEngineLimitsSpec,
-    CallAuctionEventKind, CallAuctionExecutionReport, CallAuctionRejectReason,
-    CallAuctionUncrossCommand, CallAuctionUncrossObservation, ConditionalCallAuctionCommandOutcome,
-    ConditionalCallAuctionCommandPreparation, ConditionalCallAuctionOutcome,
-    ConditionalCallAuctionPreparation, PreparedCallAuctionCommand, evaluate_conditional_cancel,
-    evaluate_conditional_uncross,
+    CallAuctionAmendObservation, CallAuctionAmendOrder, CallAuctionCancelObservation,
+    CallAuctionCancelOrder, CallAuctionCheckpoint, CallAuctionCheckpointError, CallAuctionCommand,
+    CallAuctionCommandOutcome, CallAuctionCommandPreparation, CallAuctionEngine,
+    CallAuctionEngineConstructionError, CallAuctionEngineError, CallAuctionEngineLimits,
+    CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionExecutionReport,
+    CallAuctionRejectReason, CallAuctionUncrossCommand, CallAuctionUncrossObservation,
+    ConditionalCallAuctionCommandOutcome, ConditionalCallAuctionCommandPreparation,
+    ConditionalCallAuctionOutcome, ConditionalCallAuctionPreparation, PreparedCallAuctionCommand,
+    evaluate_conditional_amend, evaluate_conditional_cancel, evaluate_conditional_uncross,
 };
 use crate::bounded_hash::BoundedHashMap;
 use crate::domain::{AccountId, OrderId, Side};
@@ -1560,10 +1560,29 @@ impl CallAuctionRiskManagedEngine {
         &self,
         preparation: &CallAuctionCommandPreparation,
     ) -> Result<(), CallAuctionEngineError> {
+        self.validate_conditional_authorization(preparation, |command| {
+            matches!(command, CallAuctionCommand::Cancel(_))
+        })
+    }
+
+    pub(crate) fn validate_conditional_amend_authorization(
+        &self,
+        preparation: &CallAuctionCommandPreparation,
+    ) -> Result<(), CallAuctionEngineError> {
+        self.validate_conditional_authorization(preparation, |command| {
+            matches!(command, CallAuctionCommand::Amend(_))
+        })
+    }
+
+    fn validate_conditional_authorization(
+        &self,
+        preparation: &CallAuctionCommandPreparation,
+        is_expected_command: fn(CallAuctionCommand) -> bool,
+    ) -> Result<(), CallAuctionEngineError> {
         let CallAuctionCommandPreparation::Ready(prepared) = preparation else {
             return Ok(());
         };
-        if !matches!(prepared.command(), CallAuctionCommand::Cancel(_)) {
+        if !is_expected_command(prepared.command()) {
             return Err(CallAuctionEngineError::InternalInvariantViolation);
         }
         if prepared.core_rejection().is_none() && self.risk.authorize(prepared.command()).is_err() {
@@ -1608,6 +1627,42 @@ impl CallAuctionRiskManagedEngine {
         let preparation = self.prepare(CallAuctionCommand::Cancel(command))?;
         self.validate_conditional_cancel_authorization(&preparation)?;
         match evaluate_conditional_cancel(&self.engine, preparation, accept)? {
+            ConditionalCallAuctionCommandPreparation::Complete(outcome) => Ok(outcome),
+            ConditionalCallAuctionCommandPreparation::Commit {
+                prepared,
+                observation,
+            } => {
+                self.commit(prepared)
+                    .map(|report| ConditionalCallAuctionCommandOutcome::Reported {
+                        observation: if report.replayed { None } else { observation },
+                        report,
+                    })
+            }
+        }
+    }
+
+    /// Atomically risk-gates, observes, and conditionally commits one amendment.
+    ///
+    /// Replay plus core rejection bypass `accept`. Decline or unwind changes
+    /// neither auction nor risk state. Acceptance commits the exact observed
+    /// quantity reduction and decreases its coupled reservation once while
+    /// retaining order identity and priority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionEngineError`] for preparation, fail-closed query,
+    /// generation validation, or coupled commit failure.
+    pub fn try_submit_amend_order_if(
+        &mut self,
+        command: CallAuctionAmendOrder,
+        accept: impl FnOnce(&CallAuctionAmendObservation) -> bool,
+    ) -> Result<
+        ConditionalCallAuctionCommandOutcome<CallAuctionAmendObservation>,
+        CallAuctionEngineError,
+    > {
+        let preparation = self.prepare(CallAuctionCommand::Amend(command))?;
+        self.validate_conditional_amend_authorization(&preparation)?;
+        match evaluate_conditional_amend(&self.engine, preparation, accept)? {
             ConditionalCallAuctionCommandPreparation::Complete(outcome) => Ok(outcome),
             ConditionalCallAuctionCommandPreparation::Commit {
                 prepared,

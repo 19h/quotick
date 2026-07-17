@@ -430,6 +430,14 @@ Run any program with `cargo run --example <name>`.
   locally validated target state to the same prepared cancel. Replay and
   business rejection bypass the predicate; decline or unwind is state-, risk-,
   and WAL-neutral; accepted durable execution uses the existing two frames.
+- Atomic conditional retained-priority quantity amendment on the plain,
+  coupled-risk, and both durable engine surfaces. A fixed-size owned observation
+  binds exact previous and resulting order state, command/phase/book
+  provenance, prospective sequences, and prior indication to one prepared
+  amendment. Replay and business rejection bypass the predicate; decline or
+  unwind is state-, risk-, and WAL-neutral; acceptance preserves identity and
+  priority and reduces the coupled reservation by the exact quantity/notional
+  delta.
 - Zero-copy exact lookup and chronological iteration over the engine's bounded
   command/report history, including accepted commands and business rejections;
   exact retries add no row and do not change the canonical cached report.
@@ -474,6 +482,9 @@ Run any program with `cargo run --example <name>`.
   validates that coupled authorization after ordinary core preparation but
   before observation. Acceptance releases only the exact observed
   target reservation; decline or unwind leaves every reservation unchanged.
+  Conditional call-auction amendment uses the same account-independent gate.
+  Acceptance reduces only the exact observed target reservation quantity,
+  notional, and exposure; decline or unwind leaves every reservation unchanged.
 - Reservation lifecycle derived from the sequenced trace across fills,
   cancellation, GTD expiry, stop arming/activation, replacement, mass
   cancellation, account controls, and self-trade prevention; dormant stops
@@ -643,9 +654,9 @@ Conditional expiry-sweep predicates have the same process-local boundary and
 are not persisted, authenticated, clock-scheduled, or transported.
 Conditional stop-trigger-sweep predicates have the same process-local boundary
 and are not persisted, authenticated, source-authorized, or transported.
-Conditional call-auction uncross predicates are likewise process-local and are
-not persisted, authenticated, authorized, transported, or retained as durable
-decision evidence.
+Conditional call-auction uncross, cancellation, and amendment predicates are
+likewise process-local and are not persisted, authenticated, authorized,
+transported, or retained as durable decision evidence.
 Their synchronous execution extends the exclusive local shard borrow. A
 dormant-stop observation contains no activation-time forecast, and active
 minimum-quantity IOC observations must be interpreted with the submitted
@@ -690,7 +701,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 152 tagged assumptions (A1–A152), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 153 tagged assumptions (A1–A153), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -806,7 +817,12 @@ includes:
   exact target/provenance observation, selected-link fail-closed behavior,
   rejection/replay predicate bypass, unwind/decline neutrality, exact coupled
   reservation release, zero-frame durable noncommit, two-frame acceptance,
-  and plain/coupled durable recovery. Retained auction-history queries
+  and plain/coupled durable recovery. Atomic conditional retained-priority
+  amendment coverage adds fixed-size exact previous/resulting state and
+  provenance, rejection/replay predicate bypass, stale-preparation rejection,
+  priority retention, unwind/decline neutrality, exact coupled reservation
+  reduction, zero-frame durable noncommit, two-frame acceptance, and plain/
+  coupled durable recovery. Retained auction-history queries
   cover accepted and rejected rows, exact lookup, zero-copy chronological
   iteration, retry stability, unchanged resource telemetry, and durable
   recovery. Account-order queries cover canonical all/side selection, unknown
