@@ -332,3 +332,78 @@ fn retained_replay_repairs_a_replica_without_a_snapshot() {
     publisher.validate_against(&book).unwrap();
     replica.validate().unwrap();
 }
+
+#[test]
+fn snapshot_and_retained_suffix_recovery_is_atomic_and_lineage_checked() {
+    let definition = instrument_definition(1);
+    let (book, _, batches) = three_batches(definition);
+    let initial = MarketDataPublisher::from_book(&OrderBook::new(definition))
+        .unwrap()
+        .snapshot();
+    let mut replay = MarketDataReplayBuffer::try_new(instrument(1), version(), 0, 6).unwrap();
+    for batch in &batches {
+        replay.push_batch(batch).unwrap();
+    }
+
+    let mut advancing = MarketDataReplica::new(instrument(1), version(), TradingState::Open);
+    advancing.apply_snapshot(&initial).unwrap();
+    advancing.apply_batch(&batches[0]).unwrap();
+    advancing.apply_batch(&batches[1]).unwrap();
+    advancing
+        .apply_snapshot_and_replay(&initial, replay.replay_after(0, 6).unwrap())
+        .unwrap();
+    assert_eq!(advancing.last_sequence(), book.last_event_sequence());
+    assert_eq!(
+        advancing.depth(Side::Buy, usize::MAX),
+        book.depth(Side::Buy, usize::MAX)
+    );
+    advancing.validate().unwrap();
+
+    let mut regressing = MarketDataReplica::new(instrument(1), version(), TradingState::Open);
+    regressing.apply_snapshot(&initial).unwrap();
+    for batch in &batches {
+        regressing.apply_batch(batch).unwrap();
+    }
+    let before_bid = regressing.depth(Side::Buy, usize::MAX);
+    let before_sequence = regressing.last_sequence();
+    let before_bid_status = regressing.price_level_arena_status(Side::Buy);
+    assert_eq!(
+        regressing.apply_snapshot_and_replay(&initial, replay.replay_after(0, 2).unwrap()),
+        Err(MarketDataError::RecoverySequenceRegression {
+            current: before_sequence,
+            recovered: 2,
+        })
+    );
+    assert_eq!(regressing.last_sequence(), before_sequence);
+    assert_eq!(regressing.depth(Side::Buy, usize::MAX), before_bid);
+    assert_eq!(
+        regressing.price_level_arena_status(Side::Buy),
+        before_bid_status
+    );
+    assert!(!regressing.is_poisoned());
+    regressing.validate().unwrap();
+
+    let mut fork_book = OrderBook::new(definition);
+    let mut fork_publisher = MarketDataPublisher::from_book(&fork_book).unwrap();
+    let fork_batch = publish(
+        &mut fork_book,
+        &mut fork_publisher,
+        order(definition, 1, 1, 101),
+    );
+    let mut fork_replay = MarketDataReplayBuffer::try_new(instrument(1), version(), 0, 2).unwrap();
+    fork_replay.push_batch(&fork_batch).unwrap();
+
+    let mut forked = MarketDataReplica::new(instrument(1), version(), TradingState::Open);
+    forked.apply_snapshot(&initial).unwrap();
+    forked.apply_batch(&batches[0]).unwrap();
+    let before = forked.depth(Side::Buy, usize::MAX);
+    let sequence = forked.last_sequence();
+    assert_eq!(
+        forked.apply_snapshot_and_replay(&initial, fork_replay.replay_after(0, 2).unwrap()),
+        Err(MarketDataError::SnapshotSequenceFork { sequence })
+    );
+    assert_eq!(forked.last_sequence(), sequence);
+    assert_eq!(forked.depth(Side::Buy, usize::MAX), before);
+    assert!(!forked.is_poisoned());
+    forked.validate().unwrap();
+}

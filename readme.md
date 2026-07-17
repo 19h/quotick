@@ -577,6 +577,10 @@ Run any program with `cargo run --example <name>`.
   state. Newer snapshots cannot regress continuous trade/state revisions or
   call-auction command/phase/book/trade coordinates; poisoned replicas retain
   valid authoritative same-sequence repair.
+- Continuous and call-auction replicas atomically combine one validated
+  snapshot anchor with one retained zero-copy replay page. Older anchors may
+  advance beyond the current boundary; replay failure, final regression, or an
+  equal-boundary fork restores the exact prior active state and poison status.
 - Authoritative call-auction books expose one fixed-size revision-bound public
   observation plus typed best/point, market, full-depth, and inclusive-range
   reads. Scalar, market, and best state fails before output; streamed rows are
@@ -778,7 +782,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 162 tagged assumptions (A1–A162), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 163 tagged assumptions (A1–A163), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |

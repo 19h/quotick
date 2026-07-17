@@ -2270,6 +2270,14 @@ market-data stream and its replicas.
     - Replay queries use an exclusive sequence cursor and positive page bound.
       They return a zero-copy source-ordered iterator across physical wrap, or
       report that the cursor is ahead or its required first sequence is gone.
+    - `apply_snapshot_and_replay` validates a non-empty page's first remaining
+      sequence against the snapshot, stages the image, and applies the page
+      through the ordinary update grammar. An older anchor is accepted only if
+      the final result does not regress the original event boundary. Healthy
+      equal results must exactly reproduce original depth, trade, and state;
+      later results retain subordinate monotonicity. Any error swaps the
+      original active arenas and scalars back. An empty page delegates to
+      ordinary snapshot application.
 14. Trace or structural failures after incremental mutation poison publisher or
     replica state; a fresh authoritative bootstrap/snapshot is required. A
     poisoned publisher cannot supply that snapshot and must be reconstructed
@@ -2501,6 +2509,13 @@ replica contract.
       gap, level-capacity, transition, poisoning, and command-counter path as
       live batch application. Replay therefore advances event and command
       boundaries together.
+    - `apply_snapshot_and_replay` makes one snapshot plus one page of complete
+      batches atomic with respect to active replica state. Older anchors are
+      permitted only when the final event boundary is non-regressing. A healthy
+      equal-boundary result must reproduce every depth, market, indication,
+      phase, book, trade, command, and cycle-trace value; later results preserve
+      their subordinate coordinates. Any replay or lineage error swaps the
+      original active arenas back and restores all scalars and poison.
     - The unframed single-update replica API rejects `Replaced`,
       `MassCancelled`, and `MassCancelCompleted`; replacement and mass
       cancellation require their complete command batches.
@@ -3080,14 +3095,20 @@ Continuous replay tests reject zero/unrepresentable capacities, identity/version
 gaps, collisions, evicted overlap, future/zero-limit queries, and oversized
 batches without mutation; prove exact retry, recovered boundaries, pagination,
 10,000 allocation-stable wraps, and `u64::MAX`; and reconstruct a skipped
-replica suffix before exercising snapshot fallback beyond retention.
+replica suffix before exercising snapshot fallback beyond retention. Atomic
+snapshot-plus-page tests advance from an older anchor, reject an insufficient
+suffix and a same-final-sequence publisher fork with complete active rollback,
+and inject a crossed candidate only after a prior staged update has advanced.
 
 Call-auction replay tests additionally preserve command boundaries across
 pagination and ring wrap, retain one-update amendment batches, refuse to split
 multi-update uncross, replacement, or mass-cancel batches, reject an
 inside-batch cursor and an undersized page,
 expose partial-oldest-batch eviction, and reconstruct event sequence, command
-sequence, and crossed depth without a snapshot.
+sequence, and crossed depth without a snapshot. Atomic snapshot-plus-complete-
+batch tests cover older-anchor advance, final regression, same-sequence branch
+fork, and exact scalar/depth/cycle rollback after a staged update precedes an
+invalid aggregate transition.
 
 Call-auction market-data capacity tests apply the equivalent source-envelope,
 constructor-failure, full-replica, oversized-batch, and double-buffered snapshot
@@ -3399,7 +3420,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Clearing lifecycle | explicit positive trade-bound fee transfers and atomic full-settlement bust/replacement corrections are implemented for call-auction DVP; remaining work is novation/allocation, fee calculation and authorization, settlement dates, fails, partial trade/allocation amendments, coordinated matching/risk/external-position correction, correction-reason evidence, and externally anchored reconciliation |
 | High | Security boundary | authenticated principals, authorization policy, secret management, audit export, and abuse controls |
 | Medium | Gateways and schemas | versioned binary protocol, FIX adapter, backpressure, session recovery, and conformance fixtures |
-| Medium | Market-data distribution | constructor-reserved per-instrument short-gap replay for continuous updates and complete call-auction command batches, with typed gap/collision/eviction/boundary handling and snapshot fallback, is implemented; remaining work is authenticated transport framing, entitlement, fanout, remote retransmission sessions, bandwidth control, and conformance fixtures |
+| Medium | Market-data distribution | constructor-reserved per-instrument short-gap replay for continuous updates and complete call-auction command batches, with typed gap/collision/eviction/boundary handling and atomic snapshot-plus-retained-page recovery, is implemented; remaining work is authenticated transport framing, entitlement, fanout, remote retransmission sessions, bandwidth control, and conformance fixtures |
 | Medium | Order-management and ledger history | bounded zero-copy live lookup and chronological iteration over continuous/call-auction command/report history, typed fail-closed ledger record history, allocation-free account/asset posting filtering, and allocation-free exact point-in-time ledger balance reconstruction are implemented and survive WAL/checkpoint recovery; remaining work is authenticated account-scoped authorization, remote pagination/transport, audit export, and fenced history-generation rollover |
 | Medium | Operations | metrics, traces, structured logs, health, capacity limits, alert rules, and runbooks |
 | Medium | Performance evidence | pinned-hardware benchmarks, allocation counts, tail latency, saturation, and regression thresholds |

@@ -1195,9 +1195,11 @@ authoritative checked fold and signed-notional accumulator. Poison rejection is
 human-readable detail and returns a static source-divergence category without
 partial output.
 
-Applying one valid non-stale snapshot retains the existing `O(P log P)`
-standby-fill and constant-time active/standby swap bound, clears poison, and
-re-enables the complete observation boundary at the snapshot sequence.
+For `P` snapshot rows and `S <= P_max` initialized standby slots, applying one
+valid non-stale snapshot costs `O(S + P log(P + 1))`: arena clearing visits
+`S` slots, standby filling performs `P` ordered insertions, and the
+active/standby swap is constant-time. It clears poison and re-enables the
+complete observation boundary at the snapshot sequence.
 
 For replay capacity `N`, one `MarketDataReplayBuffer` initializes `N` optional
 typed slots in `O(N)` time and retains `O(N)` state. An `E`-update admission
@@ -1208,6 +1210,16 @@ iterating `R` returned updates is `O(R)` time with `O(1)` borrowed iterator
 state, including physical wrap. Typed in-memory slot bytes and allocator/page
 rounding are target-dependent; version-3 encoded updates remain 33 B, 43 B,
 66 B, or 91 B by payload kind.
+
+`MarketDataReplica::apply_snapshot_and_replay` validates `P` snapshot rows,
+clears `S` initialized standby slots, fills the candidate image, and applies
+`R` retained updates in `O(S + P log(P + 1) + R log(P + 1))` time. A healthy
+final result at the original sequence adds an `O(P)` full-state comparison;
+a later result adds `O(1)` coordinate checks. Success and ordinary rollback use
+`O(1)` auxiliary state and allocate nothing. Rollback swaps the original active
+arenas in `O(1)`; if the rejected continuous candidate is crossed, clearing its
+initialized slots costs `O(S_c)`, where `S_c <= P_max`. Standby occupancy is
+scratch telemetry and need not equal its pre-transaction value.
 
 ## Call-auction market data
 
@@ -1239,8 +1251,9 @@ updates and `U` unique affected limit identities:
   the output. Poison rejects in `O(1)` before allocation or tree traversal.
   Snapshot validation is `O(P)`. Healthy equal-event retry comparison is
   `O(P)` and nonmutating; later subordinate-coordinate checks are `O(1)`.
-  Double-buffered forward or poisoned snapshot application is allocation-free
-  after construction and `O(P log(P + 1))`.
+  For `S <= P_max` initialized standby slots, double-buffered forward or
+  poisoned snapshot application is allocation-free after construction and
+  `O(S + P log(P + 1))`.
 
 Publisher fixed state is `O(O_max + P_max)` and replica fixed state is
 `O(P_max + E_max)`, including four active/standby side arenas in total.
@@ -1290,6 +1303,14 @@ each replay batch has the ordinary replica `O(E + U)` capacity-preflight and
 residency are target-dependent; version-5 payload bytes are unchanged by the
 process-local replay ring. Indicative updates are 84 B without executable
 interest and 124 B with clearing; an empty closed snapshot is 113 B.
+
+`CallAuctionMarketDataReplica::apply_snapshot_and_replay` adds snapshot
+validation and installation cost `O(S + P log(P + 1))` to the ordinary
+per-complete-batch replay bounds above. A healthy final result at the original
+event boundary adds an `O(P)` comparison of limit depth and `O(1)` scalar/
+cycle state; a later result adds `O(1)` coordinate checks. Success and rollback
+use `O(1)` auxiliary state, allocate nothing, and restore active arenas through
+constant-time swaps. A valid rejected candidate may remain in standby scratch.
 
 ## WAL and journal
 

@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A162 are stable and are referenced from code comments and other
+identifiers A1-A163 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -6886,8 +6886,9 @@ A107, A108, A130, A132, A159, A161, A162] For `P` total snapshot rows,
 validation and an equal-sequence complete-image comparison each use `O(P)`
 time and `O(1)` auxiliary state. An exact healthy retry performs no arena or
 scalar mutation. A fork or coordinate regression fails before standby mutation.
-Forward or poisoned recovery retains the existing allocation-free
-`O(P log(P + 1))` standby fill and `O(1)` active/standby swap.
+For `S` initialized standby slots, forward or poisoned recovery is allocation-
+free `O(S + P log(P + 1))`: clearing is `O(S)`, filling is
+`O(P log(P + 1))`, and the active/standby swap is `O(1)`.
 
 **Falsification probe.** Apply exact genesis, one-sided, two-sided, market-only,
 indicative, crossed call-auction, and uncrossed continuous snapshots twice at
@@ -6908,10 +6909,103 @@ fork/regression, rejected valid poisoned repair, retry mutation, poison on
 lineage rejection, allocation growth, partial active mutation, replay divergence,
 or encoded-byte change falsifies A162.
 
+## A163 — atomic snapshot-plus-retained-suffix recovery
+
+**Assumption.** One continuous or call-auction
+`apply_snapshot_and_replay` call holds one exclusive replica borrow and one
+immutable zero-copy replay-page borrow. An empty page has exactly A162
+standalone-snapshot semantics. For a non-empty page, snapshot identity,
+complete grammar/economics, side capacities, and `snapshot event sequence + 1`
+representability are validated before standby mutation. The first update of
+the remaining continuous iterator, or first update of the first remaining
+complete auction batch, must have that exact successor sequence. A partially
+consumed page therefore cannot silently omit a prefix.
+
+A healthy anchor at the current event boundary must be an A162 complete-image
+retry; a later anchor must retain A162 subordinate-coordinate monotonicity.
+An older anchor is admitted only inside this combined transaction, and its
+lineage is deferred to the final recovered state. A poisoned replica does not
+use its partial economic image or subordinate coordinates as anchor authority.
+Snapshot identity, structure, economics, capacity, and suffix continuity
+remain mandatory in every case.
+
+After preflight, the snapshot is installed through the existing standby arenas
+and every retained update or complete auction batch is applied through the
+ordinary replica transition grammar. The final event sequence cannot predate
+the original event boundary, including when the original replica was poisoned.
+At the original healthy event sequence, the recovered depth and every scalar
+and cycle-trace coordinate must exactly reproduce the original state; different
+content is `SnapshotSequenceFork`. At a later healthy event sequence, the A162
+continuous trade/state or auction command/phase/book/trade coordinates cannot
+regress. Poisoned original state waives only those untrusted economic
+comparisons.
+
+Any replay or final-lineage error swaps the original active arenas back and
+restores every original scalar, cycle-trace value, event/command coordinate,
+and poison bit. Active-arena telemetry is restored because the original arena
+objects are swapped back. Standby arenas are non-authoritative process-local
+scratch: they may retain a structurally valid rejected candidate and their
+occupancy telemetry is not transactional. A crossed continuous candidate is
+cleared after rollback so the complete replica layout remains auditable. One
+page may have `has_more = true`; success establishes one coherent intermediate
+boundary from which the caller can query the next page. A163 changes no update,
+snapshot, replay-ring, codec, WAL, checkpoint, or wire value.
+
+**Dependent results.** [A1, A3, A10, A12, A21, A23, A44, A55, A67, A70,
+A107, A108, A159, A161, A162, A163] Let `P` be snapshot rows, `R` replayed
+updates, and `S <= P_max` the initialized standby slots. Snapshot validation is
+`O(P)`, installation is `O(S + P log(P + 1))`, continuous replay is
+`O(R log(P + 1))`, and call-auction replay retains its per-batch
+`O(E + U) + O(E log(P + 1))` preflight/application bounds. Final equal-boundary
+comparison is `O(P)`; later coordinate validation is `O(1)`. Successful and
+ordinary failed paths use `O(1)` auxiliary state and allocate nothing. Rollback
+is `O(1)` except clearing an invalid crossed continuous candidate, which is
+`O(S_c)` for its initialized standby slots. The borrowed ring retains its
+existing `O(N)` storage independently.
+
+**Falsification probe.** From healthy and poisoned replicas, combine genesis,
+older, equal, and later valid snapshots with empty, complete, paginated, and
+partially consumed retained pages. Require exact successor admission and reject
+overflow, foreign identity/version, gaps, invalid images, capacity excess,
+healthy equal-anchor forks, and later-anchor coordinate regressions before
+standby mutation.
+
+Recover an older anchor beyond the original boundary and require exact source
+parity. End before the original boundary and require the typed recovered-
+sequence regression. End at the same healthy sequence on a divergent real
+publisher branch and require the typed fork. Independently regress every
+subordinate coordinate at a later result. Inject a structural failure only
+after one staged update has advanced or mutated continuous and auction
+candidate state. On every error, require exact original active depth, scalars,
+cycle trace, poison, active-arena telemetry, empty batch scratch, and successful
+layout audit; permit only documented standby-scratch differences. Any partial
+active commit, accepted sequence/coordinate regression or equal-boundary fork,
+rejected valid poisoned repair, transition-grammar duplication, allocation,
+invalid retained standby image, or encoded-byte change falsifies A163.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** A163 makes snapshot anchoring plus one retained continuous
+  page or complete-auction-batch page one active-state transaction. Older
+  anchors may repair beyond an existing healthy or poisoned boundary without
+  exposing a partially recovered order book.
+
+- **Medium impact opportunity:** a controller can advance large recovery
+  suffixes page by page, using each successful coherent boundary as the cursor
+  for the next bounded zero-copy page.
+
+- **High impact risk:** rollback restores active state but deliberately does
+  not promise standby occupancy equality. Standby arenas are process-local
+  reusable scratch, may retain a valid rejected candidate, and must not be
+  interpreted as economic recovery evidence.
+
+- **High impact boundary:** A163 proves atomicity only after the snapshot and
+  replay page have been selected. It does not authenticate either source,
+  atomically query a concurrently changing producer, durably record fork
+  evidence, or establish cross-process failover lineage.
 
 - **High impact:** A162 makes healthy continuous and call-auction snapshot
   application idempotent and component-monotone. Equal-sequence forks and

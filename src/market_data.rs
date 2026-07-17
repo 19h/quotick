@@ -688,6 +688,13 @@ pub enum MarketDataError {
         /// Coordinate proposed by the snapshot.
         snapshot: u64,
     },
+    /// A snapshot-plus-replay transaction ended before the prior boundary.
+    RecoverySequenceRegression {
+        /// Replica sequence before recovery began.
+        current: u64,
+        /// Final sequence produced by the candidate recovery transaction.
+        recovered: u64,
+    },
     /// A full-depth image violated a structural invariant.
     InvalidSnapshot(&'static str),
     /// An incremental update violated a structural invariant.
@@ -743,6 +750,10 @@ impl fmt::Display for MarketDataError {
             } => write!(
                 formatter,
                 "market-data snapshot {coordinate} regresses from {current} to {snapshot}"
+            ),
+            Self::RecoverySequenceRegression { current, recovered } => write!(
+                formatter,
+                "market-data recovery sequence {recovered} predates replica sequence {current}"
             ),
             Self::InvalidSnapshot(detail)
             | Self::InvalidUpdate(detail)
@@ -3314,6 +3325,14 @@ pub struct MarketDataReplica {
     poisoned: bool,
 }
 
+#[derive(Clone, Copy)]
+struct MarketDataReplicaScalars {
+    last_sequence: u64,
+    last_trade_id: Option<TradeId>,
+    trading_state: TradingStateSnapshot,
+    poisoned: bool,
+}
+
 impl MarketDataReplica {
     /// Creates an empty consumer for one immutable instrument version.
     ///
@@ -3410,18 +3429,94 @@ impl MarketDataReplica {
     /// a healthy same-sequence fork, subordinate-coordinate regression, or
     /// capacity failure. A successfully applied snapshot clears poison.
     pub fn apply_snapshot(&mut self, snapshot: &MarketDataSnapshot) -> Result<(), MarketDataError> {
-        if snapshot.instrument_id != self.instrument_id {
-            return Err(MarketDataError::WrongInstrument);
-        }
-        if snapshot.instrument_version != self.instrument_version {
-            return Err(MarketDataError::WrongInstrumentVersion);
-        }
+        self.validate_snapshot_identity(snapshot)?;
         if snapshot.as_of_sequence < self.last_sequence {
             return Err(MarketDataError::StaleSnapshot {
                 current: self.last_sequence,
                 snapshot: snapshot.as_of_sequence,
             });
         }
+        self.validate_snapshot_body(snapshot)?;
+        if self.validate_snapshot_lineage(snapshot)? {
+            return Ok(());
+        }
+        self.install_snapshot(snapshot);
+        Ok(())
+    }
+
+    /// Atomically applies one snapshot anchor and one retained replay page.
+    ///
+    /// A non-empty replay page must begin exactly after the snapshot boundary.
+    /// Older anchors are admissible only when the final recovered sequence does
+    /// not predate the original replica. A healthy result at the original
+    /// sequence must reproduce the complete original state; a later result must
+    /// preserve subordinate lineage coordinates. On error, active depth,
+    /// scalars, poison, and active-arena telemetry are restored exactly. The
+    /// standby arenas remain reusable process-local scratch and may retain a
+    /// valid rejected candidate image.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarketDataError`] for snapshot admission, replay continuity or
+    /// transition failure, final sequence regression, an equal-sequence fork,
+    /// or subordinate-coordinate regression. An empty page has exactly the
+    /// semantics of [`Self::apply_snapshot`].
+    pub fn apply_snapshot_and_replay(
+        &mut self,
+        snapshot: &MarketDataSnapshot,
+        replay: MarketDataReplay<'_>,
+    ) -> Result<(), MarketDataError> {
+        if replay.len() == 0 {
+            return self.apply_snapshot(snapshot);
+        }
+        self.validate_snapshot_identity(snapshot)?;
+        self.validate_snapshot_body(snapshot)?;
+        let expected = snapshot
+            .as_of_sequence
+            .checked_add(1)
+            .ok_or(MarketDataError::ArithmeticOverflow)?;
+        let Some(first) = replay.clone().next() else {
+            return self.apply_snapshot(snapshot);
+        };
+        if first.sequence != expected {
+            return Err(MarketDataError::SequenceGap {
+                expected,
+                actual: first.sequence,
+            });
+        }
+        if snapshot.as_of_sequence >= self.last_sequence {
+            self.validate_snapshot_lineage(snapshot)?;
+        }
+
+        let previous = self.scalars();
+        self.install_snapshot(snapshot);
+        for update in replay {
+            if let Err(error) = self.apply(update) {
+                self.rollback_snapshot_replay(previous);
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.validate_recovered_lineage(previous) {
+            self.rollback_snapshot_replay(previous);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn validate_snapshot_identity(
+        &self,
+        snapshot: &MarketDataSnapshot,
+    ) -> Result<(), MarketDataError> {
+        if snapshot.instrument_id != self.instrument_id {
+            return Err(MarketDataError::WrongInstrument);
+        }
+        if snapshot.instrument_version != self.instrument_version {
+            return Err(MarketDataError::WrongInstrumentVersion);
+        }
+        Ok(())
+    }
+
+    fn validate_snapshot_body(&self, snapshot: &MarketDataSnapshot) -> Result<(), MarketDataError> {
         snapshot.validate()?;
         if snapshot.trading_state.revision() == 0
             && snapshot.trading_state.state() != self.initial_trading_state
@@ -3445,10 +3540,17 @@ impl MarketDataReplica {
                 attempted: snapshot.asks.len(),
             });
         }
+        Ok(())
+    }
+
+    fn validate_snapshot_lineage(
+        &self,
+        snapshot: &MarketDataSnapshot,
+    ) -> Result<bool, MarketDataError> {
         if !self.poisoned {
             if snapshot.as_of_sequence == self.last_sequence {
                 return if self.snapshot_matches_active(snapshot) {
-                    Ok(())
+                    Ok(true)
                 } else {
                     Err(MarketDataError::SnapshotSequenceFork {
                         sequence: self.last_sequence,
@@ -3466,6 +3568,10 @@ impl MarketDataReplica {
                 snapshot.trading_state.revision(),
             )?;
         }
+        Ok(false)
+    }
+
+    fn install_snapshot(&mut self, snapshot: &MarketDataSnapshot) {
         self.standby_bids.clear();
         self.standby_asks.clear();
         for level in &snapshot.bids {
@@ -3492,7 +3598,70 @@ impl MarketDataReplica {
         self.last_trade_id = snapshot.last_trade_id;
         self.trading_state = snapshot.trading_state;
         self.poisoned = false;
-        Ok(())
+    }
+
+    const fn scalars(&self) -> MarketDataReplicaScalars {
+        MarketDataReplicaScalars {
+            last_sequence: self.last_sequence,
+            last_trade_id: self.last_trade_id,
+            trading_state: self.trading_state,
+            poisoned: self.poisoned,
+        }
+    }
+
+    fn validate_recovered_lineage(
+        &self,
+        previous: MarketDataReplicaScalars,
+    ) -> Result<(), MarketDataError> {
+        if self.last_sequence < previous.last_sequence {
+            return Err(MarketDataError::RecoverySequenceRegression {
+                current: previous.last_sequence,
+                recovered: self.last_sequence,
+            });
+        }
+        if previous.poisoned {
+            return Ok(());
+        }
+        if self.last_sequence == previous.last_sequence {
+            if self.last_trade_id == previous.last_trade_id
+                && self.trading_state == previous.trading_state
+                && self.bids == self.standby_bids
+                && self.asks == self.standby_asks
+            {
+                return Ok(());
+            }
+            return Err(MarketDataError::SnapshotSequenceFork {
+                sequence: previous.last_sequence,
+            });
+        }
+        Self::validate_snapshot_coordinate(
+            MarketDataSnapshotCoordinate::LastTradeId,
+            trade_coordinate(previous.last_trade_id),
+            trade_coordinate(self.last_trade_id),
+        )?;
+        Self::validate_snapshot_coordinate(
+            MarketDataSnapshotCoordinate::TradingStateRevision,
+            previous.trading_state.revision(),
+            self.trading_state.revision(),
+        )
+    }
+
+    fn rollback_snapshot_replay(&mut self, previous: MarketDataReplicaScalars) {
+        std::mem::swap(&mut self.bids, &mut self.standby_bids);
+        std::mem::swap(&mut self.asks, &mut self.standby_asks);
+        self.last_sequence = previous.last_sequence;
+        self.last_trade_id = previous.last_trade_id;
+        self.trading_state = previous.trading_state;
+        self.poisoned = previous.poisoned;
+        if self
+            .standby_bids
+            .last_key_value()
+            .zip(self.standby_asks.first_key_value())
+            .is_some_and(|((bid, _), (ask, _))| bid >= ask)
+        {
+            self.standby_bids.clear();
+            self.standby_asks.clear();
+        }
     }
 
     fn validate_snapshot_coordinate(
@@ -5016,6 +5185,76 @@ mod resource_limit_tests {
             replica.bids.get(&Price::from_raw(100)).unwrap().quantity,
             11
         );
+        replica.validate().unwrap();
+    }
+
+    #[test]
+    fn snapshot_replay_rolls_back_after_a_mutating_transition_failure() {
+        let snapshot = recovery_snapshot();
+        let mut replica = replica();
+        replica.apply_snapshot(&snapshot).unwrap();
+        let before = replica.scalars();
+        let before_bids = replica.bids.clone();
+        let before_asks = replica.asks.clone();
+        let before_bid_status = replica.price_level_arena_status(Side::Buy);
+        let before_ask_status = replica.price_level_arena_status(Side::Sell);
+        let before_scratch_status = replica.batch_level_hash_status();
+
+        let updates = [
+            MarketDataUpdate::from_parts(
+                InstrumentId::new(1).unwrap(),
+                InstrumentVersion::new(1).unwrap(),
+                5,
+                TimestampNs::from_unix_nanos(5),
+                MarketDataKind::NoBookChange,
+            )
+            .unwrap(),
+            MarketDataUpdate::from_parts(
+                InstrumentId::new(1).unwrap(),
+                InstrumentVersion::new(1).unwrap(),
+                6,
+                TimestampNs::from_unix_nanos(6),
+                MarketDataKind::Level(
+                    MarketDataLevel::new(Side::Buy, Price::from_raw(120), 1, 1).unwrap(),
+                ),
+            )
+            .unwrap(),
+        ];
+        let mut retained = MarketDataReplayBuffer::try_new(
+            InstrumentId::new(1).unwrap(),
+            InstrumentVersion::new(1).unwrap(),
+            snapshot.as_of_sequence,
+            2,
+        )
+        .unwrap();
+        for update in updates {
+            retained.push(update).unwrap();
+        }
+
+        assert_eq!(
+            replica.apply_snapshot_and_replay(
+                &snapshot,
+                retained.replay_after(snapshot.as_of_sequence, 2).unwrap(),
+            ),
+            Err(MarketDataError::InvalidUpdate(
+                "incremental update produced a crossed or locked book"
+            ))
+        );
+        assert_eq!(replica.last_sequence, before.last_sequence);
+        assert_eq!(replica.last_trade_id, before.last_trade_id);
+        assert_eq!(replica.trading_state, before.trading_state);
+        assert_eq!(replica.poisoned, before.poisoned);
+        assert_eq!(replica.bids, before_bids);
+        assert_eq!(replica.asks, before_asks);
+        assert_eq!(
+            replica.price_level_arena_status(Side::Buy),
+            before_bid_status
+        );
+        assert_eq!(
+            replica.price_level_arena_status(Side::Sell),
+            before_ask_status
+        );
+        assert_eq!(replica.batch_level_hash_status(), before_scratch_status);
         replica.validate().unwrap();
     }
 

@@ -265,6 +265,127 @@ fn retained_batches_repair_a_gap_without_losing_command_boundaries() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one shared real-publisher fixture proves advance, regression, and fork rollback"
+)]
+fn snapshot_and_retained_batches_recovery_is_atomic_and_lineage_checked() {
+    let definition = definition();
+    let mut source = engine(definition);
+    let mut publisher = CallAuctionMarketDataPublisher::from_engine(&source).unwrap();
+    let initial = publisher.snapshot();
+    let mut batches = Vec::new();
+    for command in [
+        phase(definition),
+        order(definition, 2, 1, Side::Buy, 100),
+        order(definition, 3, 2, Side::Sell, 101),
+        order(definition, 4, 3, Side::Buy, 99),
+    ] {
+        batches.push(publish(&mut source, &mut publisher, command));
+    }
+    let mut replay = CallAuctionMarketDataReplayBuffer::try_new(
+        definition.instrument_id(),
+        definition.version(),
+        initial.as_of_sequence(),
+        4,
+    )
+    .unwrap();
+    for batch in &batches {
+        replay.push_batch(batch).unwrap();
+    }
+
+    let mut advancing = CallAuctionMarketDataReplica::new(definition);
+    advancing.apply_snapshot(&initial).unwrap();
+    advancing.apply_batch(&batches[0]).unwrap();
+    advancing.apply_batch(&batches[1]).unwrap();
+    advancing
+        .apply_snapshot_and_replay(
+            &initial,
+            replay
+                .replay_batches_after(initial.as_of_sequence(), 4)
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(advancing.last_sequence(), publisher.last_sequence());
+    assert_eq!(
+        advancing.limit_depth(Side::Buy, usize::MAX),
+        source.book().limit_depth(Side::Buy, usize::MAX)
+    );
+    assert_eq!(advancing.phase(), source.phase_snapshot());
+    advancing.validate().unwrap();
+
+    let mut regressing = CallAuctionMarketDataReplica::new(definition);
+    regressing.apply_snapshot(&initial).unwrap();
+    for batch in &batches {
+        regressing.apply_batch(batch).unwrap();
+    }
+    let before = regressing.limit_depth(Side::Buy, usize::MAX);
+    let before_sequence = regressing.last_sequence();
+    let before_bid_status = regressing.price_level_arena_status(Side::Buy);
+    assert_eq!(
+        regressing.apply_snapshot_and_replay(
+            &initial,
+            replay
+                .replay_batches_after(initial.as_of_sequence(), 2)
+                .unwrap(),
+        ),
+        Err(CallAuctionMarketDataError::RecoverySequenceRegression {
+            current: before_sequence,
+            recovered: 2,
+        })
+    );
+    assert_eq!(regressing.last_sequence(), before_sequence);
+    assert_eq!(regressing.limit_depth(Side::Buy, usize::MAX), before);
+    assert_eq!(
+        regressing.price_level_arena_status(Side::Buy),
+        before_bid_status
+    );
+    assert!(!regressing.is_poisoned());
+    regressing.validate().unwrap();
+
+    let mut fork_source = engine(definition);
+    let mut fork_publisher = CallAuctionMarketDataPublisher::from_engine(&fork_source).unwrap();
+    let fork_batches = [
+        publish(&mut fork_source, &mut fork_publisher, phase(definition)),
+        publish(
+            &mut fork_source,
+            &mut fork_publisher,
+            order(definition, 2, 1, Side::Buy, 99),
+        ),
+    ];
+    let mut fork_replay = CallAuctionMarketDataReplayBuffer::try_new(
+        definition.instrument_id(),
+        definition.version(),
+        initial.as_of_sequence(),
+        2,
+    )
+    .unwrap();
+    for batch in &fork_batches {
+        fork_replay.push_batch(batch).unwrap();
+    }
+
+    let mut forked = CallAuctionMarketDataReplica::new(definition);
+    forked.apply_snapshot(&initial).unwrap();
+    forked.apply_batch(&batches[0]).unwrap();
+    forked.apply_batch(&batches[1]).unwrap();
+    let before = forked.limit_depth(Side::Buy, usize::MAX);
+    let sequence = forked.last_sequence();
+    assert_eq!(
+        forked.apply_snapshot_and_replay(
+            &initial,
+            fork_replay
+                .replay_batches_after(initial.as_of_sequence(), 2)
+                .unwrap(),
+        ),
+        Err(CallAuctionMarketDataError::SnapshotSequenceFork { sequence })
+    );
+    assert_eq!(forked.last_sequence(), sequence);
+    assert_eq!(forked.limit_depth(Side::Buy, usize::MAX), before);
+    assert!(!forked.is_poisoned());
+    forked.validate().unwrap();
+}
+
+#[test]
 fn replay_pages_never_split_uncross_batches_and_eviction_is_explicit() {
     let definition = definition();
     let mut engine = engine(definition);
