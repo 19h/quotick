@@ -142,6 +142,14 @@ expiry AVL. With `P` occupied prices and `X` active GTD orders, commit is
 `O(K(log(P + 1) + log(X + 1)))`; its report contains exactly `K + 1` events.
 An empty sweep is `O(1)`, consumes no lease, and still advances the watermark.
 
+Conditional expiry instead fills the ordinary lease during preparation and
+constructs complete caller-owned selected-state output. Each selected ID is
+validated by exact active-order and expiry-index lookup, adding
+`O(K log(X + 1))` preparation work after the ordinary prefix count. Accepted
+commit validates and drains those same IDs without a second ordered-prefix
+traversal or sort. The lease and caller output each retain `O(K)` rows; a valid
+empty prefix uses neither and still invokes its predicate.
+
 For `K` stops activated by one explicit reference, preparation counts the
 eligible prefix and derives matching work before mutation. It leases `O(K)`
 selection scratch and selects canonical buy/sell trigger heads. If those
@@ -729,6 +737,26 @@ observation. Coupled acceptance releases `O` reservations in expected `O(O)`
 time. Durable acceptance and business rejection append the existing two
 frames; query failure, decline, unwind, and replay append zero. Count,
 revision, and quantity arithmetic has zero approximation error, and no wire
+value or fixed authoritative state changes.
+
+`try_submit_expiry_sweep_if` composes ordinary `ExpirySweep` preparation with
+one canonical selected-ID pass into the existing lease, exactly reserved
+complete selected-state output, a predicate, and ordinary expiry commit. Let
+`A` be ordinary expiry preparation cost, `K` selected orders, `X` active GTD
+orders, `F` predicate cost, and `M` ordinary expiry commit cost. Exact active-
+order and expiry-index validation costs `O(K log(X + 1))` after `A`.
+
+Acceptance is `O(A + K log(X + 1) + F + M)` time; decline is
+`O(A + K log(X + 1) + F)`. Accepted commit reuses the prepared IDs and performs
+no second ordered-prefix traversal or sort. The constructor-owned lease
+retains `O(K)` ID scratch, caller output owns `O(K)`
+`ActiveOrderSnapshot` rows, and evaluator auxiliary state is `O(1)`. Core
+rejection and exact replay skip selection, output reservation, and `F`; a
+valid empty prefix invokes `F` without a lease or selected output. Coupled
+acceptance releases `K` reservations in expected `O(K)` time. Durable
+acceptance and business rejection append the existing two frames; query
+failure, decline, unwind, and replay append zero. Count, quantity, and
+nanosecond-watermark arithmetic has zero approximation error, and no wire
 value or fixed authoritative state changes.
 
 ## Default matching limits and memory

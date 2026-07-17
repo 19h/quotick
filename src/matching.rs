@@ -2485,6 +2485,8 @@ pub enum OrderBookQueryResource {
     AccountControlOrders,
     /// Complete active-order states selected by one conditional trading-state control.
     TradingStateControlOrders,
+    /// Complete active-order states selected by one conditional expiry sweep.
+    ExpirySweepOrders,
 }
 
 impl fmt::Display for OrderBookQueryResource {
@@ -2497,6 +2499,7 @@ impl fmt::Display for OrderBookQueryResource {
             Self::MassCancelOrders => "mass-cancel-order output",
             Self::AccountControlOrders => "account-control-order output",
             Self::TradingStateControlOrders => "trading-state-control-order output",
+            Self::ExpirySweepOrders => "expiry-sweep-order output",
         })
     }
 }
@@ -3717,16 +3720,28 @@ fn try_order_selection_quantity(
     orders: &[ActiveOrderSnapshot],
     selection: &'static str,
 ) -> Result<u128, InvariantViolation> {
-    let mut previous_order_id = None;
+    try_order_selection_quantity_by_key(orders, selection, |order| Ok(order.order_id()))
+}
+
+fn try_order_selection_quantity_by_key<K: Ord>(
+    orders: &[ActiveOrderSnapshot],
+    selection: &'static str,
+    mut key: impl FnMut(&ActiveOrderSnapshot) -> Result<K, InvariantViolation>,
+) -> Result<u128, InvariantViolation> {
+    let mut previous_key = None;
     let mut selected_quantity_lots = 0_u128;
     for order in orders {
-        if previous_order_id.is_some_and(|previous| previous >= order.order_id()) {
+        let current_key = key(order)?;
+        if previous_key
+            .as_ref()
+            .is_some_and(|previous| previous >= &current_key)
+        {
             return Err(InvariantViolation::new(format!(
                 "{selection} selection is not strictly ordered at order {}",
                 order.order_id()
             )));
         }
-        previous_order_id = Some(order.order_id());
+        previous_key = Some(current_key);
         selected_quantity_lots = selected_quantity_lots
             .checked_add(u128::from(order.leaves_quantity().lots()))
             .ok_or_else(|| {
@@ -4015,6 +4030,114 @@ impl TradingStateControlSubmissionObservation {
     #[must_use]
     pub const fn selected_quantity_lots(&self) -> u128 {
         self.selected_quantity_lots
+    }
+}
+
+/// Frozen watermark and canonical private state selected by one expiry sweep.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpirySweepObservation {
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    book_event_sequence: u64,
+    previous_watermark: Option<TimestampNs>,
+    through: TimestampNs,
+    orders: Vec<ActiveOrderSnapshot>,
+    expired_quantity_lots: u128,
+}
+
+impl ExpirySweepObservation {
+    fn try_new(
+        instrument_id: InstrumentId,
+        instrument_version: InstrumentVersion,
+        book_event_sequence: u64,
+        previous_watermark: Option<TimestampNs>,
+        through: TimestampNs,
+        orders: Vec<ActiveOrderSnapshot>,
+    ) -> Result<Self, InvariantViolation> {
+        if previous_watermark.is_some_and(|watermark| through < watermark) {
+            return Err(InvariantViolation::new(
+                "expiry-sweep observation regresses the current watermark",
+            ));
+        }
+        let expired_quantity_lots =
+            try_order_selection_quantity_by_key(&orders, "expiry-sweep", |order| {
+                let expires_at = order.expires_at().ok_or_else(|| {
+                    InvariantViolation::new(format!(
+                        "expiry-sweep selection contains nonexpiring order {}",
+                        order.order_id()
+                    ))
+                })?;
+                if expires_at > through {
+                    return Err(InvariantViolation::new(format!(
+                        "expiry-sweep selection contains order {} after its horizon",
+                        order.order_id()
+                    )));
+                }
+                Ok((expires_at, order.order_id()))
+            })?;
+        Ok(Self {
+            instrument_id,
+            instrument_version,
+            book_event_sequence,
+            previous_watermark,
+            through,
+            orders,
+            expired_quantity_lots,
+        })
+    }
+
+    /// Returns the selected instrument.
+    #[must_use]
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version used by preparation.
+    #[must_use]
+    pub const fn instrument_version(&self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the last committed event sequence visible to preparation.
+    #[must_use]
+    pub const fn book_event_sequence(&self) -> u64 {
+        self.book_event_sequence
+    }
+
+    /// Returns the committed watermark visible before the proposed sweep.
+    #[must_use]
+    pub const fn previous_watermark(&self) -> Option<TimestampNs> {
+        self.previous_watermark
+    }
+
+    /// Returns the requested inclusive expiration horizon.
+    #[must_use]
+    pub const fn through(&self) -> TimestampNs {
+        self.through
+    }
+
+    /// Returns the watermark produced by acceptance.
+    #[must_use]
+    pub const fn current_watermark(&self) -> TimestampNs {
+        self.through
+    }
+
+    /// Returns complete selected states in `(expires_at, OrderId)` order.
+    #[must_use]
+    pub fn orders(&self) -> &[ActiveOrderSnapshot] {
+        &self.orders
+    }
+
+    /// Returns the number of active orders selected for expiration.
+    #[must_use]
+    pub fn expired_order_count(&self) -> usize {
+        self.orders.len()
+    }
+
+    /// Returns exact selected total leaves in lots.
+    #[must_use]
+    pub const fn expired_quantity_lots(&self) -> u128 {
+        self.expired_quantity_lots
     }
 }
 
@@ -9128,6 +9251,29 @@ impl OrderBook {
         )
     }
 
+    /// Atomically observes and conditionally applies one inclusive GTD expiry sweep.
+    ///
+    /// The predicate borrows the current watermark, requested horizon, and
+    /// every selected resting and dormant-stop state in canonical
+    /// `(expires_at, OrderId)` order under the same exclusive book borrow as
+    /// commit. Replay and core rejection bypass observation and predicate
+    /// execution. Query failure, decline, or unwind precedes semantic
+    /// mutation. Acceptance commits the preparation containing the identical
+    /// selected identifiers. An empty valid prefix still invokes the predicate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConditionalOrderError::Matching`] for preparation or commit
+    /// failure and [`ConditionalOrderError::Query`] when complete caller-owned
+    /// selected state cannot be reserved or validated.
+    pub fn try_submit_expiry_sweep_if(
+        &mut self,
+        command: ExpirySweep,
+        accept: impl FnOnce(&ExpirySweepObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<ExpirySweepObservation>, ConditionalOrderError> {
+        self.submit_conditional_expiry_sweep(command, |_, observation| Ok(observation), accept)
+    }
+
     /// Atomically quotes and conditionally submits one canonical IOC order.
     ///
     /// Core matching rejection and exact replay bypass `accept` and return a
@@ -9284,6 +9430,19 @@ impl OrderBook {
         E: From<MatchingError> + From<OrderBookQueryError>,
     {
         let preflight = self.prepare_conditional_trading_state_control::<E>(command)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_expiry_sweep<T, E>(
+        &mut self,
+        command: ExpirySweep,
+        observe: impl FnOnce(&Self, ExpirySweepObservation) -> Result<T, E>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, E>
+    where
+        E: From<MatchingError> + From<OrderBookQueryError>,
+    {
+        let preflight = self.prepare_conditional_expiry_sweep::<E>(command)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 
@@ -9491,6 +9650,38 @@ impl OrderBook {
         }
     }
 
+    pub(crate) fn prepare_conditional_expiry_sweep<E>(
+        &self,
+        command: ExpirySweep,
+    ) -> Result<ConditionalExecutionPreflight<ExpirySweepObservation>, E>
+    where
+        E: From<MatchingError> + From<OrderBookQueryError>,
+    {
+        match self
+            .prepare(Command::ExpirySweep(command))
+            .map_err(E::from)?
+        {
+            preparation @ CommandPreparation::Replay(_) => Ok(ConditionalExecutionPreflight {
+                preparation,
+                observation: None,
+            }),
+            CommandPreparation::Ready(mut prepared) => {
+                let observation = if prepared.core_rejection().is_none() {
+                    Some(
+                        self.try_expiry_sweep_observation(command, &mut prepared)
+                            .map_err(E::from)?,
+                    )
+                } else {
+                    None
+                };
+                Ok(ConditionalExecutionPreflight {
+                    preparation: CommandPreparation::Ready(prepared),
+                    observation,
+                })
+            }
+        }
+    }
+
     fn try_mass_cancel_observation(
         &self,
         command: MassCancel,
@@ -9582,6 +9773,37 @@ impl OrderBook {
             control,
             command.target_state,
             command.action,
+            orders,
+        )
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn try_expiry_sweep_observation(
+        &self,
+        command: ExpirySweep,
+        prepared: &mut PreparedCommand,
+    ) -> Result<ExpirySweepObservation, OrderBookQueryError> {
+        let expected_count = prepared.maximum_events.checked_sub(1).ok_or_else(|| {
+            InvariantViolation::new("prepared expiry sweep has no completion event")
+        })?;
+        let orders = self.try_selected_order_states(
+            prepared,
+            OrderBookQueryResource::ExpirySweepOrders,
+            |book, selected| book.try_select_expiring_orders_into(command.through, selected),
+        )?;
+        if orders.len() != expected_count {
+            return Err(InvariantViolation::new(format!(
+                "expiry-sweep selection length {} differs from prepared count {expected_count}",
+                orders.len()
+            ))
+            .into());
+        }
+        ExpirySweepObservation::try_new(
+            self.instrument_id(),
+            self.instrument_version(),
+            self.last_event_sequence(),
+            self.expiry_watermark,
+            command.through,
             orders,
         )
         .map_err(Into::into)
@@ -12259,20 +12481,29 @@ impl OrderBook {
     ) -> Result<ExecutionReport, MatchingError> {
         let previous_watermark = self.expiry_watermark;
         debug_assert!(previous_watermark.is_none_or(|value| command.through >= value));
-        let selected_count = self.expiring_order_count(command.through);
-        debug_assert_eq!(events.maximum_events, selected_count + 1);
+        let selected_count = events
+            .maximum_events
+            .checked_sub(1)
+            .ok_or(MatchingError::InternalInvariantViolation)?;
         if selected.capacity() < selected_count {
             return Err(MatchingError::InternalInvariantViolation);
         }
         let selected_values = selected.values_mut();
         let selected_buffer = selected_values.as_ptr();
-        selected_values.extend(
-            self.expiries
-                .iter()
-                .take_while(|(key, _)| key.expires_at <= command.through)
-                .map(|(_, &order_id)| order_id),
-        );
-        debug_assert_eq!(selected_values.len(), selected_count);
+        if selected_values.is_empty() {
+            self.try_select_expiring_orders_into(command.through, selected_values)
+                .map_err(|_| MatchingError::InternalInvariantViolation)?;
+            if selected_values.len() != selected_count {
+                return Err(MatchingError::InternalInvariantViolation);
+            }
+        } else {
+            self.try_validate_selected_expiring_orders(
+                command.through,
+                selected_count,
+                selected_values,
+            )
+            .map_err(|_| MatchingError::InternalInvariantViolation)?;
+        }
         debug_assert_eq!(selected_values.as_ptr(), selected_buffer);
 
         let expired_order_count =
@@ -13625,6 +13856,97 @@ impl OrderBook {
         Ok(())
     }
 
+    fn try_select_expiring_orders_into(
+        &self,
+        through: TimestampNs,
+        selected: &mut Vec<OrderId>,
+    ) -> Result<(), InvariantViolation> {
+        if !selected.is_empty() {
+            return Err(InvariantViolation::new(
+                "expiry-sweep selection output is not empty",
+            ));
+        }
+        for (indexed_key, &order_id) in self
+            .expiries
+            .iter()
+            .take_while(|(key, _)| key.expires_at <= through)
+        {
+            if selected.len() == selected.capacity() {
+                return Err(InvariantViolation::new(format!(
+                    "expiry-sweep selection capacity {} is below its qualifying prefix",
+                    selected.capacity()
+                )));
+            }
+            let actual_key = self.try_active_expiry_key(order_id)?;
+            if *indexed_key != actual_key {
+                return Err(InvariantViolation::new(format!(
+                    "expiry index key {indexed_key:?} for order {order_id} differs from active key {actual_key:?}"
+                )));
+            }
+            selected.push(order_id);
+        }
+        Ok(())
+    }
+
+    fn try_active_expiry_key(&self, order_id: OrderId) -> Result<ExpiryKey, InvariantViolation> {
+        let order = self.orders.get(&order_id).ok_or_else(|| {
+            InvariantViolation::new(format!(
+                "expiry index references absent active order {order_id}"
+            ))
+        })?;
+        if order.order_id != order_id {
+            return Err(InvariantViolation::new(format!(
+                "expiry index order {order_id} resolves to embedded order {}",
+                order.order_id
+            )));
+        }
+        let expires_at = order.expires_at.ok_or_else(|| {
+            InvariantViolation::new(format!(
+                "expiry index references nonexpiring active order {order_id}"
+            ))
+        })?;
+        let key = ExpiryKey {
+            expires_at,
+            order_id,
+        };
+        if self.expiries.get(&key).copied() != Some(order_id) {
+            return Err(InvariantViolation::new(format!(
+                "active order {order_id} has no exact expiry-index entry"
+            )));
+        }
+        Ok(key)
+    }
+
+    fn try_validate_selected_expiring_orders(
+        &self,
+        through: TimestampNs,
+        expected_count: usize,
+        selected: &[OrderId],
+    ) -> Result<(), InvariantViolation> {
+        if selected.len() != expected_count {
+            return Err(InvariantViolation::new(format!(
+                "prepared expiry selection length {} differs from prepared count {expected_count}",
+                selected.len()
+            )));
+        }
+        let mut previous_key = None;
+        for &order_id in selected {
+            let key = self.try_active_expiry_key(order_id)?;
+            if key.expires_at > through {
+                return Err(InvariantViolation::new(format!(
+                    "prepared expiry selection contains order {order_id} after its horizon"
+                )));
+            }
+            if previous_key.is_some_and(|previous| previous >= key) {
+                return Err(InvariantViolation::new(format!(
+                    "prepared expiry selection is not strictly ordered at order {order_id}"
+                )));
+            }
+            previous_key = Some(key);
+        }
+        Ok(())
+    }
+
     fn try_validate_selected_all_orders(
         &self,
         selected: &[OrderId],
@@ -14271,10 +14593,10 @@ mod price_level_index_tests {
         AccountControlSnapshot, ActiveOrderObservation, ActiveOrderSnapshot, BuyStopKey,
         CancelOrder, Command, CommandOutcome, CommandPreparation, ConditionalOrderError,
         DisplayedLiquidityQuote, DisplayedLiquidityRequest, DisplayedLiquidityTermination,
-        DormantStopState, EventTraceBuilder, ImmediateExecutionLevel, ImmediateExecutionQuote,
-        ImmediateExecutionRequest, ImmediateExecutionTermination, IncomingPreview,
-        InvariantViolation, LevelSnapshot, MassCancel, MassCancelScope, MatchingCapacity,
-        MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsSpec,
+        DormantStopState, EventTraceBuilder, ExpiryKey, ExpirySweep, ImmediateExecutionLevel,
+        ImmediateExecutionQuote, ImmediateExecutionRequest, ImmediateExecutionTermination,
+        IncomingPreview, InvariantViolation, LevelSnapshot, MassCancel, MassCancelScope,
+        MatchingCapacity, MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsSpec,
         OrderBookQueryError, OrderBookQueryResource, OrderDisplay, OrderQueueClass,
         OrderSelectionPool, OrderSnapshot, OrderType, PriceLevel, PriceLevels,
         PublicLevelObservation, RejectReason, ReplaceOrder, RestingOrder, SelfTradePrevention,
@@ -16383,6 +16705,69 @@ mod price_level_index_tests {
         assert_eq!(book.retained_command_count(), 2);
         assert_eq!(book.active_order_count(), 2);
         assert_eq!(book.trading_state().revision(), 0);
+        assert_eq!(book.order_selection_pool_status(), pool_before);
+    }
+
+    #[test]
+    fn conditional_expiry_sweep_propagates_index_corruption_and_returns_its_lease() {
+        let mut book = OrderBook::new(reserve_definition());
+        for (command_id, order_id, price, expires_at) in
+            [(1_u64, 1_u64, 100_i64, 100_u64), (2, 2, 99, 200)]
+        {
+            book.submit(Command::New(NewOrder {
+                command_id: CommandId::new(command_id).unwrap(),
+                order_id: OrderId::new(order_id).unwrap(),
+                account_id: AccountId::new(order_id).unwrap(),
+                instrument_id: InstrumentId::new(1).unwrap(),
+                instrument_version: InstrumentVersion::new(1).unwrap(),
+                side: Side::Buy,
+                quantity: Quantity::new(1).unwrap(),
+                display: OrderDisplay::FullyDisplayed,
+                order_type: OrderType::Limit(Price::from_raw(price)),
+                time_in_force: TimeInForce::GoodTilTimestamp {
+                    expires_at: TimestampNs::from_unix_nanos(expires_at),
+                },
+                self_trade_prevention: SelfTradePrevention::CancelAggressor,
+                received_at: TimestampNs::from_unix_nanos(command_id),
+            }))
+            .unwrap();
+        }
+        *book
+            .expiries
+            .get_mut(&ExpiryKey {
+                expires_at: TimestampNs::from_unix_nanos(100),
+                order_id: OrderId::new(1).unwrap(),
+            })
+            .unwrap() = OrderId::new(2).unwrap();
+        let sequence_before = book.last_event_sequence();
+        let pool_before = book.order_selection_pool_status();
+
+        let error = book
+            .try_submit_expiry_sweep_if(
+                ExpirySweep {
+                    command_id: CommandId::new(3).unwrap(),
+                    instrument_id: InstrumentId::new(1).unwrap(),
+                    instrument_version: InstrumentVersion::new(1).unwrap(),
+                    through: TimestampNs::from_unix_nanos(100),
+                    received_at: TimestampNs::from_unix_nanos(100),
+                },
+                |_| panic!("expiry-index corruption must bypass the predicate"),
+            )
+            .unwrap_err();
+
+        let ConditionalOrderError::Query(OrderBookQueryError::InvariantViolation(error)) = error
+        else {
+            panic!("expiry-index corruption must remain a typed query failure");
+        };
+        assert!(
+            error.detail().contains("differs from active key"),
+            "{}",
+            error.detail()
+        );
+        assert_eq!(book.last_event_sequence(), sequence_before);
+        assert_eq!(book.retained_command_count(), 2);
+        assert_eq!(book.active_order_count(), 2);
+        assert_eq!(book.expiry_watermark(), None);
         assert_eq!(book.order_selection_pool_status(), pool_before);
     }
 

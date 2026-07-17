@@ -332,6 +332,14 @@ Run any program with `cargo run --example <name>`.
   observation and predicate; query failure, decline, or unwind changes no
   matching, risk, history, or WAL state. Plain, coupled-risk, and both durable
   paths share the contract.
+- Conditional expiry sweeping binds the previous and resulting watermark to
+  the exact canonical `(deadline, OrderId)` GTD prefix that the ordinary sweep
+  removes. The observation contains every selected validated resting or
+  dormant-stop state, exact count, and checked `u128` total leaves. Acceptance
+  consumes those prepared identifiers without a second expiry-prefix traversal
+  or sort; core rejection and replay bypass observation and predicate, while
+  query failure, decline, or unwind changes no matching, risk, history, or WAL
+  state. Plain, coupled-risk, and both durable paths share the contract.
 - A fallible private immediate-execution curve uses that same reserve/hidden/
   STP scanner to return one exact market-ordered aggregate per contributing
   price. It requests capacity for the exact row count before copying, then
@@ -426,6 +434,9 @@ Run any program with `cargo run --example <name>`.
   Conditional trading-state control performs its account-independent coupled
   gate before observation and releases exactly the observed transition-and-
   cancel reservations only on commit; transition changes no reservation.
+  Conditional expiry performs its account-independent coupled gate before
+  observation and releases exactly the canonical observed expiring
+  reservations only on commit.
 - Reservation lifecycle derived from the sequenced trace across fills,
   cancellation, GTD expiry, stop arming/activation, replacement, mass
   cancellation, account controls, and self-trade prevention; dormant stops
@@ -591,6 +602,8 @@ account-control predicates are process-local and are not persisted,
 authenticated, transported, or valid across shard borrows.
 Conditional trading-state-control predicates have the same process-local
 boundary and are not persisted, authenticated, or transported.
+Conditional expiry-sweep predicates have the same process-local boundary and
+are not persisted, authenticated, clock-scheduled, or transported.
 Their synchronous execution extends the exclusive local shard borrow. A
 dormant-stop observation contains no activation-time forecast, and active
 minimum-quantity IOC observations must be interpreted with the submitted
@@ -635,7 +648,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 148 tagged assumptions (A1–A148), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 149 tagged assumptions (A1–A149), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -710,6 +723,8 @@ includes:
   resulting fence provenance, enable without selected output, accept/decline/
   unwind, and core, risk, replay, WAL, and recovery boundaries, GTD intake and
   canonical expiry sweeps,
+  including conditional prior/resulting watermark and exact canonical expiring-
+  order observation across all four book surfaces,
   revisioned instrument trading-state control with current/target/resulting
   state, transition without selected output, and exact all-order cancellation,
   dormant stop intake, canonical bounded trigger sweeps,

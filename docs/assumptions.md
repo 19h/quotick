@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A148 are stable and are referenced from code comments and other
+identifiers A1-A149 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -5823,6 +5823,88 @@ release on noncommit or missing release on acceptance; interposed shard
 transition; durable protocol or recovery drift; or new wire value falsifies
 A148.
 
+## A149 — atomic conditional expiry-sweep observation
+
+**Assumption.** One `try_submit_expiry_sweep_if` call on an `OrderBook`,
+`RiskManagedOrderBook`, `DurableOrderBook`, or `DurableRiskOrderBook` holds the
+corresponding exclusive mutable shard borrow across ordinary `ExpirySweep`
+preparation, construction of one `ExpirySweepObservation`, a borrowed local
+predicate, and commit of that same preparation. It reuses the ordinary
+inclusive watermark, expiry cancellation, coupled-risk trace, report,
+persistence, and recovery paths.
+
+For a core-admissible horizon selecting `K` active GTD orders, observation
+fills the same move-only A87 lease acquired by ordinary preparation exactly
+once in canonical `(expires_at, OrderId)` order. Each selected expiry-index
+entry is checked against its exact active order and deadline before one exact
+fallible request for `K` caller-owned `ActiveOrderSnapshot` rows. The result
+binds instrument ID, immutable definition version, last visible book event
+sequence, previous optional watermark, requested horizon and resulting current
+watermark, complete selected resting or dormant-stop states, selected count,
+and the checked exact `u128` total leaves. Accepted commit validates and drains
+those identical prepared IDs without another expiry-prefix traversal or sort.
+An empty valid prefix acquires no lease, allocates no selected-order output,
+and still invokes the predicate with the watermark transition.
+
+Exact replay plus wrong-route, wrong-version, a horizon after command time,
+watermark regression, and other core business rejections return a reported
+`ConditionalCommandOutcome` without selection, observation, or predicate
+execution. Coupled risk performs its existing account-independent expiry
+authorization before observation. A query failure, predicate decline, or
+unwind drops preparation and returns any lease before sequence, event,
+matching, risk, history, public, or WAL mutation. Acceptance advances the
+watermark and releases exactly the selected reservations through the ordinary
+canonical cancellation trace.
+
+Durable acceptance and business rejection retain command-before-state-before-
+report and append the existing two frames. Query failure, decline, unwind, and
+replay append zero frames. The observation and callback decision are process-
+local, unencoded, unauthenticated, and valid only within the call. Existing
+command, report, checkpoint, market-data, and wire values are unchanged.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A9, A10, A12, A15, A20, A21,
+A22, A37, A39, A48, A50, A52, A55, A72, A77, A80, A81, A82, A84, A87,
+A103, A117, A138, A145, A146, A147, A148, A149] Let `A` be ordinary expiry-
+sweep preparation cost, `K` selected orders, `X` active GTD orders, `F`
+predicate cost, and `M` ordinary expiry commit cost. Canonical selection and
+exact expiry-index validation cost
+`O(K log(X + 1))` after ordinary preparation; complete selected-state
+validation adds expected `O(K)` active-order work. Acceptance costs
+`O(A + K log(X + 1) + F + M)` and decline costs
+`O(A + K log(X + 1) + F)`. Accepted commit reuses the prepared IDs and does
+not repeat the ordered-prefix traversal or sorting. The constructor-owned lease
+retains `O(K)` ID scratch, caller output owns `O(K)`
+`ActiveOrderSnapshot` rows, and evaluator auxiliary state is `O(1)`. Core
+rejection and replay retain their existing preparation path and skip selection,
+output, and `F`; a valid empty prefix invokes `F` without a lease or selected
+output. Coupled acceptance releases `K` reservations in expected `O(K)` time.
+Durable acceptance and business rejection append two existing frames; query
+failure, decline, unwind, and replay append zero. Count, quantity, and
+nanosecond-watermark arithmetic is exact integer arithmetic; approximation
+error is zero.
+
+**Falsification probe.** Across all four surfaces, exercise empty and mixed
+fully displayed, reserve, fully hidden, dormant stop-market, and dormant stop-
+limit GTD state with equal deadlines and nonmonotonic identities. Run
+accepting, declining, and unwinding predicates. Require exact instrument/
+version/sequence/previous-watermark/horizon/current-watermark provenance,
+canonical `(expires_at, OrderId)` rows, complete snapshots, selected count,
+`u128` total leaves, unchanged later-GTD and GTC orders, and one predicate call
+for a valid empty prefix. Exercise wrong route/version, a future horizon,
+watermark regression, every core rejection, exact retry, command-ID collision,
+selected-output reservation failure, expiry-index corruption, selection-pool
+exhaustion, and durable write/report failure.
+
+Count predicate and allocation calls; compare selection-pool availability,
+private/public book, expiry watermark, risk positions/reservations/exposures,
+command history, WAL frames, and plain/coupled-risk reopen state. Any selection,
+output, or predicate on rejection or replay; noncanonical, incomplete, aliased,
+or provenance-drifted observation; second expiry-prefix selection or sort at
+commit; partial watermark/cancellation mutation; WAL growth before acceptance;
+lease loss; reservation release on noncommit or missing release on acceptance;
+interposed shard transition; durable protocol or recovery drift; or new wire
+value falsifies A149.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
@@ -6120,6 +6202,27 @@ capability, a remaining risk, or an opportunity.
   control. It adds no remote or asynchronous validity, callback authentication
   or durability, controller authorization, session/calendar scheduling,
   cross-shard coordination, or completion aggregation.
+
+- **High impact:** A149 closes the expiry-query-to-sweep race inside one local
+  call. The predicate receives the exact prior and resulting watermark plus the
+  canonical complete GTD state that acceptance removes across plain, coupled-
+  risk, durable, and durable-risk books.
+
+- **Medium impact opportunity:** one expiry predicate can gate on exact
+  deadlines, resting or dormant state, leaves, display, aggregate expiring
+  quantity, and source sequence without correlating a separate active-order or
+  expiry-index query.
+
+- **Medium impact risk:** conditional expiry materializes `O(K)` private caller
+  output and executes its predicate synchronously while the shard is
+  exclusively borrowed. Allocation, expiry-index validation, callback latency,
+  and external blocking extend local sweep latency; no callback deadline or
+  scheduling isolation is provided.
+
+- **High impact boundary:** A149 is one process-local synchronous expiry
+  decision. It adds no remote or asynchronous validity, callback
+  authentication or durability, clock or calendar scheduling, controller
+  authorization, cross-shard coordination, or completion aggregation.
 
 - **Medium impact opportunity:** one predicate can gate immediate slippage,
   per-price concentration, passive resting admission, reserve/hidden residual

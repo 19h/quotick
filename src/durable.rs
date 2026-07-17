@@ -23,12 +23,12 @@ use crate::journal::{
 use crate::matching::{
     AccountControl, AccountControlSubmissionObservation, ActiveOrderObservation, CancelOrder,
     Command, CommandPreparation, ConditionalCommandOutcome, ConditionalExecutionPreflight,
-    ConditionalExecutionPreparation, ConditionalOrderOutcome, ExecutionReport,
-    ImmediateExecutionCurve, ImmediateExecutionCurveOutcome, ImmediateExecutionOutcome,
-    ImmediateExecutionQuote, ImmediateExecutionSubmission, InvariantViolation, MassCancel,
-    MassCancelObservation, MatchingError, NewOrder, OrderBook, OrderBookCheckpoint,
-    OrderBookCheckpointCapture, OrderBookCheckpointError, OrderBookLimits, OrderBookQueryError,
-    OrderExecution, PreparedCommand, ReplaceOrder, TradingStateControl,
+    ConditionalExecutionPreparation, ConditionalOrderOutcome, ExecutionReport, ExpirySweep,
+    ExpirySweepObservation, ImmediateExecutionCurve, ImmediateExecutionCurveOutcome,
+    ImmediateExecutionOutcome, ImmediateExecutionQuote, ImmediateExecutionSubmission,
+    InvariantViolation, MassCancel, MassCancelObservation, MatchingError, NewOrder, OrderBook,
+    OrderBookCheckpoint, OrderBookCheckpointCapture, OrderBookCheckpointError, OrderBookLimits,
+    OrderBookQueryError, OrderExecution, PreparedCommand, ReplaceOrder, TradingStateControl,
     TradingStateControlSubmissionObservation, evaluate_conditional_execution,
 };
 use crate::snapshot::{
@@ -927,6 +927,26 @@ impl DurableOrderBook {
         )
     }
 
+    /// Durably observes and conditionally applies one inclusive expiry sweep.
+    ///
+    /// Replay and core rejection bypass observation and `accept`. Otherwise
+    /// the predicate borrows the frozen current watermark and complete
+    /// canonical expiring selection before WAL append. Observation failure,
+    /// decline, or unwind changes neither WAL nor semantic state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableError`] for poison, preparation, observation, journal,
+    /// or commit failure. A post-acknowledgement failure poisons the instance
+    /// for deterministic reopen recovery.
+    pub fn try_submit_expiry_sweep_if(
+        &mut self,
+        command: ExpirySweep,
+        accept: impl FnOnce(&ExpirySweepObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<ExpirySweepObservation>, DurableError> {
+        self.submit_conditional_expiry_sweep(command, |_, observation| Ok(observation), accept)
+    }
+
     /// Durably and atomically quotes and conditionally submits one canonical IOC order.
     ///
     /// Replay and core rejection bypass `accept`. A declined quote is returned
@@ -1086,6 +1106,21 @@ impl DurableOrderBook {
         let preflight = self
             .book
             .prepare_conditional_trading_state_control::<DurableError>(command)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_expiry_sweep<T>(
+        &mut self,
+        command: ExpirySweep,
+        observe: impl FnOnce(&OrderBook, ExpirySweepObservation) -> Result<T, DurableError>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, DurableError> {
+        if self.is_poisoned() {
+            return Err(DurableError::Poisoned);
+        }
+        let preflight = self
+            .book
+            .prepare_conditional_expiry_sweep::<DurableError>(command)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 

@@ -21,11 +21,11 @@ use crate::journal::{
 use crate::matching::{
     AccountControl, AccountControlSubmissionObservation, ActiveOrderObservation, CancelOrder,
     Command, CommandPreparation, ConditionalCommandOutcome, ConditionalExecutionPreflight,
-    ConditionalExecutionPreparation, ConditionalOrderOutcome, ExecutionReport,
-    ImmediateExecutionCurve, ImmediateExecutionCurveOutcome, ImmediateExecutionOutcome,
-    ImmediateExecutionQuote, ImmediateExecutionSubmission, MassCancel, MassCancelObservation,
-    MatchingError, NewOrder, OrderBook, OrderBookQueryError, OrderExecution, PreparedCommand,
-    ReplaceOrder, TradingStateControl, TradingStateControlSubmissionObservation,
+    ConditionalExecutionPreparation, ConditionalOrderOutcome, ExecutionReport, ExpirySweep,
+    ExpirySweepObservation, ImmediateExecutionCurve, ImmediateExecutionCurveOutcome,
+    ImmediateExecutionOutcome, ImmediateExecutionQuote, ImmediateExecutionSubmission, MassCancel,
+    MassCancelObservation, MatchingError, NewOrder, OrderBook, OrderBookQueryError, OrderExecution,
+    PreparedCommand, ReplaceOrder, TradingStateControl, TradingStateControlSubmissionObservation,
     evaluate_conditional_execution,
 };
 use crate::risk::{
@@ -1057,6 +1057,27 @@ impl DurableRiskOrderBook {
         )
     }
 
+    /// Durably risk-gates, observes, and conditionally applies one expiry sweep.
+    ///
+    /// Replay plus core or risk rejection bypass observation and `accept`.
+    /// Otherwise the predicate borrows the frozen current watermark and
+    /// complete canonical expiring selection before WAL append. Observation
+    /// failure, decline, or unwind changes neither WAL, matching, nor risk
+    /// state. Acceptance releases exactly the selected reservations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableRiskError`] for poison, preparation, observation,
+    /// journal, or coupled commit failure. A post-acknowledgement failure
+    /// poisons the instance for deterministic reopen recovery.
+    pub fn try_submit_expiry_sweep_if(
+        &mut self,
+        command: ExpirySweep,
+        accept: impl FnOnce(&ExpirySweepObservation) -> bool,
+    ) -> Result<ConditionalCommandOutcome<ExpirySweepObservation>, DurableRiskError> {
+        self.submit_conditional_expiry_sweep(command, |_, observation| Ok(observation), accept)
+    }
+
     /// Durably risk-gates, quotes, and conditionally submits one canonical IOC order.
     ///
     /// Replay plus core or risk rejection bypass `accept`. Decline occurs
@@ -1221,6 +1242,21 @@ impl DurableRiskOrderBook {
         let preflight = self
             .managed
             .prepare_conditional_trading_state_control::<DurableRiskError>(command)?;
+        self.submit_conditional_execution(preflight, observe, accept)
+    }
+
+    fn submit_conditional_expiry_sweep<T>(
+        &mut self,
+        command: ExpirySweep,
+        observe: impl FnOnce(&OrderBook, ExpirySweepObservation) -> Result<T, DurableRiskError>,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<ConditionalCommandOutcome<T>, DurableRiskError> {
+        if self.is_poisoned() {
+            return Err(DurableRiskError::Poisoned);
+        }
+        let preflight = self
+            .managed
+            .prepare_conditional_expiry_sweep::<DurableRiskError>(command)?;
         self.submit_conditional_execution(preflight, observe, accept)
     }
 
