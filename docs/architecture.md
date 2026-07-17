@@ -1344,6 +1344,26 @@ process-local call-auction engine.
     - Both interfaces borrow cache storage. They allocate no output, clone no
       command or report, copy no event trace, construct no checkpoint, and
       mutate no auction state.
+12. `try_submit_uncross_if` holds one exclusive mutable engine borrow across
+    ordinary uncross preparation, validation, one synchronous predicate, and
+    commit of that same move-only preparation.
+    - `CallAuctionUncrossObservation` is a fixed-size zero-copy view borrowing
+      the prepared allocation plan, deterministic counterparty trades, and
+      remainder cancellations. It also binds exact command identity and receive
+      time, instrument/version, prospective command and first-event sequences,
+      current/resulting phase and book revisions, auction, band, reference,
+      clearing and uncross policies, and the previous still-current indication.
+    - Before invoking the predicate, the engine rejects foreign or stale engine
+      and book generations and revalidates every prepared fill, trade,
+      cancellation, aggregate, account binding, and trade-ID range. A replay or
+      business rejection bypasses both observation and predicate and follows
+      the ordinary report path.
+    - Predicate decline or unwind drops the preparation, returns its A86 lease,
+      and changes no sequence, event, indication, phase, book, trade identity,
+      history, risk, or durable state. Acceptance cannot admit an intervening
+      engine mutation and consumes the identical preparation. The observation
+      and decision are process-local and valid only during the call; they are
+      not retained or encoded.
 
 ## Coupled call-auction risk invariants
 
@@ -1425,6 +1445,11 @@ admission and tracks reservations and positions.
    one dangling non-retry command, verifies risk-aware replay, and supports
    single-file or segmented A/B cutover. The plain
    `DurableCallAuctionEngine` below remains a distinct non-risk grammar.
+9. Conditional uncross performs the same account-independent authorization as
+   ordinary uncross before constructing its observation. Decline or unwind
+   changes no reservation, exposure, position, or netting scratch. Acceptance
+   commits the observed trace once, releasing paired/remainder reservations and
+   applying the existing per-account net position update exactly once.
 
 ## Durable call-auction invariants
 
@@ -1461,6 +1486,11 @@ call-auction engine.
    acknowledgement poisons that instance; deterministic reopen is the only
    supported continuation. The configured buffered/data-sync/full-sync policy
    defines acknowledgement strength.
+   - Conditional uncross validates and invokes its process-local predicate
+     before command append. Acceptance and business rejection retain the same
+     command-before-state-before-report two-frame grammar. Decline, unwind, and
+     exact retry append zero frames; no command, report, checkpoint, or WAL
+     value changes.
 4. Full-WAL recovery starts a fresh engine, submits every persisted command,
    and requires exact equality with its following report. Checkpoint recovery
    independently validates direct state against complete semantic history,
@@ -2629,6 +2659,14 @@ available through the recovered live engine.
 Call-auction risk unit tests corrupt account-list cycles and unlink an otherwise
 valid reservation, then exercise middle removal, partial decrement, head
 removal, and final removal while auditing after every transition.
+Conditional call-auction uncross tests cover exact command, sequence, phase,
+book, band, reference, policy, previous-indication, allocation, trade, and
+remainder-cancellation provenance through zero-copy borrowed views. They cover
+predicate acceptance, decline, and unwind; core rejection, self-trade abort,
+and exact-replay predicate bypass; internally stale preparation rejection before
+the predicate; A86 lease exhaustion and return; coupled reservation/position
+application; zero-frame durable noncommit; two-frame acceptance and business
+rejection; and exact plain/coupled-risk reopen state.
 
 FOK tests cover reserve-hidden and fully hidden total-leaves eligibility,
 displayed- and hidden-class same-price self barriers, atomic decrement-and-
@@ -3104,6 +3142,7 @@ There is no additional claim that semantic checkpoint history is size bounded.
 | High | Conditional instrument control | Atomic revisioned trading-state control with exact current/target/resulting state and one canonical all-order cancellation set is implemented across plain, coupled-risk, durable, and durable-risk books; remaining work is authenticated controller authorization, sequenced session/calendar scheduling, cross-shard coordination, and completion aggregation |
 | High | Conditional expiry control | Atomic expiry control with exact prior/resulting watermarks and one canonical qualifying GTD set is implemented across plain, coupled-risk, durable, and durable-risk books; remaining work is authenticated controller authorization, sequenced clock/calendar scheduling, cross-shard coordination, and completion aggregation |
 | High | Conditional stop-reference control | Atomic bounded stop-reference control with exact prior/requested sourced references and one canonical qualifying dormant-stop prefix is implemented across plain, coupled-risk, durable, and durable-risk books; remaining work is authenticated source/controller authorization, raw-feed normalization and gap recovery, cross-shard coordination, and completion aggregation |
+| High | Conditional call-auction uncross | Atomic local binding of exact prepared allocation, counterparty trades, remainder cancellations, and phase/book provenance to the same uncross commit is implemented across plain, coupled-risk, durable, and durable-risk engines; remaining work is authenticated policy authority, durable decision evidence before command append, callback latency limits, remote protocol mapping, and multi-shard coordination |
 | High | Instrument lifecycle expansion | authoritative calendar ingestion/distribution/activation, session transitions, corporate actions, derivative expiry/exercise, and external symbology mappings |
 | High | Venue reserve-order conformance | per-venue refresh priority, modification rules, public feed mapping, session persistence, mass-cancel behavior, and certified protocol fixtures |
 | High | Coordinated multi-shard kill controls | local revisioned account fence and atomic cancellation are implemented; remaining evidence is authenticated firm/session/account ownership, cross-shard fanout, completion aggregation, and cancel-on-behalf audit export |

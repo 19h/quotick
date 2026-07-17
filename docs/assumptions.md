@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A150 are stable and are referenced from code comments and other
+identifiers A1-A151 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -5993,10 +5993,111 @@ mutation; WAL growth before acceptance; lease loss; reservation change on
 noncommit or trace divergence on acceptance; interposed shard transition;
 durable protocol or recovery drift; or new wire value falsifies A150.
 
+## A151 — atomic conditional call-auction uncross
+
+**Assumption.** One `try_submit_uncross_if` call on a `CallAuctionEngine`,
+`CallAuctionRiskManagedEngine`, `DurableCallAuctionEngine`, or
+`DurableCallAuctionRiskEngine` holds the corresponding exclusive mutable shard
+borrow across ordinary A63/A64 uncross preparation, complete preparation
+validation, one borrowed local predicate, and commit of that same move-only
+preparation. The command remains an ordinary `CallAuctionUncrossCommand` and
+the accepted/rejected result remains an ordinary `CallAuctionExecutionReport`.
+
+For a core-admissible executable uncross, `CallAuctionUncrossObservation`
+borrows the A86 allocation plan, deterministic counterparty trades, and
+remainder cancellations directly from the preparation. Its fixed-size value
+also binds exact command identity and receive time, instrument ID/version,
+prospective command and first-event sequences, current and resulting phase and
+book revisions, active auction, price band, reference, price and uncross
+policies, and the previous still-current A112 indication. Before predicate
+execution, the engine proves same-instance/same-generation engine state and
+revalidates every fill, trade, cancellation, source aggregate, account binding,
+trade-ID range, phase, revision, auction, and policy relation. The observation
+cannot outlive or mutate the preparation.
+
+Exact replay and every core business rejection, including A113 self-trade
+abort, bypass the predicate and return a reported outcome. Predicate decline
+or unwind drops the preparation and returns its A86 lease before consuming a
+sequence or changing event, indication, phase, book, trade identity, history,
+risk, public, or WAL state. Acceptance commits without an intervening engine
+mutation. Coupled acceptance applies the existing complete uncross risk trace
+once; its account-independent authorization adds no new rejection class.
+
+Durable acceptance and business rejection retain command-before-state-before-
+report and append the existing two frames. Decline, unwind, and replay append
+zero frames. The observation and callback decision are process-local,
+unencoded, unauthenticated, unauthorized, and retained only for the predicate
+duration. A151 introduces no command, report, market-data, checkpoint, snapshot,
+or WAL value and requires no wire-version change.
+
+**Dependent results.** [A1, A2, A3, A4, A5, A9, A10, A12, A15, A22, A37,
+A39, A52, A60, A61, A62, A63, A64, A65, A67, A72, A80, A81, A82, A85, A86,
+A110, A112, A113, A151] Let `A` be ordinary uncross preparation cost, `O` the
+canonical source-order count, `F_b + F_a` positive fills, `T` trade pairs, `C`
+remainder cancellations, `V` pre-predicate validation, `F` predicate cost, and
+`M` ordinary commit cost. Stable-AVL identity resolution and linear source
+scans give `V = O(O + (F_b + F_a + T + C) log(O + 1))`. Acceptance costs
+`O(A + V + F + M)` and decline or unwind costs `O(A + V + F)`. Ordinary `M`
+retains its own preparation validation before mutation, so acceptance performs
+the deliberate pre-predicate validation plus the ordinary commit validation.
+The observation and evaluator add `O(1)` auxiliary state and no allocation;
+the existing A86 lease retains `O(F_b + F_a + T + C)` live elements. Coupled
+acceptance retains expected `O(T + C)` risk application. Durable acceptance and
+business rejection append two existing frames; decline, unwind, and replay
+append zero. Count, quantity, price, revision, and sequence arithmetic is exact
+integer arithmetic; approximation error is zero.
+
+**Falsification probe.** Across all four surfaces, exercise empty/nonexecutable,
+one-pair, multi-pair, partial, complete, retained-remainder, market-only,
+limit-only, mixed, signed-price, price-time, pro-rata-time, `Permit`, and A113
+`Abort` uncrosses. Run accepting, declining, and unwinding predicates. Require
+exact command/instrument/sequence/time/phase/book/auction/band/reference/policy/
+previous-indication provenance, pointer identity with the prepared plan/trade/
+cancellation storage, and exact equality between accepted observation and the
+committed trace. Exercise wrong route/version/cycle/revision/phase, empty
+execution, every business rejection, exact retry, command-ID collision,
+sequence/history/report exhaustion, A86 pool exhaustion, and internally stale
+or foreign preparations before predicate execution.
+
+Count predicate calls and compare lease availability, private/public book,
+phase, indication, sequence/trade counters, risk reservations/exposures/
+positions, command history, WAL frames, and plain/coupled reopen state. Any
+predicate on rejection or replay; copied, incomplete, mutable, retained, or
+provenance-drifted observation; callback before exact preparation validation;
+different accepted allocation, pair, or cancellation; sequencing or state
+change on noncommit; WAL growth before acceptance; lost lease; risk trace
+duplication or omission; interposed engine mutation; durable grammar/recovery
+drift; allocation; or new wire value falsifies A151.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** A151 closes the process-local gap between call-auction
+  allocation/pairing observation and uncross commit. Policy code can inspect
+  the exact prepared fills, counterparty pairs, remainder cancellations,
+  revisions, and prior indication while the exclusive engine borrow prevents
+  an interposed local transition; acceptance consumes that same preparation.
+
+- **Medium impact opportunity:** exact pre-uncross allocation, pairing, and
+  cancellation views can support deterministic local capacity, concentration,
+  exposure, surveillance, and execution-quality gates without reconstructing
+  private economics from the later event trace. Cross-shard or external
+  decisions still require synchronized and authenticated inputs.
+
+- **Medium impact risk:** the A151 predicate extends the exclusive local shard
+  borrow while it runs and retains one A86 lease. Slow or blocked callback work
+  therefore increases shard latency and can delay lease return. The operation
+  intentionally performs full fail-closed preparation validation before the
+  predicate and repeats ordinary validation at accepted commit; pinned-hardware
+  latency at configured maximum order count remains unknown.
+
+- **High impact boundary:** A151 is not a remote conditional-order protocol,
+  authorization system, durable decision record, multi-shard transaction, or
+  authenticated reference/band source. A process failure after a predicate
+  accepts but before command persistence leaves no durable evidence of that
+  decision; recovery can reproduce only appended ordinary commands.
 
 - **High impact:** continuous matching now supports a frozen-best
   market-to-limit instruction with GTC/GTD residuals, hidden-best capture,

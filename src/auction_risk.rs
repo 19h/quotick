@@ -20,7 +20,9 @@ use crate::auction_engine::{
     CallAuctionCommandOutcome, CallAuctionCommandPreparation, CallAuctionEngine,
     CallAuctionEngineConstructionError, CallAuctionEngineError, CallAuctionEngineLimits,
     CallAuctionEngineLimitsSpec, CallAuctionEventKind, CallAuctionExecutionReport,
-    CallAuctionRejectReason, PreparedCallAuctionCommand,
+    CallAuctionRejectReason, CallAuctionUncrossCommand, CallAuctionUncrossObservation,
+    ConditionalCallAuctionOutcome, ConditionalCallAuctionPreparation, PreparedCallAuctionCommand,
+    evaluate_conditional_uncross,
 };
 use crate::bounded_hash::BoundedHashMap;
 use crate::domain::{AccountId, OrderId, Side};
@@ -1564,6 +1566,32 @@ impl CallAuctionRiskManagedEngine {
         match self.prepare(command)? {
             CallAuctionCommandPreparation::Replay(report) => Ok(report),
             CallAuctionCommandPreparation::Ready(prepared) => self.commit(prepared),
+        }
+    }
+
+    /// Atomically risk-gates, observes, and conditionally commits one uncross.
+    ///
+    /// Replay plus core rejection bypass `accept`. A core-admissible uncross
+    /// borrows the exact zero-copy allocation, trade pairs, and remainder
+    /// cancellations from the preparation. Decline or unwind changes neither
+    /// auction nor risk state; acceptance commits that token and applies its
+    /// coupled risk trace once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionEngineError`] for preparation, observation
+    /// validation, or coupled commit failure.
+    pub fn try_submit_uncross_if(
+        &mut self,
+        command: CallAuctionUncrossCommand,
+        accept: impl FnOnce(&CallAuctionUncrossObservation<'_>) -> bool,
+    ) -> Result<ConditionalCallAuctionOutcome, CallAuctionEngineError> {
+        let preparation = self.prepare(CallAuctionCommand::Uncross(command))?;
+        match evaluate_conditional_uncross(&self.engine, preparation, accept)? {
+            ConditionalCallAuctionPreparation::Complete(outcome) => Ok(outcome),
+            ConditionalCallAuctionPreparation::Commit(prepared) => self
+                .commit(prepared)
+                .map(ConditionalCallAuctionOutcome::Reported),
         }
     }
 

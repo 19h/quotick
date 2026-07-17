@@ -413,6 +413,15 @@ Run any program with `cargo run --example <name>`.
   guaranteeing that currently valid individual/non-empty mass cancellation,
   freeze/close, and uncross commands remain possible for a full book even at
   exhausted ordinary capacity.
+- Atomic conditional uncross on the plain, coupled-risk, and both durable
+  engine surfaces. One exclusive shard borrow spans ordinary uncross
+  preparation, fail-closed validation, a zero-copy predicate view of exact
+  command/sequence/phase/book provenance, allocation, counterparty trades,
+  remainder cancellations, and commit of that same move-only preparation.
+  Replay and business rejection bypass the predicate; decline or unwind
+  returns the leased buffers without sequencing, state mutation, risk change,
+  or WAL growth. Durable acceptance and rejection retain the existing two-
+  frame command/report grammar.
 - Zero-copy exact lookup and chronological iteration over the engine's bounded
   command/report history, including accepted commands and business rejections;
   exact retries add no row and do not change the canonical cached report.
@@ -450,6 +459,9 @@ Run any program with `cargo run --example <name>`.
   gate before observation. Acceptance transitions exactly the observed
   dormant reservations through the ordinary trigger, trade, cancellation, and
   residual lifecycle; noncommit leaves every reservation unchanged.
+  Conditional call-auction uncross is also account-independent before
+  observation. Acceptance applies the ordinary complete uncross trace once;
+  decline or unwind leaves reservations, exposures, and positions unchanged.
 - Reservation lifecycle derived from the sequenced trace across fills,
   cancellation, GTD expiry, stop arming/activation, replacement, mass
   cancellation, account controls, and self-trade prevention; dormant stops
@@ -619,6 +631,9 @@ Conditional expiry-sweep predicates have the same process-local boundary and
 are not persisted, authenticated, clock-scheduled, or transported.
 Conditional stop-trigger-sweep predicates have the same process-local boundary
 and are not persisted, authenticated, source-authorized, or transported.
+Conditional call-auction uncross predicates are likewise process-local and are
+not persisted, authenticated, authorized, transported, or retained as durable
+decision evidence.
 Their synchronous execution extends the exclusive local shard borrow. A
 dormant-stop observation contains no activation-time forecast, and active
 minimum-quantity IOC observations must be interpreted with the submitted
@@ -663,7 +678,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 150 tagged assumptions (A1–A150), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 151 tagged assumptions (A1–A151), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -771,7 +786,11 @@ includes:
   risk, public-feed, replay, snapshot, and WAL recovery, and a 10,000-command
   engine phase-model run. Fail-closed self-trade abort is covered across
   canonical pairing, sequencing, risk neutrality, public no-change projection,
-  stable codecs, and durable exact retry. Retained auction-history queries
+  stable codecs, and durable exact retry. Atomic conditional uncross coverage
+  proves exact zero-copy allocation/trade/cancellation observation, decline and
+  unwind neutrality, predicate bypass on rejection/replay, lease exhaustion
+  and return, coupled-risk application, WAL-free noncommit, and plain/coupled
+  durable recovery. Retained auction-history queries
   cover accepted and rejected rows, exact lookup, zero-copy chronological
   iteration, retry stability, unchanged resource telemetry, and durable
   recovery. Account-order queries cover canonical all/side selection, unknown

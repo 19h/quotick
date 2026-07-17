@@ -1239,6 +1239,12 @@ impl PreparedCallAuctionUncross {
         self.state_revision
     }
 
+    /// Returns the collection revision produced by successful commit.
+    #[must_use]
+    pub const fn resulting_state_revision(&self) -> u64 {
+        self.next_state_revision
+    }
+
     /// Returns the explicit uncross policy.
     #[must_use]
     pub const fn policy(&self) -> CallAuctionUncrossPolicy {
@@ -3032,6 +3038,22 @@ impl CallAuctionBook {
             policy: prepared.policy,
             pooled: prepared.pooled,
         })
+    }
+
+    pub(crate) fn validate_uncross_observation(
+        &self,
+        prepared: &PreparedCallAuctionUncross,
+    ) -> Result<(), CallAuctionCommitError> {
+        if prepared.book_instance_id != self.instance_id {
+            return Err(CallAuctionCommitError::ForeignPreparation);
+        }
+        if prepared.state_revision != self.state_revision {
+            return Err(CallAuctionCommitError::StalePreparation {
+                observed: prepared.state_revision,
+                current: self.state_revision,
+            });
+        }
+        self.validate_uncross_preparation(prepared)
     }
 
     /// Audits every redundant index, intrusive queue, aggregate, priority

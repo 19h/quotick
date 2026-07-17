@@ -15,7 +15,9 @@ use std::ops::Index;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::auction::{AuctionClearing, AuctionError, AuctionPriceBand, AuctionPricePolicy};
+use crate::auction::{
+    AuctionAllocationPlan, AuctionClearing, AuctionError, AuctionPriceBand, AuctionPricePolicy,
+};
 use crate::auction_book::{
     CallAuctionAdmissionError, CallAuctionAmendError, CallAuctionBook, CallAuctionBookLimits,
     CallAuctionCancelError, CallAuctionCancellation, CallAuctionCommitError,
@@ -604,6 +606,164 @@ pub struct CallAuctionIndicativeState {
     reference_price: Price,
     price_policy: AuctionPricePolicy,
     clearing: Option<AuctionClearing>,
+}
+
+/// Exact zero-copy economics prepared for one conditional call-auction uncross.
+///
+/// The value borrows constructor-owned preparation buffers and is valid only
+/// during the synchronous predicate call. It cannot outlive or mutate the
+/// underlying preparation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CallAuctionUncrossObservation<'a> {
+    command_id: CommandId,
+    instrument_id: InstrumentId,
+    instrument_version: InstrumentVersion,
+    command_sequence: u64,
+    first_event_sequence: u64,
+    auction_id: AuctionId,
+    phase: CallAuctionPhase,
+    phase_revision: u64,
+    resulting_phase: CallAuctionPhase,
+    resulting_phase_revision: u64,
+    book_revision: u64,
+    resulting_book_revision: u64,
+    price_band: AuctionPriceBand,
+    reference_price: Price,
+    price_policy: AuctionPricePolicy,
+    uncross_policy: CallAuctionUncrossPolicy,
+    received_at: TimestampNs,
+    previous_indicative: Option<CallAuctionIndicativeState>,
+    allocation_plan: &'a AuctionAllocationPlan,
+    trades: &'a [CallAuctionTrade],
+    cancellations: &'a [CallAuctionCancellation],
+}
+
+impl CallAuctionUncrossObservation<'_> {
+    /// Returns the exact command identity.
+    #[must_use]
+    pub const fn command_id(&self) -> CommandId {
+        self.command_id
+    }
+
+    /// Returns the immutable instrument identity.
+    #[must_use]
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the immutable instrument-definition version.
+    #[must_use]
+    pub const fn instrument_version(&self) -> InstrumentVersion {
+        self.instrument_version
+    }
+
+    /// Returns the command sequence assigned by acceptance.
+    #[must_use]
+    pub const fn command_sequence(&self) -> u64 {
+        self.command_sequence
+    }
+
+    /// Returns the first event sequence assigned by acceptance.
+    #[must_use]
+    pub const fn first_event_sequence(&self) -> u64 {
+        self.first_event_sequence
+    }
+
+    /// Returns the frozen auction cycle being uncrossed.
+    #[must_use]
+    pub const fn auction_id(&self) -> AuctionId {
+        self.auction_id
+    }
+
+    /// Returns the current phase.
+    #[must_use]
+    pub const fn phase(&self) -> CallAuctionPhase {
+        self.phase
+    }
+
+    /// Returns the current phase revision.
+    #[must_use]
+    pub const fn phase_revision(&self) -> u64 {
+        self.phase_revision
+    }
+
+    /// Returns the phase produced by acceptance.
+    #[must_use]
+    pub const fn resulting_phase(&self) -> CallAuctionPhase {
+        self.resulting_phase
+    }
+
+    /// Returns the phase revision produced by acceptance.
+    #[must_use]
+    pub const fn resulting_phase_revision(&self) -> u64 {
+        self.resulting_phase_revision
+    }
+
+    /// Returns the exact collection-book revision used by preparation.
+    #[must_use]
+    pub const fn book_revision(&self) -> u64 {
+        self.book_revision
+    }
+
+    /// Returns the collection-book revision produced by acceptance.
+    #[must_use]
+    pub const fn resulting_book_revision(&self) -> u64 {
+        self.resulting_book_revision
+    }
+
+    /// Returns the authoritative candidate-price band.
+    #[must_use]
+    pub const fn price_band(&self) -> AuctionPriceBand {
+        self.price_band
+    }
+
+    /// Returns the authoritative reference price.
+    #[must_use]
+    pub const fn reference_price(&self) -> Price {
+        self.reference_price
+    }
+
+    /// Returns the explicit clearing-price policy.
+    #[must_use]
+    pub const fn price_policy(&self) -> AuctionPricePolicy {
+        self.price_policy
+    }
+
+    /// Returns the explicit allocation, remainder, and self-trade policy.
+    #[must_use]
+    pub const fn uncross_policy(&self) -> CallAuctionUncrossPolicy {
+        self.uncross_policy
+    }
+
+    /// Returns the gateway/controller receive time.
+    #[must_use]
+    pub const fn received_at(&self) -> TimestampNs {
+        self.received_at
+    }
+
+    /// Returns the latest still-current published indication, if present.
+    #[must_use]
+    pub const fn previous_indicative(&self) -> Option<CallAuctionIndicativeState> {
+        self.previous_indicative
+    }
+
+    /// Returns the exact order-level allocation consumed by acceptance.
+    #[must_use]
+    pub const fn allocation_plan(&self) -> &AuctionAllocationPlan {
+        self.allocation_plan
+    }
+
+    /// Returns the exact deterministic counterparty pairs emitted by acceptance.
+    #[must_use]
+    pub const fn trades(&self) -> &[CallAuctionTrade] {
+        self.trades
+    }
+
+    /// Returns exact positive remainders cancelled by acceptance.
+    #[must_use]
+    pub const fn cancellations(&self) -> &[CallAuctionCancellation] {
+        self.cancellations
+    }
 }
 
 impl CallAuctionIndicativeState {
@@ -1217,6 +1377,15 @@ pub enum CallAuctionCommandOutcome {
     Accepted,
     /// Command was sequenced but made no state change.
     Rejected(CallAuctionRejectReason),
+}
+
+/// Result of one synchronous conditional call-auction command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConditionalCallAuctionOutcome {
+    /// The predicate declined the complete prepared uncross without sequencing.
+    Declined,
+    /// Replay, business rejection, or accepted commit returned a report.
+    Reported(CallAuctionExecutionReport),
 }
 
 /// Exact immutable report for one sequenced command.
@@ -2829,6 +2998,43 @@ impl PreparedCallAuctionCommand {
     }
 }
 
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the move-only uncross preparation stays inline to avoid a conditional-path Box allocation"
+)]
+pub(crate) enum ConditionalCallAuctionPreparation {
+    Complete(ConditionalCallAuctionOutcome),
+    Commit(PreparedCallAuctionCommand),
+}
+
+pub(crate) fn evaluate_conditional_uncross(
+    engine: &CallAuctionEngine,
+    preparation: CallAuctionCommandPreparation,
+    accept: impl FnOnce(&CallAuctionUncrossObservation<'_>) -> bool,
+) -> Result<ConditionalCallAuctionPreparation, CallAuctionEngineError> {
+    match preparation {
+        CallAuctionCommandPreparation::Replay(report) => {
+            Ok(ConditionalCallAuctionPreparation::Complete(
+                ConditionalCallAuctionOutcome::Reported(report),
+            ))
+        }
+        CallAuctionCommandPreparation::Ready(prepared) => {
+            if prepared.core_rejection().is_some() {
+                return Ok(ConditionalCallAuctionPreparation::Commit(prepared));
+            }
+            let observation = engine.try_uncross_observation(&prepared)?;
+            if accept(&observation) {
+                Ok(ConditionalCallAuctionPreparation::Commit(prepared))
+            } else {
+                Ok(ConditionalCallAuctionPreparation::Complete(
+                    ConditionalCallAuctionOutcome::Declined,
+                ))
+            }
+        }
+    }
+}
+
 /// Process-local resource telemetry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CallAuctionEngineResourceStatus {
@@ -3273,6 +3479,32 @@ impl CallAuctionEngine {
         }
     }
 
+    /// Atomically observes and conditionally commits one frozen-cycle uncross.
+    ///
+    /// Replay and business rejection bypass `accept`. A core-admissible
+    /// command invokes the predicate with a zero-copy view of the exact
+    /// allocation, trades, and remainder cancellations already owned by the
+    /// move-only preparation. Decline or unwind drops that preparation without
+    /// sequencing or state mutation; acceptance commits the same token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallAuctionEngineError`] for collision, capacity, discovery,
+    /// allocation, pairing, counter, preparation-validation, or commit failure.
+    pub fn try_submit_uncross_if(
+        &mut self,
+        command: CallAuctionUncrossCommand,
+        accept: impl FnOnce(&CallAuctionUncrossObservation<'_>) -> bool,
+    ) -> Result<ConditionalCallAuctionOutcome, CallAuctionEngineError> {
+        let preparation = self.prepare(CallAuctionCommand::Uncross(command))?;
+        match evaluate_conditional_uncross(self, preparation, accept)? {
+            ConditionalCallAuctionPreparation::Complete(outcome) => Ok(outcome),
+            ConditionalCallAuctionPreparation::Commit(prepared) => self
+                .commit(prepared)
+                .map(ConditionalCallAuctionOutcome::Reported),
+        }
+    }
+
     /// Fully preflights one command without semantic state mutation.
     ///
     /// Exact retries precede every capacity gate. The returned move-only token
@@ -3330,6 +3562,70 @@ impl CallAuctionEngine {
                 events,
             },
         ))
+    }
+
+    fn try_uncross_observation<'a>(
+        &'a self,
+        prepared: &'a PreparedCallAuctionCommand,
+    ) -> Result<CallAuctionUncrossObservation<'a>, CallAuctionEngineError> {
+        if prepared.engine_instance_id != self.instance_id {
+            return Err(CallAuctionEngineError::ForeignPreparation);
+        }
+        if prepared.expected_retained_commands != self.reports.len()
+            || prepared.expected_retained_events != self.retained_event_count
+        {
+            return Err(CallAuctionEngineError::StalePreparation);
+        }
+        let CallAuctionCommand::Uncross(command) = prepared.command else {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        };
+        let PreparedCallAuctionAction::Uncross {
+            auction_id,
+            phase_revision,
+            prepared: uncross,
+        } = &prepared.action
+        else {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        };
+        self.book
+            .validate_uncross_observation(uncross)
+            .map_err(CallAuctionEngineError::UncrossCommit)?;
+        if *auction_id != command.auction_id
+            || self.active_auction_id != Some(*auction_id)
+            || self.phase != CallAuctionPhase::Frozen
+            || self.phase_revision != command.expected_phase_revision
+            || *phase_revision
+                != self
+                    .phase_revision
+                    .checked_add(1)
+                    .ok_or(CallAuctionEngineError::InternalInvariantViolation)?
+            || uncross.policy() != command.uncross_policy
+        {
+            return Err(CallAuctionEngineError::InternalInvariantViolation);
+        }
+        Ok(CallAuctionUncrossObservation {
+            command_id: command.command_id,
+            instrument_id: command.instrument_id,
+            instrument_version: command.instrument_version,
+            command_sequence: self.next_command_sequence,
+            first_event_sequence: self.next_event_sequence,
+            auction_id: *auction_id,
+            phase: self.phase,
+            phase_revision: self.phase_revision,
+            resulting_phase: CallAuctionPhase::Closed,
+            resulting_phase_revision: *phase_revision,
+            book_revision: uncross.state_revision(),
+            resulting_book_revision: uncross.resulting_state_revision(),
+            price_band: command.price_band,
+            reference_price: command.reference_price,
+            price_policy: command.price_policy,
+            uncross_policy: command.uncross_policy,
+            received_at: command.received_at,
+            previous_indicative: self.last_indicative,
+            allocation_plan: uncross.allocation_plan(),
+            trades: uncross.trades(),
+            cancellations: uncross.cancellations(),
+        })
     }
 
     /// Commits one same-instance, same-generation preparation.
@@ -5076,24 +5372,28 @@ impl std::error::Error for CallAuctionEngineInvariantViolation {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::{
         CallAuctionCheckpointError, CallAuctionCheckpointResource, CallAuctionCommand,
         CallAuctionCommandOutcome, CallAuctionCommandPreparation, CallAuctionEngine,
-        CallAuctionEventKind, CallAuctionPhase, CallAuctionPhaseControl, CallAuctionRejectReason,
-        CallAuctionUncrossCommand, reserve_call_auction_checkpoint_map,
+        CallAuctionEngineError, CallAuctionEventKind, CallAuctionPhase, CallAuctionPhaseControl,
+        CallAuctionRejectReason, CallAuctionSubmitOrder, CallAuctionUncrossCommand,
+        evaluate_conditional_uncross, reserve_call_auction_checkpoint_map,
         reserve_call_auction_checkpoint_set, reserve_call_auction_checkpoint_vec,
     };
-    use crate::auction::AuctionPricePolicy;
+    use crate::auction::{AuctionOrderConstraint, AuctionPricePolicy};
     use crate::auction_book::{
-        CallAuctionOrderSnapshot, CallAuctionRemainderPolicy, CallAuctionSelfTradePolicy,
-        CallAuctionUncrossPolicy,
+        CallAuctionCommitError, CallAuctionOrder, CallAuctionOrderSnapshot,
+        CallAuctionRemainderPolicy, CallAuctionSelfTradePolicy, CallAuctionUncrossPolicy,
     };
     use crate::instrument::{
         InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
         QuantityRules, ReserveOrderRules, TradingState,
     };
     use crate::{
-        AssetId, AuctionId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price, TimestampNs,
+        AccountId, AssetId, AuctionId, CommandId, InstrumentId, InstrumentVersion, OrderId, Price,
+        Quantity, Side, TimestampNs,
     };
 
     fn definition() -> InstrumentDefinition {
@@ -5263,6 +5563,101 @@ mod tests {
         assert_eq!(
             report.outcome,
             CallAuctionCommandOutcome::Rejected(CallAuctionRejectReason::NoExecutableInterest)
+        );
+    }
+
+    #[test]
+    fn conditional_uncross_rejects_a_stale_book_preparation_before_predicate() {
+        let mut engine = CallAuctionEngine::try_new(definition()).unwrap();
+        let instrument_id = engine.book.definition().instrument_id();
+        let instrument_version = engine.book.definition().version();
+        let auction_id = AuctionId::new(1).unwrap();
+        engine
+            .submit(CallAuctionCommand::PhaseControl(CallAuctionPhaseControl {
+                command_id: CommandId::new(1).unwrap(),
+                instrument_id,
+                instrument_version,
+                auction_id,
+                expected_phase_revision: 0,
+                target_phase: CallAuctionPhase::Collecting,
+                received_at: TimestampNs::from_unix_nanos(1),
+            }))
+            .unwrap();
+        for (command_id, order_id, account_id, side) in
+            [(2_u64, 1_u64, 1_u64, Side::Buy), (3, 2, 2, Side::Sell)]
+        {
+            engine
+                .submit(CallAuctionCommand::Submit(CallAuctionSubmitOrder {
+                    command_id: CommandId::new(command_id).unwrap(),
+                    auction_id,
+                    expected_phase_revision: 1,
+                    order: CallAuctionOrder::new(
+                        OrderId::new(order_id).unwrap(),
+                        AccountId::new(account_id).unwrap(),
+                        instrument_id,
+                        instrument_version,
+                        side,
+                        AuctionOrderConstraint::Market,
+                        Quantity::new(2).unwrap(),
+                        crate::auction::AuctionPriorityClass::HIGHEST,
+                    ),
+                    received_at: TimestampNs::from_unix_nanos(command_id),
+                }))
+                .unwrap();
+        }
+        engine
+            .submit(CallAuctionCommand::PhaseControl(CallAuctionPhaseControl {
+                command_id: CommandId::new(4).unwrap(),
+                instrument_id,
+                instrument_version,
+                auction_id,
+                expected_phase_revision: 1,
+                target_phase: CallAuctionPhase::Frozen,
+                received_at: TimestampNs::from_unix_nanos(4),
+            }))
+            .unwrap();
+        let command = CallAuctionCommand::Uncross(CallAuctionUncrossCommand {
+            command_id: CommandId::new(5).unwrap(),
+            instrument_id,
+            instrument_version,
+            auction_id,
+            expected_phase_revision: 2,
+            price_band: engine.book.instrument_price_band(),
+            reference_price: Price::from_raw(50),
+            price_policy: AuctionPricePolicy::REFERENCE_THEN_LOWER,
+            uncross_policy: CallAuctionUncrossPolicy::new(
+                crate::auction::AuctionAllocationPolicy::PriceTime,
+                CallAuctionRemainderPolicy::CancelAll,
+                CallAuctionSelfTradePolicy::Permit,
+            ),
+            received_at: TimestampNs::from_unix_nanos(5),
+        });
+        let preparation = engine.prepare(command).unwrap();
+        assert_eq!(
+            engine.book.resource_status().available_prepared_uncrosses,
+            1
+        );
+        engine
+            .book
+            .cancel(AccountId::new(1).unwrap(), OrderId::new(1).unwrap())
+            .unwrap();
+        let called = Cell::new(false);
+        let error = evaluate_conditional_uncross(&engine, preparation, |_| {
+            called.set(true);
+            true
+        })
+        .unwrap_err();
+        assert!(!called.get());
+        assert!(matches!(
+            error,
+            CallAuctionEngineError::UncrossCommit(CallAuctionCommitError::StalePreparation {
+                observed: 2,
+                current: 3,
+            })
+        ));
+        assert_eq!(
+            engine.book.resource_status().available_prepared_uncrosses,
+            2
         );
     }
 

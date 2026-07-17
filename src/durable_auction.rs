@@ -15,6 +15,8 @@ use crate::auction_engine::{
     CallAuctionCommand, CallAuctionCommandPreparation, CallAuctionEngine,
     CallAuctionEngineConstructionError, CallAuctionEngineError,
     CallAuctionEngineInvariantViolation, CallAuctionEngineLimits, CallAuctionExecutionReport,
+    CallAuctionUncrossCommand, CallAuctionUncrossObservation, ConditionalCallAuctionOutcome,
+    ConditionalCallAuctionPreparation, PreparedCallAuctionCommand, evaluate_conditional_uncross,
 };
 use crate::auction_risk::{
     CallAuctionRiskCheckpoint, CallAuctionRiskCheckpointCapture, CallAuctionRiskCheckpointError,
@@ -997,6 +999,46 @@ impl DurableCallAuctionEngine {
             }
             CallAuctionCommandPreparation::Ready(prepared) => prepared,
         };
+        self.commit_prepared(prepared)
+    }
+
+    /// Durably observes and conditionally commits one frozen-cycle uncross.
+    ///
+    /// Replay and business rejection bypass `accept`. The predicate borrows
+    /// the exact zero-copy preparation before WAL append. Decline or unwind
+    /// changes neither WAL nor auction state. Acceptance persists and commits
+    /// the same move-only token under the ordinary poison/recovery protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, preparation,
+    /// observation validation, journal, or commit failure.
+    pub fn try_submit_uncross_if(
+        &mut self,
+        command: CallAuctionUncrossCommand,
+        accept: impl FnOnce(&CallAuctionUncrossObservation<'_>) -> bool,
+    ) -> Result<ConditionalCallAuctionOutcome, DurableCallAuctionError> {
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        let preparation = self.engine.prepare(CallAuctionCommand::Uncross(command))?;
+        match evaluate_conditional_uncross(&self.engine, preparation, accept)? {
+            ConditionalCallAuctionPreparation::Complete(outcome) => {
+                if self.is_poisoned() {
+                    return Err(DurableCallAuctionError::Poisoned);
+                }
+                Ok(outcome)
+            }
+            ConditionalCallAuctionPreparation::Commit(prepared) => self
+                .commit_prepared(prepared)
+                .map(ConditionalCallAuctionOutcome::Reported),
+        }
+    }
+
+    fn commit_prepared(
+        &mut self,
+        prepared: PreparedCallAuctionCommand,
+    ) -> Result<CallAuctionExecutionReport, DurableCallAuctionError> {
         if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }
@@ -1592,6 +1634,46 @@ impl DurableCallAuctionRiskEngine {
             }
             CallAuctionCommandPreparation::Ready(prepared) => prepared,
         };
+        self.commit_prepared(prepared)
+    }
+
+    /// Durably risk-gates, observes, and conditionally commits one uncross.
+    ///
+    /// Replay plus core rejection bypass `accept`. The predicate borrows the
+    /// exact zero-copy preparation before WAL append. Decline or unwind changes
+    /// neither WAL, auction, nor risk state. Acceptance persists and commits
+    /// that token and applies its coupled risk trace once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableCallAuctionError`] for poison, preparation,
+    /// observation validation, journal, or coupled commit failure.
+    pub fn try_submit_uncross_if(
+        &mut self,
+        command: CallAuctionUncrossCommand,
+        accept: impl FnOnce(&CallAuctionUncrossObservation<'_>) -> bool,
+    ) -> Result<ConditionalCallAuctionOutcome, DurableCallAuctionError> {
+        if self.is_poisoned() {
+            return Err(DurableCallAuctionError::Poisoned);
+        }
+        let preparation = self.managed.prepare(CallAuctionCommand::Uncross(command))?;
+        match evaluate_conditional_uncross(self.managed.engine(), preparation, accept)? {
+            ConditionalCallAuctionPreparation::Complete(outcome) => {
+                if self.is_poisoned() {
+                    return Err(DurableCallAuctionError::Poisoned);
+                }
+                Ok(outcome)
+            }
+            ConditionalCallAuctionPreparation::Commit(prepared) => self
+                .commit_prepared(prepared)
+                .map(ConditionalCallAuctionOutcome::Reported),
+        }
+    }
+
+    fn commit_prepared(
+        &mut self,
+        prepared: PreparedCallAuctionCommand,
+    ) -> Result<CallAuctionExecutionReport, DurableCallAuctionError> {
         if self.is_poisoned() {
             return Err(DurableCallAuctionError::Poisoned);
         }

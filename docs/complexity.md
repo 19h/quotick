@@ -432,6 +432,21 @@ only through the first conflicting canonical pair, then emits one fixed-size
 business-rejection event. It performs no commit work or terminal-lane
 admission.
 
+For conditional uncross, let `A` be ordinary uncross preparation, `F_b + F_a`
+the positive fill count, `T` trade pairs, `C` remainder cancellations, `O`
+canonical source orders, `F` predicate cost, and `M` ordinary commit cost.
+Before the predicate, exact observation validation adds
+`V = O(O + (F_b + F_a + T + C) log(O + 1))`: source/cancellation topology is
+scanned linearly and every referenced active identity is resolved through the
+stable AVL. Acceptance costs `O(A + V + F + M)`; decline or unwind costs
+`O(A + V + F)`. Ordinary `M` retains its own commit-time validation, so the
+accepted conditional path deliberately pays that second fail-closed validation
+before mutation. The observation itself is fixed-size, borrows the existing
+A86 plan/trade/cancellation buffers, adds `O(1)` auxiliary state, and performs
+no allocation. Coupled-risk acceptance retains expected `O(T + C)` trace
+application. Durable acceptance and business rejection append two existing
+frames; decline, unwind, and replay append zero.
+
 One sequenced indicative publication reconstructs the canonical bid and ask
 aggregates and applies the shared discovery kernel in `O(B + A)` time with
 `O(1)` auxiliary space. It emits exactly one fixed-size event whether clearing
