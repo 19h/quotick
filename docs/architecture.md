@@ -2422,14 +2422,16 @@ replica contract.
 13. A non-replayed publication rejects a report above its batch bound and
     fallibly reserves the complete output vector before applying its first
     event. Uncross source scratch is cleared on success and every poisoning
-    path. Replica `limit_depth_iter` exposes double-ended, exact-size
+    path. Replica `try_limit_depth_iter` exposes typed double-ended, exact-size
     best-to-worst limit traversal without output allocation;
-    `limit_depth_range_iter` applies inclusive endpoints, treats an inverted
-    range as empty, and excludes separately reported market interest.
-    `try_limit_depth_range` counts selected rows without allocation and reserves
-    exactly that cardinality before copying. `try_snapshot`, `try_limit_depth`,
-    and `try_limit_depth_range` make caller-owned output allocation failure
-    typed; convenience wrappers may panic under A12.
+    `try_limit_depth_range_iter` applies inclusive endpoints, treats an
+    inverted range as empty, and excludes separately reported market interest.
+    Every streamed row validates its price and quantity/count aggregate.
+    `try_limit_depth_range` and `try_limit_depth` validate selected rows before
+    exactly reserving and copying them through a second immutable pass.
+    `try_snapshot`, `try_limit_depth`, and `try_limit_depth_range` make caller-
+    owned output allocation failure typed; convenience wrappers compose these
+    paths and may panic under A12.
 14. A replica owns active and standby AVL arenas for both sides plus a fixed
     batch-level scratch hash. It simulates all price-level occupancy transitions
     before mutation and validates aggregate deltas during application.
@@ -2439,7 +2441,7 @@ replica contract.
     definition prices, and both side cardinalities before clearing standby
     arenas. It fills already-owned standby slots and atomically swaps both
     sides; the prior active image becomes the next reusable standby allocation.
-    Process-local limits and allocation telemetry are absent from version-3
+    Process-local limits and allocation telemetry are absent from version-5
     payload bytes.
 16. A separate `CallAuctionMarketDataReplayBuffer` may retain one exact bounded
     suffix before snapshot recovery.
@@ -2467,7 +2469,25 @@ replica contract.
     Successful page selection and iteration are each `O(R)` for `R` returned
     updates with `O(1)` iterator state; an unavailable partial-oldest-batch
     diagnostic can scan `O(N)` retained slots. The ring is volatile and changes
-    no version-3 payload byte or external transport boundary.
+    no version-5 payload byte or external transport boundary.
+18. Every call-auction replica economic read composes one coherent observation
+    gate. It rejects poison before inspection, then validates scalar chronology,
+    phase/cycle lineage, indication provenance, both market aggregates, and both
+    best limit extrema. Aggregate quantity is bounded by order count times the
+    instrument active-leaves increment/maximum and is congruent to that
+    increment; the lower bound does not reuse the new-order minimum because a
+    partial fill can leave a smaller positive remainder.
+    Aggregate count is not capped by the replica's live-batch envelope because
+    a snapshot-only recovery consumer can hold a larger source image while
+    rejecting live batches above its local update maximum.
+    Locked and crossed best limits remain valid auction state.
+    `CallAuctionMarketDataObservation` owns that fixed-size state with
+    instrument/version and event/command provenance. Deeper full/range rows are
+    validated per item; bulk queries return no partial vector. Phase, revision,
+    indication, market, depth, range, and iterator convenience reads panic on a
+    typed unhealthy result. Event/command sequences, poison, limits, and
+    allocation telemetry remain available for repair. A valid current snapshot
+    clears poison and atomically re-enables every economic observation.
 
 ## Journal and recovery invariants
 
@@ -3031,7 +3051,12 @@ reservations and require structural rejection.
 Replica limit-depth query tests additionally cover allocation-free
 best-to-worst full and inclusive-band traversal, reverse traversal, limits,
 inverted bands, separate market interest, and authoritative-book parity on
-both sides.
+both sides. Coherent-observation tests bind phase, indication, event/command
+sequences, book revision, market interest, and both best limits in one fixed-
+size value. An actual invalid incremental transition must fence every economic
+read until snapshot repair; unit corruption tests require outer failure for
+invalid scalar/extremum state, forward/reverse per-item failure for deeper
+rows, selected-prefix locality, and bulk no-partial failure.
 
 Ledger-capacity tests independently exhaust balance, transaction, reversal,
 record, per-entry, per-record, and retained-posting resources; verify exact

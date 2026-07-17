@@ -567,6 +567,12 @@ Run any program with `cargo run --example <name>`.
   per-instrument replay ring repairs retained short gaps without allocation;
   older gaps recover by atomically swapping double-buffered, pre-reserved
   snapshot arenas.
+- Call-auction replicas expose one fixed-size coherent observation binding
+  event/command provenance, phase/cycle, book revision, nullable indication,
+  market interest, and both best limit levels. Poison or incoherent scalar/best
+  state fails before economic output; typed full/range iterators validate every
+  selected row, bulk queries return no partial vector, and a current valid
+  snapshot atomically re-enables the complete read boundary.
 - Call-auction replay retains exact batch starts and ends, never splits a
   multi-update uncross, two-update replacement, or mass-cancel removal/
   completion trace across pages, and
@@ -757,7 +763,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 158 tagged assumptions (A1–A158), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 159 tagged assumptions (A1–A159), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |

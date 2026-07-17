@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A158 are stable and are referenced from code comments and other
+identifiers A1-A159 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -6636,10 +6636,122 @@ rejection or replay, stale or drifting transition, partial mutation, noncommit
 effect, risk change, WAL growth before acceptance, recovery divergence,
 successful-path allocation, or new wire value falsifies A158.
 
+## A159 — fail-closed call-auction replica observation boundary
+
+**Assumption.** One public observation holds one immutable
+`CallAuctionMarketDataReplica` borrow. Every economic fallible query composes
+`try_observation` as one shared gate. The gate rejects `poisoned = true` before
+economic state inspection. It then requires command sequence not to exceed
+event sequence, collection-book revision and phase revision not to exceed event
+sequence, and a retained trade ID not to exceed event sequence. Book and phase
+revisions are deliberately compared with the event boundary rather than the
+complete-command counter because the unframed single-update API advances no
+command boundary.
+
+For one aggregate with quantity `Q`, order count `C`, instrument active-leaves
+increment `q_inc`, and per-order maximum `q_max`, empty state requires
+`Q = C = 0`. Occupied state requires `C >= 1`,
+`C q_inc <= Q <= C q_max`, and `Q mod q_inc = 0`. The lower bound uses the
+increment rather than the new-order minimum because partial auction execution
+can leave one positive active remainder below that admission minimum. The gate
+applies this exact rule to both market aggregates. It validates both best limit
+prices against the immutable
+instrument grid/collar and applies the same aggregate rule to both best rows.
+Locked and crossed opposing limit extrema remain valid call-auction collection
+state and are not subjected to a continuous-book spread rule.
+
+A present indication must be structurally valid, use valid definition prices,
+belong to the active cycle, equal the current phase revision and book revision,
+and be absent in `Closed`. The fixed-size owned
+`CallAuctionMarketDataObservation` binds instrument ID/version, final event and
+complete-command sequences, phase/cycle lineage, book revision, nullable
+indication, both market aggregates, and nullable best bid/ask limit rows. It is
+`Copy`, owns no allocation, and changes no replica state.
+
+`try_limit_depth_iter` and `try_limit_depth_range_iter` pass the shared gate
+before exposing an iterator. Every streamed row independently validates its
+price and exact aggregate rule. A valid prefix can therefore precede a typed
+deeper-row failure; forward, reverse, and mixed traversal cannot omit the
+selected invalid row. `try_limit_depth` and `try_limit_depth_range` validate
+the selected side/range/limit prefix without allocation, exactly reserve its
+semantic cardinality, and copy through a second identical pass. They return no
+partial vector. An invalid row outside the selected prefix or range is not
+inspected by that materializer.
+
+The `observation`, phase, book-revision, indication, market-aggregate, depth,
+range, and iterator convenience methods compose the fallible boundary and
+panic on typed failure under A12. Event/command sequence, poison, limits, and
+arena/hash telemetry remain readable because they diagnose snapshot repair and
+are not economic output. Applying one valid non-stale authoritative snapshot
+atomically swaps the preallocated depth image, replaces scalar state, clears
+poison, and re-enables the complete boundary. A159 changes no update, snapshot,
+replay, WAL, checkpoint, or wire value.
+
+**Dependent results.** [A1, A10, A12, A23, A55, A62, A67, A108, A112, A123,
+A159] Poison and scalar validation cost `O(1)`. Reading and validating both AVL
+extrema costs
+`O(log(P + 1))` for `P` occupied limit prices and uses `O(1)` space. The owned
+observation is fixed-size and allocates nothing. Full and range fallible
+iterators retain `O(log(P + 1))` setup, `O(P)` or `O(K)` complete traversal,
+`O(1)` iterator state, and zero output allocation; each selected row adds
+`O(1)` exact integer validation.
+
+For `S = min(P, L)` selected full-depth rows under limit `L`, materialization
+makes two `O(log(P + 1) + S)` prefix passes, exactly reserves `S` rows, and
+owns `O(S)` output. For `S = min(K, L)` selected rows in a band containing `K`
+prices, range materialization has the same two-pass bound over `K`. Quantity
+lower/upper bounds and increment congruence use exact `u128` arithmetic:
+`C`, `q_inc`, and `q_max` are `u64`, so each product fits `u128` without
+approximation or overflow. Snapshot repair retains its existing
+`O(P log(P + 1))` standby-fill and constant-time arena-swap bounds.
+
+**Falsification probe.** Exercise empty, market-only, one-sided, locked,
+crossed, and uncrossed books; nullable indication; batch and single-update
+application; both sides; limits `0`, `1`, occupied cardinality, and
+`usize::MAX`; inclusive, outside, and inverted bands; and forward, reverse,
+and mixed traversal. Require exact observation provenance, source parity,
+market/best values, fixed-size ownership, no successful observation/streaming
+allocation, and nonmutation.
+
+Cause an actual invalid incremental transition and require poison from
+observation, both fallible materializers, and both fallible iterator factories
+before output or iterator exposure. Require every economic convenience method
+to panic while sequence, poison, limits, and telemetry remain readable. Apply
+the current valid publisher snapshot and require exact source parity. In
+white-box state, inject zero, mismatched, below-active-leaves-bound,
+above-maximum, off-increment, and invalid-price aggregates at each extremum and
+at a deeper row; corrupt sequence/revision/phase/trade/indication coordinates.
+Require outer-gate failure for scalar/extremum corruption, per-item failure for
+selected deeper corruption from either end, prefix/range locality, and no
+partial owned vector. Any economic output while poisoned, invalid selected row
+omission, continuous spread rule, untyped failure, partial vector, diagnostic
+fencing, mutation, allocation on successful observation/streaming, recovery
+divergence, or wire-byte change falsifies A159.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** A159 closes the call-auction public-replica read-after-poison
+  gap. One fixed-size observation coherently binds phase, indication, market
+  interest, and best limit depth, while typed full/range streams and
+  materializers share the same fail-closed gate.
+
+- **Medium impact opportunity:** feed handlers, auction monitors, ladder and
+  heatmap views, and recovery controllers can consume one explicit healthy
+  boundary instead of correlating independent scalar/depth reads or treating a
+  stopped update loop as proof that the last public image remains valid.
+
+- **Medium impact risk:** a fallible depth stream can return a valid prefix
+  before encountering a corrupt non-extremum row. Consumers requiring
+  all-or-nothing ownership must use the vector materializers; the fixed-size
+  observation proves scalar and best-level coherence, not complete depth.
+
+- **High impact boundary:** A159 supplies no source authentication, transport
+  freshness, entitlement, conflation policy, cross-venue time alignment, or
+  complete private-book proof. Sequence and snapshot authority remain external
+  to the local replica.
 
 - **High impact:** A158 closes the final command-class gap in local atomic
   conditional call-auction control. One fixed-size predicate value owns the

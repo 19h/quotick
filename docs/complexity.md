@@ -1229,16 +1229,31 @@ Publisher fixed state is `O(O_max + P_max)` and replica fixed state is
 Default maxima are 4,096 active orders, 4,096 limit prices per side, and
 8,193 updates per command.
 
-For `P` occupied limit prices on one replica side and requested limit `L`,
-`limit_depth_iter` has `O(log(P + 1))` setup, `O(P)` complete traversal, and
-`O(1)` auxiliary space; `try_limit_depth` owns `O(min(P, L))` output. For an
-inclusive band containing `K` occupied limit prices,
-`limit_depth_range_iter` costs `O(log(P + 1) + K)` total time and `O(1)`
-auxiliary space. For `S = min(K, L)` selected rows,
-`try_limit_depth_range` counts and copies in two passes, exactly reserves `S`
-rows, and owns `O(S)` output. An inverted band is empty, and
-market-constrained interest remains separate. Both iterator types are double-
-ended; the full iterator is exact-size.
+Every call-auction replica economic query first constructs the fixed-size
+`CallAuctionMarketDataObservation`. Poison and scalar chronology checks are
+`O(1)`. Reading and validating both best AVL extrema is `O(log(P + 1))` for
+`P` occupied limit prices, with `O(1)` state and no allocation. Market and
+selected-limit aggregate validation is `O(1)`: for count `C`, quantity `Q`,
+active-leaves increment `q_inc`, and per-order maximum `q_max`, it checks exact
+`u128` bounds `C q_inc <= Q <= C q_max` and `Q mod q_inc = 0`. The increment
+is the lower bound because a partial fill can leave active quantity below the
+new-order admission minimum.
+
+For one replica side and requested limit `L`, `try_limit_depth_iter` has
+`O(log(P + 1))` gated setup, `O(P)` complete traversal, and `O(1)` auxiliary
+space; each item adds `O(1)` price/aggregate validation. For
+`S = min(P, L)`, `try_limit_depth` validates and copies through two
+`O(log(P + 1) + S)` prefix passes, exactly reserves `S` rows, and owns `O(S)`
+output. For an inclusive band containing `K` occupied limit prices,
+`try_limit_depth_range_iter` costs `O(log(P + 1) + K)` total time and `O(1)`
+auxiliary space. For `S = min(K, L)` selected range rows,
+`try_limit_depth_range` makes the same two validated passes, exactly reserves
+`S` rows, and owns `O(S)` output. An inverted band is empty, market-constrained
+interest remains separate, and locked/crossed limit extrema are valid. Both
+iterator types are double-ended; the full iterator is exact-size. A streamed
+valid prefix may precede a typed deeper-row failure; materializers expose no
+partial vector. Applying a current valid snapshot retains the existing
+`O(P log(P + 1))` standby-fill and constant-time arena-swap repair bound.
 
 For call-auction replay capacity `N`, one
 `CallAuctionMarketDataReplayBuffer` initializes `N` typed slots in `O(N)`
