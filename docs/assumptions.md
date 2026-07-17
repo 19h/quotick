@@ -6,7 +6,7 @@ listed falsification probe.
 The register holds one section per assumption. Each section states what is
 assumed (**Assumption**), which results depend on it (**Dependent results**),
 and the stress test that would refute it (**Falsification probe**). The
-identifiers A1-A164 are stable and are referenced from code comments and other
+identifiers A1-A165 are stable and are referenced from code comments and other
 documents.
 
 ## A1 — instrument definition authority
@@ -7055,10 +7055,108 @@ point dependence, double rounding, sign ambiguity, partial returned output,
 partial ledger effect, policy-metadata claim, allocation growth, or divergent
 explicit-versus-calculated settlement semantics falsifies A164.
 
+## A165 — provenance-bound entry-time pegged limits
+
+**Assumption.** One `PeggedPriceRequest` selects a prospective side, displayed
+`Primary`, displayed `Market`, or two-sided displayed `Midpoint` reference, a
+signed `i64` tick offset, an optional side-directed limit, and one explicit
+crossing policy. Primary means same-side displayed best; Market means opposite-
+side displayed best. Midpoint requires both displayed sides and selects a tick
+through `Down`, `Up`, or `NearestTiesToEven` rounding over signed tick indexes.
+The calculation uses Euclidean division, so negative prices follow the same
+grid semantics as positive prices. Fully hidden prices and reserve-hidden
+leaves do not supply a reference.
+
+The signed offset is applied in increasing-price direction. The optional limit
+is an upper cap for a buy and lower floor for a sell and must satisfy the
+immutable instrument grid and collar. `Allow` permits locking/crossing,
+`Reject` returns the exact bounded price and displayed opposite best, and
+`SlidePassive` moves a locking/crossing price to one tick below the displayed
+offer for a buy or one tick above the displayed bid for a sell. Arithmetic,
+unavailable-reference, limit, final-collar, rejected-crossing, and unavailable-
+passive-price failures are typed and nonmutating.
+
+`PeggedPriceResolution` retains the complete A128 `BestBidOffer`, request,
+rounded reference, offset-and-limit-bounded price, final price, and whether a
+passive slide occurred. `submit_pegged_new_order_if` first performs ordinary
+new-order preparation. For a new command that survives core and coupled-risk
+gates, the supplied command must name the resolution's instrument, definition
+version, side, and exact ordinary limit price. The current complete BBO,
+including event sequence and displayed aggregates, must equal the retained
+BBO before the local predicate runs. A mismatch is typed and changes no
+matching, risk, history, or WAL state. Exact replay and ordinary core or risk
+rejection retain A143 semantics and bypass resolution validation and the
+predicate. Plain, coupled-risk, durable, and durable-risk paths share this
+contract.
+
+The request and resolution are process-local caller state. Acceptance commits
+and, where applicable, persists only the ordinary `OrderType::Limit` command
+and its existing report. No peg instruction, automatic repricing, external
+reference, or additional command/report, WAL, snapshot, checkpoint, or market-
+data value is introduced.
+
+**Dependent results.** [A1, A3, A7, A12, A15, A17, A44, A48, A53, A75,
+A128, A143, A165] Resolution performs a fixed number of BBO reads, checked
+`i128` tick-index operations, comparisons, and instrument-price validations.
+It is `O(1)` time and space, allocates no output, and has zero numerical
+approximation error.
+
+Let `A` be ordinary new-order preparation, `Q` the applicable A124 private
+quote scan, `V = O(1)` resolution/command/freshness validation, `F` predicate
+cost, and `M` ordinary limit commit. Acceptance is
+`O(A + Q + V + F + M)` and decline is `O(A + Q + V + F)`. Stale or mismatched
+resolution failure is `O(A + Q + V)` after preparation and before `F` or
+mutation. Core/risk rejection and exact replay retain their existing bound and
+skip `Q`, `V`, and `F`. The fixed observation adds `O(1)` state and no output
+allocation. Durable acceptance and business rejection append the existing two
+frames; resolution failure, decline, unwind, and replay append zero.
+
+**Falsification probe.** Exercise empty, one-sided, two-sided, hidden-only,
+positive, zero-crossing, and negative-price books. Cover exact and half-tick
+midpoints with every rounding mode and even/odd lower tick; both sides; minimum
+and maximum collars; signed offset extrema; caps/floors that do and do not
+bound an otherwise unrepresentable raw price; and every crossing policy.
+Compare every result with an independent signed tick-index calculation.
+
+Submit matching and mismatched side/type/price commands; require ordinary core-
+rejection bypass for instrument/version mismatches; change price, quantity, or
+only event-sequence provenance after resolution; exercise predicate acceptance,
+decline, and unwind; core and risk rejection; exact retry before and after
+unrelated book progress; private-public BBO corruption; coupled reservation
+insertion; durable reopen; frame-count neutrality; and byte equality with the
+equivalent literal limit command. Any hidden reference, rounding/sign
+disagreement, untyped arithmetic/collar/crossing failure, stale predicate
+execution, partial mutation, retry revalidation, extra durable frame, new wire
+value, or automatic repricing falsifies A165.
+
 ## Bounded scope expansion
 
 Each entry below is tagged with an impact level and records an implemented
 capability, a remaining risk, or an opportunity.
+
+- **High impact:** A165 adds allocation-free displayed primary, market, and
+  explicitly rounded midpoint entry-price resolution with signed tick offsets,
+  buy caps/sell floors, and allow/reject/passive-slide crossing policies. One
+  complete BBO provenance token can be freshness-checked and submitted as an
+  ordinary limit across plain, coupled-risk, durable, and durable-risk books.
+
+- **Medium impact opportunity:** a local smart-order or quoting controller can
+  construct deterministic replayable entry decisions without duplicating BBO,
+  signed midpoint, tick, collar, or crossing arithmetic. The retained request,
+  intermediate prices, final price, and event sequence can be stored as
+  external decision evidence.
+
+- **Medium impact risk:** any intervening committed book event invalidates a
+  resolution even when displayed best prices and quantities are unchanged.
+  High-rate callers can therefore observe stale-resolution rejection and must
+  re-resolve under their own bounded retry/cancellation policy. The token does
+  not reserve displayed or hidden liquidity.
+
+- **High impact boundary:** A165 is entry-time price binding, not a native
+  persistent pegged order. It adds no automatic reference-driven cancel/
+  replace cycle, repricing priority rule, external or consolidated reference,
+  discretionary range, peg instruction in WAL/checkpoints, or authenticated
+  remote decision protocol.
 
 - **High impact:** A164 adds deterministic instrument-version-bound Buy/Sell
   call-auction fee and rebate assessment over lots, base units, or absolute

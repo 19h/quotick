@@ -725,6 +725,26 @@ zero-trade cancellation. Durable acceptance and business rejection append two
 existing frames; allocation failure, decline, unwind, and replay append zero.
 No command/report codec, event bound, or fixed authoritative state changes.
 
+`try_resolve_pegged_price` reads one coherent displayed BBO and performs a
+fixed number of checked `i128` tick-index operations, price validations, and
+comparisons. Primary, market, and midpoint selection, signed offset, optional
+buy cap/sell floor, and allow/reject/passive-slide crossing protection are
+therefore `O(1)` time and space, allocate no output, and have zero numerical
+approximation error.
+
+`submit_pegged_new_order_if` reuses ordinary conditional new-order preparation
+and private observation. Let `A` be ordinary preparation, `Q` the applicable
+A124 quote scan, `V = O(1)` exact command/resolution/BBO validation, `F`
+predicate cost, and `M` ordinary limit commit. Acceptance is
+`O(A + Q + V + F + M)` and decline is `O(A + Q + V + F)`. A stale or
+mismatched resolution fails in `O(A + Q + V)` before `F`, mutation, or WAL
+append. Core/risk rejection and exact replay skip `Q`, `V`, and `F` under the
+ordinary conditional contract. The resolution and paired observation are
+fixed-size `O(1)` state. Durable acceptance and business rejection append the
+existing two frames; resolution failure, decline, unwind, and replay append
+zero. No command/report codec, event bound, or fixed authoritative state
+changes.
+
 `submit_replace_order_if` and `try_submit_replace_order_curve_if` reuse the
 same evaluator with ordinary `ReplaceOrder` preparation. Let `R` be ordinary
 replacement preparation cost, `Q` the applicable A124 scan cost, `C` the

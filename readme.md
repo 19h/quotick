@@ -293,6 +293,15 @@ Run any program with `cargo run --example <name>`.
   commit, while replay and core/risk rejection bypass observation and the
   predicate. Submitted TIF remains authoritative, including minimum-quantity
   IOC cancellation and post-only/FOK admission behavior.
+- Entry-time pegged-limit resolution selects displayed primary, market, or
+  explicitly rounded midpoint prices, applies a signed tick offset, optional
+  buy cap or sell floor, and allow/reject/passive-slide crossing policy, then
+  binds the result to the complete BBO provenance. Atomic conditional
+  submission across plain, coupled-risk, and both durable paths freshness-
+  checks that token before the predicate and commits only the equivalent
+  ordinary limit command. Exact replay and core/risk rejection retain their
+  ordinary predicate-bypass behavior. The token is process-local and causes no
+  persistent automatic repricing or wire-format change.
 - Conditional replacement applies the same observation-bound commit to active
   and dormant stop-limit orders. Active replacement quotes or curves the target
   account/side/STP against the requested quantity and price; decline, unwind,
@@ -730,9 +739,9 @@ Live continuous and call-auction command/report history is likewise a local
 borrowed order-management interface; it provides no authenticated remote
 transport, account filtering, entitlement, pagination, audit export, eviction,
 or generation rollover.
-Conditional IOC, new-order, replacement, cancellation, mass-cancellation, and
-account-control predicates are process-local and are not persisted,
-authenticated, transported, or valid across shard borrows.
+Conditional IOC, new-order, pegged-limit, replacement, cancellation, mass-
+cancellation, and account-control predicates are process-local and are not
+persisted, authenticated, transported, or valid across shard borrows.
 Conditional trading-state-control predicates have the same process-local
 boundary and are not persisted, authenticated, or transported.
 Conditional expiry-sweep predicates have the same process-local boundary and
@@ -760,9 +769,11 @@ orders require an authoritative external source to
 submit each sequenced reference; matching never infers one
 from local trades or wall time. Source coordinates are validated and retained,
 but source authentication, transport recovery, and raw-feed normalization are
-external. The platform does not implement pegged orders,
-discretionary ranges, cross-instrument or multi-leg execution, volatility-
-interruption trigger logic, or venue-specific priority rule sets. Immutable
+external. Entry-time pegged resolution uses only the local displayed BBO and
+persists an ordinary limit command. The platform does not implement persistent
+automatically repriced pegged orders, discretionary ranges, cross-instrument
+or multi-leg execution, volatility-interruption trigger logic, or venue-
+specific priority rule sets. Immutable
 calendar images and day/session-to-GTD normalization are implemented, but
 authoritative calendar ingestion, signed distribution, atomic activation,
 original-request audit durability, and sequenced session-state transitions are
@@ -788,7 +799,7 @@ assumptions are documented in
 | Document | Contents |
 | --- | --- |
 | [Architecture](docs/architecture.md) | System boundary, per-subsystem invariants, failure model, standards provenance, required production increments |
-| [Assumption register](docs/assumptions.md) | 164 tagged assumptions (A1–A164), each with dependent results and a falsification probe |
+| [Assumption register](docs/assumptions.md) | 165 tagged assumptions (A1–A165), each with dependent results and a falsification probe |
 | [Local storage contract](docs/storage.md) | Writer ownership, segmented directories, checkpoint cutover, durability conditions, failure/recovery matrix |
 | [Complexity and resource bounds](docs/complexity.md) | Asymptotic time/space bounds and fixed-memory derivations for every subsystem |
 | [Trading-calendar payload v1](docs/trading-calendar-v1.md) | Stable immutable UTC schedule payload and canonical decoder rules |
@@ -871,6 +882,9 @@ includes:
   prior/requested sourced-reference and exact canonical trigger-prefix
   observation across all four book surfaces,
   activation-time failures,
+  displayed primary/market/midpoint pegged-limit resolution, signed offsets,
+  cap/floor and crossing policies, stale-token rejection, literal-limit wire
+  equality, coupled risk, durable recovery, and replay bypass,
   mass cancellation, account and trading-state controls, every self-trade
   policy, atomic FOK decrement-and-cancel barriers and exact minimum-quantity
   decrement-and-cancel execution through direct and dormant paths, coupled-risk

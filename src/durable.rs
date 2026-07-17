@@ -28,7 +28,8 @@ use crate::matching::{
     ImmediateExecutionOutcome, ImmediateExecutionQuote, ImmediateExecutionSubmission,
     InvariantViolation, MassCancel, MassCancelObservation, MatchingError, NewOrder, OrderBook,
     OrderBookCheckpoint, OrderBookCheckpointCapture, OrderBookCheckpointError, OrderBookLimits,
-    OrderBookQueryError, OrderExecution, PreparedCommand, ReplaceOrder, StopTriggerSweep,
+    OrderBookQueryError, OrderExecution, PeggedOrderObservation, PeggedOrderSubmissionError,
+    PeggedPriceResolution, PreparedCommand, ReplaceOrder, StopTriggerSweep,
     StopTriggerSweepObservation, TradingStateControl, TradingStateControlSubmissionObservation,
     evaluate_conditional_execution,
 };
@@ -469,6 +470,18 @@ impl From<SnapshotError> for DurableError {
     }
 }
 
+impl From<MatchingError> for PeggedOrderSubmissionError<DurableError> {
+    fn from(error: MatchingError) -> Self {
+        Self::Submission(DurableError::Matching(error))
+    }
+}
+
+impl From<DurableError> for PeggedOrderSubmissionError<DurableError> {
+    fn from(error: DurableError) -> Self {
+        Self::Submission(error)
+    }
+}
+
 /// One crash-recoverable, single-writer instrument matching shard.
 #[derive(Debug)]
 pub struct DurableOrderBook {
@@ -771,6 +784,41 @@ impl DurableOrderBook {
         self.submit_conditional_new_order(order, |_, observation| Ok(observation), accept)
     }
 
+    /// Durably freshness-checks and conditionally submits one resolved pegged limit.
+    ///
+    /// Exact replay and ordinary core rejection bypass the resolution check and
+    /// predicate. A new admissible command must exactly match the resolution's
+    /// instrument, version, side, price, and complete displayed-BBO provenance
+    /// before any WAL append. Acceptance persists only the ordinary limit
+    /// command and its report; peg instructions and automatic repricing are not
+    /// durable state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeggedOrderSubmissionError::PeggedPrice`] for peg binding or
+    /// freshness failure and [`PeggedOrderSubmissionError::Submission`] for
+    /// poison, matching, journal, or commit failure.
+    pub fn submit_pegged_new_order_if(
+        &mut self,
+        resolution: PeggedPriceResolution,
+        order: NewOrder,
+        accept: impl FnOnce(&PeggedOrderObservation<OrderExecution<ImmediateExecutionQuote>>) -> bool,
+    ) -> Result<
+        ConditionalCommandOutcome<PeggedOrderObservation<OrderExecution<ImmediateExecutionQuote>>>,
+        PeggedOrderSubmissionError<DurableError>,
+    > {
+        self.submit_conditional_new_order(
+            order,
+            |book, execution| {
+                resolution
+                    .validate_submission(book, order)
+                    .map_err(PeggedOrderSubmissionError::PeggedPrice)?;
+                Ok(PeggedOrderObservation::new(resolution, execution))
+            },
+            accept,
+        )
+    }
+
     /// Durably constructs an active private execution curve and conditionally
     /// submits one complete new order.
     ///
@@ -1040,17 +1088,17 @@ impl DurableOrderBook {
         self.submit_conditional_execution(preflight, observe, accept)
     }
 
-    fn submit_conditional_new_order<T>(
+    fn submit_conditional_new_order<T, E>(
         &mut self,
         order: NewOrder,
-        observe: impl FnOnce(
-            &OrderBook,
-            OrderExecution<ImmediateExecutionQuote>,
-        ) -> Result<T, DurableError>,
+        observe: impl FnOnce(&OrderBook, OrderExecution<ImmediateExecutionQuote>) -> Result<T, E>,
         accept: impl FnOnce(&T) -> bool,
-    ) -> Result<ConditionalCommandOutcome<T>, DurableError> {
+    ) -> Result<ConditionalCommandOutcome<T>, E>
+    where
+        E: From<DurableError> + From<MatchingError>,
+    {
         if self.is_poisoned() {
-            return Err(DurableError::Poisoned);
+            return Err(DurableError::Poisoned.into());
         }
         let preflight = self.book.prepare_conditional_new_order(order)?;
         self.submit_conditional_execution(preflight, observe, accept)
@@ -1165,17 +1213,20 @@ impl DurableOrderBook {
         self.submit_conditional_execution(preflight, observe, accept)
     }
 
-    fn submit_conditional_execution<T, U>(
+    fn submit_conditional_execution<T, U, E>(
         &mut self,
         preflight: ConditionalExecutionPreflight<T>,
-        observe: impl FnOnce(&OrderBook, T) -> Result<U, DurableError>,
+        observe: impl FnOnce(&OrderBook, T) -> Result<U, E>,
         accept: impl FnOnce(&U) -> bool,
-    ) -> Result<ConditionalCommandOutcome<U>, DurableError> {
+    ) -> Result<ConditionalCommandOutcome<U>, E>
+    where
+        E: From<DurableError> + From<MatchingError>,
+    {
         match evaluate_conditional_execution(preflight, |value| observe(&self.book, value), accept)?
         {
             ConditionalExecutionPreparation::Complete(decision) => {
                 if self.is_poisoned() {
-                    return Err(DurableError::Poisoned);
+                    return Err(DurableError::Poisoned.into());
                 }
                 Ok(decision)
             }
@@ -1183,7 +1234,7 @@ impl DurableOrderBook {
                 prepared,
                 observation,
             } => {
-                let report = self.commit_prepared(prepared)?;
+                let report = self.commit_prepared(prepared).map_err(E::from)?;
                 let retained_observation = if report.replayed { None } else { observation };
                 Ok(ConditionalCommandOutcome::Reported {
                     observation: retained_observation,

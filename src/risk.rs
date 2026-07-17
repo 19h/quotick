@@ -24,7 +24,8 @@ use crate::matching::{
     ImmediateExecutionQuote, ImmediateExecutionSubmission, MassCancel, MassCancelObservation,
     MatchingCapacity, MatchingError, NewOrder, OrderBook, OrderBookCheckpoint,
     OrderBookCheckpointError, OrderBookLimits, OrderBookLimitsSpec, OrderBookQueryError,
-    OrderExecution, OrderType, PreparedCommand, RejectReason, ReplaceOrder, SelfTradePrevention,
+    OrderExecution, OrderType, PeggedOrderObservation, PeggedOrderSubmissionError,
+    PeggedPriceResolution, PreparedCommand, RejectReason, ReplaceOrder, SelfTradePrevention,
     StopTriggerSweep, StopTriggerSweepObservation, Trade, TradingStateControl,
     TradingStateControlSubmissionObservation, evaluate_conditional_execution,
 };
@@ -2016,6 +2017,40 @@ impl RiskManagedOrderBook {
         accept: impl FnOnce(&OrderExecution<ImmediateExecutionQuote>) -> bool,
     ) -> Result<ConditionalOrderOutcome<ImmediateExecutionQuote>, MatchingError> {
         self.submit_conditional_new_order(order, |_, observation| Ok(observation), accept)
+    }
+
+    /// Atomically risk-gates and freshness-checks one entry-time pegged limit.
+    ///
+    /// New admissible commands must exactly match the resolution and its
+    /// complete displayed-BBO provenance. Exact replay plus ordinary core or
+    /// risk rejection bypass freshness validation and `accept`. Acceptance
+    /// applies the same coupled preparation as an ordinary limit command and
+    /// creates no persistent automatic-repricing state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeggedOrderSubmissionError::PeggedPrice`] for peg binding or
+    /// freshness failure and [`PeggedOrderSubmissionError::Submission`] for
+    /// ordinary coupled matching/risk preparation or commit failure.
+    pub fn submit_pegged_new_order_if(
+        &mut self,
+        resolution: PeggedPriceResolution,
+        order: NewOrder,
+        accept: impl FnOnce(&PeggedOrderObservation<OrderExecution<ImmediateExecutionQuote>>) -> bool,
+    ) -> Result<
+        ConditionalCommandOutcome<PeggedOrderObservation<OrderExecution<ImmediateExecutionQuote>>>,
+        PeggedOrderSubmissionError<MatchingError>,
+    > {
+        self.submit_conditional_new_order(
+            order,
+            |book, execution| {
+                resolution
+                    .validate_submission(book, order)
+                    .map_err(PeggedOrderSubmissionError::PeggedPrice)?;
+                Ok(PeggedOrderObservation::new(resolution, execution))
+            },
+            accept,
+        )
     }
 
     /// Atomically risk-gates, constructs an active private execution curve,

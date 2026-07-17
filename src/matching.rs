@@ -31,7 +31,7 @@ use crate::domain::{
 };
 use crate::history::RetainedCommandReport;
 use crate::indexed_avl::{DirectionalIter, IndexedAvlHandle, IndexedAvlMap};
-use crate::instrument::{AdmissionError, InstrumentDefinition, TradingState};
+use crate::instrument::{AdmissionError, InstrumentDefinition, PriceRules, TradingState};
 use crate::trace_arena::AppendOnlyTraceArena;
 
 static NEXT_ORDER_BOOK_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -1892,6 +1892,560 @@ impl BestBidOffer {
             return None;
         };
         Some(i128::from(bid.price.raw()) + i128::from(offer.price.raw()))
+    }
+}
+
+/// Displayed public price selected by one entry-time peg instruction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PegReference {
+    /// Same-side displayed best: bid for buys and offer for sells.
+    Primary,
+    /// Opposite-side displayed best: offer for buys and bid for sells.
+    Market,
+    /// Two-sided displayed midpoint under an explicit tick-rounding rule.
+    Midpoint(PegMidpointRounding),
+}
+
+/// Tick-grid rounding for a displayed midpoint that lies between two ticks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PegMidpointRounding {
+    /// Select the lower tick in signed price space.
+    Down,
+    /// Select the upper tick in signed price space.
+    Up,
+    /// Select the nearest tick and resolve an exact half tick to an even tick index.
+    NearestTiesToEven,
+}
+
+/// Price protection applied after peg reference, offset, and limit resolution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PegCrossingPolicy {
+    /// Permit the resolved limit to lock or cross the displayed opposite best.
+    Allow,
+    /// Return a typed error when the resolved limit would lock or cross.
+    Reject,
+    /// Move a locking or crossing limit to the nearest passive tick.
+    SlidePassive,
+}
+
+/// Caller-owned instruction for resolving one entry-time pegged limit price.
+///
+/// `offset_ticks` is signed in increasing-price direction. `limit_price` is a
+/// maximum for buys and a minimum for sells. The request does not become
+/// persistent order state and does not cause automatic repricing after entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeggedPriceRequest {
+    /// Side of the prospective order.
+    pub side: Side,
+    /// Displayed public reference and any midpoint rounding rule.
+    pub reference: PegReference,
+    /// Signed number of instrument ticks added to the selected reference.
+    pub offset_ticks: i64,
+    /// Optional buy cap or sell floor, necessarily on the instrument tick grid.
+    pub limit_price: Option<Price>,
+    /// Locking and crossing protection applied to the bounded price.
+    pub crossing_policy: PegCrossingPolicy,
+}
+
+/// Fixed-size, provenance-bound result of resolving one entry-time peg.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeggedPriceResolution {
+    request: PeggedPriceRequest,
+    best_bid_offer: BestBidOffer,
+    reference_price: Price,
+    bounded_price: Price,
+    price: Price,
+    passively_slid: bool,
+}
+
+impl PeggedPriceResolution {
+    /// Returns the exact caller instruction that produced this resolution.
+    #[must_use]
+    pub const fn request(self) -> PeggedPriceRequest {
+        self.request
+    }
+
+    /// Returns the coherent displayed BBO and its state provenance.
+    #[must_use]
+    pub const fn best_bid_offer(self) -> BestBidOffer {
+        self.best_bid_offer
+    }
+
+    /// Returns the source event sequence bound to this resolution.
+    #[must_use]
+    pub const fn book_event_sequence(self) -> u64 {
+        self.best_bid_offer.book_event_sequence()
+    }
+
+    /// Returns the selected reference after any midpoint tick rounding.
+    #[must_use]
+    pub const fn reference_price(self) -> Price {
+        self.reference_price
+    }
+
+    /// Returns the offset price after applying the optional buy cap or sell floor.
+    #[must_use]
+    pub const fn bounded_price(self) -> Price {
+        self.bounded_price
+    }
+
+    /// Returns the final admissible tick-aligned limit price.
+    #[must_use]
+    pub const fn price(self) -> Price {
+        self.price
+    }
+
+    /// Returns whether crossing protection moved the bounded price passively.
+    #[must_use]
+    pub const fn was_passively_slid(self) -> bool {
+        self.passively_slid
+    }
+
+    /// Returns the ordinary limit-order type represented by this resolution.
+    #[must_use]
+    pub const fn order_type(self) -> OrderType {
+        OrderType::Limit(self.price)
+    }
+
+    pub(crate) fn validate_submission(
+        self,
+        book: &OrderBook,
+        order: NewOrder,
+    ) -> Result<(), PeggedPriceError> {
+        let current = book.try_best_bid_offer()?;
+        if current.instrument_id() != self.best_bid_offer.instrument_id()
+            || current.instrument_version() != self.best_bid_offer.instrument_version()
+        {
+            return Err(PeggedPriceError::ForeignResolution {
+                expected_instrument_id: current.instrument_id(),
+                expected_instrument_version: current.instrument_version(),
+                actual_instrument_id: self.best_bid_offer.instrument_id(),
+                actual_instrument_version: self.best_bid_offer.instrument_version(),
+            });
+        }
+        if order.side != self.request.side {
+            return Err(PeggedPriceError::OrderSideMismatch {
+                expected: self.request.side,
+                actual: order.side,
+            });
+        }
+        if order.order_type != self.order_type() {
+            return Err(PeggedPriceError::OrderPriceMismatch {
+                expected: self.price,
+                actual: order.order_type,
+            });
+        }
+        if current != self.best_bid_offer {
+            return Err(PeggedPriceError::StaleResolution {
+                expected_book_event_sequence: self.best_bid_offer.book_event_sequence(),
+                actual_book_event_sequence: current.book_event_sequence(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Failure while resolving or freshness-checking an entry-time pegged price.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PeggedPriceError {
+    /// Coherent displayed BBO construction exposed an order-book invariant failure.
+    InvariantViolation(InvariantViolation),
+    /// The selected displayed reference was absent.
+    ReferenceUnavailable {
+        /// Prospective order side.
+        side: Side,
+        /// Reference that could not be selected.
+        reference: PegReference,
+    },
+    /// The optional buy cap or sell floor was not tick aligned.
+    LimitPriceOffTickGrid {
+        /// Invalid caller-supplied limit.
+        price: Price,
+    },
+    /// The optional buy cap or sell floor was outside the instrument collar.
+    LimitPriceOutsideCollar {
+        /// Invalid caller-supplied limit.
+        price: Price,
+    },
+    /// Tick-offset arithmetic or conversion to the signed price domain overflowed.
+    PriceArithmeticOverflow,
+    /// The final price was outside the instrument collar.
+    PriceOutsideCollar {
+        /// Computed final price.
+        price: Price,
+    },
+    /// Reject crossing policy encountered a locking or crossing price.
+    WouldCross {
+        /// Prospective order side.
+        side: Side,
+        /// Computed bounded price.
+        price: Price,
+        /// Displayed opposite best that would be locked or crossed.
+        opposite_best: Price,
+    },
+    /// A nearest passive price could not be represented within the collar.
+    PassivePriceUnavailable {
+        /// Prospective order side.
+        side: Side,
+        /// Displayed opposite best from which the passive tick was derived.
+        opposite_best: Price,
+    },
+    /// The ordinary limit command uses a different side.
+    OrderSideMismatch {
+        /// Side bound to the resolution request.
+        expected: Side,
+        /// Side named by the command.
+        actual: Side,
+    },
+    /// The ordinary command is not a limit at the resolved price.
+    OrderPriceMismatch {
+        /// Final resolved limit price.
+        expected: Price,
+        /// Actual command order type.
+        actual: OrderType,
+    },
+    /// The resolution belongs to another instrument shard or definition version.
+    ForeignResolution {
+        /// Instrument owned by the submission target.
+        expected_instrument_id: InstrumentId,
+        /// Definition version owned by the submission target.
+        expected_instrument_version: InstrumentVersion,
+        /// Instrument carried by the resolution.
+        actual_instrument_id: InstrumentId,
+        /// Definition version carried by the resolution.
+        actual_instrument_version: InstrumentVersion,
+    },
+    /// The book committed another event after the caller resolved the price.
+    StaleResolution {
+        /// Event sequence carried by the resolution.
+        expected_book_event_sequence: u64,
+        /// Current event sequence at conditional submission.
+        actual_book_event_sequence: u64,
+    },
+}
+
+impl fmt::Display for PeggedPriceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvariantViolation(error) => error.fmt(formatter),
+            Self::ReferenceUnavailable { side, reference } => {
+                write!(
+                    formatter,
+                    "{reference:?} reference is unavailable for {side:?}"
+                )
+            }
+            Self::LimitPriceOffTickGrid { price } => {
+                write!(
+                    formatter,
+                    "pegged limit {} is off the tick grid",
+                    price.raw()
+                )
+            }
+            Self::LimitPriceOutsideCollar { price } => {
+                write!(
+                    formatter,
+                    "pegged limit {} is outside the price collar",
+                    price.raw()
+                )
+            }
+            Self::PriceArithmeticOverflow => {
+                formatter.write_str("pegged price arithmetic overflowed")
+            }
+            Self::PriceOutsideCollar { price } => {
+                write!(
+                    formatter,
+                    "resolved pegged price {} is outside the collar",
+                    price.raw()
+                )
+            }
+            Self::WouldCross {
+                side,
+                price,
+                opposite_best,
+            } => write!(
+                formatter,
+                "resolved {side:?} pegged price {} would lock or cross opposite best {}",
+                price.raw(),
+                opposite_best.raw()
+            ),
+            Self::PassivePriceUnavailable {
+                side,
+                opposite_best,
+            } => write!(
+                formatter,
+                "passive {side:?} price from opposite best {} is outside the collar",
+                opposite_best.raw()
+            ),
+            Self::OrderSideMismatch { expected, actual } => write!(
+                formatter,
+                "pegged resolution side {expected:?} differs from order side {actual:?}"
+            ),
+            Self::OrderPriceMismatch { expected, actual } => write!(
+                formatter,
+                "pegged resolution requires limit {} but order type is {actual:?}",
+                expected.raw()
+            ),
+            Self::ForeignResolution {
+                expected_instrument_id,
+                expected_instrument_version,
+                actual_instrument_id,
+                actual_instrument_version,
+            } => write!(
+                formatter,
+                "submission target {expected_instrument_id}@{expected_instrument_version} differs from pegged resolution {actual_instrument_id}@{actual_instrument_version}"
+            ),
+            Self::StaleResolution {
+                expected_book_event_sequence,
+                actual_book_event_sequence,
+            } => write!(
+                formatter,
+                "pegged resolution event sequence {expected_book_event_sequence} is stale at {actual_book_event_sequence}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PeggedPriceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvariantViolation(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<InvariantViolation> for PeggedPriceError {
+    fn from(error: InvariantViolation) -> Self {
+        Self::InvariantViolation(error)
+    }
+}
+
+/// Failure while conditionally submitting a provenance-bound pegged limit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PeggedOrderSubmissionError<E> {
+    /// Matching, risk, durability, or wrapper-specific submission failure.
+    Submission(E),
+    /// Peg resolution, command binding, or freshness failure.
+    PeggedPrice(PeggedPriceError),
+}
+
+impl<E: fmt::Display> fmt::Display for PeggedOrderSubmissionError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Submission(error) => error.fmt(formatter),
+            Self::PeggedPrice(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for PeggedOrderSubmissionError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Submission(error) => Some(error),
+            Self::PeggedPrice(error) => Some(error),
+        }
+    }
+}
+
+impl From<MatchingError> for PeggedOrderSubmissionError<MatchingError> {
+    fn from(error: MatchingError) -> Self {
+        Self::Submission(error)
+    }
+}
+
+/// Peg resolution paired with the ordinary conditional-order observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeggedOrderObservation<T> {
+    resolution: PeggedPriceResolution,
+    execution: T,
+}
+
+impl<T> PeggedOrderObservation<T> {
+    pub(crate) const fn new(resolution: PeggedPriceResolution, execution: T) -> Self {
+        Self {
+            resolution,
+            execution,
+        }
+    }
+
+    /// Returns the exact resolution freshness-checked before the predicate.
+    #[must_use]
+    pub const fn resolution(&self) -> PeggedPriceResolution {
+        self.resolution
+    }
+
+    /// Returns the ordinary limit-order execution observation.
+    #[must_use]
+    pub const fn execution(&self) -> &T {
+        &self.execution
+    }
+
+    /// Consumes the pair into its resolution and ordinary execution observation.
+    #[must_use]
+    pub fn into_parts(self) -> (PeggedPriceResolution, T) {
+        (self.resolution, self.execution)
+    }
+}
+
+fn validate_pegged_request_limit(
+    rules: PriceRules,
+    limit: Option<Price>,
+) -> Result<(), PeggedPriceError> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    match rules.validate(limit) {
+        Ok(()) => Ok(()),
+        Err(AdmissionError::PriceOffTickGrid) => {
+            Err(PeggedPriceError::LimitPriceOffTickGrid { price: limit })
+        }
+        Err(AdmissionError::PriceOutsideCollar) => {
+            Err(PeggedPriceError::LimitPriceOutsideCollar { price: limit })
+        }
+        Err(_) => Err(PeggedPriceError::InvariantViolation(
+            InvariantViolation::new("price-rule validation returned a non-price error"),
+        )),
+    }
+}
+
+fn validate_pegged_bbo_prices(
+    rules: PriceRules,
+    best_bid_offer: BestBidOffer,
+) -> Result<(), PeggedPriceError> {
+    for (side, level) in [
+        (Side::Buy, best_bid_offer.bid()),
+        (Side::Sell, best_bid_offer.offer()),
+    ] {
+        let Some(level) = level else {
+            continue;
+        };
+        if rules.validate(level.price).is_err() {
+            return Err(PeggedPriceError::InvariantViolation(
+                InvariantViolation::new(format!(
+                    "displayed {side:?} reference price {} violates instrument rules",
+                    level.price.raw()
+                )),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn pegged_reference_index(
+    best_bid_offer: BestBidOffer,
+    request: PeggedPriceRequest,
+    tick: i128,
+) -> Result<i128, PeggedPriceError> {
+    let level = |value: Option<LevelSnapshot>| {
+        value.ok_or(PeggedPriceError::ReferenceUnavailable {
+            side: request.side,
+            reference: request.reference,
+        })
+    };
+    match request.reference {
+        PegReference::Primary => {
+            let value = match request.side {
+                Side::Buy => best_bid_offer.bid(),
+                Side::Sell => best_bid_offer.offer(),
+            };
+            Ok(i128::from(level(value)?.price.raw()).div_euclid(tick))
+        }
+        PegReference::Market => {
+            let value = match request.side {
+                Side::Buy => best_bid_offer.offer(),
+                Side::Sell => best_bid_offer.bid(),
+            };
+            Ok(i128::from(level(value)?.price.raw()).div_euclid(tick))
+        }
+        PegReference::Midpoint(rounding) => {
+            let bid = level(best_bid_offer.bid())?;
+            let offer = level(best_bid_offer.offer())?;
+            let sum = i128::from(bid.price.raw())
+                .div_euclid(tick)
+                .checked_add(i128::from(offer.price.raw()).div_euclid(tick))
+                .ok_or(PeggedPriceError::PriceArithmeticOverflow)?;
+            let lower = sum.div_euclid(2);
+            let is_half_tick = sum.rem_euclid(2) != 0;
+            Ok(match rounding {
+                PegMidpointRounding::Down => lower,
+                PegMidpointRounding::Up => lower + i128::from(is_half_tick),
+                PegMidpointRounding::NearestTiesToEven => {
+                    if !is_half_tick || lower.rem_euclid(2) == 0 {
+                        lower
+                    } else {
+                        lower + 1
+                    }
+                }
+            })
+        }
+    }
+}
+
+fn price_from_pegged_raw(raw: i128) -> Result<Price, PeggedPriceError> {
+    Ok(Price::from_raw(
+        i64::try_from(raw).map_err(|_| PeggedPriceError::PriceArithmeticOverflow)?,
+    ))
+}
+
+fn apply_pegged_crossing_policy(
+    rules: PriceRules,
+    best_bid_offer: BestBidOffer,
+    request: PeggedPriceRequest,
+    bounded_price: Price,
+    tick: i128,
+) -> Result<(Price, bool), PeggedPriceError> {
+    let opposite_best = match request.side {
+        Side::Buy => best_bid_offer.offer().map(|level| level.price),
+        Side::Sell => best_bid_offer.bid().map(|level| level.price),
+    };
+    let would_cross = opposite_best.is_some_and(|opposite| match request.side {
+        Side::Buy => bounded_price >= opposite,
+        Side::Sell => bounded_price <= opposite,
+    });
+    match (request.crossing_policy, opposite_best, would_cross) {
+        (PegCrossingPolicy::Reject, Some(opposite_best), true) => {
+            Err(PeggedPriceError::WouldCross {
+                side: request.side,
+                price: bounded_price,
+                opposite_best,
+            })
+        }
+        (PegCrossingPolicy::SlidePassive, Some(opposite_best), true) => {
+            let passive_raw = match request.side {
+                Side::Buy => i128::from(opposite_best.raw()) - tick,
+                Side::Sell => i128::from(opposite_best.raw()) + tick,
+            };
+            let Ok(passive_raw) = i64::try_from(passive_raw) else {
+                return Err(PeggedPriceError::PassivePriceUnavailable {
+                    side: request.side,
+                    opposite_best,
+                });
+            };
+            let passive = Price::from_raw(passive_raw);
+            if rules.validate(passive).is_err() {
+                return Err(PeggedPriceError::PassivePriceUnavailable {
+                    side: request.side,
+                    opposite_best,
+                });
+            }
+            Ok((passive, true))
+        }
+        _ => Ok((bounded_price, false)),
+    }
+}
+
+fn validate_resolved_pegged_price(rules: PriceRules, price: Price) -> Result<(), PeggedPriceError> {
+    match rules.validate(price) {
+        Ok(()) => Ok(()),
+        Err(AdmissionError::PriceOutsideCollar) => {
+            Err(PeggedPriceError::PriceOutsideCollar { price })
+        }
+        Err(AdmissionError::PriceOffTickGrid) => Err(PeggedPriceError::InvariantViolation(
+            InvariantViolation::new("resolved pegged price is off the instrument tick grid"),
+        )),
+        Err(_) => Err(PeggedPriceError::InvariantViolation(
+            InvariantViolation::new("price-rule validation returned a non-price error"),
+        )),
     }
 }
 
@@ -9368,6 +9922,44 @@ impl OrderBook {
         self.submit_conditional_new_order(order, |_, observation| Ok(observation), accept)
     }
 
+    /// Freshness-checks one resolved peg and conditionally submits its ordinary
+    /// limit command under the same exclusive book borrow.
+    ///
+    /// New admissible commands must match the resolution's instrument,
+    /// definition version, side, and final price. The complete displayed BBO,
+    /// including its event sequence, must still equal the state used for
+    /// resolution. Exact command replay and ordinary core rejection bypass the
+    /// freshness check and `accept`, preserving normal idempotency semantics.
+    /// Acceptance commits an ordinary [`OrderType::Limit`] command; neither the
+    /// peg instruction nor subsequent automatic repricing becomes book state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeggedOrderSubmissionError::PeggedPrice`] for a command/
+    /// resolution mismatch, foreign resolution, stale BBO, or BBO invariant
+    /// failure. Returns [`PeggedOrderSubmissionError::Submission`] for ordinary
+    /// matching preparation or commit failure.
+    pub fn submit_pegged_new_order_if(
+        &mut self,
+        resolution: PeggedPriceResolution,
+        order: NewOrder,
+        accept: impl FnOnce(&PeggedOrderObservation<OrderExecution<ImmediateExecutionQuote>>) -> bool,
+    ) -> Result<
+        ConditionalCommandOutcome<PeggedOrderObservation<OrderExecution<ImmediateExecutionQuote>>>,
+        PeggedOrderSubmissionError<MatchingError>,
+    > {
+        self.submit_conditional_new_order(
+            order,
+            |book, execution| {
+                resolution
+                    .validate_submission(book, order)
+                    .map_err(PeggedOrderSubmissionError::PeggedPrice)?;
+                Ok(PeggedOrderObservation::new(resolution, execution))
+            },
+            accept,
+        )
+    }
+
     /// Atomically constructs a private execution curve and conditionally
     /// submits one complete new order.
     ///
@@ -10627,6 +11219,64 @@ impl OrderBook {
             bid,
             offer,
         )
+    }
+
+    /// Resolves one displayed entry-time peg to an admissible ordinary limit.
+    ///
+    /// Primary and market references select the same-side and opposite-side
+    /// displayed best respectively. Midpoint resolution operates on tick
+    /// indexes with Euclidean division, so negative prices and exact half ticks
+    /// follow the requested rounding rule. A signed tick offset is applied,
+    /// followed by an optional buy cap or sell floor and the requested crossing
+    /// policy. Hidden-only liquidity never supplies a reference.
+    ///
+    /// The fixed-size result binds the complete displayed BBO to instrument,
+    /// immutable definition version, and final event sequence. Successful
+    /// resolution is `O(1)`, allocation-free, and non-mutating. It does not
+    /// register a persistent peg or arrange automatic repricing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeggedPriceError`] for invalid public BBO state, an unavailable
+    /// reference, invalid caller limit, arithmetic overflow, collar violation,
+    /// rejected crossing, or unavailable passive tick.
+    pub fn try_resolve_pegged_price(
+        &self,
+        request: PeggedPriceRequest,
+    ) -> Result<PeggedPriceResolution, PeggedPriceError> {
+        let best_bid_offer = self.try_best_bid_offer()?;
+        let rules = self.definition.price_rules();
+        validate_pegged_bbo_prices(rules, best_bid_offer)?;
+        validate_pegged_request_limit(rules, request.limit_price)?;
+        let tick = i128::from(rules.tick_size());
+        let reference_index = pegged_reference_index(best_bid_offer, request, tick)?;
+        let reference_raw = reference_index
+            .checked_mul(tick)
+            .ok_or(PeggedPriceError::PriceArithmeticOverflow)?;
+        let reference_price = price_from_pegged_raw(reference_raw)?;
+        let offset_index = reference_index
+            .checked_add(i128::from(request.offset_ticks))
+            .ok_or(PeggedPriceError::PriceArithmeticOverflow)?;
+        let offset_raw = offset_index
+            .checked_mul(tick)
+            .ok_or(PeggedPriceError::PriceArithmeticOverflow)?;
+        let bounded_raw = match (request.side, request.limit_price) {
+            (Side::Buy, Some(limit)) => offset_raw.min(i128::from(limit.raw())),
+            (Side::Sell, Some(limit)) => offset_raw.max(i128::from(limit.raw())),
+            (_, None) => offset_raw,
+        };
+        let bounded_price = price_from_pegged_raw(bounded_raw)?;
+        let (price, passively_slid) =
+            apply_pegged_crossing_policy(rules, best_bid_offer, request, bounded_price, tick)?;
+        validate_resolved_pegged_price(rules, price)?;
+        Ok(PeggedPriceResolution {
+            request,
+            best_bid_offer,
+            reference_price,
+            bounded_price,
+            price,
+            passively_slid,
+        })
     }
 
     /// Fallibly returns the current displayed best bid after validating both
@@ -15039,11 +15689,12 @@ mod price_level_index_tests {
         IncomingPreview, InvariantViolation, LevelSnapshot, MassCancel, MassCancelScope,
         MatchingCapacity, MatchingError, NewOrder, OrderBook, OrderBookLimits, OrderBookLimitsSpec,
         OrderBookQueryError, OrderBookQueryResource, OrderDisplay, OrderQueueClass,
-        OrderSelectionPool, OrderSnapshot, OrderType, PriceLevel, PriceLevels,
-        PublicLevelObservation, RejectReason, ReplaceOrder, RestingOrder, SelfTradePrevention,
-        StopActivation, StopReference, StopReferenceCursor, StopTriggerSweep, TimeInForce,
-        TradingStateControl, TradingStateControlAction, TradingStateObservation,
-        reserve_order_book_query_vec, try_event_arena,
+        OrderSelectionPool, OrderSnapshot, OrderType, PegCrossingPolicy, PegReference,
+        PeggedPriceError, PeggedPriceRequest, PriceLevel, PriceLevels, PublicLevelObservation,
+        RejectReason, ReplaceOrder, RestingOrder, SelfTradePrevention, StopActivation,
+        StopReference, StopReferenceCursor, StopTriggerSweep, TimeInForce, TradingStateControl,
+        TradingStateControlAction, TradingStateObservation, reserve_order_book_query_vec,
+        try_event_arena,
     };
     use crate::instrument::{
         InstrumentDefinition, InstrumentKind, InstrumentSpec, InstrumentSymbol, PriceRules,
@@ -15706,6 +16357,17 @@ mod price_level_index_tests {
         book.bids.best_visible = Some((valid_bid.0, zero_bid));
         let error = book.try_best_bid_offer().unwrap_err();
         assert!(error.detail().contains("zero aggregate or order count"));
+        assert!(matches!(
+            book.try_resolve_pegged_price(PeggedPriceRequest {
+                side: Side::Buy,
+                reference: PegReference::Primary,
+                offset_ticks: 0,
+                limit_price: None,
+                crossing_policy: PegCrossingPolicy::Allow,
+            }),
+            Err(PeggedPriceError::InvariantViolation(error))
+                if error.detail().contains("zero aggregate or order count")
+        ));
 
         let mut zero_count_bid = valid_bid.1;
         zero_count_bid.visible_order_count = 0;
@@ -15717,6 +16379,20 @@ mod price_level_index_tests {
         book.asks.best_visible = Some((valid_bid.0, valid_offer.1));
         let error = book.try_best_bid_offer().unwrap_err();
         assert!(error.detail().contains("locked or crossed public best"));
+
+        let mut invalid_price = OrderBook::new(reserve_definition());
+        invalid_price.asks.insert(Price::from_raw(1_100), level(3));
+        assert!(matches!(
+            invalid_price.try_resolve_pegged_price(PeggedPriceRequest {
+                side: Side::Buy,
+                reference: PegReference::Market,
+                offset_ticks: 0,
+                limit_price: None,
+                crossing_policy: PegCrossingPolicy::Allow,
+            }),
+            Err(PeggedPriceError::InvariantViolation(error))
+                if error.detail().contains("violates instrument rules")
+        ));
     }
 
     #[test]
